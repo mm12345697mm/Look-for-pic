@@ -2910,7 +2910,7 @@ def find_related_by_title(
 ) -> list[dict]:
     """Up to max_n works similar by title/theme (not the main code).
 
-    Title/theme first; when empty, same-actress plus up to 2 keyword-theme works.
+    Title/theme first for every work; when empty, same-actress plus up to 2 keyword-theme works (ranked by hit count).
     Soft deadline (default ~8s; multi uses a shorter budget) so identify stays responsive.
     """
     import time as _time
@@ -2923,6 +2923,12 @@ def find_related_by_title(
 
     def _left() -> float:
         return budget - (_time.monotonic() - t0)
+
+    # Keep wall-time for actress+keyword fallback (any title with no name siblings).
+    _fallback_reserve = 7.5 if (actress or "").strip() else 5.5
+
+    def _left_title() -> float:
+        return _left() - _fallback_reserve
 
     exclude = ""
     if exclude_code and parse_code_parts(str(exclude_code)):
@@ -2951,7 +2957,7 @@ def find_related_by_title(
 
     # 1) Title search candidates (same query → sibling codes / close titles)
     hit = None
-    if _left() > 1.0:
+    if _left_title() > 1.0:
         try:
             hit = search_by_title(title, actress=actress)
         except Exception:
@@ -2998,7 +3004,7 @@ def find_related_by_title(
                 return out
 
     # 2) Shorter / keyword title search — only keep real title similarity
-    if len(out) < max_n and len(title) >= 8 and _left() > 1.5:
+    if len(out) < max_n and len(title) >= 8 and _left_title() > 1.5:
         queries: list[str] = []
         for q in title_query_variants(title)[1:5]:
             if q and q not in queries:
@@ -3009,7 +3015,7 @@ def find_related_by_title(
                 queries.append(q)
         ranked2: list[tuple[float, dict]] = []
         for q in queries:
-            if len(out) >= max_n or _left() < 0.8:
+            if len(out) >= max_n or _left_title() < 0.8:
                 break
             try:
                 more = fetch_avbase_title_results(q, actress=None)[:10]
@@ -3047,26 +3053,33 @@ def find_related_by_title(
         except Exception:
             pass
 
-    # 4) When title/theme found nothing: same-actress + keyword theme extras.
-    # Actress first (up to max_n), then up to 2 keyword matches (more hits rank higher).
-    if not out and _left() > 1.0:
+    # 4) ANY title with no name/theme siblings: same-actress + up to 2 keyword works.
+    # Keyword ranking = more overlapping theme tokens (満員/電車/媚薬/巨乳/OL…) first.
+    if not out:
         actress_cap = max_n
         keyword_cap = 2
         combined: list[dict] = []
         seen_fb: set[str] = set(seen)
+        leftover = max(0.0, _left())
+        # Always split remaining time so keywords are not starved by actress search.
+        kw_budget = min(6.5, max(4.0, leftover * 0.55)) if leftover >= 2.0 else max(1.0, leftover * 0.5)
+        act_budget = max(1.0, leftover - kw_budget) if (actress or "").strip() else 0.0
 
-        if actress and _left() > 1.0:
-            for r in _find_related_by_actress(
-                actress,
-                exclude_code=exclude or None,
-                max_n=actress_cap,
-                budget_sec=max(1.0, min(5.0, _left())),
-            ):
-                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-                if not code or code in seen_fb:
-                    continue
-                seen_fb.add(code)
-                combined.append(r)
+        if actress and act_budget >= 1.0:
+            try:
+                for r in _find_related_by_actress(
+                    actress,
+                    exclude_code=exclude or None,
+                    max_n=actress_cap,
+                    budget_sec=act_budget,
+                ):
+                    code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                    if not code or code in seen_fb:
+                        continue
+                    seen_fb.add(code)
+                    combined.append(r)
+            except Exception:
+                pass
 
         # Demo actress siblings for MIDA when online actress search is empty
         if not combined and exclude and is_mida616(exclude):
@@ -3088,13 +3101,14 @@ def find_related_by_title(
             except Exception:
                 pass
 
-        if _left() > 1.2:
+        # Keyword extras for every title that lacked name siblings (not just one work).
+        try:
             for r in _find_related_by_keywords(
                 title,
                 exclude_code=exclude or None,
                 actress=actress,
                 max_n=keyword_cap,
-                budget_sec=max(1.0, _left()),
+                budget_sec=max(kw_budget, _left()),
                 already=seen_fb,
             ):
                 code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
@@ -3102,6 +3116,8 @@ def find_related_by_title(
                     continue
                 seen_fb.add(code)
                 combined.append(r)
+        except Exception:
+            pass
 
         out = combined
 
@@ -3639,7 +3655,7 @@ def run_multi_identify_pipeline(
     )
     # Single related pass on main only, short budget (avoid N×8s timeouts)
     _progress(on_progress, "done", "active", "補齊片名相關作品…", 0.94)
-    payload = attach_related_by_title(payload, budget_sec=5.0, per_item=False)
+    payload = attach_related_by_title(payload, budget_sec=14.0, per_item=False)
     # Mirror top-level related onto main results[0] for galleryFromIdentify
     if results and isinstance(results[0], dict):
         results[0]["related_by_title"] = list(payload.get("related_by_title") or [])
