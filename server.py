@@ -1095,9 +1095,13 @@ def enrich_title_candidate(c: dict, why: str = "片名候選") -> dict:
         stills = [str(u) for u in stills if u and not is_now_printing_url(str(u))]
         if not stills:
             stills = stills_default
+    title_zh = (
+        str(c.get("title_zh") or c.get("titleZh") or "").strip() or None
+    )
     out = {
         "code": code or None,
         "title": (str(c.get("title") or "").strip() or None),
+        "title_zh": title_zh,
         "actress": (str(c.get("actress") or "").strip() or None),
         "studio": (str(c.get("studio") or "").strip() or None),
         "cid": cid or None,
@@ -2157,7 +2161,9 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
 
     # 0b) Chinese title → Gemini map to JP title + code
     gemini_hit: dict | None = None
+    query_title_zh: str | None = None
     if is_chinese_heavy_title(title):
+        query_title_zh = _clean_title_zh(title) or title.strip()
         try:
             gemini_hit = gemini_map_chinese_title(title)
         except Exception:
@@ -2166,6 +2172,8 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
         # seed candidates and continue so multi-code listing works.
         if gemini_hit and gemini_hit.get("title_ja"):
             title = str(gemini_hit["title_ja"]).strip() or title
+        if gemini_hit and gemini_hit.get("title_zh"):
+            query_title_zh = _clean_title_zh(str(gemini_hit["title_zh"])) or query_title_zh
 
     candidates: list[dict] = []
 
@@ -2177,6 +2185,7 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
             {
                 "code": code,
                 "title": gemini_hit.get("title_ja") or gemini_hit.get("title") or title,
+                "title_zh": query_title_zh or gemini_hit.get("title_zh"),
                 "actress": gemini_hit.get("actress") or actress,
                 "studio": gemini_hit.get("studio"),
                 "cover": cover_url(cid) if cid else None,
@@ -2274,6 +2283,7 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
             return {
                 "code": None,
                 "title": gemini_hit.get("title_ja") or gemini_hit.get("title"),
+                "title_zh": query_title_zh or gemini_hit.get("title_zh"),
                 "actress": gemini_hit.get("actress") or actress,
                 "studio": gemini_hit.get("studio"),
                 "cover": None,
@@ -2296,6 +2306,7 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
     out = {
         "code": best.get("code"),
         "title": best.get("title") or title,
+        "title_zh": best.get("title_zh") or query_title_zh,
         "actress": best.get("actress") or actress,
         "studio": best.get("studio"),
         "cover": best.get("cover"),
@@ -2560,10 +2571,24 @@ def identify_code(
         cover=None,
     )
 
+    title_zh = None
+    try:
+        # Prefer Chinese from online meta if present
+        if meta and isinstance(meta, dict):
+            title_zh = meta.get("title_zh")
+        title_zh = resolve_chinese_title(
+            display,
+            title_ja=title,
+            existing_zh=title_zh,
+        )
+    except Exception:
+        title_zh = None
+
     return {
         "ok": True,
         "code": display,
         "title": title,
+        "title_zh": title_zh,
         "actress": actress,
         "studio": studio,
         "cid": cid,
@@ -2863,6 +2888,243 @@ def health():
     )
 
 
+
+
+
+def http_get(url: str, *, timeout: float = 10.0, headers: dict | None = None) -> str | None:
+    """Lightweight GET returning text, or None on failure (for catalog scrapes)."""
+    try:
+        h = {"User-Agent": UA, "Accept-Language": "zh-TW,zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.5"}
+        if headers:
+            h.update(headers)
+        r = requests.get(url, headers=h, timeout=(3, timeout), verify=False, allow_redirects=True)
+        if r.status_code >= 400 or not r.text:
+            return None
+        if "Just a moment" in r.text[:800]:
+            return None
+        return r.text
+    except Exception:
+        return None
+
+
+def _looks_chinese_title(s: str | None) -> bool:
+    """True when string is likely a Chinese title (not kanji-only Japanese).
+
+    Prefer is_chinese_heavy_title; also accept Simplified-Chinese markers /
+    common CN phrasing. Pure JP kanji compounds (羞恥電車) alone are NOT enough.
+    """
+    t = (s or "").strip()
+    if len(t) < 2:
+        return False
+    try:
+        if is_chinese_heavy_title(t):
+            return True
+    except Exception:
+        pass
+    kana = len(re.findall(r"[\u3040-\u30ff]", t))
+    if kana >= 1:
+        return False  # any kana → treat as Japanese primary title
+    # Simplified-only characters strongly suggest ZH
+    simplified_markers = "耻汉与齐车杀产发经总后东来对吗么这说开关时实际"
+    if any(ch in t for ch in simplified_markers):
+        han = len(re.findall(r"[\u4e00-\u9fff]", t))
+        return han >= 2
+    # CN function words / grammar particles uncommon in JP titles
+    cn_hints = ("的", "了", "是", "被", "和", "与", "在", "她", "他", "我", "不", "人妻")
+    if any(h in t for h in cn_hints):
+        han = len(re.findall(r"[\u4e00-\u9fff]", t))
+        return han >= 3
+    return False
+
+
+def _clean_title_zh(raw: str | None, *, title_ja: str | None = None, code: str | None = None) -> str | None:
+    t = re.sub(r"\s+", " ", (raw or "").strip())
+    if not t:
+        return None
+    # Strip site name suffixes only (avoid eating 品番 hyphens like NHDTC-099)
+    t = re.sub(r"\s*[\|／/]\s*.{0,40}$", "", t).strip()
+    t = re.sub(
+        r"\s+[\-–—]\s*(MissAV|JAVLibrary|JavBus|AVBase|FANZA|DMM).*$",
+        "",
+        t,
+        flags=re.I,
+    ).strip()
+    if code:
+        variants = set()
+        raw_code = str(code).strip()
+        variants.add(raw_code)
+        if parse_code_parts(raw_code):
+            disp = format_display_code(raw_code)
+            variants.add(disp)
+            parts = parse_code_parts(raw_code)
+            if parts:
+                letter, num = parts[0], parts[1]
+                variants.add(f"{letter}-{num}")
+                variants.add(f"{letter}-{num.lstrip('0') or '0'}")
+                variants.add(f"{letter}{num}")
+                variants.add(f"{letter}{num.zfill(3)}")
+                variants.add(f"{letter}{num.zfill(5)}")
+        for v in sorted(variants, key=len, reverse=True):
+            if not v:
+                continue
+            t = re.sub(re.escape(v), " ", t, flags=re.I)
+        t = re.sub(r"\s+", " ", t).strip(" -\u3000")
+    if title_ja and t == title_ja.strip():
+        return None
+    if not _looks_chinese_title(t):
+        return None
+    if len(t) < 2 or len(t) > 80:
+        return None
+    return t
+
+
+def fetch_missav_chinese_title(code: str) -> str | None:
+    """Best-effort Chinese title from MissAV public HTML (no magnets)."""
+    if not code or not parse_code_parts(str(code)):
+        return None
+    disp = format_display_code(str(code))
+    slug = disp.lower()
+    hosts = (
+        f"https://missav.ai/{slug}",
+        f"https://missav.ws/{slug}",
+        f"https://missav.live/{slug}",
+    )
+    for url in hosts:
+        html = http_get(url, timeout=8.0)
+        if not html:
+            continue
+        # og:title / h1 often: "CODE 中文标题" or "中文标题 - CODE"
+        for pat in (
+            r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
+            r'content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']',
+            r"<h1[^>]*>(.*?)</h1>",
+            r"<title[^>]*>([^<]+)</title>",
+        ):
+            m = re.search(pat, html, flags=re.I | re.S)
+            if not m:
+                continue
+            raw = re.sub(r"<[^>]+>", "", m.group(1))
+            zh = _clean_title_zh(raw, code=disp)
+            if zh:
+                return zh
+    return None
+
+
+def fetch_javlibrary_chinese_title(code: str) -> str | None:
+    """Best-effort Chinese title from JAVLibrary CN search/detail."""
+    if not code or not parse_code_parts(str(code)):
+        return None
+    disp = format_display_code(str(code))
+    url = f"https://www.javlibrary.com/cn/vl_searchbyid.php?keyword={quote(disp)}"
+    html = http_get(url, timeout=8.0, headers={"Referer": "https://www.javlibrary.com/cn/"})
+    if not html:
+        return None
+    # Direct detail redirect page
+    tm = re.search(r'id="video_title".*?<a[^>]*>([^<]+)</a>', html, flags=re.I | re.S)
+    if tm:
+        zh = _clean_title_zh(tm.group(1), code=disp)
+        if zh:
+            return zh
+    # Search result cards: title="CODE 中文..."
+    for m in re.finditer(
+        r'class="video"[^>]*>.*?title="([^"]+)"', html, flags=re.I | re.S
+    ):
+        raw = m.group(1)
+        if disp.replace("-", "").upper() not in re.sub(r"[\s\-]", "", raw).upper() and disp.upper() not in raw.upper():
+            # still accept if starts with code-ish
+            if not re.match(re.escape(disp.split("-")[0]), raw, flags=re.I):
+                continue
+        zh = _clean_title_zh(raw, code=disp)
+        if zh:
+            return zh
+    return None
+
+
+def resolve_chinese_title(
+    code: str | None,
+    *,
+    title_ja: str | None = None,
+    existing_zh: str | None = None,
+    user_title: str | None = None,
+) -> str | None:
+    """Resolve Traditional/Simplified Chinese title from public catalogs.
+
+    Sources (public HTML only): existing payload → user Chinese query →
+    MissAV → JAVLibrary CN. No pirate/magnet links. Returns None if unavailable.
+    """
+    zh = _clean_title_zh(existing_zh, title_ja=title_ja, code=code)
+    if zh:
+        return zh
+    if user_title and _looks_chinese_title(user_title):
+        zh = _clean_title_zh(user_title, title_ja=title_ja, code=code)
+        if zh:
+            return zh
+    # If the "Japanese" title is already Chinese-heavy, treat as zh and skip scrape
+    if title_ja and _looks_chinese_title(title_ja) and not re.search(r"[\u3040-\u30ff]", title_ja):
+        return None  # caller already showing Chinese as main title
+    if not code or not parse_code_parts(str(code)):
+        return None
+    for fetcher in (fetch_missav_chinese_title, fetch_javlibrary_chinese_title):
+        try:
+            zh = fetcher(str(code))
+        except Exception:
+            zh = None
+        if zh:
+            return zh
+    return None
+
+
+def attach_chinese_titles(payload: dict, *, related_network: bool = False) -> dict:
+    """Fill title_zh on main work (and optionally related) when missing.
+
+    related_network=False (default): only keep already-known title_zh on related
+    to avoid N× catalog round-trips during identify. Set True for single-item APIs.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    code = payload.get("code")
+    if code and (str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code))):
+        code = None
+    if not payload.get("title_zh"):
+        zh = resolve_chinese_title(
+            str(code) if code else None,
+            title_ja=payload.get("title"),
+            existing_zh=payload.get("title_zh"),
+            user_title=payload.get("user_title") or payload.get("query_title"),
+        )
+        if zh:
+            payload["title_zh"] = zh
+    for key in ("related_by_title", "related"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            # Normalize passthrough
+            if item.get("title_zh"):
+                item["title_zh"] = _clean_title_zh(
+                    str(item.get("title_zh")),
+                    title_ja=item.get("title"),
+                    code=item.get("code"),
+                ) or item.get("title_zh")
+                continue
+            if not related_network:
+                continue
+            icode = item.get("code")
+            if not icode or not parse_code_parts(str(icode)):
+                continue
+            try:
+                zh = resolve_chinese_title(
+                    str(icode),
+                    title_ja=item.get("title"),
+                    existing_zh=item.get("title_zh"),
+                )
+            except Exception:
+                zh = None
+            if zh:
+                item["title_zh"] = zh
+    return payload
 
 
 def _title_related_keyword_queries(title: str) -> list[str]:
@@ -3176,7 +3438,7 @@ def _find_related_by_keywords(
     *,
     exclude_code: str | None = None,
     actress: str | None = None,
-    max_n: int = 3,
+    max_n: int = 5,
     budget_sec: float = 6.0,
     already: set[str] | None = None,
 ) -> list[dict]:
@@ -3302,11 +3564,11 @@ def _find_related_by_actress(
     actress: str,
     *,
     exclude_code: str | None = None,
-    max_n: int = 5,
+    max_n: int = 3,
     budget_sec: float = 6.0,
     already: set[str] | None = None,
 ) -> list[dict]:
-    """Same-actress fill (last resort): 3–5 other works."""
+    """Same-actress bucket: up to max_n other works (cap 3). No junk pad."""
     import time as _time
 
     name = (actress or "").strip()
@@ -3350,7 +3612,8 @@ def _find_related_by_actress(
             seen.add(code)
 
     ranked.sort(key=lambda x: x[0], reverse=True)
-    target = max(3, min(int(max_n), 5))
+    # Cap only — never pad; return however many real same-actress hits we found (≤ max_n)
+    target = max(0, min(int(max_n), 3))
     for _sc, c in ranked[:target]:
         item = enrich_title_candidate(c, why="同演員")
         item["line"] = "actress"
@@ -3366,18 +3629,33 @@ def find_related_by_title(
     actress: str | None = None,
     budget_sec: float = 8.0,
 ) -> list[dict]:
-    """Related works: title/series first → keywords only if needed → actress only if keywords fail.
+    """Related works in three independent buckets (caps, not quotas):
 
-    Prefer fewer high-relevance hits. Dedupes by code. Soft deadline for identify.
+    1. Same title / series / name-similarity — up to 5
+    2. Kanji keyword matches from JP title — up to 5 (separate, not a top-up)
+    3. Same actress — up to 3
+
+    Order: title → keyword → actress. Deduplicate by code. Never pad with junk;
+    empty/short buckets are fine. Soft deadline for identify.
     """
     import time as _time
 
     title = normalize_ocr_title(title) or (title or "").strip()
-    title_cap = max(3, min(int(max_n) if max_n else 5, 5))
+    title_cap = max(0, min(int(max_n) if max_n else 5, 5))
     keyword_cap = 5
-    actress_cap = 5
-    min_enough = 3
+    actress_cap = 3
     if title_cap <= 0 or not is_usable_title(title):
+        # Still allow actress-only when title unusable but actress known
+        if (actress or "").strip():
+            try:
+                return _find_related_by_actress(
+                    actress,
+                    exclude_code=exclude_code,
+                    max_n=actress_cap,
+                    budget_sec=min(5.0, float(budget_sec) if budget_sec else 5.0),
+                )[:actress_cap]
+            except Exception:
+                return []
         return []
     t0 = _time.monotonic()
     budget = float(budget_sec) if budget_sec and budget_sec > 0 else 8.0
@@ -3385,8 +3663,8 @@ def find_related_by_title(
     def _left() -> float:
         return budget - (_time.monotonic() - t0)
 
-    # Spend most budget on title/series; keep a slice for keyword/actress fallback
-    _later_reserve = 6.0 if (actress or "").strip() else 4.0
+    # Reserve time so keyword + actress buckets can still run after title search
+    _later_reserve = 5.0 if (actress or "").strip() else 3.5
 
     def _left_title() -> float:
         return _left() - _later_reserve
@@ -3413,7 +3691,7 @@ def find_related_by_title(
         item["why"] = why
         out.append(item)
 
-    # --- 1) Title / same-series search ---
+    # --- 1) Title / same-series (cap 5, no pad) ---
     hit = None
     if _left_title() > 1.0:
         try:
@@ -3432,6 +3710,7 @@ def find_related_by_title(
                 "cid": hit.get("cid"),
                 "score": hit.get("score"),
                 "source": hit.get("source"),
+                "title_zh": hit.get("title_zh"),
             }
             if not any(
                 format_display_code(str(c.get("code") or ""))
@@ -3451,7 +3730,6 @@ def find_related_by_title(
             if not ok and float(c.get("score") or 0) < 0.85:
                 continue
             if not ok:
-                # Exact catalog head only when score is very high still needs theme gate
                 continue
             ranked.append((sc, c))
         ranked.sort(key=lambda x: x[0], reverse=True)
@@ -3493,13 +3771,11 @@ def find_related_by_title(
                 ct = re.sub(r"\s+", "", str(c.get("title") or ""))
                 hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
                 sim = title_similarity(title, str(c.get("title") or ""))
-                # Rank: stronger theme score, more keyword overlap, higher similarity
                 sc = float(sc) + float(hits) * 0.03 + float(sim) * 0.15
                 if q and re.sub(r"\s+", "", q) in ct:
                     sc += 0.08
                 ranked2.append((sc, c))
         ranked2.sort(key=lambda x: x[0], reverse=True)
-        # Prefer fewer high-relevance: keep top scores; drop long tail below quality floor
         if ranked2:
             top = ranked2[0][0]
             ranked2 = [x for x in ranked2 if x[0] >= max(0.48, top - 0.22)]
@@ -3526,20 +3802,19 @@ def find_related_by_title(
 
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
 
-    # --- 2) Keywords only if title tier not enough ---
+    # --- 2) Keywords — independent bucket (cap 5), always try when keywords exist ---
     keyword_items_added = 0
-    if theme_n < min_enough and _left() >= 1.5:
-        need = min(keyword_cap, max(1, min_enough - theme_n))
+    if keywords and _left() >= 1.2:
         try:
             for r in _find_related_by_keywords(
                 title,
                 exclude_code=exclude or None,
                 actress=actress,
-                max_n=need,
-                budget_sec=min(8.0, max(2.5, _left() * 0.55)),
+                max_n=keyword_cap,
+                budget_sec=min(6.0, max(2.0, _left() * 0.45)),
                 already=seen,
             ):
-                # Promote strong title-series matches that keyword search found
+                # Strong title-series matches found via keyword search → promote to theme
                 ok, _sc = _is_title_theme_match(
                     title, str(r.get("title") or ""), keywords=keywords, phrases=phrases
                 )
@@ -3549,7 +3824,7 @@ def find_related_by_title(
                     continue
                 _push(r, why=str(r.get("why") or "名稱關鍵字"), line="keyword")
                 keyword_items_added += 1
-                if keyword_items_added >= need:
+                if keyword_items_added >= keyword_cap:
                     break
         except Exception:
             pass
@@ -3557,19 +3832,14 @@ def find_related_by_title(
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
     keyword_n = sum(1 for x in out if str(x.get("line")) == "keyword")
 
-    # --- 3) Actress only if title+keyword both failed (prefer fewer high-relevance) ---
-    if (
-        theme_n == 0
-        and keyword_n == 0
-        and (actress or "").strip()
-        and _left() >= 1.0
-    ):
+    # --- 3) Actress — independent bucket (cap 3), always try when actress known ---
+    if (actress or "").strip() and _left() >= 0.8:
         try:
             for r in _find_related_by_actress(
                 actress,
                 exclude_code=exclude or None,
                 max_n=actress_cap,
-                budget_sec=min(5.0, max(2.0, _left())),
+                budget_sec=min(4.0, max(1.5, _left())),
                 already=seen,
             ):
                 _push(r, why=str(r.get("why") or "同演員"), line="actress")
@@ -3582,8 +3852,6 @@ def find_related_by_title(
     if (
         actress
         and not any(str(x.get("line")) == "actress" for x in out)
-        and theme_n == 0
-        and keyword_n == 0
         and exclude
         and is_mida616(exclude)
     ):
@@ -3598,18 +3866,19 @@ def find_related_by_title(
         except Exception:
             pass
 
-    # Stable display order: theme → keyword → actress
-    theme_items = [x for x in out if str(x.get("line")) == "theme"]
-    keyword_items = [x for x in out if str(x.get("line")) == "keyword"]
-    actress_items = [x for x in out if str(x.get("line")) == "actress"]
+    # Stable display order: theme → keyword → actress (caps already applied)
+    theme_items = [x for x in out if str(x.get("line")) == "theme"][:title_cap]
+    keyword_items = [x for x in out if str(x.get("line")) == "keyword"][:keyword_cap]
+    actress_items = [x for x in out if str(x.get("line")) == "actress"][:actress_cap]
     other_items = [
         x
         for x in out
-        if x not in theme_items and x not in keyword_items and x not in actress_items
+        if str(x.get("line")) not in {"theme", "keyword", "actress"}
     ]
     # Within keyword tier: more hits first
     keyword_items.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
     return theme_items + keyword_items + actress_items + other_items
+
 
 
 def attach_related_by_title(
@@ -3618,7 +3887,11 @@ def attach_related_by_title(
     budget_sec: float = 14.0,
     per_item: bool = True,
 ) -> dict:
-    """Mutate identify payload to include related_by_title (title → keyword → actress last-resort).
+    """Mutate identify payload to include related_by_title.
+
+    Independent buckets (caps, not quotas — no junk pad):
+      title/series ≤5 → keyword ≤5 → actress ≤3
+    Order preserved; dedupe by code. Total related ≤ ~13.
 
     per_item=False (multi): only fill top-level related_by_title once, skip results[].
     """
@@ -3642,7 +3915,6 @@ def attach_related_by_title(
         except Exception:
             result["related_by_title"] = []
     else:
-        # Cap & exclude main; keep up to 5 (actress + keyword extras).
         main = format_display_code(str(code)) if code and parse_code_parts(str(code)) else ""
         cleaned = []
         seen: set[str] = {main} if main else set()
@@ -3655,13 +3927,14 @@ def attach_related_by_title(
             seen.add(rc)
             item = enrich_title_candidate(r, why=str(r.get("why") or "片名相近"))
             item["line"] = r.get("line") or "theme"
+            if r.get("title_zh") and not item.get("title_zh"):
+                item["title_zh"] = r.get("title_zh")
             cleaned.append(item)
             if len(cleaned) >= 13:
                 break
         result["related_by_title"] = cleaned
 
-    # Re-order + light top-up only when title tier is short (no junk pad).
-    # Priority: theme → keyword (only if needed) → actress (only if keywords failed).
+    # Ensure each independent bucket is filled up to its cap when possible
     try:
         rel = list(result.get("related_by_title") or [])
         seen_codes: set[str] = set()
@@ -3687,20 +3960,22 @@ def attach_related_by_title(
         theme_n = sum(1 for x in rel if _line_of(x) == "theme")
         kw_n = sum(1 for x in rel if _line_of(x) == "keyword")
         act_n = sum(1 for x in rel if _line_of(x) == "actress")
-        min_enough = 3
+        title_cap, keyword_cap, actress_cap = 5, 5, 3
 
-        # Keywords only when title/series still short
-        if theme_n < min_enough and is_usable_title(str(title or "")):
-            need = min(5, max(min_enough - theme_n, 2))
-            if kw_n < need:
-                kw_budget = max(4.0, min(8.0, float(budget_sec) if budget_sec else 6.0))
-                phrases = _title_sibling_phrases(str(title or ""))
-                kws = _extract_title_theme_keywords(str(title or ""), actress=result.get("actress"))
+        # Keywords: independent top-up to cap 5 (only real matches)
+        if (
+            kw_n < keyword_cap
+            and is_usable_title(str(title or ""))
+        ):
+            kw_budget = max(3.0, min(7.0, float(budget_sec) if budget_sec else 6.0))
+            phrases = _title_sibling_phrases(str(title or ""))
+            kws = _extract_title_theme_keywords(str(title or ""), actress=result.get("actress"))
+            if kws:
                 for r in _find_related_by_keywords(
                     str(title or ""),
                     exclude_code=str(code) if code else None,
                     actress=result.get("actress"),
-                    max_n=need - kw_n,
+                    max_n=keyword_cap - kw_n,
                     budget_sec=kw_budget,
                     already=seen_codes,
                 ):
@@ -3710,33 +3985,33 @@ def attach_related_by_title(
                     ok, _sc = _is_title_theme_match(
                         str(title or ""), str(r.get("title") or ""), keywords=kws, phrases=phrases
                     )
-                    if ok and theme_n < 5:
+                    if ok and theme_n < title_cap:
                         r = dict(r)
                         r["line"] = "theme"
                         r["why"] = "片名相近"
                         theme_n += 1
                     else:
+                        r = dict(r)
+                        r["line"] = "keyword"
+                        r["why"] = str(r.get("why") or "名稱關鍵字")
                         kw_n += 1
                     seen_codes.add(rc)
                     rel.append(r)
-                    if theme_n >= min_enough or kw_n >= need:
+                    if theme_n >= title_cap and kw_n >= keyword_cap:
+                        break
+                    if kw_n >= keyword_cap and theme_n >= title_cap:
                         break
 
         theme_n = sum(1 for x in rel if _line_of(x) == "theme")
         kw_n = sum(1 for x in rel if _line_of(x) == "keyword")
         act_n = sum(1 for x in rel if _line_of(x) == "actress")
 
-        # Actress only if keywords also failed
-        if (
-            theme_n == 0
-            and kw_n == 0
-            and act_n < 3
-            and (result.get("actress") or "").strip()
-        ):
+        # Actress: independent top-up to cap 3
+        if act_n < actress_cap and (result.get("actress") or "").strip():
             for r in _find_related_by_actress(
                 result.get("actress"),
                 exclude_code=str(code) if code else None,
-                max_n=5 - act_n,
+                max_n=actress_cap - act_n,
                 budget_sec=min(4.0, float(budget_sec) if budget_sec else 4.0),
                 already=seen_codes,
             ):
@@ -3744,14 +4019,17 @@ def attach_related_by_title(
                 if not rc or rc in seen_codes:
                     continue
                 seen_codes.add(rc)
+                r = dict(r)
+                r["line"] = "actress"
+                r["why"] = str(r.get("why") or "同演員")
                 rel.append(r)
                 act_n += 1
-                if act_n >= 5:
+                if act_n >= actress_cap:
                     break
 
-        theme_items = [x for x in rel if _line_of(x) == "theme"]
-        keyword_items = [x for x in rel if _line_of(x) == "keyword"]
-        actress_items = [x for x in rel if _line_of(x) == "actress"]
+        theme_items = [x for x in rel if _line_of(x) == "theme"][:title_cap]
+        keyword_items = [x for x in rel if _line_of(x) == "keyword"][:keyword_cap]
+        actress_items = [x for x in rel if _line_of(x) == "actress"][:actress_cap]
         keyword_items.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
         ordered = []
         seen_o: set[str] = set()
@@ -3761,13 +4039,19 @@ def attach_related_by_title(
                 if not rc or rc in seen_o:
                     continue
                 seen_o.add(rc)
-                # Normalize line for frontend badges
                 x = dict(x)
                 x["line"] = _line_of(x)
                 ordered.append(x)
         result["related_by_title"] = ordered[:13]
     except Exception:
         pass
+
+    # Attach Chinese titles on related + main when missing
+    try:
+        attach_chinese_titles(result)
+    except Exception:
+        pass
+
     if not per_item:
         return result
     # Also attach on each results[] entry if present (single-image path)
@@ -3775,13 +4059,16 @@ def attach_related_by_title(
         if not isinstance(item, dict):
             continue
         if item.get("related_by_title"):
-            # Still sanitize covers on pre-filled related lists
             fixed = []
             for r in item.get("related_by_title") or []:
                 if not isinstance(r, dict):
                     continue
                 fixed.append(enrich_title_candidate(r, why=str(r.get("why") or "片名相近")))
             item["related_by_title"] = fixed[:13]
+            try:
+                attach_chinese_titles(item)
+            except Exception:
+                pass
             continue
         it_title = item.get("title") or title
         it_code = item.get("code")
@@ -3795,9 +4082,11 @@ def attach_related_by_title(
                 actress=item.get("actress"),
                 budget_sec=min(budget_sec, 10.0),
             )
+            attach_chinese_titles(item)
         except Exception:
             item["related_by_title"] = []
     return result
+
 
 
 def collect_images_from_request() -> list[tuple[bytes, str | None]]:
@@ -4848,12 +5137,19 @@ def identify():
 
 @app.get("/api/related-by-title")
 def related_by_title_api():
-    """Fetch up to 3 title/theme-related works for a code/title (history detail)."""
+    """Fetch related works: title≤5 + keyword≤5 + actress≤3 (caps; history detail)."""
     title = (request.args.get("title") or "").strip()
     code = (request.args.get("code") or request.args.get("exclude") or "").strip()
     actress = (request.args.get("actress") or "").strip() or None
     try:
-        items = find_related_by_title(title, exclude_code=code or None, max_n=3, actress=actress)
+        items = find_related_by_title(title, exclude_code=code or None, max_n=5, actress=actress, budget_sec=16.0)
+        # Light Chinese title attach for API consumers
+        wrap = {"ok": True, "code": code or None, "title": title, "related_by_title": items}
+        try:
+            attach_chinese_titles(wrap)
+            items = wrap.get("related_by_title") or items
+        except Exception:
+            pass
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
     return jsonify({"ok": True, "related_by_title": items, "title": title, "exclude": code})

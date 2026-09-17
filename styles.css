@@ -977,7 +977,7 @@ body.lightbox-open {
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
-  padding: 0 2px 8px;
+  padding: 8px 2px 0;
 }
 .work-carousel-hint {
   font-size: 0.78rem;
@@ -996,6 +996,7 @@ body.lightbox-open {
 }
 .work-carousel-track {
   display: flex;
+  align-items: flex-start; /* do not stretch slides to tallest related card */
   gap: 12px;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
@@ -1011,9 +1012,11 @@ body.lightbox-open {
   scroll-snap-align: start;
   scroll-snap-stop: always;
   box-sizing: border-box;
+  align-self: flex-start;
 }
 .work-carousel-slide .card {
-  height: 100%;
+  /* height follows content — avoids large empty gap under short stills rows */
+  height: auto;
 }
 /* Keep stills horizontal; isolate nested sideways scroll from the work carousel */
 .stills-scroll {

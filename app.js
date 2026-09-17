@@ -101,6 +101,20 @@
     return out;
   }
 
+
+  /** 日本語タイトル（中文片名）— omit empty parentheses when no Chinese title */
+  function formatDisplayTitle(titleJa, titleZh) {
+    const ja = (titleJa || '').trim();
+    const zh = (titleZh || '').trim();
+    if (!ja && !zh) return '（無標題）';
+    if (!zh) return ja || '（無標題）';
+    if (!ja) return zh;
+    // Avoid duplicating when OCR already Chinese-only or identical
+    if (ja === zh) return ja;
+    if (ja.includes('（' + zh + '）') || ja.includes('(' + zh + ')')) return ja;
+    return ja + '（' + zh + '）';
+  }
+
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
     const titleOnly =
@@ -137,6 +151,7 @@
     return {
       code,
       title: raw.title ? String(raw.title) : '',
+      titleZh: raw.title_zh ? String(raw.title_zh) : (raw.titleZh ? String(raw.titleZh) : ''),
       actress: raw.actress ? String(raw.actress) : '',
       studio: raw.studio ? String(raw.studio) : '',
       cid,
@@ -683,10 +698,17 @@
       const line = String((rw && rw.line) || '');
       return line === 'keyword' || why.includes('關鍵字');
     });
-    if (hasActress && hasKeyword) return '同演員／關鍵字';
-    if (hasActress) return '同演員';
-    if (hasKeyword) return '關鍵字';
-    return '依片名';
+    const hasTitle = (relatedList || []).some((rw) => {
+      const why = String((rw && rw.why) || '');
+      const line = String((rw && rw.line) || '');
+      return line === 'theme' || line === 'title' || why.includes('片名') || why.includes('主題');
+    });
+    const parts = [];
+    if (hasTitle) parts.push('片名');
+    if (hasKeyword) parts.push('關鍵字');
+    if (hasActress) parts.push('同演員');
+    if (!parts.length) return '相關作品';
+    return parts.join('／');
   }
 
   /** Single work card (cover + stills). Related works are NOT nested here. */
@@ -704,7 +726,7 @@
       escapeHtml(w.code) +
       '</p>' +
       '<p class="card-title">' +
-      escapeHtml(w.title || '（無標題）') +
+      escapeHtml(formatDisplayTitle(w.title, w.titleZh)) +
       '</p>' +
       (w.actress
         ? '<p class="card-actress">女優：' + escapeHtml(w.actress) + (w.studio ? ' · ' + escapeHtml(w.studio) : '') + '</p>'
@@ -759,8 +781,6 @@
     pager.textContent = '1 / ' + total;
     head.appendChild(hint);
     head.appendChild(pager);
-    block.appendChild(head);
-
     const track = document.createElement('div');
     track.className = 'work-carousel-track';
     track.setAttribute('aria-label', '主作品與相關作品橫向切換');
@@ -801,7 +821,9 @@
       window.requestAnimationFrame(updatePager);
     }, { passive: true });
 
+    // Track first, then hint/pager as snug footer under stills (no stretch gap)
     block.appendChild(track);
+    block.appendChild(head);
     return block;
   }
 
@@ -1009,6 +1031,7 @@
       ? data.related_by_title.slice(0, 13).map((r) => ({
           code: r.code || '',
           title: r.title || '',
+          title_zh: r.title_zh || '',
           cover: r.cover || '',
           stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
         }))
@@ -1029,6 +1052,7 @@
         ts: Date.now(),
         code: code,
         title: item.title || data.title || '',
+        title_zh: item.title_zh || data.title_zh || '',
         cover: item.cover || data.cover || '',
         stills: Array.isArray(item.stills) ? item.stills.slice(0, 12) : (data.stills || []).slice(0, 12),
         userShots: userShots,
@@ -1036,6 +1060,7 @@
           ? item.related_by_title.slice(0, 13).map((r) => ({
               code: r.code || '',
               title: r.title || '',
+              title_zh: r.title_zh || '',
               cover: r.cover || '',
               stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
             }))
@@ -1095,7 +1120,7 @@
         escapeHtml(rec.code || '—') +
         '</p>' +
         '<p class="history-title">' +
-        escapeHtml(rec.title || '（無標題）') +
+        escapeHtml(formatDisplayTitle(rec.title, rec.title_zh)) +
         '</p>' +
         '<p class="history-ts">' +
         escapeHtml(formatTs(rec.ts)) +
@@ -1147,6 +1172,7 @@
       {
         code: rec.code,
         title: rec.title,
+        title_zh: rec.title_zh || '',
         cover: rec.cover,
         stills: rec.stills,
         actress: rec.actress,
