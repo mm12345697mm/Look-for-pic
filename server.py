@@ -1326,6 +1326,109 @@ def _cid_from_avbase_product(product: dict | None, work_id: str | None = None) -
     return None
 
 
+
+def fetch_avbase_by_code(code: str) -> dict | None:
+    """Resolve a 品番 via avbase.net work page / works?q=code (title + actress + studio)."""
+    from urllib.parse import quote
+
+    display = format_display_code(code) if parse_code_parts(code) else (code or "").strip().upper()
+    if not display or not parse_code_parts(display):
+        return None
+    headers = _avbase_headers()
+    work = None
+    # Prefer exact work page (stable even when search ranking is odd)
+    for slug in (display, display.lower(), display.replace("-", "")):
+        try:
+            url = f"https://www.avbase.net/works/{quote(slug)}"
+            r = requests.get(url, headers=headers, timeout=10, verify=False)
+            if r.status_code >= 400 or not r.text:
+                continue
+            m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+            if not m:
+                continue
+            data = json.loads(m.group(1))
+            cand = ((data.get("props") or {}).get("pageProps") or {}).get("work")
+            if isinstance(cand, dict) and str(cand.get("work_id") or "").strip():
+                wid = format_display_code(str(cand.get("work_id")))
+                if wid == display:
+                    work = cand
+                    break
+        except Exception:
+            continue
+    if work is None:
+        try:
+            rows = fetch_avbase_title_results(display, actress=None)
+        except Exception:
+            rows = []
+        for row in rows:
+            if format_display_code(str(row.get("code") or "")) == display:
+                # Normalize to identify_code meta shape
+                return {
+                    "code": display,
+                    "title": row.get("title"),
+                    "actress": row.get("actress"),
+                    "studio": row.get("studio"),
+                    "cid": row.get("cid") or code_to_cid(display),
+                    "related": [],
+                    "source": "avbase",
+                    "cover": row.get("cover"),
+                }
+        return None
+
+    title = str(work.get("title") or "").strip() or None
+    products = work.get("products") or []
+    p0 = products[0] if products and isinstance(products[0], dict) else {}
+    cid = _cid_from_avbase_product(p0, display) if p0 else None
+    if not cid:
+        cid = code_to_cid(display)
+    studio = None
+    actress_name = None
+    if p0:
+        maker = p0.get("maker") or {}
+        if isinstance(maker, dict):
+            studio = maker.get("name")
+    actors = (
+        work.get("actors")
+        or work.get("casts")
+        or work.get("performers")
+        or (p0.get("actors") if p0 else None)
+        or []
+    )
+    if isinstance(actors, list) and actors:
+        a0 = actors[0]
+        if isinstance(a0, dict):
+            actress_name = (
+                a0.get("name")
+                or a0.get("actor_name")
+                or ((a0.get("actor") or {}) if isinstance(a0.get("actor"), dict) else {}).get("name")
+            )
+        elif isinstance(a0, str):
+            actress_name = a0
+    # Title often ends with actress name after a space (…巨乳美女6 広瀬美結)
+    if not actress_name and title:
+        parts = str(title).strip().split()
+        if len(parts) >= 2 and 2 <= len(parts[-1]) <= 20:
+            # Avoid trailing digits-only tokens
+            if any(ch.isalpha() or ("\u3040" <= ch <= "\u30ff") or ("\u4e00" <= ch <= "\u9fff") for ch in parts[-1]):
+                if not re.search(r"\d", parts[-1]):
+                    actress_name = parts[-1]
+    cover = None
+    if p0:
+        cover = p0.get("image_url") or p0.get("thumbnail_url")
+    if not cover and cid:
+        cover = cover_url(cid)
+    return {
+        "code": display,
+        "title": title,
+        "actress": actress_name,
+        "studio": studio,
+        "cid": cid,
+        "related": [],
+        "source": "avbase",
+        "cover": cover,
+    }
+
+
 def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[dict]:
     """
     Title → code via avbase.net (works from this box; ~0.3–0.7s).
@@ -1364,6 +1467,10 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
             score = title_similarity(title, rtitle)
             if title and title[: min(8, len(title))] and title[:8] in rtitle:
                 score = max(score, 0.85)
+            # Code-style queries (e.g. DRPT-120) must match work_id, not JP title text
+            q_code = format_display_code(title) if parse_code_parts(title) else ""
+            if q_code and q_code == code:
+                score = max(score, 1.0)
             if score < 0.25:
                 continue
             products = w.get("products") or []
@@ -2242,11 +2349,17 @@ def identify_code(
         elif src_meta and not meta:
             meta = src_meta
 
+    # AVBase first: exact 品番 page, then search (JAVLibrary/DDG helpers are flaky here).
     try:
-        meta = fetch_javlibrary(display)
+        meta = fetch_avbase_by_code(display)
     except Exception:
         meta = None
 
+    if not _has_title(meta) and _budget_left() > 0.5:
+        try:
+            meta = fetch_javlibrary(display)
+        except Exception:
+            meta = meta
     if not _has_title(meta) and _budget_left() > 0.5:
         try:
             jb = fetch_javbus(display)
@@ -2299,18 +2412,18 @@ def identify_code(
             related_note = "線上目錄未取得同女優相關；僅顯示主作品 CDN。"
         message = f"來源：{meta.get('source') or 'web'}"
         if not (title and str(title).strip()):
-            related_note = "已取得 CDN 封面，但無法解析標題（JAVLibrary／JavBus／搜尋／Gemini 皆無結果）。"
+            related_note = "已取得 CDN 封面，但無法解析標題（AVBase／JAVLibrary／JavBus／搜尋／Gemini 皆無結果）。"
             if timed_out:
                 message = "僅 CDN（標題查詢逾時）— 已嘗試線上來源"
             else:
-                message = "僅 CDN（無標題）— 已嘗試 JAVLibrary、JavBus、DuckDuckGo、Gemini"
+                message = "僅 CDN（無標題）— 已嘗試 AVBase、JAVLibrary、JavBus、DuckDuckGo、Gemini"
     else:
         title = None
-        related_note = "已取得 CDN 封面，但無法解析標題（JAVLibrary／JavBus／搜尋／Gemini 皆無結果）。"
+        related_note = "已取得 CDN 封面，但無法解析標題（AVBase／JAVLibrary／JavBus／搜尋／Gemini 皆無結果）。"
         if timed_out:
             message = "僅 CDN（標題查詢逾時）— 已嘗試線上來源"
         else:
-            message = "僅 CDN（無標題）— 已嘗試 JAVLibrary、JavBus、DuckDuckGo、Gemini"
+            message = "僅 CDN（無標題）— 已嘗試 AVBase、JAVLibrary、JavBus、DuckDuckGo、Gemini"
 
     # Prefer vision title; fill missing fields from vision
     if vision_meta:
