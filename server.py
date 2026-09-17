@@ -2764,30 +2764,59 @@ def _find_related_by_keywords(
     if exclude:
         seen.add(exclude)
 
-    # Prefer multi-keyword queries, then singles
+    # Build queries that AV catalogs actually answer:
+    # concatenated JP compounds (満員電車) beat spaced pairs (満員 電車 → often 0 hits).
     queries: list[str] = []
-    primary = keywords[:6]
-    for i in range(len(primary)):
-        for j in range(i + 1, len(primary)):
-            q = f"{primary[i]} {primary[j]}"
-            if q not in queries:
-                queries.append(q)
-            if len(queries) >= 6:
-                break
-        if len(queries) >= 6:
-            break
-    for kw in primary[:5]:
-        if kw not in queries:
-            queries.append(kw)
+    primary = keywords[:8]
+
+    def _add_q(q: str) -> None:
+        q = (q or "").strip()
+        if len(q) >= 2 and q not in queries:
+            queries.append(q)
+
+    # Title-order keywords → adjacent concatenations (満員+電車, 媚薬+オイル…)
+    ordered = sorted(
+        primary,
+        key=lambda k: (title.find(k) if k and k in title else 10_000, -len(k)),
+    )
+    for i in range(len(ordered) - 1):
+        a, b = ordered[i], ordered[i + 1]
+        if a and b and a.casefold() != b.casefold():
+            _add_q(a + b)
+            _add_q(f"{a} {b}")  # keep spaced as secondary
+    # High-value known theme compounds when both tokens exist
+    for a, b in (
+        ("満員", "電車"), ("滿員", "電車"), ("媚薬", "オイル"), ("媚藥", "オイル"),
+        ("乳首", "開発"), ("乳首", "イキ"), ("巨乳", "OL"), ("美乳", "OL"),
+    ):
+        if any(k.casefold() == a.casefold() for k in keywords) and any(
+            k.casefold() == b.casefold() for k in keywords
+        ):
+            _add_q(a + b)
+    # Strong singles last
+    for kw in ordered[:5]:
+        _add_q(kw)
+    queries = queries[:10]
 
     ranked: dict[str, tuple[float, dict]] = {}
     for q in queries:
         if _time.monotonic() - t0 > budget:
             break
-        try:
-            rows = fetch_avbase_title_results(q, actress=None)[:12]
-        except Exception:
-            rows = []
+        rows: list[dict] = []
+        for fetch in (
+            fetch_avbase_title_results,
+            fetch_jav321_title_results,
+            fetch_javlibrary_title_results,
+        ):
+            if _time.monotonic() - t0 > budget:
+                break
+            try:
+                rows.extend(fetch(q, actress=None)[:10])
+            except Exception:
+                pass
+            if rows:
+                break  # one healthy source is enough per query
+        rows = rows[:12]
         for c in rows:
             code_raw = str(c.get("code") or "").strip()
             if not code_raw or not parse_code_parts(code_raw):
@@ -3053,17 +3082,35 @@ def find_related_by_title(
         except Exception:
             pass
 
-    # 4) ANY title with no name/theme siblings: same-actress + up to 2 keyword works.
-    # Keyword ranking = more overlapping theme tokens (満員/電車/媚薬/巨乳/OL…) first.
+    # 4) ANY title with no name/theme siblings: keyword theme extras + same-actress.
+    # Keywords first (catalog queries need the reserved time); actress fills after.
+    # Keyword ranking = more overlapping theme tokens first.
     if not out:
         actress_cap = max_n
         keyword_cap = 2
         combined: list[dict] = []
         seen_fb: set[str] = set(seen)
         leftover = max(0.0, _left())
-        # Always split remaining time so keywords are not starved by actress search.
-        kw_budget = min(6.5, max(4.0, leftover * 0.55)) if leftover >= 2.0 else max(1.0, leftover * 0.5)
+        kw_budget = min(7.0, max(4.5, leftover * 0.6)) if leftover >= 2.0 else max(1.5, leftover * 0.6)
         act_budget = max(1.0, leftover - kw_budget) if (actress or "").strip() else 0.0
+
+        # Keyword extras for every title that lacked name siblings (universal rule).
+        try:
+            for r in _find_related_by_keywords(
+                title,
+                exclude_code=exclude or None,
+                actress=actress,
+                max_n=keyword_cap,
+                budget_sec=max(kw_budget, min(_left(), 7.0)),
+                already=seen_fb,
+            ):
+                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                if not code or code in seen_fb:
+                    continue
+                seen_fb.add(code)
+                combined.append(r)
+        except Exception:
+            pass
 
         if actress and act_budget >= 1.0:
             try:
@@ -3071,7 +3118,7 @@ def find_related_by_title(
                     actress,
                     exclude_code=exclude or None,
                     max_n=actress_cap,
-                    budget_sec=act_budget,
+                    budget_sec=max(act_budget, min(_left(), 5.0)),
                 ):
                     code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
                     if not code or code in seen_fb:
@@ -3082,7 +3129,7 @@ def find_related_by_title(
                 pass
 
         # Demo actress siblings for MIDA when online actress search is empty
-        if not combined and exclude and is_mida616(exclude):
+        if actress and not any(str(x.get("line")) == "actress" for x in combined) and exclude and is_mida616(exclude):
             try:
                 for r in related_from_demo():
                     why = str(r.get("why") or "")
@@ -3096,30 +3143,16 @@ def find_related_by_title(
                     item["why"] = why or "同演員"
                     seen_fb.add(code)
                     combined.append(item)
-                    if len(combined) >= actress_cap:
+                    if sum(1 for x in combined if str(x.get("line")) == "actress") >= actress_cap:
                         break
             except Exception:
                 pass
 
-        # Keyword extras for every title that lacked name siblings (not just one work).
-        try:
-            for r in _find_related_by_keywords(
-                title,
-                exclude_code=exclude or None,
-                actress=actress,
-                max_n=keyword_cap,
-                budget_sec=max(kw_budget, _left()),
-                already=seen_fb,
-            ):
-                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-                if not code or code in seen_fb:
-                    continue
-                seen_fb.add(code)
-                combined.append(r)
-        except Exception:
-            pass
-
-        out = combined
+        # Prefer display order: actress block then keyword (UI section is mixed-aware)
+        actress_items = [x for x in combined if str(x.get("line")) == "actress"]
+        keyword_items = [x for x in combined if str(x.get("line")) == "keyword"]
+        other_items = [x for x in combined if x not in actress_items and x not in keyword_items]
+        out = actress_items + keyword_items + other_items
 
     return out[: max(max_n + 2, len(out))]
 
