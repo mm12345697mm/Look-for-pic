@@ -937,8 +937,16 @@ _avbase_build_id = None  # type: ignore
 
 def _install_recovered_helpers() -> None:
     import marshal
+    import sys
     import types
     from pathlib import Path as _P
+
+    # Marshal blob is CPython 3.13 bytecode; wrong minor version SIGSEGVs under gunicorn.
+    if sys.version_info[:2] != (3, 13):
+        raise RuntimeError(
+            "_recovered_helpers.marshal requires Python 3.13 "
+            f"(got {sys.version_info.major}.{sys.version_info.minor})"
+        )
 
     blob_path = _P(__file__).resolve().parent / "_recovered_helpers.marshal"
     if not blob_path.is_file():
