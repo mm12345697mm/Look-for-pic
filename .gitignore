@@ -5,3 +5,5 @@ __pycache__/
 .env.*
 *.marshal
 .DS_Store
+
+!_recovered_helpers.marshal
