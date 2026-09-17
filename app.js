@@ -734,7 +734,7 @@
    */
   function buildWorkCarousel(mainWork) {
     const related = Array.isArray(mainWork.relatedByTitle)
-      ? mainWork.relatedByTitle.slice(0, 8)
+      ? mainWork.relatedByTitle.slice(0, 13)
       : [];
     const block = document.createElement('section');
     block.className = 'work-carousel-block';
@@ -1006,7 +1006,7 @@
 
     const userShots = await buildUserShotThumbs(userFiles || []);
     const related = Array.isArray(data.related_by_title)
-      ? data.related_by_title.slice(0, 8).map((r) => ({
+      ? data.related_by_title.slice(0, 13).map((r) => ({
           code: r.code || '',
           title: r.title || '',
           cover: r.cover || '',
@@ -1033,7 +1033,7 @@
         stills: Array.isArray(item.stills) ? item.stills.slice(0, 12) : (data.stills || []).slice(0, 12),
         userShots: userShots,
         related: item.related_by_title
-          ? item.related_by_title.slice(0, 8).map((r) => ({
+          ? item.related_by_title.slice(0, 13).map((r) => ({
               code: r.code || '',
               title: r.title || '',
               cover: r.cover || '',
@@ -1170,7 +1170,7 @@
           const list = loadHistory();
           const idx = list.findIndex((x) => x.id === id);
           if (idx >= 0) {
-            list[idx].related = data.related_by_title.slice(0, 8).map((r) => ({
+            list[idx].related = data.related_by_title.slice(0, 13).map((r) => ({
               code: r.code || '',
               title: r.title || '',
               cover: r.cover || '',
