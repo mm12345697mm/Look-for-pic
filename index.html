@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1" />
+  <meta name="theme-color" content="#0f0f12" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="番號辨識" />
+  <meta name="description" content="選圖或輸入番號／片名，伺服器辨識後自動顯示封面與劇照畫廊" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="apple-touch-icon" href="icons/apple-touch-icon.png" />
+  <link rel="icon" type="image/png" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="styles.css?v=1789617841" />
+  <title>番號辨識 · Look-for-pic</title>
+</head>
+<body>
+  <div id="app">
+    <!-- HOME -->
+    <section id="screen-home" class="screen active" aria-label="首頁">
+      <header class="header">
+        <div class="header-row">
+          <h1>番號辨識</h1>
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-history" style="width:auto;padding:8px 12px;min-height:36px">紀錄</button>
+        </div>
+        <p>選取多張截圖或輸入番號／片名 → 自動顯示封面與劇照畫廊</p>
+      </header>
+
+      <div class="stack">
+        <label class="btn btn-lg" id="btn-pick" for="file-pick">選取照片（可多選）</label>
+        <label class="btn btn-secondary" id="btn-camera" for="file-camera">相機拍攝</label>
+        <button type="button" class="btn btn-ghost" id="btn-demo">離線示範 MIDA-616</button>
+
+        <!-- Pending multi-shot strip -->
+        <div id="pending-panel" class="pending-panel hidden">
+          <div class="pending-head">
+            <span id="pending-label">已選 0 張</span>
+            <button type="button" class="btn btn-ghost btn-sm" id="btn-pending-clear" style="width:auto;padding:6px 10px;min-height:32px">清空</button>
+          </div>
+          <div id="pending-thumbs" class="pending-thumbs" aria-label="已選截圖"></div>
+          <div class="pending-actions">
+            <label class="btn btn-secondary" id="btn-pending-add" for="file-pick">再加照片</label>
+            <button type="button" class="btn" id="btn-pending-start">開始辨識</button>
+          </div>
+        </div>
+
+        <div class="divider">或手動輸入</div>
+
+        <div>
+          <div class="field-label">番號或片名（例：MIDA-616 或中／日文片名）</div>
+          <div class="input-row">
+            <input
+              id="code-input"
+              type="text"
+              inputmode="text"
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="characters"
+              spellcheck="false"
+              placeholder="番號或中/日文片名"
+              aria-label="番號或片名"
+            />
+            <button type="button" class="btn" id="btn-code">查詢</button>
+          </div>
+        </div>
+
+        <p class="hint">
+          可一次選多張截圖；辨識前可再追加。伺服器逐張看圖後去重顯示。找到即自動進入畫廊（含「相關作品（依片名）」）。
+          封面採完整顯示（不裁切）。僅使用 pics.dmm.co.jp 圖片。
+        </p>
+      </div>
+
+      <div id="status" class="status-bar" role="status" aria-live="polite"></div>
+    </section>
+
+    <!-- Progress stays outside screens so it remains visible above gallery -->
+    <div id="progress-panel" class="progress-panel hidden" aria-live="polite" aria-busy="false">
+      <button type="button" id="progress-toggle" class="progress-head" aria-expanded="true" aria-controls="progress-body">
+        <span class="progress-head-main">
+          <span class="progress-chevron" aria-hidden="true"></span>
+          <span class="progress-title-wrap">
+            <span class="progress-title">處理進度</span>
+            <span id="progress-summary" class="progress-summary">準備中…</span>
+          </span>
+        </span>
+        <span id="progress-pct" class="progress-pct">0%</span>
+      </button>
+      <div id="progress-body" class="progress-body">
+        <div class="progress-bar-track" aria-hidden="true">
+          <div id="progress-bar" class="progress-bar-fill" style="width:0%"></div>
+        </div>
+        <ol id="progress-steps" class="progress-steps"></ol>
+        <p id="progress-detail" class="progress-detail"></p>
+      </div>
+    </div>
+
+    <!-- GALLERY -->
+    <section id="screen-gallery" class="screen" aria-label="畫廊">
+      <div id="user-shots-panel" class="user-shots-panel hidden" aria-label="你的截圖">
+        <div class="user-shots-head">你的截圖</div>
+        <div id="user-shots-scroll" class="user-shots-scroll"></div>
+      </div>
+      <div class="gallery-top">
+        <h2>畫廊 <span id="gallery-count" class="badge"></span></h2>
+        <button type="button" class="btn btn-ghost" id="btn-reset" style="width:auto;padding:8px 14px;min-height:40px">重新開始</button>
+      </div>
+      <div id="gallery-notice" class="notice" hidden></div>
+      <div id="gallery-cards" class="cards"></div>
+    </section>
+
+    <!-- HISTORY -->
+    <section id="screen-history" class="screen" aria-label="辨識紀錄">
+      <div class="gallery-top">
+        <h2>辨識紀錄 <span id="history-count" class="badge"></span></h2>
+        <div class="history-top-actions">
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-history-clear" style="width:auto;padding:8px 12px;min-height:36px">全部清除</button>
+          <button type="button" class="btn btn-ghost" id="btn-history-back" style="width:auto;padding:8px 14px;min-height:40px">返回</button>
+        </div>
+      </div>
+      <div id="history-empty" class="notice" hidden>尚無紀錄。成功辨識後會自動儲存在此裝置。</div>
+      <div id="history-list" class="history-list"></div>
+    </section>
+
+    <!-- HISTORY DETAIL -->
+    <section id="screen-history-detail" class="screen" aria-label="紀錄詳情">
+      <div class="gallery-top">
+        <h2>紀錄詳情</h2>
+        <div class="history-top-actions">
+          <button type="button" class="btn btn-ghost btn-sm" id="btn-history-delete" style="width:auto;padding:8px 12px;min-height:36px">刪除</button>
+          <button type="button" class="btn btn-ghost" id="btn-history-detail-back" style="width:auto;padding:8px 14px;min-height:40px">返回</button>
+        </div>
+      </div>
+      <div id="history-detail" class="history-detail"></div>
+    </section>
+  </div>
+
+  <!-- Hidden file inputs (multi) -->
+  <input id="file-pick" class="hidden-file" type="file" accept="image/*,.heic,.heif,.jpg,.jpeg,.png,.webp" multiple />
+  <input id="file-camera" class="hidden-file" type="file" accept="image/*,.heic,.heif,.jpg,.jpeg,.png,.webp" capture="environment" />
+
+  <!-- Manual code sheet when OCR finds nothing -->
+  <div id="ocr-overlay" class="overlay hidden" hidden role="dialog" aria-modal="true" aria-labelledby="ocr-title" aria-hidden="true">
+    <div class="sheet">
+      <h2 id="ocr-title">未找到番號或片名</h2>
+      <p>請輸入封面／盒上的番號或片名（一次即可），之後會自動進入畫廊。</p>
+      <div class="input-row" style="margin-bottom:12px">
+        <input
+          id="ocr-code-input"
+          type="text"
+          inputmode="text"
+          autocomplete="off"
+          autocorrect="off"
+          autocapitalize="characters"
+          spellcheck="false"
+          placeholder="番號或中/日文片名"
+        />
+        <button type="button" class="btn" id="btn-ocr-submit">確定</button>
+      </div>
+      <button type="button" class="btn btn-secondary" id="btn-ocr-cancel">取消</button>
+    </div>
+  </div>
+
+
+  <!-- Lightbox: viewport-fixed, swipeable -->
+  <div id="lightbox" class="lightbox hidden" role="dialog" aria-modal="true" aria-label="圖片預覽" hidden>
+    <div class="lightbox-backdrop" data-lightbox-close="1"></div>
+    <div class="lightbox-frame">
+      <button type="button" class="lightbox-close" id="lightbox-close" aria-label="關閉">×</button>
+      <button type="button" class="lightbox-nav lightbox-prev" id="lightbox-prev" aria-label="上一張">‹</button>
+      <button type="button" class="lightbox-nav lightbox-next" id="lightbox-next" aria-label="下一張">›</button>
+      <div class="lightbox-stage" id="lightbox-stage">
+        <img id="lightbox-img" alt="預覽" decoding="async" referrerpolicy="no-referrer" />
+      </div>
+      <div class="lightbox-counter" id="lightbox-counter"></div>
+    </div>
+  </div>
+
+  <script src="app.js?v=1789617841" defer></script>
+</body>
+</html>

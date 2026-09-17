@@ -1,0 +1,3823 @@
+#!/usr/bin/env python3
+"""Look-for-pic Web — Flask server with Gemini vision / OCR + metadata identify API."""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import re
+import subprocess
+import tempfile
+from html import unescape
+from pathlib import Path
+from typing import Any
+
+import requests
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+from flask import Flask, Response, jsonify, request, send_from_directory, stream_with_context
+from PIL import Image, ImageEnhance, ImageOps
+
+ROOT = Path(__file__).resolve().parent
+DEMO_PATH = ROOT / "data" / "demo-package.json"
+
+DMM_PICS = "https://pics.dmm.co.jp/digital/video"
+PREFIX_ONE_LABELS = {
+    "nhdtc", "nhdtb", "nhdta", "nhdts", "nhdt",
+    # SOD-style digital CIDs need leading "1" (curl-verified: without → now_printing)
+    "sdmf", "stars", "sdde", "sdmm", "sdam", "start", "fsdss",
+    # HAWA / DANDY(A) likewise need leading "1"
+    "hawa", "dandy", "dandya",
+}
+PREFERRED_LABELS = {
+    "MIDA", "SSNI", "SNIS", "STARS", "PRED", "MIDV", "MIDE",
+    "JUFE", "SSIS", "SONE", "IPX", "IPZZ", "STARS", "ABF", "FSDSS",
+}
+AV_CODE_RE = re.compile(r"([A-Za-z]{2,10})[-－‐‑‒–—―ー−_\s／/]*(\d{2,5})", re.I)
+
+UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+HTTP_TIMEOUT = 12
+DDG_TIMEOUT = 7
+VISUAL_COMPARE_BUDGET = 28
+VISUAL_COMPARE_MAX = 8
+SAME_SERIES_TITLE_SIM = 0.72
+SAME_SERIES_SCORE_GAP = 0.08
+COVER_DOWNLOAD_TIMEOUT = 3
+TEXT_TIMEOUT = 20
+VISION_TIMEOUT = 45
+# Soft deadline for online code→title attempts in identify_code
+IDENTIFY_ONLINE_BUDGET = 20
+GEMINI_MODELS = (
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-3.5-flash-lite",
+)
+# Prefer only first two for text meta (faster; avoid long model cascades)
+GEMINI_TEXT_MODELS = (
+    "gemini-flash-latest",
+    "gemini-flash-lite-latest",
+)
+VISION_PROMPT = """你是 AV／JAV 列表截圖辨識助手。圖片可能是 JAVDB 等網站的整頁截圖：封面圖下方或旁邊有番號與日文片名。
+
+請只讀取畫面中「主作品／焦點那一筆」的資訊，回傳 JSON（不要 markdown、不要程式碼圍欄、不要多餘說明）：
+{"code":"MIDA-616","title":"日本語タイトル","actress":"...","studio":"...","confidence":0.0,"notes":""}
+
+規則：
+1. 務必嘗試讀出番號（品番，如 MIDA-616）以及封面附近／下方的日文片名那一行。若是封面局部裁切、無明顯番號，也請盡力讀出畫面上可見的日文標題片段。
+2. 片名請用畫面上的原文（多半是日文），不要翻譯、不要發明、不要補全看不到的字。
+3. 看不清楚的欄位請填 null；confidence 為 0.0～1.0。
+4. actress／studio 若畫面沒有就 null。
+5. 只輸出一行合法 JSON。
+"""
+
+VISUAL_MATCH_PROMPT = """你是 AV／JAV 封面比對助手。Image A 是使用者上傳的封面裁切／截圖；Image B 是目錄封面圖。
+
+請判斷兩者是否為「同一作品」的封面。同系列常換女優，身材／版面相似不夠，必須是同一個人。
+只回傳 JSON（不要 markdown、不要程式碼圍欄）：
+{"same_work":true,"confidence":0.0,"reason":"簡短中文或日文理由","match_person":true,"match_face":true,"match_accessories":true,"match_clothes":true,"match_pose":true}
+
+規則：
+1. same_work=true 僅在同一女優＋服裝＋姿勢大致對得上時。
+2. 必須細看臉：唇形、眼型、髮際／瀏海；以及項鍊、耳環、手飾等飾品。臉或飾品明顯不同 → match_face/match_accessories=false，same_work=false，confidence≤0.35。
+3. 同系列、身材／場景相似但不同女優 → same_work=false，confidence≤0.30。
+4. confidence 必須嚴格：幾乎同一張圖才 ≥0.85；僅同系列相似 ≤0.4。
+5. 只輸出一行合法 JSON。
+"""
+
+VISUAL_RANK_BATCH_PROMPT = """你是 AV／JAV 封面比對助手。第一張圖是使用者上傳的封面裁切／截圖；後面依序是候選目錄封面 Cover0、Cover1、…
+
+同系列常換女優，身材／版面／場景相似很容易誤判。請優先比對：唇形、眼型、臉型、項鍊／耳環等飾品，再比服裝與姿勢。選出與使用者圖為「同一作品／同一人」者。
+只回傳 JSON（不要 markdown）：
+{"best_index":0,"rankings":[{"index":0,"same_work":true,"confidence":0.0,"match_person":true,"match_face":true,"match_accessories":true,"match_clothes":true,"match_pose":true,"reason":"..."}]}
+
+規則：
+1. rankings 必須涵蓋每一個 Cover index（0..N-1）。
+2. 最多只能有 1 個 same_work=true；其餘 false。臉或飾品對不上者不得 same_work=true。
+3. best_index 必須是最可能同一人／同一作品者；若所有候選臉都不像，best_index 仍可給最接近者但全部 same_work=false 且 confidence≤0.35。
+4. 同系列不同女優 → 絕對不要標 same_work。
+5. confidence 要拉開差距（不要全部 1.0）。
+"""
+
+
+app = Flask(__name__, static_folder=None)
+
+_demo_cache: dict | None = None
+
+
+def load_demo() -> dict:
+    global _demo_cache
+    if _demo_cache is not None:
+        return _demo_cache
+    if DEMO_PATH.is_file():
+        with open(DEMO_PATH, encoding="utf-8") as f:
+            _demo_cache = json.load(f)
+    else:
+        _demo_cache = {}
+    return _demo_cache
+
+
+
+def get_gemini_api_key() -> str:
+    """Env first; else box-secrets card.GEMINI_API_KEY. Never log the key."""
+    key = (os.environ.get("GEMINI_API_KEY") or "").strip()
+    if key:
+        return key
+    try:
+        secrets_path = Path("/home/box/agent-data/box-secrets.json")
+        if secrets_path.is_file():
+            with open(secrets_path, encoding="utf-8") as f:
+                data = json.load(f)
+            card = data.get("card") if isinstance(data, dict) else None
+            if isinstance(card, dict):
+                key = str(card.get("GEMINI_API_KEY") or "").strip()
+                if key:
+                    return key
+    except Exception:
+        pass
+    return ""
+
+
+def is_usable_title(title: str | None) -> bool:
+    """Title usable for search: len>=4 and mostly JP/CJK."""
+    if not title:
+        return False
+    t = str(title).strip()
+    if len(t) < 4:
+        return False
+    cjk = 0
+    other = 0
+    for c in t:
+        o = ord(c)
+        if c.isspace() or c in "　・…‥「」『』【】（）()[]【】!?！？ー−-—_./·":
+            continue
+        if (
+            0x3040 <= o <= 0x30FF  # hiragana/katakana
+            or 0x4E00 <= o <= 0x9FFF  # CJK
+            or 0x3400 <= o <= 0x4DBF
+            or 0xF900 <= o <= 0xFAFF
+            or 0xFF66 <= o <= 0xFF9D  # halfwidth kana
+        ):
+            cjk += 1
+        else:
+            other += 1
+    if cjk < 2:
+        return False
+    total = cjk + other
+    if total == 0:
+        return False
+    return (cjk / total) >= 0.4
+
+
+def title_similarity(a: str | None, b: str | None) -> float:
+    a = (a or "").strip()
+    b = (b or "").strip()
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if a in b or b in a:
+        return 0.92
+    # Long shared prefix (vision OCR often drifts only on the tail)
+    n = 0
+    lim = min(len(a), len(b))
+    while n < lim and a[n] == b[n]:
+        n += 1
+    prefix = 0.0
+    if n >= 8:
+        prefix = 0.55 + 0.4 * (n / max(len(a), len(b), 1))
+    sa, sb = set(a), set(b)
+    inter = len(sa & sb)
+    union = len(sa | sb) or 1
+    jacc = inter / union
+    return max(jacc, prefix)
+
+
+def normalize_code(raw: str) -> str:
+    s = (raw or "").strip().upper()
+    for ch in "‐‑‒–—―ー−":
+        s = s.replace(ch, "-")
+    s = re.sub(r"\s+", "", s)
+    s = s.replace("_", "-").replace("／", "-").replace("/", "-")
+    s = s.replace("－", "-")
+    return s
+
+
+def parse_code_parts(code: str) -> tuple[str, str] | None:
+    n = normalize_code(code)
+    m = re.match(r"^([A-Z]{2,10})-?(\d{1,5})$", n)
+    if not m:
+        return None
+    return m.group(1), m.group(2)
+
+
+def format_display_code(code: str) -> str:
+    parts = parse_code_parts(code)
+    if not parts:
+        return normalize_code(code)
+    label, number = parts
+    stripped = number.lstrip("0") or "0"
+    return f"{label}-{stripped}"
+
+
+def code_to_cid(code: str) -> str | None:
+    parts = parse_code_parts(code)
+    if not parts:
+        return None
+    label, number = parts
+    label_l = label.lower()
+    num = number.zfill(5)
+    if label_l in PREFIX_ONE_LABELS:
+        return f"1{label_l}{num}"
+    return f"{label_l}{num}"
+
+
+def cover_url(cid: str) -> str:
+    return f"{DMM_PICS}/{cid}/{cid}pl.jpg"
+
+
+def still_urls(cid: str, count: int = 10) -> list[str]:
+    return [f"{DMM_PICS}/{cid}/{cid}jp-{i}.jpg" for i in range(1, count + 1)]
+
+
+COVER_PROBE_TIMEOUT = 4.0
+TITLE_CODE_MATCH_MIN = 0.45
+
+
+def is_now_printing_url(url: str | None) -> bool:
+    """True if URL is DMM's placeholder / missing-cover image."""
+    return "now_printing" in (url or "").lower()
+
+
+def probe_cover_url(url: str, timeout: float = COVER_PROBE_TIMEOUT) -> tuple[bool, str | None]:
+    """
+    HEAD/GET a cover URL following redirects.
+    Returns (ok, final_url). Rejects 404 and now_printing.
+    """
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return False, None
+    headers = {
+        "User-Agent": UA,
+        "Referer": "https://www.dmm.co.jp/",
+        "Accept": "image/*,*/*;q=0.8",
+    }
+    try:
+        r = requests.head(
+            u,
+            timeout=(2, timeout),
+            headers=headers,
+            allow_redirects=True,
+            verify=False,
+        )
+        final = str(r.url or u)
+        if is_now_printing_url(final):
+            return False, final
+        if r.status_code in (403, 405) or (r.status_code >= 400 and r.status_code != 404):
+            r = requests.get(
+                u,
+                timeout=(2, timeout),
+                headers=headers,
+                allow_redirects=True,
+                verify=False,
+                stream=True,
+            )
+            final = str(r.url or u)
+            try:
+                next(r.iter_content(256), b"")
+            except Exception:
+                pass
+            try:
+                r.close()
+            except Exception:
+                pass
+        if r.status_code >= 400:
+            return False, final
+        if is_now_printing_url(final):
+            return False, final
+        return True, final
+    except Exception:
+        return False, None
+
+
+def cover_cid_candidates(code: str) -> list[str]:
+    """Ordered CID guesses for a product code (deduped)."""
+    parts = parse_code_parts(code)
+    if not parts:
+        return []
+    label, number = parts
+    label_l = label.lower()
+    stripped = number.lstrip("0") or "0"
+    pads: list[str] = []
+    seen_p: set[str] = set()
+    for w in (5, 4, 3):
+        p = stripped.zfill(w) if len(stripped) <= w else stripped
+        if p not in seen_p:
+            seen_p.add(p)
+            pads.append(p)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(c: str) -> None:
+        if c and c not in seen:
+            seen.add(c)
+            out.append(c)
+
+    primary = code_to_cid(code)
+    if primary:
+        add(primary)
+    for p in pads:
+        add(f"1{label_l}{p}")
+        add(f"{label_l}{p}")
+    return out
+
+
+def resolve_cover_cid(code: str) -> tuple[str | None, str | None]:
+    """
+    Try CID candidates until a real (non-now_printing) DMM cover is found.
+    Returns (cid, cover_url) or (None, None).
+    """
+    for cid in cover_cid_candidates(code):
+        url = cover_url(cid)
+        ok, final = probe_cover_url(url)
+        if ok and not is_now_printing_url(final):
+            return cid, url
+    return None, None
+
+
+def sanitize_cover_fields(
+    code: str | None = None,
+    cid: str | None = None,
+    cover: str | None = None,
+) -> tuple[str | None, str | None, list[str]]:
+    """Ensure cover is a working CDN URL (never now_printing). Returns (cid, cover, stills)."""
+    cover_s = (str(cover).strip() if cover else "") or None
+    cid_s = (str(cid).strip() if cid else "") or None
+
+    if cover_s and is_now_printing_url(cover_s):
+        cover_s = None
+
+    if cover_s:
+        ok, final = probe_cover_url(cover_s)
+        if not ok or is_now_printing_url(final):
+            cover_s = None
+
+    if not cover_s and code and parse_code_parts(str(code)):
+        rcid, rcover = resolve_cover_cid(str(code))
+        if rcid and rcover:
+            return rcid, rcover, still_urls(rcid, 10)
+
+    if not cover_s and cid_s:
+        url = cover_url(cid_s)
+        ok, final = probe_cover_url(url)
+        if ok and not is_now_printing_url(final):
+            return cid_s, url, still_urls(cid_s, 10)
+        if code and parse_code_parts(str(code)):
+            rcid, rcover = resolve_cover_cid(str(code))
+            if rcid and rcover:
+                return rcid, rcover, still_urls(rcid, 10)
+        return None, None, []
+
+    if cover_s and cid_s:
+        return cid_s, cover_s, still_urls(cid_s, 10)
+    if cover_s:
+        return cid_s, cover_s, []
+    return cid_s, None, []
+
+
+def fetch_catalog_title_for_code(code: str) -> dict | None:
+    """Lightweight code→official title for cross-check (jav321 / javlibrary / ddg)."""
+    display = format_display_code(code)
+    for fetcher in (fetch_javbus, fetch_javlibrary, fetch_duckduckgo):
+        try:
+            meta = fetcher(display)
+        except Exception:
+            meta = None
+        if meta and (meta.get("title") or "").strip():
+            return meta
+    return None
+
+
+def verify_code_matches_title(
+    code: str,
+    reference_title: str | None,
+    *,
+    min_sim: float = TITLE_CODE_MATCH_MIN,
+) -> dict:
+    """
+    Cross-check a candidate 番號 against an on-screen / user title.
+    Rejects low title similarity OR missing/now_printing cover.
+    """
+    display = format_display_code(code)
+    ref = (reference_title or "").strip()
+    cid, cover = resolve_cover_cid(display)
+    cover_ok = bool(cid and cover)
+    catalog = fetch_catalog_title_for_code(display)
+    catalog_title = (catalog.get("title") if catalog else None) or None
+    sim = title_similarity(ref, catalog_title) if (ref and catalog_title) else 0.0
+    title_ok = True
+    if is_usable_title(ref):
+        if catalog_title:
+            title_ok = sim >= min_sim
+        else:
+            # Have a readable title but no catalog title for this code → do not trust
+            title_ok = False
+            sim = 0.0
+    ok = bool(title_ok and cover_ok)
+    reason_bits: list[str] = []
+    if not cover_ok:
+        reason_bits.append("封面無效／now_printing")
+    if is_usable_title(ref) and not title_ok:
+        reason_bits.append(f"片名不符(sim={sim:.2f})")
+    return {
+        "ok": ok,
+        "code": display,
+        "similarity": sim,
+        "catalog_title": catalog_title,
+        "reference_title": ref or None,
+        "cid": cid,
+        "cover": cover,
+        "cover_ok": cover_ok,
+        "title_ok": title_ok,
+        "source": (catalog or {}).get("source") if catalog else None,
+        "reason": "；".join(reason_bits) if reason_bits else "ok",
+    }
+
+
+def extract_codes(text: str) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in AV_CODE_RE.finditer(text or ""):
+        code = normalize_code(f"{m.group(1)}-{m.group(2)}")
+        if not parse_code_parts(code):
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        found.append(code)
+    return found
+
+
+def pick_best_code(codes: list[str]) -> str | None:
+    if not codes:
+        return None
+    if len(codes) == 1:
+        return codes[0]
+
+    def score(c: str) -> int:
+        parts = parse_code_parts(c)
+        if not parts:
+            return 0
+        label, number = parts
+        s = len(label)
+        if len(number) >= 3:
+            s += 2
+        if label.upper() in PREFERRED_LABELS:
+            s += 5
+        return s
+
+    return max(codes, key=score)
+
+
+def run_tesseract(image_path: str, lang: str = "jpn+eng") -> str:
+    try:
+        r = subprocess.run(
+            ["tesseract", image_path, "stdout", "-l", lang, "--psm", "6"],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+        return (r.stdout or "") + ("\n" + r.stderr if r.returncode and r.stderr else "")
+    except Exception as e:
+        return f"[tesseract error: {e}]"
+
+
+def preprocess_image(src: Path, dest: Path) -> None:
+    img = Image.open(src)
+    img = ImageOps.exif_transpose(img)
+    if img.mode != "L":
+        img = img.convert("L")
+    img = ImageOps.autocontrast(img)
+    img = ImageEnhance.Contrast(img).enhance(1.6)
+    # Upscale small images for OCR
+    w, h = img.size
+    if max(w, h) < 1200:
+        scale = 1200 / max(w, h)
+        img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+    img.save(dest, format="PNG")
+
+
+def ocr_image_bytes(image_bytes: bytes) -> str:
+    texts: list[str] = []
+    with tempfile.TemporaryDirectory(prefix="lfpic-ocr-") as td:
+        td_path = Path(td)
+        raw_path = td_path / "upload.bin"
+        raw_path.write_bytes(image_bytes)
+        # Ensure readable image extension for tesseract
+        try:
+            img = Image.open(raw_path)
+            img = ImageOps.exif_transpose(img)
+            png_path = td_path / "orig.png"
+            img.save(png_path, format="PNG")
+        except Exception:
+            png_path = raw_path
+
+        t1 = run_tesseract(str(png_path))
+        texts.append(t1)
+
+        try:
+            prep = td_path / "prep.png"
+            preprocess_image(png_path, prep)
+            t2 = run_tesseract(str(prep))
+            texts.append(t2)
+        except Exception:
+            pass
+
+    # Prefer the text that yields more AV codes
+    best = ""
+    best_n = -1
+    for t in texts:
+        n = len(extract_codes(t))
+        if n > best_n or (n == best_n and len(t) > len(best)):
+            best = t
+            best_n = n
+    return best
+
+
+def ocr_image(file_storage) -> str:
+    return ocr_image_bytes(file_storage.read())
+
+
+def detect_image_mime(image_bytes: bytes, filename: str | None = None) -> str:
+    name = (filename or "").lower()
+    if name.endswith(".png"):
+        return "image/png"
+    if name.endswith(".webp"):
+        return "image/webp"
+    if name.endswith(".gif"):
+        return "image/gif"
+    if name.endswith(".jpg") or name.endswith(".jpeg"):
+        return "image/jpeg"
+    if image_bytes.startswith(b"\x89PNG"):
+        return "image/png"
+    if image_bytes[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if image_bytes[:4] == b"RIFF" and image_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    return "image/jpeg"
+
+
+def maybe_downscale_for_vision(image_bytes: bytes, mime_type: str) -> tuple[bytes, str]:
+    """Keep Gemini payload reasonable; return (bytes, mime)."""
+    try:
+        from io import BytesIO
+
+        img = Image.open(BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)
+        w, h = img.size
+        max_side = max(w, h)
+        if max_side <= 2048 and len(image_bytes) <= 4_000_000:
+            return image_bytes, mime_type
+        scale = min(1.0, 2048 / max_side)
+        if scale < 1.0:
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        out_mime = "image/jpeg"
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        img.save(buf, format="JPEG", quality=85, optimize=True)
+        return buf.getvalue(), out_mime
+    except Exception:
+        return image_bytes, mime_type
+
+
+def strip_json_fences(text: str) -> str:
+    s = (text or "").strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.I)
+        s = re.sub(r"\s*```$", "", s)
+    return s.strip()
+
+
+def parse_vision_json(text: str) -> dict[str, Any]:
+    s = strip_json_fences(text)
+    # Try direct parse, then first {...} block
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", s)
+        if not m:
+            raise ValueError("vision response is not JSON")
+        data = json.loads(m.group(0))
+    if not isinstance(data, dict):
+        raise ValueError("vision JSON root must be object")
+
+    def clean_str(v: Any) -> str | None:
+        if v is None:
+            return None
+        if isinstance(v, str):
+            t = v.strip()
+            if not t or t.lower() in ("null", "none", "n/a", "不明", "なし"):
+                return None
+            return t
+        return str(v).strip() or None
+
+    code = clean_str(data.get("code"))
+    if code:
+        # Normalize common fullwidth / spacing
+        codes = extract_codes(code)
+        code = format_display_code(codes[0]) if codes else format_display_code(code)
+
+    conf = data.get("confidence")
+    try:
+        confidence = float(conf) if conf is not None else None
+    except (TypeError, ValueError):
+        confidence = None
+
+    return {
+        "code": code,
+        "title": clean_str(data.get("title")),
+        "actress": clean_str(data.get("actress")),
+        "studio": clean_str(data.get("studio")),
+        "confidence": confidence,
+        "notes": clean_str(data.get("notes")) or "",
+    }
+
+
+def gemini_extract_text(resp_json: dict) -> str:
+    cands = resp_json.get("candidates") or []
+    if not cands:
+        feedback = resp_json.get("promptFeedback") or resp_json.get("error") or resp_json
+        raise RuntimeError(f"Gemini 無 candidates：{feedback}")
+    parts = (((cands[0] or {}).get("content") or {}).get("parts")) or []
+    texts = [str(p.get("text") or "") for p in parts if isinstance(p, dict)]
+    text = "\n".join(t for t in texts if t).strip()
+    if not text:
+        raise RuntimeError("Gemini 回傳空文字")
+    return text
+
+
+def call_gemini_vision(image_bytes: bytes, mime_type: str, api_key: str) -> dict[str, Any]:
+    image_bytes, mime_type = maybe_downscale_for_vision(image_bytes, mime_type)
+    b64 = base64.b64encode(image_bytes).decode("ascii")
+    payload_base = {
+        "contents": [
+            {
+                "role": "user",
+                "parts": [
+                    {"text": VISION_PROMPT},
+                    {"inline_data": {"mime_type": mime_type, "data": b64}},
+                ],
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": 1024,
+        },
+    }
+    last_err: Exception | None = None
+    for model in GEMINI_MODELS:
+        # Never log api_key; keep it only in the request URL query.
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+        try:
+            r = requests.post(url, json=payload_base, timeout=VISION_TIMEOUT)
+            if r.status_code >= 400:
+                body = (r.text or "")[:300]
+                # Continue on unavailable / rate-limit / overload / not-found
+                if r.status_code in (400, 404, 429, 503) or "not found" in body.lower() or "overloaded" in body.lower():
+                    last_err = RuntimeError(f"model {model} HTTP {r.status_code}: {body}")
+                    continue
+                last_err = RuntimeError(f"Gemini HTTP {r.status_code}: {body}")
+                continue
+            text = gemini_extract_text(r.json())
+            parsed = parse_vision_json(text)
+            parsed["_model"] = model
+            return parsed
+        except requests.Timeout as e:
+            last_err = RuntimeError(f"model {model} 逾時（~{VISION_TIMEOUT}s）")
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(str(last_err) if last_err else "Gemini 模型皆不可用")
+
+
+def call_gemini_text(prompt: str, api_key: str, *, max_tokens: int = 1024) -> str:
+    """Text-only Gemini generateContent with short timeout + 2-model fallback. Never logs the key."""
+    payload_base = {
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": max_tokens,
+        },
+    }
+    last_err: Exception | None = None
+    for model in GEMINI_TEXT_MODELS:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+        try:
+            r = requests.post(url, json=payload_base, timeout=TEXT_TIMEOUT)
+            if r.status_code >= 400:
+                body = (r.text or "")[:300]
+                if r.status_code in (400, 404, 429, 503) or "not found" in body.lower() or "overloaded" in body.lower():
+                    last_err = RuntimeError(f"model {model} HTTP {r.status_code}: {body}")
+                    continue
+                last_err = RuntimeError(f"Gemini HTTP {r.status_code}: {body}")
+                continue
+            return gemini_extract_text(r.json())
+        except requests.Timeout:
+            last_err = RuntimeError(f"model {model} 逾時（~{TEXT_TIMEOUT}s）")
+            continue
+        except Exception as e:
+            last_err = e
+            continue
+    raise RuntimeError(str(last_err) if last_err else "Gemini 模型皆不可用")
+
+
+def _clean_meta_str(v: Any) -> str | None:
+    if v is None:
+        return None
+    if isinstance(v, (list, tuple)):
+        parts = [_clean_meta_str(x) for x in v]
+        parts = [p for p in parts if p]
+        return "、".join(parts) if parts else None
+    if isinstance(v, str):
+        t = v.strip()
+        if not t or t.lower() in ("null", "none", "n/a", "不明", "なし", "unknown"):
+            return None
+        return t
+    return str(v).strip() or None
+
+
+
+# --- Recovered helpers from pre-corruption bytecode (pyc 11:47) ---
+_avbase_build_id = None  # type: ignore
+
+def _install_recovered_helpers() -> None:
+    import marshal
+    import types
+    from pathlib import Path as _P
+
+    blob_path = _P(__file__).resolve().parent / "_recovered_helpers.marshal"
+    blob = marshal.loads(blob_path.read_bytes())
+    g = globals()
+    for _name, _co in blob.items():
+        g[_name] = types.FunctionType(_co, g, _name)
+
+
+_install_recovered_helpers()
+
+# FunctionType(marshal) drops __defaults__/__kwdefaults__; restore common ones.
+def _restore_helper_defaults() -> None:
+    import types as _types
+    g = globals()
+    # Known signatures from original source
+    fixes = {
+        "download_cover_bytes": ((3.0,), None),  # timeout=COVER_DOWNLOAD_TIMEOUT approx
+        "fetch_avbase_title_results": ((None,), None),  # actress=None — overridden below anyway
+        "fetch_jav321_title_results": ((None,), None),
+        "fetch_javlibrary_title_results": ((None,), None),
+        "gemini_compare_user_to_cover": (None, {"timeout": 10.0}),
+        "work_payload": (None, {"why": None}),
+        "related_from_demo": (None, None),
+    }
+    for name, (defaults, kwdefaults) in fixes.items():
+        fn = g.get(name)
+        if not isinstance(fn, _types.FunctionType):
+            continue
+        if defaults is not None:
+            # Use module COVER_DOWNLOAD_TIMEOUT when present
+            if name == "download_cover_bytes":
+                fn.__defaults__ = (float(g.get("COVER_DOWNLOAD_TIMEOUT", 3)),)
+            else:
+                fn.__defaults__ = defaults
+        if kwdefaults is not None:
+            fn.__kwdefaults__ = dict(kwdefaults)
+
+_restore_helper_defaults()
+
+
+def download_cover_bytes(url: str, timeout: float | None = None) -> bytes | None:
+    """Fetch candidate cover image bytes (short timeout). Prefer DMM CDN."""
+    if timeout is None:
+        timeout = float(COVER_DOWNLOAD_TIMEOUT)
+    u = (url or "").strip()
+    if not u.startswith("http"):
+        return None
+    try:
+        r = requests.get(
+            u,
+            timeout=(2, timeout),
+            headers={"User-Agent": UA, "Referer": "https://www.dmm.co.jp/"},
+            verify=False,
+        )
+        if r.status_code >= 400 or not r.content or len(r.content) < 800:
+            return None
+        if is_now_printing_url(str(r.url or u)):
+            return None
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        if "html" in ctype:
+            return None
+        return r.content
+    except Exception:
+        return None
+
+
+
+def enrich_title_candidate(c: dict, why: str = "片名候選") -> dict:
+    """Normalize a title-search hit into a gallery-ready work dict (CDN cover/stills)."""
+    code_raw = str(c.get("code") or "").strip()
+    code = format_display_code(code_raw) if code_raw and parse_code_parts(code_raw) else ""
+    cid_in = str(c.get("cid") or "") or None
+    cover_in = str(c.get("cover") or c.get("cover_url") or "").strip() or None
+    cid, cover, stills_default = sanitize_cover_fields(
+        code=code or None, cid=cid_in, cover=cover_in
+    )
+    stills = c.get("stills")
+    if not isinstance(stills, list) or not stills:
+        stills = stills_default
+    else:
+        stills = [str(u) for u in stills if u and not is_now_printing_url(str(u))]
+        if not stills:
+            stills = stills_default
+    out = {
+        "code": code or None,
+        "title": (str(c.get("title") or "").strip() or None),
+        "actress": (str(c.get("actress") or "").strip() or None),
+        "studio": (str(c.get("studio") or "").strip() or None),
+        "cid": cid or None,
+        "cover": cover or None,
+        "stills": stills,
+        "why": why,
+        "line": "candidate",
+        "score": (
+            c.get("visual_score")
+            if c.get("visual_score") is not None
+            else c.get("score")
+        ),
+        "title_score": c.get("title_score", c.get("score")),
+        "source": c.get("source"),
+    }
+    if c.get("visual") is not None:
+        out["visual"] = c.get("visual")
+    if c.get("visual_score") is not None:
+        out["visual_score"] = c.get("visual_score")
+        vs = c.get("visual") or {}
+        if vs.get("same_work"):
+            out["why"] = f"{why}／視覺相符"
+        elif c.get("visual_score"):
+            out["why"] = f"{why}／視覺排序"
+    return out
+
+
+def parse_visual_match_json(text: str) -> dict[str, Any]:
+    s = strip_json_fences(text)
+    try:
+        data = json.loads(s)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", s)
+        if not m:
+            return {
+                "same_work": False,
+                "confidence": 0.0,
+                "reason": "parse_fail",
+                "match_person": False,
+                "match_clothes": False,
+                "match_pose": False,
+            }
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return {
+                "same_work": False,
+                "confidence": 0.0,
+                "reason": "parse_fail",
+                "match_person": False,
+                "match_clothes": False,
+                "match_pose": False,
+            }
+    if not isinstance(data, dict):
+        data = {}
+
+    def as_bool(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return bool(v)
+        if isinstance(v, str):
+            return v.strip().lower() in ("1", "true", "yes", "y")
+        return False
+
+    try:
+        conf = float(data.get("confidence") if data.get("confidence") is not None else 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    reason = data.get("reason")
+    if not isinstance(reason, str):
+        reason = ""
+    return {
+        "same_work": as_bool(data.get("same_work")),
+        "confidence": conf,
+        "reason": reason.strip()[:160],
+        "match_person": as_bool(data.get("match_person")),
+        "match_face": as_bool(data.get("match_face")) if "match_face" in data else None,
+        "match_accessories": as_bool(data.get("match_accessories")) if "match_accessories" in data else None,
+        "match_clothes": as_bool(data.get("match_clothes")),
+        "match_pose": as_bool(data.get("match_pose")),
+    }
+
+
+def visual_match_score(vm: dict) -> float:
+    """Rank score from visual compare JSON. Face/accessories outweigh series similarity."""
+    conf = float(vm.get("confidence") or 0.0)
+    bonus = 0.0
+    if vm.get("match_person"):
+        bonus += 0.08
+    if vm.get("match_face"):
+        bonus += 0.16
+    elif "match_face" in vm and not vm.get("match_face"):
+        bonus -= 0.12
+        conf = min(conf, 0.35)
+    if vm.get("match_accessories"):
+        bonus += 0.12
+    elif "match_accessories" in vm and not vm.get("match_accessories"):
+        bonus -= 0.08
+    if vm.get("match_clothes"):
+        bonus += 0.08
+    if vm.get("match_pose"):
+        bonus += 0.05
+    if vm.get("same_work"):
+        if vm.get("match_face") is False:
+            bonus -= 0.2
+        else:
+            bonus += 0.12
+    return max(0.0, min(1.0, conf * 0.65 + bonus))
+
+
+def _jpeg_thumb_b64(image_bytes: bytes, max_side: int = 1024, quality: int = 75) -> tuple[str, str]:
+    """Return (b64, mime) thumbnail for Gemini multi-image calls."""
+    from io import BytesIO
+
+    try:
+        img = Image.open(BytesIO(image_bytes))
+        img = ImageOps.exif_transpose(img)
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        w, h = img.size
+        m = max(w, h)
+        if m > max_side:
+            scale = max_side / m
+            img = img.resize((int(w * scale), int(h * scale)), Image.Resampling.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        return base64.b64encode(buf.getvalue()).decode("ascii"), "image/jpeg"
+    except Exception:
+        return base64.b64encode(image_bytes).decode("ascii"), "image/jpeg"
+
+
+def gemini_rank_covers_batch(
+    user_bytes: bytes,
+    cover_bytes_list: list[bytes],
+    api_key: str,
+    *,
+    timeout: float = 10.0,
+    labels: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    """One Gemini call: user crop + N covers → per-cover visual JSON list (aligned). Never raises."""
+    if not cover_bytes_list:
+        return []
+    u_b64, u_mime = _jpeg_thumb_b64(user_bytes, max_side=900, quality=70)
+    parts: list[dict] = [
+        {"text": "UserCrop（使用者圖）："},
+        {"inline_data": {"mime_type": u_mime, "data": u_b64}},
+    ]
+    for i, cb in enumerate(cover_bytes_list):
+        c_b64, c_mime = _jpeg_thumb_b64(cb, max_side=640, quality=65)
+        label = ""
+        if labels and i < len(labels) and labels[i]:
+            label = f" code={labels[i]}"
+        parts.append({"text": f"Cover{i}{label}："})
+        parts.append({"inline_data": {"mime_type": c_mime, "data": c_b64}})
+    parts.append({"text": VISUAL_RANK_BATCH_PROMPT})
+    n_covers = len(cover_bytes_list)
+    out_tokens = 1024 if n_covers <= 4 else 1536
+    payload_base = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {"temperature": 0.05, "maxOutputTokens": out_tokens},
+    }
+    last_err: Exception | None = None
+    text = ""
+    for model in GEMINI_TEXT_MODELS:
+        url = (
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            f"{model}:generateContent?key={api_key}"
+        )
+        try:
+            r = requests.post(url, json=payload_base, timeout=timeout)
+            if r.status_code >= 400:
+                last_err = RuntimeError(f"HTTP {r.status_code}")
+                continue
+            text = gemini_extract_text(r.json())
+            break
+        except Exception as e:
+            last_err = e
+            continue
+    if not text:
+        return [
+            {
+                "same_work": False,
+                "confidence": 0.0,
+                "reason": f"batch_fail:{type(last_err).__name__ if last_err else '?'}",
+                "match_person": False,
+                "match_clothes": False,
+                "match_pose": False,
+            }
+            for _ in cover_bytes_list
+        ]
+
+    raw = strip_json_fences(text)
+    data: Any = {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", raw)
+        if m:
+            try:
+                data = json.loads(m.group(0))
+            except json.JSONDecodeError:
+                rankings_salvage: list[dict] = []
+                for rm in re.finditer(
+                    r'\{\s*"index"\s*:\s*(\d+)[^}]*\}',
+                    m.group(0),
+                ):
+                    try:
+                        rankings_salvage.append(json.loads(rm.group(0)))
+                    except json.JSONDecodeError:
+                        try:
+                            rankings_salvage.append(
+                                {
+                                    "index": int(rm.group(1)),
+                                    "same_work": False,
+                                    "confidence": 0.0,
+                                    "reason": "salvage_partial",
+                                }
+                            )
+                        except Exception:
+                            pass
+                bi = re.search(r'"best_index"\s*:\s*(\d+)', m.group(0))
+                data = {
+                    "best_index": int(bi.group(1)) if bi else None,
+                    "rankings": rankings_salvage,
+                }
+        else:
+            data = {}
+    if not isinstance(data, dict):
+        data = {}
+    rankings = data.get("rankings")
+    best_index = data.get("best_index")
+    out: list[dict[str, Any]] = []
+    by_idx: dict[int, dict] = {}
+    if isinstance(rankings, list):
+        for row in rankings:
+            if not isinstance(row, dict):
+                continue
+            try:
+                idx = int(row.get("index"))
+            except (TypeError, ValueError):
+                continue
+            by_idx[idx] = parse_visual_match_json(json.dumps(row, ensure_ascii=False))
+    for i in range(len(cover_bytes_list)):
+        vm = by_idx.get(i) or {
+            "same_work": False,
+            "confidence": 0.0,
+            "reason": "missing",
+            "match_person": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+        try:
+            if best_index is not None and int(best_index) == i:
+                vm["confidence"] = max(float(vm.get("confidence") or 0), 0.7)
+                vm["same_work"] = True if vm.get("same_work") or float(vm.get("confidence") or 0) >= 0.55 else vm.get("same_work")
+        except (TypeError, ValueError):
+            pass
+        out.append(vm)
+    same_idxs = [i for i, vm in enumerate(out) if vm.get("same_work")]
+    if len(same_idxs) > 1:
+        best = max(same_idxs, key=lambda i: float(out[i].get("confidence") or 0))
+        for i in same_idxs:
+            if i != best:
+                out[i]["same_work"] = False
+                out[i]["confidence"] = min(float(out[i].get("confidence") or 0), 0.4)
+    return out
+
+
+
+
+
+def _cid_from_avbase_product(product: dict | None, work_id: str | None = None) -> str | None:
+    """Best-effort DMM cid from an avbase product dict."""
+    if not isinstance(product, dict):
+        product = {}
+    pid = str(product.get("product_id") or product.get("cid") or "").strip()
+    if pid:
+        # strip common prefixes like h_1059
+        m = re.match(r"^(?:h_\d+)?([a-z]+\d+)$", pid, re.I)
+        if m:
+            return m.group(1).lower()
+        return pid.lower()
+    if work_id and parse_code_parts(str(work_id)):
+        return code_to_cid(format_display_code(str(work_id)))
+    return None
+
+
+def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[dict]:
+    """
+    Title → code via avbase.net (works from this box; ~0.3–0.7s).
+    Uses __NEXT_DATA__ JSON; returns candidate dicts with DMM covers.
+    """
+    import time as _time
+    from urllib.parse import quote
+
+    title = (title or "").strip()
+    if not title:
+        return []
+    headers = _avbase_headers()
+    out: list[dict] = []
+    seen: set[str] = set()
+    t0 = _time.monotonic()
+    try:
+        url = f"https://www.avbase.net/works?q={quote(title)}"
+        r = requests.get(url, headers=headers, timeout=10, verify=False)
+        if r.status_code >= 400 or not r.text:
+            return []
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+        if not m:
+            return []
+        data = json.loads(m.group(1))
+        works = ((data.get("props") or {}).get("pageProps") or {}).get("works") or []
+        for w in works:
+            if not isinstance(w, dict):
+                continue
+            code_raw = str(w.get("work_id") or "").strip()
+            if not code_raw or not parse_code_parts(code_raw):
+                continue
+            code = format_display_code(code_raw)
+            if code in seen:
+                continue
+            rtitle = str(w.get("title") or "").strip()
+            score = title_similarity(title, rtitle)
+            if title and title[: min(8, len(title))] and title[:8] in rtitle:
+                score = max(score, 0.85)
+            if score < 0.25:
+                continue
+            products = w.get("products") or []
+            p0 = products[0] if products and isinstance(products[0], dict) else {}
+            cid = _cid_from_avbase_product(p0, code)
+            cover = None
+            studio = None
+            actress_name = actress
+            if p0:
+                cover = p0.get("image_url") or p0.get("thumbnail_url")
+                maker = p0.get("maker") or {}
+                if isinstance(maker, dict):
+                    studio = maker.get("name")
+                actors = w.get("actors") or p0.get("actors") or []
+                if not actress_name and isinstance(actors, list) and actors:
+                    a0 = actors[0]
+                    if isinstance(a0, dict):
+                        actress_name = a0.get("name")
+                    elif isinstance(a0, str):
+                        actress_name = a0
+            if not cid:
+                cid = code_to_cid(code)
+            if not cover and cid:
+                cover = cover_url(cid)
+            # Prefer digital CDN pl cover when possible
+            if cover and "mono/movie" in str(cover) and cid:
+                dig = cover_url(cid)
+                if dig:
+                    cover = dig
+            seen.add(code)
+            out.append(
+                {
+                    "code": code,
+                    "title": rtitle or title,
+                    "actress": actress_name,
+                    "studio": studio,
+                    "cid": cid,
+                    "cover": cover,
+                    "href": f"https://www.avbase.net/works/{w.get('id')}" if w.get("id") else None,
+                    "source": "avbase",
+                    "score": float(score),
+                }
+            )
+            if len(out) >= 24:
+                break
+    except Exception:
+        return out
+    out.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    return out
+
+
+def fetch_jav321_title_results(title: str, actress: str | None = None) -> list[dict]:
+    """jav321 only helps when the query embeds a 品番."""
+    codes = extract_codes(title or "")
+    out: list[dict] = []
+    for c in codes[:3]:
+        disp = format_display_code(c)
+        if not parse_code_parts(disp):
+            continue
+        try:
+            meta = fetch_jav321(disp) if "fetch_jav321" in globals() else None
+        except Exception:
+            meta = None
+        cid = code_to_cid(disp)
+        item = {
+            "code": disp,
+            "title": (meta or {}).get("title") or title,
+            "actress": (meta or {}).get("actress") or actress,
+            "studio": (meta or {}).get("studio"),
+            "cid": cid,
+            "cover": cover_url(cid) if cid else None,
+            "source": "jav321",
+            "score": 0.5,
+        }
+        out.append(item)
+    return out
+
+
+def fetch_javlibrary_title_results(title: str, actress: str | None = None) -> list[dict]:
+    """Best-effort; often 403 from this box."""
+    try:
+        return fetch_javlibrary(title) if False else []  # disabled path placeholder
+    except Exception:
+        return []
+
+
+# Note: leave marshal fetch_javlibrary(code) for identify_code path
+
+
+def same_series_collision_indices(candidates: list[dict]) -> list[int]:
+    """
+    Indices of candidates that collide on near-identical titles / title scores.
+    When 2+ codes share a series title, visual compare must cover all of them
+    (not only the first 2–3 by title score).
+    """
+    coded = list(candidates or [])
+    if len(coded) < 2:
+        return list(range(len(coded)))
+    scores = [float(c.get("score") or 0.0) for c in coded]
+    top = max(scores) if scores else 0.0
+    titles = [str(c.get("title") or "").strip() for c in coded]
+    # Prefer the most common non-empty title as series anchor
+    anchor = ""
+    for t in titles:
+        if t:
+            anchor = t
+            break
+    # If top-score cluster is large, treat that whole cluster as collision
+    cluster = [
+        i
+        for i, sc in enumerate(scores)
+        if sc >= max(0.35, top - SAME_SERIES_SCORE_GAP)
+    ]
+    if len(cluster) >= 2:
+        # Expand with near-identical titles vs any cluster member
+        selected = set(cluster)
+        for i, t in enumerate(titles):
+            if i in selected or not t:
+                continue
+            for j in list(selected):
+                tj = titles[j]
+                if tj and title_similarity(t, tj) >= SAME_SERIES_TITLE_SIM:
+                    selected.add(i)
+                    break
+                if anchor and title_similarity(t, anchor) >= SAME_SERIES_TITLE_SIM:
+                    selected.add(i)
+                    break
+        return sorted(selected)
+    # Fallback: titles similar to first
+    if anchor:
+        idxs = [
+            i
+            for i, t in enumerate(titles)
+            if t and title_similarity(t, anchor) >= SAME_SERIES_TITLE_SIM
+        ]
+        if len(idxs) >= 2:
+            return idxs
+    return list(range(min(len(coded), VISUAL_COMPARE_MAX)))
+
+
+def rank_candidates_by_visual(
+    user_image_bytes: bytes,
+    candidates: list[dict],
+    *,
+    api_key: str | None = None,
+    max_n: int = VISUAL_COMPARE_MAX,
+    budget_s: float = VISUAL_COMPARE_BUDGET,
+) -> tuple[list[dict], dict]:
+    """
+    Rank candidates by Gemini visual match vs user crop.
+    For same-series title collisions, compare all near-tie codes (up to max_n),
+    set main = best visual match, and rewrite candidate scores from visual_score.
+    Never raises.
+    """
+    import time
+
+    meta: dict[str, Any] = {
+        "visual_ranked": False,
+        "compared": 0,
+        "skipped": 0,
+        "note": "",
+        "mode": "",
+        "compared_codes": [],
+    }
+    key = (api_key or get_gemini_api_key() or "").strip()
+    if not key or not user_image_bytes:
+        meta["note"] = "no_key_or_image"
+        return list(candidates or []), meta
+
+    coded = [
+        dict(c)
+        for c in (candidates or [])
+        if c.get("code") and parse_code_parts(str(c["code"]))
+    ]
+    if len(coded) < 2:
+        return list(candidates or []), meta
+
+    # Preserve original title scores
+    for c in coded:
+        if c.get("title_score") is None and c.get("score") is not None:
+            c["title_score"] = float(c.get("score") or 0)
+
+    collision_idxs = same_series_collision_indices(coded)
+    # Always include index 0; expand to full collision set, capped by max_n
+    want = sorted(set(collision_idxs) | {0})
+    # Prefer higher title_score within the collision set when truncating
+    want_sorted = sorted(
+        want,
+        key=lambda i: float(coded[i].get("title_score") or coded[i].get("score") or 0),
+        reverse=True,
+    )
+    # Same-series collisions: compare as many covers as budget allows (up to 8)
+    n_cap = max(2, min(int(max_n), 8, len(want_sorted), len(coded)))
+    pick_idxs = want_sorted[:n_cap]
+    # Keep original relative order for stable Cover0.. labels among picks
+    pick_idxs = sorted(pick_idxs)
+    top = [coded[i] for i in pick_idxs]
+    pick_set = set(pick_idxs)
+    rest = [dict(c) for i, c in enumerate(coded) if i not in pick_set]
+    t0 = time.monotonic()
+
+    pairs: list[tuple[dict, bytes]] = []
+    for c in top:
+        item = dict(c)
+        disp_c = format_display_code(str(item["code"]))
+        rcid, rcover, _ = sanitize_cover_fields(
+            code=disp_c,
+            cid=str(item.get("cid") or "") or None,
+            cover=str(item.get("cover") or "") or None,
+        )
+        if rcid:
+            item["cid"] = rcid
+        if rcover:
+            item["cover"] = rcover
+        else:
+            item["cover"] = None
+        cover = str(item.get("cover") or "").strip()
+        blob = download_cover_bytes(cover) if cover else None
+        if not blob:
+            alt = str(c.get("cover") or c.get("cover_url") or "").strip()
+            if alt and alt != cover:
+                blob = download_cover_bytes(alt)
+                if blob:
+                    item["cover"] = alt
+        if not blob:
+            meta["skipped"] += 1
+            continue
+        pairs.append((item, blob))
+
+    if len(pairs) < 2:
+        meta["note"] = "need_2_covers"
+        return list(candidates or []), meta
+
+    def _attach(item: dict, vm: dict) -> tuple[float, dict]:
+        item = dict(item)
+        item["visual"] = {
+            "same_work": vm.get("same_work"),
+            "confidence": vm.get("confidence"),
+            "reason": vm.get("reason"),
+            "match_person": vm.get("match_person"),
+            "match_face": vm.get("match_face"),
+            "match_accessories": vm.get("match_accessories"),
+            "match_clothes": vm.get("match_clothes"),
+            "match_pose": vm.get("match_pose"),
+        }
+        vs = visual_match_score(vm)
+        item["visual_score"] = vs
+        title_sc = float(item.get("title_score") or item.get("score") or 0.0)
+        item["title_score"] = title_sc
+        # Display / sort score must reflect visual discrimination (not flat 0.85)
+        item["score"] = round(vs * 0.92 + title_sc * 0.08, 4)
+        return (float(item["score"]), item)
+
+    remain = budget_s - (time.monotonic() - t0)
+    meta["mode"] = "batch"
+    meta["compared_codes"] = [str(it.get("code") or "") for it, _b in pairs]
+
+    def _run_batch(chunk: list[tuple[dict, bytes]], timeout: float) -> list[dict] | None:
+        if len(chunk) < 2:
+            return None
+        vms_local = gemini_rank_covers_batch(
+            user_image_bytes,
+            [b for _, b in chunk],
+            key,
+            timeout=timeout,
+            labels=[str(it.get("code") or "") for it, _b in chunk],
+        )
+        if (
+            not vms_local
+            or len(vms_local) != len(chunk)
+            or all(str(vm.get("reason") or "").startswith("batch_fail") for vm in vms_local)
+            or all(str(vm.get("reason") or "") in ("missing", "salvage_partial", "parse_fail") for vm in vms_local)
+        ):
+            return None
+        # Treat all-missing as fail
+        if all(str(vm.get("reason") or "") == "missing" for vm in vms_local):
+            return None
+        return vms_local
+
+    # Chunk size 4 keeps JSON short enough for Flash; tournament covers 5–8 codes
+    CHUNK = 4
+    ranked_pairs: list[tuple[float, dict]] = []
+    scored: dict[str, tuple[float, dict]] = {}
+
+    if len(pairs) <= CHUNK:
+        timeout = max(10.0, min(22.0, remain - 0.8))
+        vms = _run_batch(pairs, timeout)
+        if vms:
+            meta["compared"] = len(pairs)
+            for (item, _b), vm in zip(pairs, vms):
+                ranked_pairs.append(_attach(item, vm))
+        else:
+            remain = budget_s - (time.monotonic() - t0)
+            if remain >= 7.0 and len(pairs) >= 2:
+                meta["mode"] = "batch_top2_retry"
+                chunk = pairs[:2]
+                vms = _run_batch(chunk, max(7.0, min(16.0, remain - 0.5)))
+                if vms:
+                    meta["compared"] = 2
+                    meta["compared_codes"] = [str(it.get("code") or "") for it, _b in chunk]
+                    for (item, _b), vm in zip(chunk, vms):
+                        ranked_pairs.append(_attach(item, vm))
+                    for item, _b in pairs[2:]:
+                        item = dict(item)
+                        ts = float(item.get("title_score") or item.get("score") or 0)
+                        item["title_score"] = ts
+                        item["visual_score"] = 0.05
+                        item["score"] = round(ts * 0.05, 4)
+                        ranked_pairs.append((float(item["score"]), item))
+            if not ranked_pairs:
+                meta["mode"] = "batch_failed"
+                meta["note"] = "visual_timeout"
+                return list(candidates or []), meta
+    else:
+        # Tournament: score every cover in chunks of 4, then final face-off of top
+        meta["mode"] = "batch_tournament"
+        chunk_winners: list[tuple[dict, bytes]] = []
+        for start in range(0, len(pairs), CHUNK):
+            remain = budget_s - (time.monotonic() - t0)
+            if remain < 6.0:
+                break
+            chunk = pairs[start : start + CHUNK]
+            if len(chunk) == 1 and chunk_winners:
+                # Pair leftover with previous winner
+                chunk = [chunk_winners[-1], chunk[0]]
+            if len(chunk) < 2:
+                continue
+            timeout = max(8.0, min(18.0, remain - 0.6))
+            vms = _run_batch(chunk, timeout)
+            if not vms:
+                continue
+            meta["compared"] += len(chunk)
+            local: list[tuple[float, dict, bytes]] = []
+            for (item, blob), vm in zip(chunk, vms):
+                sc, attached = _attach(item, vm)
+                code_k = format_display_code(str(attached.get("code") or ""))
+                prev = scored.get(code_k)
+                if prev is None or sc > prev[0]:
+                    scored[code_k] = (sc, attached)
+                local.append((sc, attached, blob))
+            local.sort(key=lambda x: x[0], reverse=True)
+            # keep top 2 from chunk for final
+            for sc, attached, blob in local[:2]:
+                chunk_winners.append((attached, blob))
+        if scored:
+            # Final face-off among unique top codes (up to 4)
+            uniq: list[tuple[dict, bytes]] = []
+            seen_c: set[str] = set()
+            # Prefer highest scored so far
+            for code_k, (sc, attached) in sorted(scored.items(), key=lambda kv: kv[1][0], reverse=True):
+                if code_k in seen_c:
+                    continue
+                # find blob
+                blob = None
+                for it, b in pairs:
+                    if format_display_code(str(it.get("code") or "")) == code_k:
+                        blob = b
+                        break
+                if blob is None:
+                    continue
+                uniq.append((attached, blob))
+                seen_c.add(code_k)
+                if len(uniq) >= 4:
+                    break
+            remain = budget_s - (time.monotonic() - t0)
+            if len(uniq) >= 2 and remain >= 7.0:
+                vms = _run_batch(uniq, max(7.0, min(16.0, remain - 0.5)))
+                if vms:
+                    meta["compared"] += len(uniq)
+                    meta["mode"] = "batch_tournament_final"
+                    for (item, _b), vm in zip(uniq, vms):
+                        sc, attached = _attach(item, vm)
+                        code_k = format_display_code(str(attached.get("code") or ""))
+                        scored[code_k] = (sc, attached)
+            ranked_pairs = sorted(scored.values(), key=lambda x: x[0], reverse=True)
+            # Include any pairs not scored (failed chunk) as demoted
+            for item, _b in pairs:
+                code_k = format_display_code(str(item.get("code") or ""))
+                if code_k not in scored:
+                    item = dict(item)
+                    ts = float(item.get("title_score") or item.get("score") or 0)
+                    item["title_score"] = ts
+                    item["visual_score"] = 0.04
+                    item["score"] = 0.04
+                    ranked_pairs.append((0.04, item))
+        if not ranked_pairs:
+            meta["mode"] = "batch_failed"
+            meta["note"] = "visual_timeout"
+            return list(candidates or []), meta
+
+    ranked_pairs.sort(key=lambda x: x[0], reverse=True)
+    # Append non-compared codes after visually ranked ones (still list them),
+    # but demote flat title scores so UI ordering matches visual ranking.
+    demoted_rest: list[dict] = []
+    for item in rest:
+        item = dict(item)
+        ts = float(item.get("title_score") or item.get("score") or 0.0)
+        item["title_score"] = ts
+        if item.get("visual_score") is None:
+            item["visual_score"] = 0.02
+            item["score"] = 0.02
+        demoted_rest.append(item)
+    ranked_list = [it for _, it in ranked_pairs] + demoted_rest
+    meta["visual_ranked"] = meta["compared"] > 0
+    if meta["visual_ranked"]:
+        best_code = str(ranked_list[0].get("code") or "")
+        ncmp = meta["compared"]
+        meta["note"] = (
+            f"同系列可能混淆，已比對 {ncmp} 張封面（主選 {best_code}；依臉／飾品／姿勢）"
+        )
+    return ranked_list, meta
+
+
+
+def filter_title_candidates(candidates: list[dict], min_score: float = 0.25) -> list[dict]:
+    """Dedupe by code; keep hits with score >= min_score or javlibrary source."""
+    ranked: list[dict] = []
+    seen: set[str] = set()
+    for c in candidates or []:
+        code_raw = str(c.get("code") or "").strip()
+        if not code_raw or not parse_code_parts(code_raw):
+            continue
+        code = format_display_code(code_raw)
+        score = float(c.get("score") or 0)
+        src = str(c.get("source") or "")
+        if score < min_score and src not in ("javlibrary", "avbase", "jav321"):
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        item = dict(c)
+        item["code"] = code
+        if not item.get("cover") or is_now_printing_url(str(item.get("cover") or "")):
+            rcid, rcover, _ = sanitize_cover_fields(code=code, cid=item.get("cid"), cover=item.get("cover"))
+            item["cid"] = rcid
+            item["cover"] = rcover
+        ranked.append(item)
+
+    def rank(c: dict) -> tuple:
+        parts = parse_code_parts(c.get("code") or "")
+        label = (parts[0] if parts else "").upper()
+        pref = 1 if label in PREFERRED_LABELS else 0
+        src = 1 if c.get("source") in ("javlibrary", "avbase", "jav321") else 0
+        return (c.get("score") or 0, src, pref)
+
+    ranked.sort(key=rank, reverse=True)
+    return ranked
+
+
+def search_by_title(title: str, actress: str | None = None) -> dict | None:
+    """
+    Resolve a title to work code(s) and optional cover.
+    Tries: demo → (Chinese) Gemini map → AVBase → jav321(code) → JAVLibrary → DuckDuckGo.
+    Returns best match dict; when 2+ distinct codes match, includes them in `candidates`.
+    """
+    title = (title or "").strip()
+    if not is_usable_title(title):
+        return None
+
+    def _pack(best: dict, extras: list[dict] | None = None) -> dict:
+        """Attach candidates list (best first) and ensure CDN cover on coded hits."""
+        out = dict(best)
+        code = out.get("code")
+        if code and parse_code_parts(str(code)):
+            out["code"] = format_display_code(str(code))
+            cid, cover, _st = sanitize_cover_fields(
+                code=out["code"],
+                cid=str(out.get("cid") or "") or None,
+                cover=str(out.get("cover") or "") or None,
+            )
+            out["cid"] = cid
+            out["cover"] = cover
+        cands: list[dict] = []
+        seen: set[str] = set()
+        for item in [out] + list(extras or []):
+            c_code = item.get("code")
+            if not c_code or not parse_code_parts(str(c_code)):
+                continue
+            disp = format_display_code(str(c_code))
+            if disp in seen:
+                continue
+            seen.add(disp)
+            packed = dict(item)
+            packed["code"] = disp
+            cid, cover, _st = sanitize_cover_fields(
+                code=disp,
+                cid=str(packed.get("cid") or "") or None,
+                cover=str(packed.get("cover") or "") or None,
+            )
+            packed["cid"] = cid
+            packed["cover"] = cover
+            cands.append(packed)
+        out["candidates"] = cands
+        return out
+
+    # 0) Local demo: fast, no network — collect all strong title matches
+    demo = load_demo()
+    works = demo.get("works") or {}
+    demo_hits: list[dict] = []
+    for _k, raw in works.items():
+        if not isinstance(raw, dict) or not raw.get("code"):
+            continue
+        dt = str(raw.get("title") or "")
+        sc = title_similarity(title, dt)
+        if sc < 0.45:
+            continue
+        code = format_display_code(str(raw["code"]))
+        if not parse_code_parts(code):
+            continue
+        cid = str(raw.get("cid") or code_to_cid(code) or "")
+        demo_hits.append(
+            {
+                "code": code,
+                "title": raw.get("title") or title,
+                "actress": raw.get("actress") or actress,
+                "studio": raw.get("studio"),
+                "cover": raw.get("cover")
+                or raw.get("cover_url")
+                or (cover_url(cid) if cid else None),
+                "cid": cid or None,
+                "source": "demo",
+                "score": sc,
+            }
+        )
+    demo_hits.sort(key=lambda x: x.get("score") or 0, reverse=True)
+    # Exact / strong single demo match: return immediately (with siblings if any)
+    if demo_hits and (demo_hits[0].get("score") or 0) >= 0.55:
+        # Keep other demo hits that are clearly different codes (score >= 0.45)
+        return _pack(demo_hits[0], demo_hits)
+
+    original_title = title
+
+    # 0a) AVBase on original title (+ shorter prefixes) BEFORE Gemini rewrite
+    early_av: list[dict] = []
+    try:
+        seen_codes: set[str] = set()
+        for q in title_query_variants(original_title):
+            for item in fetch_avbase_title_results(q, actress=actress):
+                code = item.get("code")
+                if not code or code in seen_codes:
+                    continue
+                # Re-score against the full original title
+                item = dict(item)
+                item["score"] = max(
+                    float(item.get("score") or 0),
+                    title_similarity(original_title, str(item.get("title") or "")),
+                )
+                if original_title and original_title[:8] in str(item.get("title") or ""):
+                    item["score"] = max(float(item["score"]), 0.85)
+                seen_codes.add(code)
+                early_av.append(item)
+            # Stop early once we have a strong hit
+            strong = [c for c in early_av if (c.get("score") or 0) >= 0.55]
+            if strong:
+                break
+    except Exception:
+        early_av = []
+    early_av = filter_title_candidates(early_av, min_score=0.30)
+    if early_av and (early_av[0].get("score") or 0) >= 0.45:
+        best = early_av[0]
+        out = {
+            "code": best.get("code"),
+            "title": best.get("title") or original_title,
+            "actress": best.get("actress") or actress,
+            "studio": best.get("studio"),
+            "cover": best.get("cover"),
+            "cid": best.get("cid"),
+            "source": best.get("source"),
+            "score": best.get("score"),
+        }
+        return _pack(out, early_av)
+
+    # 0b) Chinese title → Gemini map to JP title + code
+    gemini_hit: dict | None = None
+    if is_chinese_heavy_title(title):
+        try:
+            gemini_hit = gemini_map_chinese_title(title)
+        except Exception:
+            gemini_hit = None
+        # Do not early-return a single Gemini code when web may yield alternatives;
+        # seed candidates and continue so multi-code listing works.
+        if gemini_hit and gemini_hit.get("title_ja"):
+            title = str(gemini_hit["title_ja"]).strip() or title
+
+    candidates: list[dict] = []
+
+    # Seed from Gemini code if present
+    if gemini_hit and gemini_hit.get("code") and parse_code_parts(str(gemini_hit["code"])):
+        code = format_display_code(str(gemini_hit["code"]))
+        cid = code_to_cid(code)
+        candidates.append(
+            {
+                "code": code,
+                "title": gemini_hit.get("title_ja") or gemini_hit.get("title") or title,
+                "actress": gemini_hit.get("actress") or actress,
+                "studio": gemini_hit.get("studio"),
+                "cover": cover_url(cid) if cid else None,
+                "cid": cid,
+                "source": "gemini",
+                "score": 0.55,
+            }
+        )
+
+    # a) AVBase title search (fast & works from this box; JAVLibrary=403 / DDG empty)
+    try:
+        queries: list[str] = []
+        for base_q in (original_title, title):
+            if base_q:
+                queries.extend(title_query_variants(base_q))
+        for q in dict.fromkeys(queries):
+            for item in fetch_avbase_title_results(q, actress=actress):
+                if any(c.get("code") == item.get("code") for c in candidates):
+                    continue
+                item = dict(item)
+                # score vs full original title
+                item["score"] = max(
+                    float(item.get("score") or 0),
+                    title_similarity(original_title, str(item.get("title") or "")),
+                )
+                if original_title and original_title[:8] in str(item.get("title") or ""):
+                    item["score"] = max(float(item["score"]), 0.85)
+                candidates.append(item)
+            if any((c.get("score") or 0) >= 0.55 and c.get("source") == "avbase" for c in candidates):
+                break
+    except Exception:
+        pass
+
+    # a2) jav321 — only helps when query embeds a 品番 (site has no JP title search)
+    try:
+        for item in fetch_jav321_title_results(title, actress=actress):
+            if not any(c.get("code") == item.get("code") for c in candidates):
+                candidates.append(item)
+    except Exception:
+        pass
+
+    strong_av = [
+        c for c in candidates
+        if c.get("source") in ("avbase", "jav321") and (c.get("score") or 0) >= 0.4
+    ]
+
+    # b) JAVLibrary / DuckDuckGo — skip when avbase already resolved (fail-fast budget)
+    if not strong_av:
+        try:
+            candidates.extend(fetch_javlibrary_title_results(title, actress=actress))
+        except Exception:
+            pass
+
+        try:
+            ddg = fetch_duckduckgo_title_results(title)
+            seen = {c["code"] for c in candidates if c.get("code")}
+            for item in ddg:
+                if item["code"] in seen:
+                    for i, c in enumerate(candidates):
+                        if c.get("code") == item["code"]:
+                            if item.get("cover") and not c.get("cover"):
+                                c["cover"] = item["cover"]
+                            if (item.get("score") or 0) > (c.get("score") or 0):
+                                merged = {**c}
+                                for k, v in item.items():
+                                    if v:
+                                        merged[k] = v
+                                candidates[i] = merged
+                    continue
+                seen.add(item["code"])
+                candidates.append(item)
+        except Exception:
+            pass
+
+    good = filter_title_candidates(candidates, min_score=0.25)
+
+    # If nothing passed the filter but we have raw candidates, keep top by rank
+    if not good and candidates:
+        def rank_raw(c: dict) -> tuple:
+            parts = parse_code_parts(c.get("code") or "")
+            label = (parts[0] if parts else "").upper()
+            pref = 1 if label in PREFERRED_LABELS else 0
+            src = 1 if c.get("source") in ("javlibrary", "avbase", "jav321") else 0
+            return (c.get("score") or 0, src, pref)
+
+        coded = [c for c in candidates if c.get("code") and parse_code_parts(str(c["code"]))]
+        if coded:
+            best_raw = max(coded, key=rank_raw)
+            if (best_raw.get("score") or 0) >= 0.15 or best_raw.get("source") in ("javlibrary", "avbase", "jav321"):
+                good = filter_title_candidates([best_raw], min_score=0.0)
+
+    if not good:
+        # Title-only partial from Gemini JP title (no code)
+        if gemini_hit and (gemini_hit.get("title") or gemini_hit.get("title_ja")):
+            return {
+                "code": None,
+                "title": gemini_hit.get("title_ja") or gemini_hit.get("title"),
+                "actress": gemini_hit.get("actress") or actress,
+                "studio": gemini_hit.get("studio"),
+                "cover": None,
+                "source": "gemini",
+                "score": 0.5,
+                "candidates": [],
+            }
+        return None
+
+    best = good[0]
+    # Require some similarity unless only one javlibrary / preferred hit
+    if (best.get("score") or 0) < 0.25 and len(good) > 1:
+        if best.get("source") not in ("javlibrary", "avbase", "jav321"):
+            # drop weak head; try next
+            good = [c for c in good if (c.get("score") or 0) >= 0.25 or c.get("source") in ("javlibrary", "avbase", "jav321")]
+            if not good:
+                return None
+            best = good[0]
+
+    out = {
+        "code": best.get("code"),
+        "title": best.get("title") or title,
+        "actress": best.get("actress") or actress,
+        "studio": best.get("studio"),
+        "cover": best.get("cover"),
+        "cid": best.get("cid"),
+        "source": best.get("source"),
+        "score": best.get("score"),
+    }
+    return _pack(out, good)
+
+
+
+def lookup_demo(code: str) -> dict | None:
+    """Lookup a work in local demo-package.json by display code."""
+    display = format_display_code(str(code or ""))
+    if not display or not parse_code_parts(display):
+        return None
+    demo = load_demo()
+    works = demo.get("works") or {}
+    # Direct key
+    if display in works and isinstance(works[display], dict):
+        return dict(works[display])
+    # Scan by code field
+    for _k, raw in works.items():
+        if not isinstance(raw, dict):
+            continue
+        rc = format_display_code(str(raw.get("code") or ""))
+        if rc == display:
+            return dict(raw)
+    # Also accept cid-ish keys
+    cid = code_to_cid(display)
+    if cid and cid in works and isinstance(works[cid], dict):
+        return dict(works[cid])
+    return None
+
+def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
+    """Prefer vision title (and fill missing actress/studio) over OCR/lookup."""
+    if not vision_meta:
+        return payload
+    vt = vision_meta.get("title")
+    if vt:
+        payload["title"] = vt
+    if vision_meta.get("actress") and not payload.get("actress"):
+        payload["actress"] = vision_meta["actress"]
+    if vision_meta.get("studio") and not payload.get("studio"):
+        payload["studio"] = vision_meta["studio"]
+    return payload
+
+
+def identify_code(
+    code: str,
+    ocr_preview: str | None = None,
+    vision_meta: dict | None = None,
+) -> dict:
+    display = format_display_code(code)
+    parts = parse_code_parts(display)
+    if not parts:
+        return apply_vision_meta(
+            {
+                "ok": False,
+                "code": display,
+                "title": None,
+                "actress": None,
+                "studio": None,
+                "cid": None,
+                "cover": None,
+                "stills": [],
+                "related": [],
+                "ocr_text_preview": ocr_preview,
+                "message": "番號格式無效，請用如 MIDA-616",
+            },
+            vision_meta,
+        )
+
+    cid = code_to_cid(display)
+    related: list[dict] = []
+    related_note = None
+    title = None
+    actress = None
+    studio = None
+    message = None
+
+    # Demo MIDA-616 path: full package
+    if is_mida616(display):
+        demo_raw = lookup_demo(display) or {
+            "code": "MIDA-616",
+            "title": "彼女の妹のノーブラ誘惑に負け巨乳ナマ乳沼に溺れたサイテーなボク",
+            "actress": "福田ゆあ",
+            "studio": "MOODYZ DIVA",
+            "cid": "mida00616",
+        }
+        main = work_payload(demo_raw, why="主作品（示範包）")
+        related = related_from_demo()
+        out = {
+            "ok": True,
+            "code": main["code"],
+            "title": main["title"],
+            "actress": main["actress"],
+            "studio": main["studio"],
+            "cid": main["cid"],
+            "cover": main["cover"],
+            "stills": main["stills"],
+            "related": related,
+            "ocr_text_preview": ocr_preview,
+            "message": "示範包：主作品＋主題＋女優",
+            "related_note": None,
+        }
+        # Vision title preferred over demo/OCR when present
+        return apply_vision_meta(out, vision_meta)
+
+    # Other demo hits
+    demo_raw = lookup_demo(display)
+    if demo_raw:
+        main = work_payload(demo_raw)
+        out = {
+            "ok": True,
+            "code": main["code"],
+            "title": main["title"],
+            "actress": main["actress"],
+            "studio": main["studio"],
+            "cid": main["cid"],
+            "cover": main["cover"],
+            "stills": main["stills"],
+            "related": [],
+            "ocr_text_preview": ocr_preview,
+            "message": "示範包內單一部作品",
+            "related_note": "相關推薦目前僅 MIDA-616 路徑會自動帶入主題＋女優。",
+        }
+        return apply_vision_meta(out, vision_meta)
+
+    # Online lookup: demo → JAVLibrary → JavBus → DDG(fast) → Gemini text → CDN-only.
+    # Soft deadline: stop online title attempts after IDENTIFY_ONLINE_BUDGET seconds.
+    import time as _time
+
+    meta = None
+    timed_out = False
+    t_online = _time.monotonic()
+
+    def _has_title(m: dict | None) -> bool:
+        return bool(m and (m.get("title") or "").strip())
+
+    def _budget_left() -> float:
+        return IDENTIFY_ONLINE_BUDGET - (_time.monotonic() - t_online)
+
+    def _merge_title(src_meta: dict | None, label: str) -> None:
+        nonlocal meta
+        if not src_meta:
+            return
+        if _has_title(src_meta):
+            if not meta:
+                meta = src_meta
+            else:
+                meta = {
+                    **meta,
+                    "title": src_meta.get("title"),
+                    "actress": meta.get("actress") or src_meta.get("actress"),
+                    "studio": meta.get("studio") or src_meta.get("studio"),
+                    "source": f"{meta.get('source') or 'web'}+{label}",
+                }
+                if src_meta.get("cid") and not meta.get("cid"):
+                    meta["cid"] = src_meta["cid"]
+                if src_meta.get("related") and not meta.get("related"):
+                    meta["related"] = src_meta["related"]
+        elif src_meta and not meta:
+            meta = src_meta
+
+    try:
+        meta = fetch_javlibrary(display)
+    except Exception:
+        meta = None
+
+    if not _has_title(meta) and _budget_left() > 0.5:
+        try:
+            jb = fetch_javbus(display)
+        except Exception:
+            jb = None
+        _merge_title(jb, (jb or {}).get("source") or "javbus")
+
+    if not _has_title(meta) and _budget_left() > 1.0:
+        try:
+            ddg = fetch_duckduckgo(display)
+        except Exception:
+            ddg = None
+        _merge_title(ddg, "duckduckgo")
+
+    if not _has_title(meta) and _budget_left() > 2.0:
+        try:
+            gmeta = gemini_lookup_code_meta(display)
+        except Exception:
+            gmeta = None
+        if _has_title(gmeta):
+            if not meta:
+                meta = {
+                    "code": display,
+                    "title": gmeta.get("title"),
+                    "actress": gmeta.get("actress"),
+                    "studio": gmeta.get("studio"),
+                    "cid": cid,
+                    "related": [],
+                    "source": "gemini",
+                }
+            else:
+                meta = {
+                    **meta,
+                    "title": gmeta.get("title"),
+                    "actress": meta.get("actress") or gmeta.get("actress"),
+                    "studio": meta.get("studio") or gmeta.get("studio"),
+                    "source": f"{meta.get('source') or 'web'}+gemini",
+                }
+    elif not _has_title(meta) and _budget_left() <= 2.0:
+        timed_out = True
+
+    if meta:
+        title = meta.get("title")
+        actress = meta.get("actress")
+        studio = meta.get("studio")
+        if meta.get("cid"):
+            cid = meta["cid"]
+        related = meta.get("related") or []
+        if not related:
+            related_note = "線上目錄未取得同女優相關；僅顯示主作品 CDN。"
+        message = f"來源：{meta.get('source') or 'web'}"
+        if not (title and str(title).strip()):
+            related_note = "已取得 CDN 封面，但無法解析標題（JAVLibrary／JavBus／搜尋／Gemini 皆無結果）。"
+            if timed_out:
+                message = "僅 CDN（標題查詢逾時）— 已嘗試線上來源"
+            else:
+                message = "僅 CDN（無標題）— 已嘗試 JAVLibrary、JavBus、DuckDuckGo、Gemini"
+    else:
+        title = None
+        related_note = "已取得 CDN 封面，但無法解析標題（JAVLibrary／JavBus／搜尋／Gemini 皆無結果）。"
+        if timed_out:
+            message = "僅 CDN（標題查詢逾時）— 已嘗試線上來源"
+        else:
+            message = "僅 CDN（無標題）— 已嘗試 JAVLibrary、JavBus、DuckDuckGo、Gemini"
+
+    # Prefer vision title; fill missing fields from vision
+    if vision_meta:
+        if vision_meta.get("title"):
+            title = vision_meta["title"]
+            if message:
+                message = f"看圖辨識＋{message}"
+            else:
+                message = "看圖辨識"
+        if vision_meta.get("actress") and not actress:
+            actress = vision_meta["actress"]
+        if vision_meta.get("studio") and not studio:
+            studio = vision_meta["studio"]
+        # If no online title but vision has one, clear the CDN-only note tone
+        if vision_meta.get("title") and (not meta or not _has_title(meta)):
+            message = "看圖辨識（標題）＋ DMM CDN"
+            related_note = related_note or "無法取得線上相關；僅顯示主作品 CDN。"
+
+    cid, cover, stills = sanitize_cover_fields(
+        code=display,
+        cid=str(cid) if cid else None,
+        cover=None,
+    )
+
+    return {
+        "ok": True,
+        "code": display,
+        "title": title,
+        "actress": actress,
+        "studio": studio,
+        "cid": cid,
+        "cover": cover,
+        "stills": stills,
+        "related": related,
+        "ocr_text_preview": ocr_preview,
+        "message": message,
+        "related_note": related_note,
+    }
+
+
+def empty_identify(
+    *,
+    ok: bool = False,
+    message: str,
+    ocr_preview: str | None = None,
+    vision_used: bool = False,
+    code: str | None = None,
+    title: str | None = None,
+    actress: str | None = None,
+    studio: str | None = None,
+    cover: str | None = None,
+    stills: list | None = None,
+    search_mode: str = "manual",
+) -> dict:
+    return {
+        "ok": ok,
+        "code": code,
+        "title": title,
+        "actress": actress,
+        "studio": studio,
+        "cid": None,
+        "cover": cover,
+        "stills": stills if stills is not None else [],
+        "related": [],
+        "ocr_text_preview": ocr_preview,
+        "vision_used": vision_used,
+        "search_mode": search_mode,
+        "message": message,
+    }
+
+
+def title_only_payload(
+    *,
+    title: str,
+    actress: str | None = None,
+    studio: str | None = None,
+    cover: str | None = None,
+    ocr_preview: str | None = None,
+    vision_used: bool = True,
+    message: str | None = None,
+) -> dict:
+    """Partial ok response when we have a title but could not resolve a code.
+
+    Never invent a cover URL — empty/missing cover means the UI shows a placeholder
+    instead of a broken「載入失敗」image.
+    """
+    cover_s = (str(cover).strip() if cover else "") or None
+    return {
+        "ok": True,
+        "code": "TITLE-SEARCH",
+        "title": title,
+        "actress": actress,
+        "studio": studio,
+        "cid": None,
+        "cover": cover_s,
+        "stills": [cover_s] if cover_s else [],
+        "related": [],
+        "candidates": [],
+        "ocr_text_preview": ocr_preview,
+        "vision_used": vision_used,
+        "search_mode": "title",
+        "message": message
+        or (
+            f"以片名搜尋：「{title}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
+        ),
+        "related_note": "片名搜尋未解析番號；可手動輸入番號以豐富結果。",
+        "needs_code": True,
+    }
+
+
+
+def apply_visual_rank_to_hit(
+    hit: dict,
+    user_image_bytes: bytes | None,
+    *,
+    api_key: str | None = None,
+) -> dict:
+    """Reorder hit.candidates via visual compare when 2+ codes and user image exist."""
+    if not hit or not user_image_bytes:
+        return hit
+    cands = list(hit.get("candidates") or [])
+    if len(cands) < 2 and hit.get("code"):
+        cands = cands or [hit]
+    coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
+    if len(coded) < 2:
+        return hit
+    ranked, meta = rank_candidates_by_visual(
+        user_image_bytes, coded, api_key=api_key
+    )
+    if not meta.get("visual_ranked"):
+        hit = dict(hit)
+        hit["visual_meta"] = meta
+        return hit
+    best = ranked[0]
+    out = dict(hit)
+    # Candidates already sorted by visual score; expose that ordering as main
+    out["candidates"] = ranked
+    out["code"] = best.get("code") or out.get("code")
+    out["title"] = best.get("title") or out.get("title")
+    out["actress"] = best.get("actress") or out.get("actress")
+    out["studio"] = best.get("studio") or out.get("studio")
+    out["cover"] = best.get("cover") or out.get("cover")
+    out["cid"] = best.get("cid") or out.get("cid")
+    out["source"] = best.get("source") or out.get("source")
+    out["score"] = (
+        best.get("visual_score")
+        if best.get("visual_score") is not None
+        else best.get("score") or out.get("score")
+    )
+    out["visual_meta"] = meta
+    out["visual_best_code"] = format_display_code(str(best.get("code") or ""))
+    # Strong single visual winner: still keep others if close
+    top_vs = float(best.get("visual_score") or 0)
+    second = float(ranked[1].get("visual_score") or 0) if len(ranked) > 1 else 0.0
+    vm0 = best.get("visual") or {}
+    if vm0.get("same_work") and top_vs >= 0.55 and (top_vs - second) >= 0.18:
+        out["visual_confident"] = True
+    else:
+        out["visual_confident"] = False
+    return out
+
+
+def merge_title_candidates(
+    result: dict,
+    hit: dict | None,
+    query_title: str = "",
+) -> dict:
+    """Attach all distinct title-search codes as candidates / related gallery cards."""
+    if not hit:
+        return result
+    raw_cands = hit.get("candidates") or []
+    if not raw_cands and hit.get("code") and parse_code_parts(str(hit["code"])):
+        raw_cands = [hit]
+    enriched = [enrich_title_candidate(c, why="片名候選") for c in raw_cands]
+    # Drop entries without a real code
+    enriched = [e for e in enriched if e.get("code") and parse_code_parts(str(e["code"]))]
+    # Prefer visual ranking order already on hit.candidates; else sort by score
+    vmeta = (hit or {}).get("visual_meta") or {}
+    if vmeta.get("visual_ranked"):
+        # Keep order from hit (visually ranked); scores already rewritten
+        pass
+    else:
+        enriched.sort(
+            key=lambda e: float(e.get("visual_score") or e.get("score") or 0),
+            reverse=True,
+        )
+    # Main must follow visual best when ranked, else hit/result code
+    preferred = (
+        hit.get("visual_best_code")
+        or hit.get("code")
+        or result.get("code")
+        or ""
+    )
+    main_code = format_display_code(str(preferred)) if preferred else ""
+    if main_code:
+        # Rotate so main is first in candidates (related = rest)
+        head = [e for e in enriched if format_display_code(str(e["code"])) == main_code]
+        tail = [e for e in enriched if format_display_code(str(e["code"])) != main_code]
+        enriched = head + tail if head else enriched
+        # Align result main fields with visual winner
+        if head:
+            m0 = head[0]
+            result["code"] = m0.get("code") or result.get("code")
+            if m0.get("title"):
+                result["title"] = m0.get("title")
+            if m0.get("actress"):
+                result["actress"] = m0.get("actress")
+            if m0.get("studio"):
+                result["studio"] = m0.get("studio")
+            if m0.get("cover"):
+                result["cover"] = m0.get("cover")
+            if m0.get("cid"):
+                result["cid"] = m0.get("cid")
+            if m0.get("score") is not None:
+                result["score"] = m0.get("score")
+            if m0.get("stills"):
+                result["stills"] = m0.get("stills")
+    result["candidates"] = enriched
+    if len(enriched) < 2:
+        return result
+
+    if not main_code:
+        main_code = format_display_code(str(result.get("code") or hit.get("code") or ""))
+    extras = [
+        e for e in enriched if format_display_code(str(e["code"])) != main_code
+    ]
+    if not extras:
+        return result
+
+    prev = list(result.get("related") or [])
+    # Candidate cards first; keep any theme/actress related after
+    result["related"] = extras + prev
+    q = (query_title or result.get("title") or hit.get("title") or "").strip()
+    n = len(enriched)
+    banner = f"片名「{q}」找到 {n} 個不同番號，已全部列出（請點選正確的）"
+    vmeta = (hit or {}).get("visual_meta") or {}
+    if vmeta.get("visual_ranked"):
+        banner = banner + "；" + (vmeta.get("note") or "同系列可能混淆，已依人物／衣服／姿勢排序")
+    prev_msg = (result.get("message") or "").strip()
+    result["message"] = banner if not prev_msg else f"{banner} {prev_msg}"
+    result["related_note"] = banner
+    result["search_mode"] = "title"
+    if vmeta:
+        result["visual_meta"] = vmeta
+    return result
+
+
+def multi_candidate_payload(
+    *,
+    query_title: str,
+    hit: dict,
+    ocr_preview: str | None = None,
+    vision_used: bool = False,
+    extra_msg: str | None = None,
+) -> dict:
+    """Build an identify response listing every coded title candidate as gallery cards."""
+    cands = hit.get("candidates") or [hit]
+    enriched = [enrich_title_candidate(c, why="片名候選") for c in cands]
+    enriched = [e for e in enriched if e.get("code") and parse_code_parts(str(e["code"]))]
+    if not enriched:
+        return title_only_payload(
+            title=query_title,
+            actress=hit.get("actress"),
+            studio=hit.get("studio"),
+            cover=None,
+            ocr_preview=ocr_preview,
+            vision_used=vision_used,
+            message=(extra_msg + " " if extra_msg else "")
+            + f"以片名搜尋：「{query_title}」。未解析出番號；可手動輸入番號以補齊封面／劇照。",
+        )
+    vmeta = (hit or {}).get("visual_meta") or {}
+    preferred = (
+        hit.get("visual_best_code")
+        or hit.get("code")
+        or (enriched[0].get("code") if enriched else "")
+        or ""
+    )
+    main_code = format_display_code(str(preferred)) if preferred else ""
+    if main_code:
+        head = [e for e in enriched if format_display_code(str(e["code"])) == main_code]
+        tail = [e for e in enriched if format_display_code(str(e["code"])) != main_code]
+        enriched = head + tail if head else enriched
+    main = enriched[0]
+    extras = enriched[1:]
+    n = len(enriched)
+    q = query_title or main.get("title") or ""
+    banner = f"片名「{q}」找到 {n} 個不同番號，已全部列出（請點選正確的）"
+    if vmeta.get("visual_ranked"):
+        banner = banner + "；" + (vmeta.get("note") or "同系列可能混淆，已依人物／衣服／姿勢排序")
+    msg = banner
+    if extra_msg:
+        msg = f"{banner} {extra_msg}"
+    out = {
+        "ok": True,
+        "code": main.get("code"),
+        "title": main.get("title") or query_title,
+        "actress": main.get("actress"),
+        "studio": main.get("studio"),
+        "cid": main.get("cid"),
+        "cover": main.get("cover"),
+        "stills": main.get("stills") or [],
+        "related": extras,
+        "candidates": enriched,
+        "ocr_text_preview": ocr_preview,
+        "vision_used": vision_used,
+        "search_mode": "title",
+        "message": msg,
+        "related_note": banner,
+        "score": main.get("score"),
+    }
+    if vmeta:
+        out["visual_meta"] = vmeta
+    return out
+
+
+@app.get("/api/health")
+def health():
+    return jsonify(
+        {
+            "ok": True,
+            "service": "look-for-pic-web",
+            "port": 8787,
+            "gemini_configured": bool(get_gemini_api_key()),
+        }
+    )
+
+
+
+def find_related_by_title(
+    title: str | None,
+    exclude_code: str | None = None,
+    max_n: int = 3,
+    actress: str | None = None,
+    budget_sec: float = 8.0,
+) -> list[dict]:
+    """Up to max_n works similar by title/theme (not the main code).
+
+    Prefers title-search siblings / theme demo over actress-only lists.
+    Soft deadline (default ~8s; multi uses a shorter budget) so identify stays responsive.
+    """
+    import time as _time
+
+    title = (title or "").strip()
+    if max_n <= 0 or not is_usable_title(title):
+        return []
+    t0 = _time.monotonic()
+    budget = float(budget_sec) if budget_sec and budget_sec > 0 else 8.0
+
+    def _left() -> float:
+        return budget - (_time.monotonic() - t0)
+
+    exclude = ""
+    if exclude_code and parse_code_parts(str(exclude_code)):
+        exclude = format_display_code(str(exclude_code))
+    seen: set[str] = {exclude} if exclude else set()
+    out: list[dict] = []
+
+    def _push(raw: dict, why: str = "片名相近") -> None:
+        nonlocal out
+        if len(out) >= max_n:
+            return
+        code_raw = str(raw.get("code") or "").strip()
+        if not code_raw or not parse_code_parts(code_raw):
+            return
+        code = format_display_code(code_raw)
+        if code in seen:
+            return
+        seen.add(code)
+        item = enrich_title_candidate(raw, why=why)
+        item["line"] = "theme"
+        item["why"] = why
+        out.append(item)
+
+    # 1) Title search candidates (same query → sibling codes / close titles)
+    hit = None
+    if _left() > 1.0:
+        try:
+            hit = search_by_title(title, actress=actress)
+        except Exception:
+            hit = None
+    if hit:
+        cands = list(hit.get("candidates") or [])
+        if hit.get("code") and parse_code_parts(str(hit["code"])):
+            # ensure head is considered
+            head = {
+                "code": hit.get("code"),
+                "title": hit.get("title"),
+                "actress": hit.get("actress"),
+                "studio": hit.get("studio"),
+                "cover": hit.get("cover"),
+                "cid": hit.get("cid"),
+                "score": hit.get("score"),
+                "source": hit.get("source"),
+            }
+            if not any(
+                format_display_code(str(c.get("code") or ""))
+                == format_display_code(str(head["code"]))
+                for c in cands
+                if c.get("code")
+            ):
+                cands = [head] + cands
+        # Prefer non-exact title matches / other codes; skip exclude
+        ranked = []
+        for c in cands:
+            code = format_display_code(str(c.get("code") or "")) if c.get("code") else ""
+            if not code or code in seen:
+                continue
+            sc = float(c.get("score") or 0)
+            # Slightly demote exact same title as query when it's the excluded sibling path
+            t_sc = title_similarity(title, str(c.get("title") or ""))
+            ranked.append((max(sc, t_sc), c))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        for _sc, c in ranked:
+            _push(c, why="片名相近")
+            if len(out) >= max_n:
+                return out
+
+    # 2) Shorter title prefix search for more theme diversity
+    if len(out) < max_n and len(title) >= 8 and _left() > 1.5:
+        for q in title_query_variants(title)[1:4]:
+            if len(out) >= max_n or _left() < 0.8:
+                break
+            try:
+                more = fetch_avbase_title_results(q, actress=None)[:8]
+            except Exception:
+                more = []
+            for c in more:
+                code = format_display_code(str(c.get("code") or "")) if c.get("code") else ""
+                if not code or code in seen:
+                    continue
+                t_sc = title_similarity(title, str(c.get("title") or ""))
+                if t_sc < 0.28 and float(c.get("score") or 0) < 0.35:
+                    continue
+                _push(c, why="主題相近")
+                if len(out) >= max_n:
+                    break
+
+    # 3) Demo theme package (MIDA path / shared works)
+    if len(out) < max_n:
+        try:
+            for r in related_from_demo():
+                why = str(r.get("why") or "")
+                if "女優" in why and "主題" not in why:
+                    continue
+                _push(r, why=why or "主題相近")
+                if len(out) >= max_n:
+                    break
+        except Exception:
+            pass
+
+    return out[:max_n]
+
+
+def attach_related_by_title(
+    result: dict,
+    *,
+    budget_sec: float = 8.0,
+    per_item: bool = True,
+) -> dict:
+    """Mutate identify payload to include related_by_title (max 3).
+
+    per_item=False (multi): only fill top-level related_by_title once, skip results[].
+    """
+    if not result or not result.get("ok"):
+        result = result or {}
+        result.setdefault("related_by_title", [])
+        return result
+    title = result.get("title")
+    code = result.get("code")
+    if code and (str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code))):
+        code = None
+    if "related_by_title" not in result:
+        try:
+            result["related_by_title"] = find_related_by_title(
+                title,
+                exclude_code=str(code) if code else None,
+                max_n=3,
+                actress=result.get("actress"),
+                budget_sec=budget_sec,
+            )
+        except Exception:
+            result["related_by_title"] = []
+    else:
+        # Cap & exclude main; ensure covers via enrich/sanitize
+        main = format_display_code(str(code)) if code and parse_code_parts(str(code)) else ""
+        cleaned = []
+        seen: set[str] = {main} if main else set()
+        for r in result.get("related_by_title") or []:
+            if not isinstance(r, dict):
+                continue
+            rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+            if not rc or rc in seen:
+                continue
+            seen.add(rc)
+            item = enrich_title_candidate(r, why=str(r.get("why") or "片名相近"))
+            item["line"] = r.get("line") or "theme"
+            cleaned.append(item)
+            if len(cleaned) >= 3:
+                break
+        result["related_by_title"] = cleaned
+    if not per_item:
+        return result
+    # Also attach on each results[] entry if present (single-image path)
+    for item in result.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        if item.get("related_by_title"):
+            # Still sanitize covers on pre-filled related lists
+            fixed = []
+            for r in item.get("related_by_title") or []:
+                if not isinstance(r, dict):
+                    continue
+                fixed.append(enrich_title_candidate(r, why=str(r.get("why") or "片名相近")))
+            item["related_by_title"] = fixed[:3]
+            continue
+        it_title = item.get("title") or title
+        it_code = item.get("code")
+        if it_code and (str(it_code) == "TITLE-SEARCH" or not parse_code_parts(str(it_code))):
+            it_code = None
+        try:
+            item["related_by_title"] = find_related_by_title(
+                it_title,
+                exclude_code=str(it_code) if it_code else None,
+                max_n=3,
+                actress=item.get("actress"),
+                budget_sec=min(budget_sec, 4.0),
+            )
+        except Exception:
+            item["related_by_title"] = []
+    return result
+
+
+def collect_images_from_request() -> list[tuple[bytes, str | None]]:
+    """Accept multiple uploads via `images` and/or repeated `image` fields.
+
+    Dedupes by content hash so clients that append both field names do not
+    double-count the same files (progress used to show 6 when 3 were selected).
+    """
+    out: list[tuple[bytes, str | None]] = []
+    seen: set[str] = set()
+    for key in ("images", "image"):
+        try:
+            files = request.files.getlist(key)
+        except Exception:
+            files = []
+        for f in files:
+            if not f or not getattr(f, "filename", None):
+                continue
+            try:
+                data = f.read() or b""
+            except Exception:
+                data = b""
+            if not data:
+                continue
+            digest = f"{len(data)}:{hash(data)}"
+            if digest in seen:
+                continue
+            seen.add(digest)
+            out.append((data, f.filename))
+    return out
+
+
+def build_multi_fail_stub(job: dict, *, why: str = "多圖未找到資料") -> dict:
+    """Lightweight gallery card for a unique vision code/title that failed resolve."""
+    row = job.get("row") or {}
+    code_raw = (job.get("code") or row.get("code") or "").strip()
+    title = (job.get("title") or row.get("title") or "").strip() or None
+    actress = (row.get("actress") or None)
+    studio = (row.get("studio") or None)
+    code = None
+    cid = None
+    cover = None
+    stills: list[str] = []
+    if code_raw and parse_code_parts(code_raw):
+        code = format_display_code(code_raw)
+        try:
+            cid, cover = resolve_cover_cid(code)
+            if cid:
+                stills = still_urls(cid, 10)
+        except Exception:
+            cid, cover, stills = None, None, []
+        # Fallback to primary CID even if probe failed (client may still load)
+        if not cid:
+            try:
+                cid = code_to_cid(code)
+                if cid:
+                    cover = cover_url(cid)
+                    stills = still_urls(cid, 10)
+            except Exception:
+                pass
+    return {
+        "ok": True,
+        "code": code or (code_raw or "TITLE-SEARCH"),
+        "title": title,
+        "actress": actress,
+        "studio": studio,
+        "cid": cid,
+        "cover": cover,
+        "stills": stills,
+        "related": [],
+        "related_by_title": [],
+        "candidates": [],
+        "why": why,
+        "line": "multi",
+        "stub": True,
+        "message": why,
+        "vision_used": bool(row.get("vision_used")),
+        "search_mode": "code" if code else "title",
+        "from_image_index": row.get("index"),
+    }
+
+
+def run_multi_identify_pipeline(
+    images: list[tuple[bytes, str | None]],
+    *,
+    user_code: str = "",
+    user_title: str = "",
+    on_progress=None,
+) -> tuple[dict, int]:
+    """Vision each image → resolve works → dedupe by code. Single image delegates."""
+    if not images:
+        return run_identify_pipeline(
+            image_bytes=None,
+            filename=None,
+            user_code=user_code,
+            user_title=user_title,
+            on_progress=on_progress,
+        )
+    if len(images) == 1:
+        result, status = run_identify_pipeline(
+            image_bytes=images[0][0],
+            filename=images[0][1],
+            user_code=user_code,
+            user_title=user_title,
+            on_progress=on_progress,
+        )
+        return attach_related_by_title(result), status
+
+    n = len(images)
+    api_key = get_gemini_api_key()
+    _progress(on_progress, "receive", "active", f"正在接收 {n} 張圖片…", 0.02)
+    _progress(on_progress, "receive", "done", f"已接收 {n} 張圖片", 1 / 7)
+
+    vision_rows: list[dict] = []
+    for i, (img_bytes, fname) in enumerate(images):
+        idx = i + 1
+        _progress(
+            on_progress,
+            "vision",
+            "active",
+            f"辨識第 {idx}/{n} 張…",
+            0.05 + 0.35 * (i / max(n, 1)),
+        )
+        row: dict = {
+            "index": idx,
+            "filename": fname,
+            "code": None,
+            "title": None,
+            "actress": None,
+            "studio": None,
+            "vision_used": False,
+            "image_bytes": img_bytes,
+        }
+        mime = detect_image_mime(img_bytes, fname)
+        if api_key:
+            try:
+                vm = call_gemini_vision(img_bytes, mime, api_key)
+                row["vision_used"] = True
+                if vm.get("code"):
+                    row["code"] = str(vm.get("code"))
+                if vm.get("title"):
+                    row["title"] = str(vm.get("title"))
+                if vm.get("actress"):
+                    row["actress"] = str(vm.get("actress"))
+                if vm.get("studio"):
+                    row["studio"] = str(vm.get("studio"))
+            except Exception as e:
+                row["vision_error"] = str(e)[:120]
+                try:
+                    ocr_text = ocr_image_bytes(img_bytes)
+                    best = pick_best_code(extract_codes(ocr_text))
+                    if best:
+                        row["code"] = best
+                except Exception:
+                    pass
+        else:
+            try:
+                ocr_text = ocr_image_bytes(img_bytes)
+                best = pick_best_code(extract_codes(ocr_text))
+                if best:
+                    row["code"] = best
+            except Exception:
+                pass
+        # Manual overrides apply to first image only as seed
+        if i == 0 and user_code and not row.get("code"):
+            row["code"] = user_code
+        if i == 0 and user_title and not row.get("title"):
+            row["title"] = user_title
+        vision_rows.append(row)
+        detail = f"第 {idx}/{n} 張"
+        if row.get("code"):
+            detail += f"：{format_display_code(str(row['code']))}"
+        elif row.get("title"):
+            detail += "：已讀到片名"
+        else:
+            detail += "：未讀到"
+        _progress(
+            on_progress,
+            "vision",
+            "done" if idx == n else "active",
+            detail,
+            0.05 + 0.35 * (idx / n),
+        )
+
+    _progress(on_progress, "vision", "done", f"已看完 {n} 張", 0.42)
+    _progress(on_progress, "parse", "active", "彙整番號／片名…", 0.45)
+
+    # Build unique resolve jobs (prefer code; else title); track drops
+    jobs: list[dict] = []
+    dropped: list[dict] = []  # {reason, code, title, index}
+    seen_codes: set[str] = set()
+    seen_titles: set[str] = set()
+    for row in vision_rows:
+        code = (row.get("code") or "").strip()
+        title = (row.get("title") or "").strip()
+        idx = row.get("index")
+        if code and parse_code_parts(code):
+            disp = format_display_code(code)
+            if disp in seen_codes:
+                dropped.append(
+                    {"reason": "duplicate", "code": disp, "title": title, "index": idx}
+                )
+                continue
+            seen_codes.add(disp)
+            jobs.append({"kind": "code", "code": disp, "title": title, "row": row})
+        elif is_usable_title(title):
+            key = title.casefold()
+            if key in seen_titles:
+                dropped.append(
+                    {"reason": "duplicate", "code": "", "title": title, "index": idx}
+                )
+                continue
+            seen_titles.add(key)
+            jobs.append({"kind": "title", "code": "", "title": title, "row": row})
+        else:
+            dropped.append(
+                {
+                    "reason": "no_signal",
+                    "code": code or "",
+                    "title": title or "",
+                    "index": idx,
+                }
+            )
+
+    if user_code and parse_code_parts(user_code):
+        disp = format_display_code(user_code)
+        if disp not in seen_codes:
+            seen_codes.add(disp)
+            jobs.insert(0, {"kind": "code", "code": disp, "title": user_title, "row": None})
+    if user_title and is_usable_title(user_title):
+        key = user_title.casefold()
+        if key not in seen_titles and not any(j.get("title", "").casefold() == key for j in jobs):
+            jobs.append({"kind": "title", "code": "", "title": user_title, "row": None})
+
+    n_dup = sum(1 for d in dropped if d["reason"] == "duplicate")
+    n_nosig = sum(1 for d in dropped if d["reason"] == "no_signal")
+    _progress(
+        on_progress,
+        "parse",
+        "done",
+        (
+            f"待查 {len(jobs)} 部（已去重"
+            + (f"，略過 {n_dup}" if n_dup else "")
+            + (f"，無番號 {n_nosig}" if n_nosig else "")
+            + "）"
+        )
+        if jobs
+        else "無可查詢項目",
+        0.5,
+    )
+
+    if not jobs:
+        _progress(on_progress, "search", "error", "多圖皆未找到番號或片名", 0.7)
+        _progress(on_progress, "done", "error", "辨識失敗", 1.0)
+        drop_bits = []
+        if n_dup:
+            drop_bits.append(f"{n_dup} 張去重")
+        if n_nosig:
+            drop_bits.append(f"{n_nosig} 張未讀到")
+        extra = f"（{'／'.join(drop_bits)}）" if drop_bits else ""
+        return (
+            empty_identify(
+                message=f"已看 {n} 張圖，皆未找到番號或片名{extra}",
+                vision_used=any(r.get("vision_used") for r in vision_rows),
+                search_mode="code",
+            ),
+            200,
+        )
+
+    _progress(on_progress, "verify", "skipped", "多圖路徑：逐部查詢", 0.52)
+    results: list[dict] = []
+    failed_jobs: list[dict] = []
+    for ji, job in enumerate(jobs):
+        _progress(
+            on_progress,
+            "search",
+            "active",
+            f"搜尋第 {ji + 1}/{len(jobs)} 部…",
+            0.55 + 0.25 * (ji / max(len(jobs), 1)),
+        )
+        row = job.get("row")
+        vm = None
+        if row:
+            vm = {
+                "title": row.get("title"),
+                "actress": row.get("actress"),
+                "studio": row.get("studio"),
+                "code": row.get("code"),
+            }
+        try:
+            if job["kind"] == "code":
+                one, _st = run_identify_pipeline(
+                    image_bytes=None,
+                    filename=None,
+                    user_code=job["code"],
+                    user_title="",
+                    on_progress=None,
+                    skip_related=True,
+                )
+                # Prefer vision title when present
+                if vm and vm.get("title") and one.get("ok"):
+                    one = apply_vision_meta(one, vm)
+            else:
+                # Already vision'd above — resolve by title only (no second vision)
+                one, _st = run_identify_pipeline(
+                    image_bytes=None,
+                    filename=None,
+                    user_code="",
+                    user_title=job["title"],
+                    on_progress=None,
+                    skip_related=True,
+                )
+                if vm and one.get("ok"):
+                    one = apply_vision_meta(one, vm)
+        except Exception as e:
+            one = empty_identify(message=f"查詢失敗：{e}")
+        if not one.get("ok"):
+            failed_jobs.append(job)
+            stub = build_multi_fail_stub(job, why="多圖未找到資料")
+            stub["line"] = "main" if not results else "multi"
+            results.append(stub)
+            dropped.append(
+                {
+                    "reason": "resolve_fail",
+                    "code": job.get("code") or "",
+                    "title": job.get("title") or "",
+                    "index": (row or {}).get("index"),
+                }
+            )
+            continue
+        # Dedupe by code against collected results
+        code = one.get("code")
+        if code and parse_code_parts(str(code)):
+            disp = format_display_code(str(code))
+            if any(
+                format_display_code(str(r.get("code") or "")) == disp
+                for r in results
+                if r.get("code") and parse_code_parts(str(r.get("code") or ""))
+            ):
+                dropped.append(
+                    {
+                        "reason": "duplicate",
+                        "code": disp,
+                        "title": one.get("title") or "",
+                        "index": (row or {}).get("index"),
+                    }
+                )
+                continue
+            one["code"] = disp
+        # Do NOT attach_related_by_title per hit — once on final payload (capped budget)
+        one.setdefault("related_by_title", [])
+        one["from_image_index"] = (row or {}).get("index")
+        one["why"] = one.get("why") or "多圖辨識"
+        one["line"] = "main" if not results else "multi"
+        results.append(one)
+
+    if not results:
+        _progress(on_progress, "search", "error", "查詢後無有效作品", 0.8)
+        _progress(on_progress, "done", "error", "失敗", 1.0)
+        return (
+            empty_identify(
+                message=f"已看 {n} 張圖，查詢後無有效作品",
+                vision_used=any(r.get("vision_used") for r in vision_rows),
+            ),
+            200,
+        )
+
+    n_fail = sum(1 for d in dropped if d["reason"] == "resolve_fail")
+    n_dup = sum(1 for d in dropped if d["reason"] == "duplicate")
+    n_nosig = sum(1 for d in dropped if d["reason"] == "no_signal")
+    n_drop_notice = n_fail + n_dup + n_nosig
+    ok_count = sum(1 for r in results if not r.get("stub"))
+    fail_codes = [
+        format_display_code(d["code"]) if d.get("code") and parse_code_parts(d["code"]) else (d.get("title") or "?")
+        for d in dropped
+        if d["reason"] == "resolve_fail"
+    ]
+
+    msg = f"多圖辨識：{n} 張 → {len(results)} 部"
+    if n_drop_notice:
+        bits = []
+        if n_fail:
+            bits.append(f"{n_fail} 張查詢失敗")
+        if n_dup:
+            bits.append(f"{n_dup} 張去重")
+        if n_nosig:
+            bits.append(f"{n_nosig} 張未讀到")
+        msg += f"（{'／'.join(bits)}）"
+        if fail_codes:
+            msg += "：" + "、".join(fail_codes[:4])
+            if len(fail_codes) > 4:
+                msg += "…"
+    elif n != len(results):
+        msg += "（已去重）"
+
+    note = f"多圖辨識共 {len(results)} 部"
+    if n_fail:
+        note += f"；其中 {n_fail} 部僅顯示番號／試封面（資料未找到）"
+    if n_dup or n_nosig:
+        note += f"；略過 {n_dup + n_nosig} 張（去重／未讀到）"
+
+    _progress(on_progress, "search", "done", f"列出 {len(results)} 部（成功 {ok_count}）", 0.82)
+    main = results[0]
+    # Other multi hits as related gallery cards (related_by_title filled once below)
+    extras = []
+    for r in results[1:]:
+        extras.append(
+            {
+                "code": r.get("code"),
+                "title": r.get("title"),
+                "actress": r.get("actress"),
+                "studio": r.get("studio"),
+                "cid": r.get("cid"),
+                "cover": r.get("cover"),
+                "stills": r.get("stills") or [],
+                "why": r.get("why") or "多圖辨識",
+                "line": "multi",
+                "related_by_title": [],
+                "stub": bool(r.get("stub")),
+            }
+        )
+    prev_related = list(main.get("related") or [])
+    payload = {
+        "ok": True,
+        "multi": True,
+        "image_count": n,
+        "result_count": len(results),
+        "code": main.get("code"),
+        "title": main.get("title"),
+        "actress": main.get("actress"),
+        "studio": main.get("studio"),
+        "cid": main.get("cid"),
+        "cover": main.get("cover"),
+        "stills": main.get("stills") or [],
+        "related": extras + prev_related,
+        "related_by_title": [],
+        "results": results,
+        "candidates": main.get("candidates") or [],
+        "vision_used": any(r.get("vision_used") for r in vision_rows),
+        "search_mode": "code",
+        "message": msg,
+        "related_note": note,
+        "dropped": dropped,
+        "ocr_text_preview": None,
+    }
+    _progress(
+        on_progress,
+        "cover",
+        "done" if payload.get("cover") else "skipped",
+        "封面就緒" if payload.get("cover") else "部分無封面",
+        0.92,
+    )
+    # Single related pass on main only, short budget (avoid N×8s timeouts)
+    _progress(on_progress, "done", "active", "補齊片名相關作品…", 0.94)
+    payload = attach_related_by_title(payload, budget_sec=5.0, per_item=False)
+    # Mirror top-level related onto main results[0] for galleryFromIdentify
+    if results and isinstance(results[0], dict):
+        results[0]["related_by_title"] = list(payload.get("related_by_title") or [])
+    n_rel = len(payload.get("related_by_title") or [])
+    done_detail = f"完成，列出 {len(results)} 部"
+    if n_rel:
+        done_detail += f"；片名相關 {n_rel}"
+    _progress(on_progress, "done", "done", done_detail, 1.0)
+    return payload, 200
+
+
+
+IDENTIFY_STEPS = (
+    ("receive", "接收圖片／文字"),
+    ("vision", "看圖辨識（Gemini）"),
+    ("parse", "讀取番號／片名"),
+    ("verify", "核對片名與番號"),
+    ("search", "搜尋作品資料"),
+    ("cover", "抓取封面與劇照"),
+    ("done", "完成，進入畫廊"),
+)
+
+
+def _progress(cb, step: str, status: str, detail: str = "", progress: float | None = None) -> None:
+    """Safe progress callback. status: pending|active|done|skipped|error."""
+    if not cb:
+        return
+    if progress is None:
+        ids = [s[0] for s in IDENTIFY_STEPS]
+        try:
+            idx = ids.index(step)
+            if status == "done":
+                progress = (idx + 1) / len(ids)
+            elif status == "active":
+                progress = idx / len(ids)
+            elif status == "skipped":
+                progress = (idx + 1) / len(ids)
+            else:
+                progress = idx / len(ids)
+        except ValueError:
+            progress = 0.0
+    try:
+        cb({"step": step, "status": status, "detail": detail or "", "progress": round(float(progress), 3)})
+    except Exception:
+        pass
+
+
+def run_identify_pipeline(
+    *,
+    image_bytes: bytes | None = None,
+    filename: str | None = None,
+    user_code: str = "",
+    user_title: str = "",
+    on_progress=None,
+    skip_related: bool = False,
+) -> tuple[dict, int]:
+    """
+    Shared identify logic for JSON and SSE endpoints.
+    Returns (payload_dict, http_status).
+    skip_related=True: caller (e.g. multi) will attach related_by_title once later.
+    """
+    ocr_preview = None
+    vision_used = False
+    vision_meta: dict | None = None
+    extra_msg: str | None = None
+    code = (user_code or "").strip()
+    user_title = (user_title or "").strip()
+    search_mode = "manual" if code else ("title" if user_title else "code")
+    api_key = get_gemini_api_key()
+
+    # Step 1: receive
+    recv_bits = []
+    if image_bytes:
+        recv_bits.append("圖片")
+    if code:
+        recv_bits.append(f"番號 {format_display_code(code)}")
+    if user_title:
+        recv_bits.append("片名文字")
+    _progress(on_progress, "receive", "active", "正在接收輸入…" if recv_bits else "等待輸入…", 0.02)
+    if not image_bytes and not code and not user_title:
+        _progress(on_progress, "receive", "error", "請提供 image、code 或 title", 0.0)
+        return (
+            empty_identify(
+                message="請提供 image、code 或 title",
+                vision_used=False,
+                search_mode="manual",
+            ),
+            400,
+        )
+    _progress(
+        on_progress,
+        "receive",
+        "done",
+        "已接收：" + "、".join(recv_bits),
+        1 / 6,
+    )
+
+    # Step 2: vision (or skip)
+    if image_bytes is not None:
+        mime = detect_image_mime(image_bytes, filename)
+        if api_key:
+            _progress(on_progress, "vision", "active", "Gemini 看圖辨識中…", 1 / 6)
+            try:
+                vision_meta = call_gemini_vision(image_bytes, mime, api_key)
+                vision_used = True
+                vcode = vision_meta.get("code")
+                if vcode and not code:
+                    code = str(vcode)
+                    search_mode = "code"
+                detail = "看圖完成"
+                if vision_meta.get("code"):
+                    detail += f"：番號 {vision_meta.get('code')}"
+                elif vision_meta.get("title"):
+                    detail += "：已讀到片名"
+                _progress(on_progress, "vision", "done", detail, 2 / 6)
+            except Exception as e:
+                extra_msg = f"看圖辨識失敗，改用 OCR：{e}"
+                vision_meta = None
+                vision_used = False
+                _progress(on_progress, "vision", "error", str(extra_msg)[:120], 2 / 6)
+                try:
+                    ocr_text = ocr_image_bytes(image_bytes)
+                    ocr_preview = (ocr_text or "")[:500]
+                    if not code:
+                        best = pick_best_code(extract_codes(ocr_text))
+                        if best:
+                            code = best
+                            search_mode = "code"
+                except Exception as ocr_e:
+                    _progress(on_progress, "parse", "error", f"OCR 亦失敗：{ocr_e}", 0.4)
+                    return (
+                        empty_identify(
+                            message=f"{extra_msg}；OCR 亦失敗：{ocr_e}",
+                            ocr_preview=ocr_preview,
+                            vision_used=False,
+                            search_mode="manual",
+                        ),
+                        500,
+                    )
+        else:
+            extra_msg = "未設定 GEMINI_API_KEY，看圖辨識不可用；改用 OCR＋查詢。"
+            _progress(on_progress, "vision", "skipped", "未設定 Gemini，略過看圖", 2 / 6)
+            try:
+                ocr_text = ocr_image_bytes(image_bytes)
+                ocr_preview = (ocr_text or "")[:500]
+                if not code:
+                    best = pick_best_code(extract_codes(ocr_text))
+                    if best:
+                        code = best
+                        search_mode = "code"
+            except Exception as e:
+                _progress(on_progress, "parse", "error", f"OCR 失敗：{e}", 0.4)
+                return (
+                    empty_identify(
+                        message=f"{extra_msg} OCR 失敗：{e}",
+                        ocr_preview=ocr_preview,
+                        vision_used=False,
+                        search_mode="manual",
+                    ),
+                    500,
+                )
+
+        # Vision succeeded but no code → OCR for code
+        if vision_used and not code:
+            try:
+                ocr_text = ocr_image_bytes(image_bytes)
+                ocr_preview = (ocr_text or "")[:500]
+                best = pick_best_code(extract_codes(ocr_text))
+                if best:
+                    code = best
+                    search_mode = "code"
+                    extra_msg = (extra_msg + " " if extra_msg else "") + "看圖未讀出番號，已用 OCR 補番號。"
+            except Exception:
+                pass
+    else:
+        _progress(on_progress, "vision", "skipped", "無圖片，略過看圖辨識", 2 / 6)
+
+    # Step 3: parse code/title
+    _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
+
+    early_payload: dict | None = None
+    early_status = 200
+    title_search_hit: dict | None = None
+    title_search_query: str = ""
+    verify_meta: dict | None = None
+
+    # Cross-check vision/OCR 番號 vs 片名 before trusting the code.
+    # Manual user_code skips title mismatch rejection (still resolves cover later).
+    ref_title_for_verify = ""
+    if user_title and is_usable_title(user_title):
+        ref_title_for_verify = user_title.strip()
+    elif vision_meta and is_usable_title(vision_meta.get("title")):
+        ref_title_for_verify = str(vision_meta.get("title") or "").strip()
+
+    if code and ref_title_for_verify and not user_code:
+        _progress(
+            on_progress,
+            "verify",
+            "active",
+            f"核對 {format_display_code(code)} 與片名…",
+            3 / 7,
+        )
+        try:
+            verify_meta = verify_code_matches_title(code, ref_title_for_verify)
+        except Exception as ve:
+            verify_meta = {
+                "ok": False,
+                "code": format_display_code(code),
+                "reason": f"核對失敗：{ve}",
+                "cover_ok": False,
+                "title_ok": False,
+                "similarity": 0.0,
+            }
+        if not verify_meta.get("ok"):
+            rejected = format_display_code(code)
+            reason = verify_meta.get("reason") or "不符"
+            cat = verify_meta.get("catalog_title") or ""
+            detail = f"拒絕 {rejected}：{reason}"
+            if cat:
+                detail += f"（目錄：{str(cat)[:36]}）"
+            _progress(on_progress, "verify", "error", detail[:120], 3 / 7)
+            extra_msg = (
+                (extra_msg + " " if extra_msg else "")
+                + f"番號 {rejected} 與片名不符或封面無效（{reason}），改以片名搜尋。"
+            )
+            code = ""
+            search_mode = "title"
+        else:
+            _progress(
+                on_progress,
+                "verify",
+                "done",
+                f"{format_display_code(code)} 片名相符"
+                + (f"（sim={float(verify_meta.get('similarity') or 0):.2f}）"),
+                3 / 7,
+            )
+            # Prefer resolved cover cid from verify
+            if verify_meta.get("cid") and vision_meta is not None:
+                vision_meta = dict(vision_meta)
+                vision_meta["_verified_cid"] = verify_meta.get("cid")
+                vision_meta["_verified_cover"] = verify_meta.get("cover")
+    elif code and user_code:
+        _progress(on_progress, "verify", "skipped", "手動番號，略過片名核對", 3 / 7)
+    elif code:
+        # Code without usable title — still probe cover; reject empty cover codes when title exists later
+        _progress(on_progress, "verify", "skipped", "無可核對片名", 3 / 7)
+    else:
+        _progress(on_progress, "verify", "skipped", "尚無番號可核對", 3 / 7)
+
+    # Image path: title search when no code
+    if image_bytes is not None and not code and vision_meta and is_usable_title(vision_meta.get("title")):
+        vtitle = str(vision_meta.get("title") or "").strip()
+        vactress = vision_meta.get("actress")
+        vstudio = vision_meta.get("studio")
+        _progress(on_progress, "parse", "done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
+        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        hit = None
+        try:
+            hit = search_by_title(vtitle, actress=vactress)
+        except Exception as se:
+            extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+
+        if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
+            # Visual rank when multiple same-series candidates
+            n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")])
+            if n_pre >= 2 and image_bytes:
+                _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+                hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
+            code = str(hit["code"])
+            search_mode = "title"
+            title_search_hit = hit
+            title_search_query = vtitle
+            if hit.get("title") and not vision_meta.get("title"):
+                vision_meta["title"] = hit["title"]
+            n_cands = len([c for c in (hit.get("candidates") or []) if c.get("code")])
+            if n_cands >= 2:
+                msg_bit = (
+                    f"以片名搜尋找到 {n_cands} 個不同番號"
+                    f"（主選 {format_display_code(code)}，來源：{hit.get('source') or 'web'}）。"
+                )
+                vmeta = hit.get("visual_meta") or {}
+                if vmeta.get("visual_ranked"):
+                    msg_bit += " " + (vmeta.get("note") or "已依人物／衣服／姿勢排序")
+            else:
+                msg_bit = f"以片名搜尋解析番號 {format_display_code(code)}（來源：{hit.get('source') or 'web'}）。"
+            extra_msg = (extra_msg + " " if extra_msg else "") + msg_bit
+            _progress(on_progress, "search", "done", msg_bit[:100], 4 / 6)
+        else:
+            # Prefer listing coded candidates over TITLE-SEARCH without cover
+            cands = (hit or {}).get("candidates") or []
+            coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
+            if len(coded) >= 1:
+                hit2 = hit or {"candidates": coded, "title": vtitle}
+                if len(coded) >= 2 and image_bytes:
+                    _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+                    hit2 = apply_visual_rank_to_hit(hit2, image_bytes, api_key=api_key)
+                    vmeta = hit2.get("visual_meta") or {}
+                    if vmeta.get("visual_ranked"):
+                        extra_msg = (
+                            (extra_msg + " " if extra_msg else "")
+                            + (vmeta.get("note") or "已依人物／衣服／姿勢排序")
+                        )
+                payload = multi_candidate_payload(
+                    query_title=vtitle,
+                    hit=hit2,
+                    ocr_preview=ocr_preview,
+                    vision_used=vision_used,
+                    extra_msg=extra_msg,
+                )
+                _progress(on_progress, "search", "done", f"片名候選 {len(coded)} 筆", 4 / 6)
+                _progress(on_progress, "cover", "done", "已依番號帶入 CDN 封面", 5 / 6)
+                _progress(on_progress, "done", "done", "完成", 1.0)
+                return payload, 200
+            early_payload = title_only_payload(
+                title=vtitle,
+                actress=vactress,
+                studio=vstudio,
+                cover=None,  # no fake / broken cover
+                ocr_preview=ocr_preview,
+                vision_used=vision_used,
+                message=(
+                    (extra_msg + " " if extra_msg else "")
+                    + f"以片名搜尋：「{vtitle}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
+                ),
+            )
+            _progress(on_progress, "search", "done", "片名搜尋未解析番號（部分結果）", 4 / 6)
+            _progress(on_progress, "cover", "skipped", "無番號可抓封面", 5 / 6)
+            _progress(on_progress, "done", "done", "完成（僅片名）", 1.0)
+            return early_payload, 200
+
+    if image_bytes is not None and not code and not early_payload:
+        vtitle = (vision_meta or {}).get("title") if vision_meta else None
+        if is_usable_title(vtitle):
+            early_payload = title_only_payload(
+                title=str(vtitle).strip(),
+                actress=(vision_meta or {}).get("actress"),
+                studio=(vision_meta or {}).get("studio"),
+                ocr_preview=ocr_preview,
+                vision_used=vision_used,
+                message=(extra_msg + " " if extra_msg else "")
+                + f"以片名搜尋：「{str(vtitle).strip()}」。未解析出番號。",
+            )
+            _progress(on_progress, "parse", "done", "僅有片名", 3 / 6)
+            _progress(on_progress, "search", "skipped", "無法解析番號", 4 / 6)
+            _progress(on_progress, "cover", "skipped", "無番號可抓封面", 5 / 6)
+            _progress(on_progress, "done", "done", "完成（僅片名）", 1.0)
+            return early_payload, 200
+        _progress(on_progress, "parse", "error", "未在圖片中找到番號或片名", 0.45)
+        _progress(on_progress, "search", "skipped", "略過", 0.5)
+        _progress(on_progress, "cover", "skipped", "略過", 0.5)
+        _progress(on_progress, "done", "error", "辨識失敗", 1.0)
+        return (
+            empty_identify(
+                message=(extra_msg + " " if extra_msg else "") + "未在圖片中找到番號或片名",
+                ocr_preview=ocr_preview,
+                vision_used=vision_used,
+                search_mode="manual",
+            ),
+            200,
+        )
+
+    # Title-only input (no image/code)
+    if not code and user_title:
+        search_mode = "title"
+        _progress(on_progress, "parse", "done", f"使用片名：{user_title[:40]}", 3 / 6)
+        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        hit = None
+        try:
+            hit = search_by_title(user_title)
+        except Exception as se:
+            extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+
+        if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
+            n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")])
+            if n_pre >= 2 and image_bytes:
+                _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+                hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
+            code = str(hit["code"])
+            title_search_hit = hit
+            title_search_query = user_title
+            vision_meta = {
+                "title": hit.get("title") or user_title,
+                "actress": hit.get("actress"),
+                "studio": hit.get("studio"),
+            }
+            n_cands = len([c for c in (hit.get("candidates") or []) if c.get("code")])
+            if n_cands >= 2:
+                msg_bit = (
+                    f"以片名「{user_title}」找到 {n_cands} 個不同番號"
+                    f"（主選 {format_display_code(code)}，來源：{hit.get('source') or 'web'}）。"
+                )
+                vmeta = hit.get("visual_meta") or {}
+                if vmeta.get("visual_ranked"):
+                    msg_bit += " " + (vmeta.get("note") or "已依人物／衣服／姿勢排序")
+            else:
+                msg_bit = (
+                    f"以片名「{user_title}」解析番號 {format_display_code(code)}"
+                    f"（來源：{hit.get('source') or 'web'}）。"
+                )
+            extra_msg = (extra_msg + " " if extra_msg else "") + msg_bit
+            _progress(on_progress, "search", "done", msg_bit[:100], 4 / 6)
+        elif hit and (hit.get("title") or user_title):
+            cands = hit.get("candidates") or []
+            coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
+            if coded:
+                hit2 = hit
+                if len(coded) >= 2 and image_bytes:
+                    _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+                    hit2 = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
+                    vmeta = hit2.get("visual_meta") or {}
+                    if vmeta.get("visual_ranked"):
+                        extra_msg = (
+                            (extra_msg + " " if extra_msg else "")
+                            + (vmeta.get("note") or "已依人物／衣服／姿勢排序")
+                        )
+                payload = multi_candidate_payload(
+                    query_title=user_title,
+                    hit=hit2,
+                    ocr_preview=ocr_preview,
+                    vision_used=False,
+                    extra_msg=extra_msg,
+                )
+                _progress(on_progress, "search", "done", f"片名候選 {len(coded)} 筆", 4 / 6)
+                _progress(on_progress, "cover", "done", "已依番號帶入 CDN 封面", 5 / 6)
+                _progress(on_progress, "done", "done", "完成", 1.0)
+                return payload, 200
+            payload = title_only_payload(
+                title=str(hit.get("title") or user_title).strip(),
+                actress=hit.get("actress"),
+                studio=hit.get("studio"),
+                cover=None,
+                ocr_preview=ocr_preview,
+                vision_used=False,
+                message=(
+                    (extra_msg + " " if extra_msg else "")
+                    + f"以片名搜尋：「{user_title}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
+                ),
+            )
+            _progress(on_progress, "search", "done", "片名搜尋未解析番號", 4 / 6)
+            _progress(on_progress, "cover", "skipped", "無封面", 5 / 6)
+            _progress(on_progress, "done", "done", "完成（僅片名）", 1.0)
+            return payload, 200
+        else:
+            _progress(on_progress, "search", "error", f"找不到片名：「{user_title}」", 0.7)
+            _progress(on_progress, "cover", "skipped", "略過", 0.7)
+            _progress(on_progress, "done", "error", "搜尋失敗", 1.0)
+            return (
+                empty_identify(
+                    message=(extra_msg + " " if extra_msg else "") + f"找不到片名：「{user_title}」",
+                    ocr_preview=ocr_preview,
+                    vision_used=False,
+                    search_mode="title",
+                    title=user_title,
+                ),
+                200,
+            )
+
+    if not code:
+        _progress(on_progress, "parse", "error", "請提供 image、code 或 title", 0.4)
+        return (
+            empty_identify(
+                message="請提供 image、code 或 title",
+                ocr_preview=ocr_preview,
+                vision_used=vision_used,
+                search_mode="manual",
+            ),
+            400,
+        )
+
+    # Have a code
+    disp = format_display_code(code)
+    _progress(on_progress, "parse", "done", f"番號：{disp}", 3 / 6)
+
+    # Step 4: search metadata
+    _progress(on_progress, "search", "active", f"搜尋作品資料（{disp}）…", 3 / 6)
+    result = identify_code(code, ocr_preview=ocr_preview, vision_meta=vision_meta)
+    result["vision_used"] = vision_used
+    result["search_mode"] = search_mode if search_mode in ("code", "title", "manual") else (
+        "manual" if user_code else ("title" if user_title else "code")
+    )
+    if user_code and not vision_used and not user_title:
+        result["search_mode"] = "manual"
+    if user_title and not user_code:
+        result["search_mode"] = "title"
+    if extra_msg:
+        prev = result.get("message") or ""
+        combined = (extra_msg + (" " + prev if prev else "")).strip()
+        if len(combined) > 280:
+            combined = combined[:277] + "…"
+        result["message"] = combined
+    result.setdefault("vision_used", vision_used)
+
+    src = result.get("message") or ""
+    if result.get("title"):
+        _progress(on_progress, "search", "done", f"標題：{str(result['title'])[:48]}", 4 / 6)
+    else:
+        _progress(on_progress, "search", "done", (src[:80] or "已查詢（可能無標題）"), 4 / 6)
+
+    # Step 5: cover/stills (URLs already built in identify_code)
+    _progress(on_progress, "cover", "active", "CDN 封面載入中…", 4 / 6)
+    if result.get("cover"):
+        n_stills = len(result.get("stills") or [])
+        _progress(on_progress, "cover", "done", f"封面就緒" + (f"＋劇照 {n_stills} 張" if n_stills else ""), 5 / 6)
+    else:
+        _progress(on_progress, "cover", "skipped", "無封面 URL", 5 / 6)
+
+    # Attach other title-search codes as gallery cards when applicable
+    if title_search_hit:
+        result = merge_title_candidates(
+            result, title_search_hit, query_title=title_search_query
+        )
+
+    # Step 6: done
+    ok = bool(result.get("ok"))
+    status = 200 if ok else 400
+    if ok:
+        n_extra = len(result.get("candidates") or [])
+        detail = "完成，進入畫廊"
+        if n_extra >= 2:
+            detail = f"完成，列出 {n_extra} 個番號候選"
+        # related_by_title (max 3) — title/theme siblings, excluding main
+        if not skip_related:
+            try:
+                result = attach_related_by_title(result)
+                n_rel = len(result.get("related_by_title") or [])
+                if n_rel:
+                    detail = f"{detail}；片名相關 {n_rel}"
+            except Exception:
+                result.setdefault("related_by_title", [])
+        else:
+            result.setdefault("related_by_title", [])
+        _progress(on_progress, "done", "done", detail, 1.0)
+    else:
+        result.setdefault("related_by_title", [])
+        _progress(on_progress, "done", "error", result.get("message") or "失敗", 1.0)
+    return result, status
+
+
+@app.post("/api/identify")
+def identify():
+    user_code = (request.form.get("code") or "").strip()
+    user_title = (request.form.get("title") or "").strip()
+    images = collect_images_from_request()
+
+    if len(images) > 1:
+        result, status = run_multi_identify_pipeline(
+            images,
+            user_code=user_code,
+            user_title=user_title,
+        )
+    elif len(images) == 1:
+        result, status = run_identify_pipeline(
+            image_bytes=images[0][0],
+            filename=images[0][1],
+            user_code=user_code,
+            user_title=user_title,
+        )
+        result = attach_related_by_title(result)
+    else:
+        result, status = run_identify_pipeline(
+            image_bytes=None,
+            filename=None,
+            user_code=user_code,
+            user_title=user_title,
+        )
+        result = attach_related_by_title(result)
+    return jsonify(result), status
+
+
+@app.get("/api/related-by-title")
+def related_by_title_api():
+    """Fetch up to 3 title/theme-related works for a code/title (history detail)."""
+    title = (request.args.get("title") or "").strip()
+    code = (request.args.get("code") or request.args.get("exclude") or "").strip()
+    actress = (request.args.get("actress") or "").strip() or None
+    try:
+        items = find_related_by_title(title, exclude_code=code or None, max_n=3, actress=actress)
+    except Exception as e:
+        return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
+    return jsonify({"ok": True, "related_by_title": items, "title": title, "exclude": code})
+
+
+@app.post("/api/identify/stream")
+def identify_stream():
+    """SSE progress stream then final result event. Accepts multiple images."""
+    user_code = (request.form.get("code") or "").strip()
+    user_title = (request.form.get("title") or "").strip()
+    images = collect_images_from_request()
+    n_images = len(images)
+
+    def generate():
+        import queue
+        import threading
+
+        q: queue.Queue = queue.Queue()
+
+        def on_progress(evt: dict) -> None:
+            q.put(("progress", evt))
+
+        def worker() -> None:
+            try:
+                if n_images > 1:
+                    result, status = run_multi_identify_pipeline(
+                        images,
+                        user_code=user_code,
+                        user_title=user_title,
+                        on_progress=on_progress,
+                    )
+                elif n_images == 1:
+                    result, status = run_identify_pipeline(
+                        image_bytes=images[0][0],
+                        filename=images[0][1],
+                        user_code=user_code,
+                        user_title=user_title,
+                        on_progress=on_progress,
+                    )
+                    result = attach_related_by_title(result)
+                else:
+                    result, status = run_identify_pipeline(
+                        image_bytes=None,
+                        filename=None,
+                        user_code=user_code,
+                        user_title=user_title,
+                        on_progress=on_progress,
+                    )
+                    result = attach_related_by_title(result)
+                q.put(("result", {"type": "result", "data": result, "status": status}))
+            except Exception as e:
+                q.put(
+                    (
+                        "result",
+                        {
+                            "type": "result",
+                            "data": empty_identify(message=f"伺服器錯誤：{e}"),
+                            "status": 500,
+                        },
+                    )
+                )
+            finally:
+                q.put(("end", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+        if n_images > 1:
+            steps = [
+                {"id": "receive", "label": f"接收圖片（{n_images} 張）"},
+                {"id": "vision", "label": "逐張看圖辨識"},
+                {"id": "parse", "label": "彙整番號／片名"},
+                {"id": "verify", "label": "核對片名與番號"},
+                {"id": "search", "label": "搜尋作品資料"},
+                {"id": "cover", "label": "抓取封面與劇照"},
+                {"id": "done", "label": "完成，進入畫廊"},
+            ]
+        else:
+            steps = [{"id": s, "label": l} for s, l in IDENTIFY_STEPS]
+        yield f"data: {json.dumps({'type': 'steps', 'steps': steps}, ensure_ascii=False)}\n\n"
+
+        while True:
+            kind, payload = q.get()
+            if kind == "end":
+                break
+            if kind == "progress":
+                body = {"type": "progress", **payload}
+                yield f"data: {json.dumps(body, ensure_ascii=False)}\n\n"
+            elif kind == "result":
+                yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+            "Connection": "keep-alive",
+        },
+    )
+
+
+# Static files from web root
+@app.route("/")
+def index():
+    return send_from_directory(ROOT, "index.html")
+
+
+@app.route("/<path:path>")
+def static_files(path: str):
+    # Do not shadow /api/*
+    if path.startswith("api/"):
+        return jsonify({"ok": False, "message": "not found"}), 404
+    target = ROOT / path
+    if target.is_file():
+        return send_from_directory(ROOT, path)
+    return jsonify({"ok": False, "message": "not found"}), 404
+
+
+
+# warm demo cache for gunicorn workers
+try:
+    load_demo()
+except Exception:
+    pass
+
+if __name__ == "__main__":
+    # Load demo once at startup
+    load_demo()
+    import os
+    port = int(os.environ.get("PORT") or "8787")
+    app.run(host="0.0.0.0", port=port, debug=False, threaded=True)

@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 192 192" width="192" height="192">
+  <rect width="192" height="192" rx="40" fill="#0f0f12"/>
+  <rect x="28" y="40" width="136" height="112" rx="12" fill="#1c1c24" stroke="#7c6cff" stroke-width="4"/>
+  <circle cx="96" cy="88" r="28" fill="none" stroke="#a78bfa" stroke-width="6"/>
+  <circle cx="96" cy="88" r="12" fill="#7c6cff"/>
+  <rect x="118" y="58" width="22" height="14" rx="4" fill="#7c6cff"/>
+  <text x="96" y="158" text-anchor="middle" font-family="system-ui,sans-serif" font-size="22" font-weight="700" fill="#e8e6f0">番號</text>
+</svg>
