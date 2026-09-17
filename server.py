@@ -42,7 +42,7 @@ UA = (
 )
 HTTP_TIMEOUT = 12
 DDG_TIMEOUT = 7
-VISUAL_COMPARE_BUDGET = 28
+VISUAL_COMPARE_BUDGET = 40
 VISUAL_COMPARE_MAX = 8
 SAME_SERIES_TITLE_SIM = 0.72
 SAME_SERIES_SCORE_GAP = 0.08
@@ -78,7 +78,7 @@ VISION_PROMPT = """你是 AV／JAV 列表截圖辨識助手。圖片可能是 JA
 
 VISUAL_MATCH_PROMPT = """你是 AV／JAV 封面比對助手。Image A 是使用者上傳的封面裁切／截圖；Image B 是目錄封面圖。
 
-請判斷兩者是否為「同一作品」的封面。同系列常換女優，身材／版面相似不夠，必須是同一個人。
+請判斷兩者是否為「同一作品」的封面／劇照。同系列常換女優，身材／版面相似不夠；必須同一人、同一套衣服、姿勢與飾品大致對得上。
 只回傳 JSON（不要 markdown、不要程式碼圍欄）：
 {"same_work":true,"confidence":0.0,"reason":"簡短中文或日文理由","match_person":true,"match_face":true,"match_accessories":true,"match_clothes":true,"match_pose":true}
 
@@ -92,7 +92,7 @@ VISUAL_MATCH_PROMPT = """你是 AV／JAV 封面比對助手。Image A 是使用�
 
 VISUAL_RANK_BATCH_PROMPT = """你是 AV／JAV 封面比對助手。第一張圖是使用者上傳的封面裁切／截圖；後面依序是候選目錄封面 Cover0、Cover1、…
 
-同系列常換女優，身材／版面／場景相似很容易誤判。請優先比對：唇形、眼型、臉型、項鍊／耳環等飾品，再比服裝與姿勢。選出與使用者圖為「同一作品／同一人」者。
+同系列常換女優，身材／版面／場景相似很容易誤判。使用者圖可能是封面裁切或劇照截圖。請優先比對：唇形、眼型、臉型、項鍊／耳環等飾品，再比服裝與姿勢。僅在人物＋衣服＋姿勢／飾品對得上時標 same_work。
 只回傳 JSON（不要 markdown）：
 {"best_index":0,"rankings":[{"index":0,"same_work":true,"confidence":0.0,"match_person":true,"match_face":true,"match_accessories":true,"match_clothes":true,"match_pose":true,"reason":"..."}]}
 
@@ -373,6 +373,9 @@ def normalize_ocr_title(title: str | None) -> str:
     }
     for a, b in repl.items():
         t = t.replace(a, b)
+    # Vision often mixes Simplified 的 into JP titles (息子的 → 息子の)
+    if "的" in t and re.search(r"[\u3040-\u30ff]", t):
+        t = t.replace("的", "の")
     t = re.sub(r"\s+", " ", t).strip()
     return t
 
@@ -1175,7 +1178,7 @@ def parse_visual_match_json(text: str) -> dict[str, Any]:
     reason = data.get("reason")
     if not isinstance(reason, str):
         reason = ""
-    return {
+    parsed = {
         "same_work": as_bool(data.get("same_work")),
         "confidence": conf,
         "reason": reason.strip()[:160],
@@ -1185,32 +1188,101 @@ def parse_visual_match_json(text: str) -> dict[str, Any]:
         "match_clothes": as_bool(data.get("match_clothes")),
         "match_pose": as_bool(data.get("match_pose")),
     }
+    return enforce_visual_same_work(parsed)
+
+
+def enforce_visual_same_work(vm: dict) -> dict:
+    """Require person/clothes/(face|accessories|pose) agreement — not mere same-series vibe.
+
+    Mutates and returns vm. same_work stays true only when the user shot matches
+    the cover/still on identity + outfit (and at least one of face/accessories/pose
+    when those flags are present).
+    """
+    if not isinstance(vm, dict):
+        return {
+            "same_work": False,
+            "confidence": 0.0,
+            "reason": "invalid",
+            "match_person": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+    person = bool(vm.get("match_person"))
+    clothes = bool(vm.get("match_clothes"))
+    pose = bool(vm.get("match_pose"))
+    face = vm.get("match_face")
+    accessories = vm.get("match_accessories")
+    # When face/accessories were omitted, fall back to pose; when present, any true helps.
+    detail_ok = False
+    if face is True or accessories is True or pose:
+        detail_ok = True
+    elif face is None and accessories is None:
+        # Older responses without face/accessories keys: person+clothes+pose enough
+        detail_ok = pose or (person and clothes)
+    else:
+        # Explicit false on face/accessories with no pose → reject
+        detail_ok = pose
+
+    try:
+        conf = float(vm.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        conf = 0.0
+
+    if not (person and clothes and detail_ok):
+        vm["same_work"] = False
+        # Same-series lookalikes often come back with inflated confidence
+        if not person or face is False:
+            conf = min(conf, 0.30)
+        elif not clothes:
+            conf = min(conf, 0.35)
+        else:
+            conf = min(conf, 0.40)
+        vm["confidence"] = conf
+        return vm
+
+    # person+clothes+detail ok — still require model same_work OR high confidence
+    if vm.get("same_work") and conf < 0.45:
+        # Soft: keep same_work but don't trust ultra-low conf
+        pass
+    if not vm.get("same_work") and conf >= 0.85 and person and clothes and (face is True or accessories is True):
+        # Near-duplicate crop vs cover: allow same_work when flags strongly agree
+        vm["same_work"] = True
+    return vm
 
 
 def visual_match_score(vm: dict) -> float:
     """Rank score from visual compare JSON. Face/accessories outweigh series similarity."""
+    vm = enforce_visual_same_work(dict(vm) if isinstance(vm, dict) else {})
     conf = float(vm.get("confidence") or 0.0)
     bonus = 0.0
     if vm.get("match_person"):
-        bonus += 0.08
+        bonus += 0.10
+    else:
+        bonus -= 0.18
+        conf = min(conf, 0.32)
     if vm.get("match_face"):
         bonus += 0.16
-    elif "match_face" in vm and not vm.get("match_face"):
-        bonus -= 0.12
-        conf = min(conf, 0.35)
+    elif "match_face" in vm and vm.get("match_face") is False:
+        bonus -= 0.14
+        conf = min(conf, 0.32)
     if vm.get("match_accessories"):
         bonus += 0.12
-    elif "match_accessories" in vm and not vm.get("match_accessories"):
+    elif "match_accessories" in vm and vm.get("match_accessories") is False:
         bonus -= 0.08
     if vm.get("match_clothes"):
-        bonus += 0.08
+        bonus += 0.10
+    else:
+        bonus -= 0.12
+        conf = min(conf, 0.36)
     if vm.get("match_pose"):
-        bonus += 0.05
+        bonus += 0.06
+    else:
+        bonus -= 0.04
     if vm.get("same_work"):
-        if vm.get("match_face") is False:
-            bonus -= 0.2
+        if vm.get("match_face") is False or not vm.get("match_person") or not vm.get("match_clothes"):
+            bonus -= 0.25
         else:
-            bonus += 0.12
+            bonus += 0.14
     return max(0.0, min(1.0, conf * 0.65 + bonus))
 
 
@@ -1357,10 +1429,12 @@ def gemini_rank_covers_batch(
         }
         try:
             if best_index is not None and int(best_index) == i:
-                vm["confidence"] = max(float(vm.get("confidence") or 0), 0.7)
-                vm["same_work"] = True if vm.get("same_work") or float(vm.get("confidence") or 0) >= 0.55 else vm.get("same_work")
+                # Prefer best_index for ranking only — never invent same_work without
+                # person/clothes/(face|accessories|pose) agreement (same-series trap).
+                vm["confidence"] = max(float(vm.get("confidence") or 0), 0.55)
         except (TypeError, ValueError):
             pass
+        vm = enforce_visual_same_work(vm)
         out.append(vm)
     same_idxs = [i for i, vm in enumerate(out) if vm.get("same_work")]
     if len(same_idxs) > 1:
@@ -1529,6 +1603,41 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
             if code in seen:
                 continue
             rtitle = str(w.get("title") or "").strip()
+            products = w.get("products") or []
+            p0 = products[0] if products and isinstance(products[0], dict) else {}
+            actors = w.get("actors") or (p0.get("actors") if isinstance(p0, dict) else None) or []
+            actor_names: list[str] = []
+            if isinstance(actors, list):
+                for a0 in actors:
+                    if isinstance(a0, dict) and a0.get("name"):
+                        actor_names.append(str(a0.get("name")))
+                    elif isinstance(a0, str) and a0.strip():
+                        actor_names.append(a0.strip())
+            actor_blob = " ".join(actor_names)
+
+            # Actress-name queries: keep works starring that person even when
+            # the title text does not contain her name (old filter dropped them).
+            q_compact = re.sub(r"[\s　・·．.]+", "", title)
+            act_q = re.sub(r"[\s　・·．.]+", "", (actress or "").strip())
+            is_actress_query = bool(
+                (actress and (actress in title or act_q == q_compact))
+                or (
+                    len(q_compact) >= 3
+                    and not parse_code_parts(title)
+                    and re.fullmatch(r"[\u3040-\u30ff\u4e00-\u9fff]{2,12}", q_compact or "")
+                    and not re.search(r"[をにでがはもとからまでへの「」]", title or "")
+                )
+            )
+            name_in_actors = False
+            if is_actress_query and q_compact:
+                for an in actor_names:
+                    an_c = re.sub(r"[\s　・·．.]+", "", an)
+                    if q_compact in an_c or an_c in q_compact or (actress and actress in an):
+                        name_in_actors = True
+                        break
+                if not name_in_actors and q_compact and q_compact in re.sub(r"\s+", "", rtitle):
+                    name_in_actors = True
+
             score = title_similarity(title, rtitle)
             if title and title[: min(8, len(title))] and title[:8] in rtitle:
                 score = max(score, 0.85)
@@ -1536,10 +1645,10 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
             q_code = format_display_code(title) if parse_code_parts(title) else ""
             if q_code and q_code == code:
                 score = max(score, 1.0)
-            if score < 0.25:
+            if is_actress_query and name_in_actors:
+                score = max(score, 0.72)
+            if score < 0.25 and not (is_actress_query and name_in_actors):
                 continue
-            products = w.get("products") or []
-            p0 = products[0] if products and isinstance(products[0], dict) else {}
             cid = _cid_from_avbase_product(p0, code)
             cover = None
             studio = None
@@ -1549,13 +1658,10 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
                 maker = p0.get("maker") or {}
                 if isinstance(maker, dict):
                     studio = maker.get("name")
-                actors = w.get("actors") or p0.get("actors") or []
-                if not actress_name and isinstance(actors, list) and actors:
-                    a0 = actors[0]
-                    if isinstance(a0, dict):
-                        actress_name = a0.get("name")
-                    elif isinstance(a0, str):
-                        actress_name = a0
+            if not actress_name and actor_names:
+                actress_name = actor_names[0]
+            if is_actress_query and name_in_actors and not actress_name:
+                actress_name = title
             if not cid:
                 cid = code_to_cid(code)
             if not cover and cid:
@@ -1771,6 +1877,7 @@ def rank_candidates_by_visual(
 
     def _attach(item: dict, vm: dict) -> tuple[float, dict]:
         item = dict(item)
+        vm = enforce_visual_same_work(dict(vm) if isinstance(vm, dict) else {})
         item["visual"] = {
             "same_work": vm.get("same_work"),
             "confidence": vm.get("confidence"),
@@ -1927,6 +2034,67 @@ def rank_candidates_by_visual(
             return list(candidates or []), meta
 
     ranked_pairs.sort(key=lambda x: x[0], reverse=True)
+
+    # Stills fallback: when cover compare finds no person+clothes same_work,
+    # re-check top candidates against jp-1 still (user shot may be a still crop).
+    remain = budget_s - (time.monotonic() - t0)
+    top_vms_ok = any(
+        (it.get("visual") or {}).get("same_work")
+        and (it.get("visual") or {}).get("match_person")
+        and (it.get("visual") or {}).get("match_clothes")
+        for _, it in ranked_pairs[:3]
+    )
+    if (not top_vms_ok) and ranked_pairs and remain >= 7.0 and len(ranked_pairs) >= 2:
+        still_pairs: list[tuple[dict, bytes]] = []
+        for _sc, it in ranked_pairs[: min(4, len(ranked_pairs))]:
+            cid = str(it.get("cid") or "") or None
+            if not cid:
+                code = format_display_code(str(it.get("code") or ""))
+                cid = code_to_cid(code) if code else None
+            urls = []
+            if cid:
+                try:
+                    urls = still_urls(cid, 2)
+                except Exception:
+                    urls = []
+            blob = None
+            for u in urls:
+                blob = download_cover_bytes(u)
+                if blob:
+                    break
+            if blob:
+                still_pairs.append((dict(it), blob))
+        if len(still_pairs) >= 2:
+            meta["mode"] = (meta.get("mode") or "batch") + "+stills"
+            timeout = max(7.0, min(16.0, remain - 0.5))
+            vms = _run_batch(still_pairs, timeout)
+            if vms:
+                meta["compared"] += len(still_pairs)
+                meta["note_stills"] = True
+                by_code: dict[str, tuple[float, dict]] = {
+                    format_display_code(str(it.get("code") or "")): (sc, it)
+                    for sc, it in ranked_pairs
+                }
+                for (item, _b), vm in zip(still_pairs, vms):
+                    sc, attached = _attach(item, vm)
+                    code_k = format_display_code(str(attached.get("code") or ""))
+                    prev = by_code.get(code_k)
+                    # Prefer stills result when it confirms same_work with person+clothes,
+                    # or when it scores clearly higher than the cover pass.
+                    if prev is None or sc > prev[0] + 0.05 or (
+                        (attached.get("visual") or {}).get("same_work")
+                        and (attached.get("visual") or {}).get("match_person")
+                        and (attached.get("visual") or {}).get("match_clothes")
+                    ):
+                        # Keep the better of cover vs stills
+                        if prev is not None and prev[0] > sc and not (
+                            (attached.get("visual") or {}).get("same_work")
+                        ):
+                            pass
+                        else:
+                            by_code[code_k] = (sc, attached)
+                ranked_pairs = sorted(by_code.values(), key=lambda x: x[0], reverse=True)
+
     # Append non-compared codes after visually ranked ones (still list them),
     # but demote flat title scores so UI ordering matches visual ranking.
     demoted_rest: list[dict] = []
@@ -1943,8 +2111,10 @@ def rank_candidates_by_visual(
     if meta["visual_ranked"]:
         best_code = str(ranked_list[0].get("code") or "")
         ncmp = meta["compared"]
+        still_bit = "＋劇照" if meta.get("note_stills") else ""
         meta["note"] = (
-            f"同系列可能混淆，已比對 {ncmp} 張封面（主選 {best_code}；依臉／飾品／姿勢）"
+            f"同系列可能混淆，已比對 {ncmp} 張封面{still_bit}"
+            f"（主選 {best_code}；依臉／服飾／姿勢／飾品）"
         )
     return ranked_list, meta
 
@@ -3173,6 +3343,7 @@ _THEME_KEYWORD_LEXICON = (
     "爆乳",
     "OL",
     "女教師",
+    "家庭教師",
     "人妻",
     "痴漢",
     "癡漢",
@@ -3226,6 +3397,16 @@ def _title_sibling_phrases(title: str) -> list[str]:
             return
         if q not in out:
             out.append(q)
+
+    # Full 「…」 / "…" hooks — series siblings share the quoted template
+    for m in re.finditer(r"[「『\"]([^」』\"]{6,40})[」』\"]", raw):
+        hook = re.sub(r"\s+", "", m.group(1))
+        _add(hook[:18])
+        _add(hook[:12])
+        head = hook.split("。")[0]
+        if len(head) >= 6:
+            _add(head[:18])
+            _add(head[:12])
 
     # Contentful chunks between particles/punctuation (series templates often live here)
     parts = re.split(r"[をにでがはもとからまでへの、。！？\!\?／/\|・]+", t)
@@ -3727,10 +3908,12 @@ def find_related_by_title(
             ok, sc = _is_title_theme_match(
                 title, str(c.get("title") or ""), keywords=keywords, phrases=phrases
             )
-            if not ok and float(c.get("score") or 0) < 0.85:
+            hit_score = float(c.get("score") or 0)
+            # Accept same-series theme match OR high catalog title score
+            if not ok and hit_score < 0.72:
                 continue
             if not ok:
-                continue
+                sc = max(float(sc), hit_score * 0.9)
             ranked.append((sc, c))
         ranked.sort(key=lambda x: x[0], reverse=True)
         for _sc, c in ranked:
