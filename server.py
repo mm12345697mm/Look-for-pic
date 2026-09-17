@@ -2661,6 +2661,64 @@ def _title_related_keyword_queries(title: str) -> list[str]:
     return out[:6]
 
 
+
+def _find_related_by_actress(
+    actress: str,
+    *,
+    exclude_code: str | None = None,
+    max_n: int = 3,
+    budget_sec: float = 6.0,
+) -> list[dict]:
+    """Up to max_n other works by the same actress (only when title-related is empty)."""
+    import time as _time
+
+    name = (actress or "").strip()
+    if not name or max_n <= 0:
+        return []
+    t0 = _time.monotonic()
+    budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
+    exclude = ""
+    if exclude_code and parse_code_parts(str(exclude_code)):
+        exclude = format_display_code(str(exclude_code))
+    seen: set[str] = {exclude} if exclude else set()
+    out: list[dict] = []
+
+    queries = [name]
+    compact = re.sub(r"[\s　・·．.]+", "", name)
+    if compact and compact not in queries:
+        queries.append(compact)
+
+    ranked: list[tuple[float, dict]] = []
+    for q in queries:
+        if _time.monotonic() - t0 > budget:
+            break
+        try:
+            rows = fetch_avbase_title_results(q, actress=name)[:12]
+        except Exception:
+            rows = []
+        for c in rows:
+            code_raw = str(c.get("code") or "").strip()
+            if not code_raw or not parse_code_parts(code_raw):
+                continue
+            code = format_display_code(code_raw)
+            if code in seen:
+                continue
+            act = str(c.get("actress") or "")
+            act_compact = re.sub(r"[\s　・·．.]+", "", act)
+            act_hit = 1.0 if (name in act or (compact and compact in act_compact)) else 0.35
+            sc = float(c.get("score") or 0) * 0.5 + act_hit
+            ranked.append((sc, c))
+            seen.add(code)
+
+    ranked.sort(key=lambda x: x[0], reverse=True)
+    for _sc, c in ranked[:max_n]:
+        item = enrich_title_candidate(c, why="同演員")
+        item["line"] = "actress"
+        item["why"] = "同演員"
+        out.append(item)
+    return out[:max_n]
+
+
 def find_related_by_title(
     title: str | None,
     exclude_code: str | None = None,
@@ -2670,7 +2728,7 @@ def find_related_by_title(
 ) -> list[dict]:
     """Up to max_n works similar by title/theme (not the main code).
 
-    Prefers title-search siblings / theme demo over actress-only lists.
+    Title/theme first; actress fallback only when title/theme found nothing.
     Soft deadline (default ~8s; multi uses a shorter budget) so identify stays responsive.
     """
     import time as _time
@@ -2702,7 +2760,10 @@ def find_related_by_title(
             return
         seen.add(code)
         item = enrich_title_candidate(raw, why=why)
-        item["line"] = "theme"
+        if "演員" in why or "女優" in why:
+            item["line"] = "actress"
+        else:
+            item["line"] = "theme"
         item["why"] = why
         out.append(item)
 
@@ -2790,7 +2851,7 @@ def find_related_by_title(
             if len(out) >= max_n:
                 break
 
-    # 3) Demo theme package ONLY for the MIDA-616 offline demo path.
+    # 3) Demo theme package ONLY for the MIDA-616 offline demo path (counts as title/theme).
     # Never pad unrelated titles (e.g. ATID-661) with SNIS-978 demo siblings.
     if len(out) < max_n and exclude and is_mida616(exclude):
         try:
@@ -2803,6 +2864,30 @@ def find_related_by_title(
                     break
         except Exception:
             pass
+
+    # 4) Actress fallback — ONLY when title/theme found nothing.
+    if not out and actress and _left() > 1.0:
+        for r in _find_related_by_actress(
+            actress,
+            exclude_code=exclude or None,
+            max_n=max_n,
+            budget_sec=max(1.0, _left()),
+        ):
+            _push(r, why=str(r.get("why") or "同演員"))
+            if len(out) >= max_n:
+                break
+        # Demo actress siblings for MIDA when online actress search is empty
+        if not out and exclude and is_mida616(exclude):
+            try:
+                for r in related_from_demo():
+                    why = str(r.get("why") or "")
+                    if "女優" not in why:
+                        continue
+                    _push(r, why=why or "同演員")
+                    if len(out) >= max_n:
+                        break
+            except Exception:
+                pass
 
     return out[:max_n]
 

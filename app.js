@@ -654,7 +654,12 @@
     sec.className = 'related-title-section';
     const heading = document.createElement('div');
     heading.className = 'related-title-heading';
-    heading.textContent = '相關作品（依片名）';
+    const actressOnly = relatedList.every((rw) => {
+      const why = String((rw && rw.why) || '');
+      const line = String((rw && rw.line) || '');
+      return line === 'actress' || why.includes('演員') || why.includes('女優');
+    });
+    heading.textContent = actressOnly ? '相關作品（同演員）' : '相關作品（依片名）';
     sec.appendChild(heading);
     relatedList.slice(0, 3).forEach((rw) => {
       const item = document.createElement('div');
