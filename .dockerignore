@@ -3,4 +3,4 @@ __pycache__
 *.pyc
 testdata
 .git
-*.marshal
+!_recovered_helpers.marshal
