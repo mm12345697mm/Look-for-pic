@@ -413,7 +413,8 @@
       if (!r.line) {
         if (/候選|candidate/i.test(why)) line = 'candidate';
         else if (/主題|theme|片名相近/i.test(why)) line = 'theme';
-        else if (/女優|actress/i.test(why)) line = 'actress';
+        else if (/女優|actress|演員/i.test(why)) line = 'actress';
+        else if (/關鍵字|keyword/i.test(why)) line = 'keyword';
         else if (/多圖/i.test(why)) line = 'multi';
       }
       return workFromApi(r, line);
@@ -580,6 +581,7 @@
     if (line === 'main') return '主作品';
     if (line === 'theme') return '主題相近';
     if (line === 'actress') return '同女優';
+    if (line === 'keyword') return '關鍵字';
     if (line === 'candidate') return '片名候選';
     if (line === 'multi') return '多圖辨識';
     return '作品';
@@ -654,14 +656,22 @@
     sec.className = 'related-title-section';
     const heading = document.createElement('div');
     heading.className = 'related-title-heading';
-    const actressOnly = relatedList.every((rw) => {
+    const hasActress = relatedList.some((rw) => {
       const why = String((rw && rw.why) || '');
       const line = String((rw && rw.line) || '');
       return line === 'actress' || why.includes('演員') || why.includes('女優');
     });
-    heading.textContent = actressOnly ? '相關作品（同演員）' : '相關作品（依片名）';
+    const hasKeyword = relatedList.some((rw) => {
+      const why = String((rw && rw.why) || '');
+      const line = String((rw && rw.line) || '');
+      return line === 'keyword' || why.includes('關鍵字');
+    });
+    if (hasActress && hasKeyword) heading.textContent = '相關作品（同演員／關鍵字）';
+    else if (hasActress) heading.textContent = '相關作品（同演員）';
+    else if (hasKeyword) heading.textContent = '相關作品（關鍵字）';
+    else heading.textContent = '相關作品（依片名）';
     sec.appendChild(heading);
-    relatedList.slice(0, 3).forEach((rw) => {
+    relatedList.slice(0, 5).forEach((rw) => {
       const item = document.createElement('div');
       item.className = 'related-title-item';
       const meta = document.createElement('div');
@@ -912,7 +922,7 @@
 
     const userShots = await buildUserShotThumbs(userFiles || []);
     const related = Array.isArray(data.related_by_title)
-      ? data.related_by_title.slice(0, 3).map((r) => ({
+      ? data.related_by_title.slice(0, 5).map((r) => ({
           code: r.code || '',
           title: r.title || '',
           cover: r.cover || '',
@@ -939,7 +949,7 @@
         stills: Array.isArray(item.stills) ? item.stills.slice(0, 12) : (data.stills || []).slice(0, 12),
         userShots: userShots,
         related: item.related_by_title
-          ? item.related_by_title.slice(0, 3).map((r) => ({
+          ? item.related_by_title.slice(0, 5).map((r) => ({
               code: r.code || '',
               title: r.title || '',
               cover: r.cover || '',
@@ -1081,7 +1091,7 @@
           const list = loadHistory();
           const idx = list.findIndex((x) => x.id === id);
           if (idx >= 0) {
-            list[idx].related = data.related_by_title.slice(0, 3).map((r) => ({
+            list[idx].related = data.related_by_title.slice(0, 5).map((r) => ({
               code: r.code || '',
               title: r.title || '',
               cover: r.cover || '',

@@ -2662,6 +2662,188 @@ def _title_related_keyword_queries(title: str) -> list[str]:
 
 
 
+
+_THEME_KEYWORD_LEXICON = (
+    # User examples + common plot tokens (JP / ZH variants)
+    "満員", "滿員", "電車", "媚薬", "媚藥", "オイル", "油", "乳首", "乳頭",
+    "巨乳", "美乳", "爆乳", "OL", "女教師", "人妻", "痴漢", "癡漢",
+    "開発", "開發", "調教", "マッサージ", "エステ", "温泉", "寝取",
+    "義妹", "彼女", "お姉さん", "ナース", "女医", "秘書", "CA",
+    "ノーブラ", "中出し", "顔射", "拘束", "監禁", "痴女", "逆レ",
+    "毎朝", "通勤", "会社", "オフィス", "下着", "パンスト",
+)
+
+
+def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
+    """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/OL …)."""
+    raw = (title or "").strip()
+    if not raw:
+        return []
+    # Drop actress name so it is not treated as a theme keyword
+    t = raw
+    if actress:
+        for piece in re.split(r"[\s　・/|]+", str(actress)):
+            piece = piece.strip()
+            if len(piece) >= 2:
+                t = t.replace(piece, " ")
+    t_norm = t
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _add(tok: str) -> None:
+        tok = (tok or "").strip()
+        if len(tok) < 2:
+            return
+        key = tok.casefold()
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(tok)
+
+    # Lexicon hits (longest first)
+    for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
+        if kw.casefold() in t_norm.casefold():
+            _add(kw)
+            # remove to reduce overlap noise for subsequent hits
+            t_norm = re.sub(re.escape(kw), " ", t_norm, flags=re.IGNORECASE)
+
+    # Latin tokens (OL, CA, VR, …)
+    for m in re.finditer(r"[A-Za-z]{2,6}", t):
+        _add(m.group(0).upper())
+
+    # Remaining kanji-heavy chunks of length 2–3 (skip grammar crumbs)
+    for m in re.finditer(r"[\u4e00-\u9fff\u3040-\u30ff]{2,3}", t_norm):
+        chunk = m.group(0)
+        if re.fullmatch(r"[\u3040-\u309f]+", chunk):
+            continue  # pure hiragana
+        if chunk[0] in "をにてがはもすり":
+            continue
+        if chunk in {"されて", "してし", "しまった", "られる", "からの", "ような"}:
+            continue
+        if len(found) >= 10:
+            break
+        _add(chunk)
+
+    return found[:12]
+
+
+def _keyword_hit_count(candidate_title: str, keywords: list[str]) -> int:
+    text = (candidate_title or "").casefold()
+    if not text or not keywords:
+        return 0
+    n = 0
+    for kw in keywords:
+        if kw and kw.casefold() in text:
+            n += 1
+    return n
+
+
+def _find_related_by_keywords(
+    title: str,
+    *,
+    exclude_code: str | None = None,
+    actress: str | None = None,
+    max_n: int = 2,
+    budget_sec: float = 6.0,
+    already: set[str] | None = None,
+) -> list[dict]:
+    """Up to max_n works matching title theme keywords; more hits rank higher."""
+    import time as _time
+
+    if max_n <= 0:
+        return []
+    keywords = _extract_title_theme_keywords(title, actress=actress)
+    if len(keywords) < 1:
+        return []
+    t0 = _time.monotonic()
+    budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
+    exclude = ""
+    if exclude_code and parse_code_parts(str(exclude_code)):
+        exclude = format_display_code(str(exclude_code))
+    seen: set[str] = set(already or ())
+    if exclude:
+        seen.add(exclude)
+
+    # Prefer multi-keyword queries, then singles
+    queries: list[str] = []
+    primary = keywords[:6]
+    for i in range(len(primary)):
+        for j in range(i + 1, len(primary)):
+            q = f"{primary[i]} {primary[j]}"
+            if q not in queries:
+                queries.append(q)
+            if len(queries) >= 6:
+                break
+        if len(queries) >= 6:
+            break
+    for kw in primary[:5]:
+        if kw not in queries:
+            queries.append(kw)
+
+    ranked: dict[str, tuple[float, dict]] = {}
+    for q in queries:
+        if _time.monotonic() - t0 > budget:
+            break
+        try:
+            rows = fetch_avbase_title_results(q, actress=None)[:12]
+        except Exception:
+            rows = []
+        for c in rows:
+            code_raw = str(c.get("code") or "").strip()
+            if not code_raw or not parse_code_parts(code_raw):
+                continue
+            code = format_display_code(code_raw)
+            if code in seen:
+                continue
+            hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
+            if hits < 1:
+                continue
+            sc = float(hits) * 10.0 + float(c.get("score") or 0)
+            prev = ranked.get(code)
+            if prev is None or sc > prev[0]:
+                ranked[code] = (sc, c)
+
+    ordered = sorted(ranked.values(), key=lambda x: x[0], reverse=True)
+    out: list[dict] = []
+    for sc, c in ordered:
+        hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
+        # Prefer multi-keyword; allow single-hit only to fill if needed later
+        if hits < 2 and len(out) == 0 and sc < 15:
+            # keep scanning for better multi-hit first
+            continue
+        if hits < 1:
+            continue
+        why = f"關鍵字×{hits}" if hits else "關鍵字相近"
+        item = enrich_title_candidate(c, why=why)
+        item["line"] = "keyword"
+        item["why"] = why
+        item["keyword_hits"] = hits
+        out.append(item)
+        seen.add(format_display_code(str(c.get("code") or "")))
+        if len(out) >= max_n:
+            break
+
+    # If multi-hit filter left us short, fill with best single-hit
+    if len(out) < max_n:
+        for sc, c in ordered:
+            code = format_display_code(str(c.get("code") or ""))
+            if code in seen:
+                continue
+            hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
+            if hits < 1:
+                continue
+            why = f"關鍵字×{hits}"
+            item = enrich_title_candidate(c, why=why)
+            item["line"] = "keyword"
+            item["why"] = why
+            item["keyword_hits"] = hits
+            out.append(item)
+            seen.add(code)
+            if len(out) >= max_n:
+                break
+    return out[:max_n]
+
+
 def _find_related_by_actress(
     actress: str,
     *,
@@ -2728,7 +2910,7 @@ def find_related_by_title(
 ) -> list[dict]:
     """Up to max_n works similar by title/theme (not the main code).
 
-    Title/theme first; actress fallback only when title/theme found nothing.
+    Title/theme first; when empty, same-actress plus up to 2 keyword-theme works.
     Soft deadline (default ~8s; multi uses a shorter budget) so identify stays responsive.
     """
     import time as _time
@@ -2865,31 +3047,65 @@ def find_related_by_title(
         except Exception:
             pass
 
-    # 4) Actress fallback — ONLY when title/theme found nothing.
-    if not out and actress and _left() > 1.0:
-        for r in _find_related_by_actress(
-            actress,
-            exclude_code=exclude or None,
-            max_n=max_n,
-            budget_sec=max(1.0, _left()),
-        ):
-            _push(r, why=str(r.get("why") or "同演員"))
-            if len(out) >= max_n:
-                break
+    # 4) When title/theme found nothing: same-actress + keyword theme extras.
+    # Actress first (up to max_n), then up to 2 keyword matches (more hits rank higher).
+    if not out and _left() > 1.0:
+        actress_cap = max_n
+        keyword_cap = 2
+        combined: list[dict] = []
+        seen_fb: set[str] = set(seen)
+
+        if actress and _left() > 1.0:
+            for r in _find_related_by_actress(
+                actress,
+                exclude_code=exclude or None,
+                max_n=actress_cap,
+                budget_sec=max(1.0, min(5.0, _left())),
+            ):
+                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                if not code or code in seen_fb:
+                    continue
+                seen_fb.add(code)
+                combined.append(r)
+
         # Demo actress siblings for MIDA when online actress search is empty
-        if not out and exclude and is_mida616(exclude):
+        if not combined and exclude and is_mida616(exclude):
             try:
                 for r in related_from_demo():
                     why = str(r.get("why") or "")
                     if "女優" not in why:
                         continue
-                    _push(r, why=why or "同演員")
-                    if len(out) >= max_n:
+                    code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                    if not code or code in seen_fb:
+                        continue
+                    item = dict(r)
+                    item["line"] = "actress"
+                    item["why"] = why or "同演員"
+                    seen_fb.add(code)
+                    combined.append(item)
+                    if len(combined) >= actress_cap:
                         break
             except Exception:
                 pass
 
-    return out[:max_n]
+        if _left() > 1.2:
+            for r in _find_related_by_keywords(
+                title,
+                exclude_code=exclude or None,
+                actress=actress,
+                max_n=keyword_cap,
+                budget_sec=max(1.0, _left()),
+                already=seen_fb,
+            ):
+                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                if not code or code in seen_fb:
+                    continue
+                seen_fb.add(code)
+                combined.append(r)
+
+        out = combined
+
+    return out[: max(max_n + 2, len(out))]
 
 
 def attach_related_by_title(
@@ -2898,7 +3114,7 @@ def attach_related_by_title(
     budget_sec: float = 8.0,
     per_item: bool = True,
 ) -> dict:
-    """Mutate identify payload to include related_by_title (max 3).
+    """Mutate identify payload to include related_by_title (max 5 when actress+keyword fallback).
 
     per_item=False (multi): only fill top-level related_by_title once, skip results[].
     """
@@ -2917,7 +3133,7 @@ def attach_related_by_title(
                 exclude_code=str(code) if code else None,
                 max_n=3,
                 actress=result.get("actress"),
-                budget_sec=budget_sec,
+                budget_sec=max(budget_sec, 12.0),
             )
         except Exception:
             result["related_by_title"] = []
@@ -2952,7 +3168,7 @@ def attach_related_by_title(
                 if not isinstance(r, dict):
                     continue
                 fixed.append(enrich_title_candidate(r, why=str(r.get("why") or "片名相近")))
-            item["related_by_title"] = fixed[:3]
+            item["related_by_title"] = fixed[:5]
             continue
         it_title = item.get("title") or title
         it_code = item.get("code")
