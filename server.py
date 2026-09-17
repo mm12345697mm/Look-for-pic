@@ -3160,7 +3160,7 @@ def find_related_by_title(
 def attach_related_by_title(
     result: dict,
     *,
-    budget_sec: float = 8.0,
+    budget_sec: float = 14.0,
     per_item: bool = True,
 ) -> dict:
     """Mutate identify payload to include related_by_title (max 5 when actress+keyword fallback).
@@ -3182,12 +3182,12 @@ def attach_related_by_title(
                 exclude_code=str(code) if code else None,
                 max_n=3,
                 actress=result.get("actress"),
-                budget_sec=max(budget_sec, 12.0),
+                budget_sec=max(budget_sec, 14.0),
             )
         except Exception:
             result["related_by_title"] = []
     else:
-        # Cap & exclude main; ensure covers via enrich/sanitize
+        # Cap & exclude main; keep up to 5 (actress + keyword extras).
         main = format_display_code(str(code)) if code and parse_code_parts(str(code)) else ""
         cleaned = []
         seen: set[str] = {main} if main else set()
@@ -3201,9 +3201,52 @@ def attach_related_by_title(
             item = enrich_title_candidate(r, why=str(r.get("why") or "片名相近"))
             item["line"] = r.get("line") or "theme"
             cleaned.append(item)
-            if len(cleaned) >= 3:
+            if len(cleaned) >= 5:
                 break
         result["related_by_title"] = cleaned
+
+    # Universal rule: if title/theme siblings are missing, ensure up to 2 keyword extras
+    # (in addition to same-actress). Re-runs are cheap when keywords already present.
+    try:
+        rel = list(result.get("related_by_title") or [])
+        has_titleish = any(
+            str(r.get("line") or "") in {"theme", "title"}
+            or ("片名" in str(r.get("why") or ""))
+            or ("主題" in str(r.get("why") or ""))
+            for r in rel
+        )
+        has_keyword = any(
+            str(r.get("line") or "") == "keyword" or "關鍵字" in str(r.get("why") or "")
+            for r in rel
+        )
+        if (not has_titleish) and (not has_keyword) and is_usable_title(str(title or "")):
+            seen_codes = set()
+            main = format_display_code(str(code)) if code and parse_code_parts(str(code)) else ""
+            if main:
+                seen_codes.add(main)
+            for r in rel:
+                rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                if rc:
+                    seen_codes.add(rc)
+            kw_budget = max(4.0, min(7.0, float(budget_sec) if budget_sec else 6.0))
+            for r in _find_related_by_keywords(
+                str(title or ""),
+                exclude_code=str(code) if code else None,
+                actress=result.get("actress"),
+                max_n=2,
+                budget_sec=kw_budget,
+                already=seen_codes,
+            ):
+                rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                if not rc or rc in seen_codes:
+                    continue
+                seen_codes.add(rc)
+                rel.append(r)
+                if sum(1 for x in rel if str(x.get("line")) == "keyword" or "關鍵字" in str(x.get("why") or "")) >= 2:
+                    break
+            result["related_by_title"] = rel[:5]
+    except Exception:
+        pass
     if not per_item:
         return result
     # Also attach on each results[] entry if present (single-image path)
@@ -3340,7 +3383,7 @@ def run_multi_identify_pipeline(
             user_title=user_title,
             on_progress=on_progress,
         )
-        return attach_related_by_title(result), status
+        return attach_related_by_title(result, budget_sec=14.0), status
 
     n = len(images)
     api_key = get_gemini_api_key()
@@ -4212,7 +4255,7 @@ def run_identify_pipeline(
         # related_by_title (max 3) — title/theme siblings, excluding main
         if not skip_related:
             try:
-                result = attach_related_by_title(result)
+                result = attach_related_by_title(result, budget_sec=14.0)
                 n_rel = len(result.get("related_by_title") or [])
                 if n_rel:
                     detail = f"{detail}；片名相關 {n_rel}"
@@ -4246,7 +4289,7 @@ def identify():
             user_code=user_code,
             user_title=user_title,
         )
-        result = attach_related_by_title(result)
+        result = attach_related_by_title(result, budget_sec=14.0)
     else:
         result, status = run_identify_pipeline(
             image_bytes=None,
@@ -4254,7 +4297,7 @@ def identify():
             user_code=user_code,
             user_title=user_title,
         )
-        result = attach_related_by_title(result)
+        result = attach_related_by_title(result, budget_sec=14.0)
     return jsonify(result), status
 
 
@@ -4305,7 +4348,7 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                    result = attach_related_by_title(result)
+                    result = attach_related_by_title(result, budget_sec=14.0)
                 else:
                     result, status = run_identify_pipeline(
                         image_bytes=None,
@@ -4314,7 +4357,7 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                    result = attach_related_by_title(result)
+                    result = attach_related_by_title(result, budget_sec=14.0)
                 q.put(("result", {"type": "result", "data": result, "status": status}))
             except Exception as e:
                 q.put(
