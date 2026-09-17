@@ -2639,6 +2639,28 @@ def health():
 
 
 
+
+def _title_related_keyword_queries(title: str) -> list[str]:
+    """Build short keyword queries that still reflect the work title."""
+    t = re.sub(r"\s+", "", (title or "").strip())
+    if len(t) < 6:
+        return []
+    # Drop trailing actress / studio-ish tails when separated by space earlier — title may be dense JP
+    out: list[str] = []
+    # Sliding windows of meaningful length
+    for n in (10, 8, 6):
+        if len(t) >= n + 2:
+            chunk = t[:n]
+            if chunk not in out:
+                out.append(chunk)
+    # Mid-title theme window (often where plot keywords sit)
+    if len(t) >= 16:
+        mid = t[4:14]
+        if mid not in out:
+            out.append(mid)
+    return out[:6]
+
+
 def find_related_by_title(
     title: str | None,
     exclude_code: str | None = None,
@@ -2724,17 +2746,30 @@ def find_related_by_title(
             ranked.append((max(sc, t_sc), c))
         ranked.sort(key=lambda x: x[0], reverse=True)
         for _sc, c in ranked:
+            t_sc = title_similarity(title, str(c.get("title") or ""))
+            # Skip weak / unrelated catalogue noise when the hit is not actually title-like
+            if t_sc < 0.32 and float(c.get("score") or 0) < 0.5:
+                continue
             _push(c, why="片名相近")
             if len(out) >= max_n:
                 return out
 
-    # 2) Shorter title prefix search for more theme diversity
+    # 2) Shorter / keyword title search — only keep real title similarity
     if len(out) < max_n and len(title) >= 8 and _left() > 1.5:
-        for q in title_query_variants(title)[1:4]:
+        queries: list[str] = []
+        for q in title_query_variants(title)[1:5]:
+            if q and q not in queries:
+                queries.append(q)
+        # Distinctive keyword chunks (avoid dumping unrelated demo works)
+        for q in _title_related_keyword_queries(title):
+            if q and q not in queries:
+                queries.append(q)
+        ranked2: list[tuple[float, dict]] = []
+        for q in queries:
             if len(out) >= max_n or _left() < 0.8:
                 break
             try:
-                more = fetch_avbase_title_results(q, actress=None)[:8]
+                more = fetch_avbase_title_results(q, actress=None)[:10]
             except Exception:
                 more = []
             for c in more:
@@ -2742,14 +2777,22 @@ def find_related_by_title(
                 if not code or code in seen:
                     continue
                 t_sc = title_similarity(title, str(c.get("title") or ""))
-                if t_sc < 0.28 and float(c.get("score") or 0) < 0.35:
+                sc = float(c.get("score") or 0)
+                # Require genuine title overlap; search score alone is not enough
+                if t_sc < 0.36 and sc < 0.55:
                     continue
-                _push(c, why="主題相近")
-                if len(out) >= max_n:
-                    break
+                if t_sc < 0.28:
+                    continue
+                ranked2.append((max(t_sc, sc * 0.5), c))
+        ranked2.sort(key=lambda x: x[0], reverse=True)
+        for _sc, c in ranked2:
+            _push(c, why="片名相近")
+            if len(out) >= max_n:
+                break
 
-    # 3) Demo theme package (MIDA path / shared works)
-    if len(out) < max_n:
+    # 3) Demo theme package ONLY for the MIDA-616 offline demo path.
+    # Never pad unrelated titles (e.g. ATID-661) with SNIS-978 demo siblings.
+    if len(out) < max_n and exclude and is_mida616(exclude):
         try:
             for r in related_from_demo():
                 why = str(r.get("why") or "")
