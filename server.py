@@ -107,40 +107,88 @@ VISUAL_RANK_BATCH_PROMPT = """你是 AV／JAV 封面比對助手。第一張圖�
 
 app = Flask(__name__, static_folder=None)
 
-# Private site gate: only people with SITE_PASSWORD can use it.
-# Set SITE_PASSWORD (and optional SECRET_KEY) in Railway variables.
+# Private site gate:
+# - SITE_PASSWORD: shared guests must enter this on /login
+# - OWNER_DEVICE_TOKEN: your phone opens /d/<token> once → long-lived cookie, no password after
+# Set both (and SECRET_KEY) in Railway variables.
 import secrets as _secrets
-from functools import wraps as _wraps
+import hmac as _hmac
 from flask import session as _session, redirect as _redirect, request as _request, make_response as _make_response
 
 app.secret_key = (os.environ.get("SECRET_KEY") or os.environ.get("SITE_PASSWORD") or _secrets.token_hex(32))
-app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 30  # 30 days
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 30  # 30 days for guest login
+_OWNER_COOKIE = "lfp_owner"
+_OWNER_COOKIE_MAX_AGE = 60 * 60 * 24 * 400  # ~13 months
 
 
 def _site_password() -> str:
     return (os.environ.get("SITE_PASSWORD") or "").strip()
 
 
+def _owner_device_token() -> str:
+    return (os.environ.get("OWNER_DEVICE_TOKEN") or "").strip()
+
+
+def _owner_cookie_value(token: str) -> str:
+    # Do not store the raw unlock token in the cookie; store an HMAC mark.
+    sk = str(app.secret_key)
+    return _hmac.new(sk.encode("utf-8"), token.encode("utf-8"), "sha256").hexdigest()
+
+
+def _is_owner_device() -> bool:
+    tok = _owner_device_token()
+    if not tok:
+        return False
+    got = (_request.cookies.get(_OWNER_COOKIE) or "").strip()
+    if not got:
+        return False
+    return _hmac.compare_digest(got, _owner_cookie_value(tok))
+
+
 def _is_authed() -> bool:
+    if _is_owner_device():
+        return True
     pw = _site_password()
     if not pw:
-        # Fail closed in production-like hosts: require password when unset on Railway
+        # Fail closed on hosted environments unless explicitly public
         if (os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT")) and not os.environ.get("ALLOW_PUBLIC"):
             return False
         return True
-    return bool(_session.get("site_ok") is True)
+    return _session.get("site_ok") is True
+
+
+def _set_owner_cookie(resp):
+    tok = _owner_device_token()
+    if not tok:
+        return resp
+    resp.set_cookie(
+        _OWNER_COOKIE,
+        _owner_cookie_value(tok),
+        max_age=_OWNER_COOKIE_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="Lax",
+        path="/",
+    )
+    return resp
 
 
 @app.before_request
 def _require_site_password():
-    if _request.endpoint in {"login", "logout", "healthz"}:
+    if _request.endpoint in {"login", "logout", "healthz", "owner_unlock", "owner_unlock_query"}:
         return None
     path = (_request.path or "/")
     if path in {"/login", "/logout", "/api/health", "/healthz"}:
         return None
-    # Allow PWA icons/manifest without auth so home-screen install still works after login cookies
+    if path.startswith("/d/"):
+        return None
     if path.startswith("/icons/") or path in {"/manifest.webmanifest", "/favicon.ico"}:
         return None
+    # One-shot query unlock: /?d=TOKEN
+    q = (_request.args.get("d") or "").strip()
+    if q and _owner_device_token() and _hmac.compare_digest(q, _owner_device_token()):
+        resp = _redirect("/")
+        return _set_owner_cookie(resp)
     if _is_authed():
         return None
     if path.startswith("/api/"):
@@ -151,11 +199,30 @@ def _require_site_password():
 
 @app.route("/healthz")
 def healthz():
-    return jsonify({"ok": True, "private": bool(_site_password())})
+    return jsonify({
+        "ok": True,
+        "private": bool(_site_password()),
+        "owner_device": _is_owner_device(),
+    })
+
+
+@app.route("/d/<token>")
+def owner_unlock(token: str):
+    """Bookmark this URL on your phone once → later visits skip the share password."""
+    expect = _owner_device_token()
+    if not expect or not _hmac.compare_digest((token or "").strip(), expect):
+        return _redirect("/login")
+    resp = _redirect("/")
+    _session["site_ok"] = True
+    _session.permanent = True
+    return _set_owner_cookie(resp)
 
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
+    # If this browser is already the owner device, skip the form
+    if _is_owner_device():
+        return _redirect("/")
     pw = _site_password()
     err = ""
     if _request.method == "POST":
@@ -190,7 +257,7 @@ button{{width:100%;padding:14px;border:0;border-radius:12px;background:#7c5cff;c
 <body>
 <form class="card" method="post" action="/login">
 <h1>私人站登入</h1>
-<p>只有你或你分享密碼的人可以使用 Look-for-pic。</p>
+<p>訪客請輸入分享密碼。你的手機可用專屬解鎖連結，之後免密。</p>
 {"<p class=err>"+err+"</p>" if err else ""}
 <input type="password" name="password" placeholder="分享密碼" autocomplete="current-password" required autofocus/>
 <button type="submit">進入</button>
@@ -205,7 +272,10 @@ button{{width:100%;padding:14px;border:0;border-radius:12px;background:#7c5cff;c
 @app.route("/logout")
 def logout():
     _session.clear()
-    return _redirect("/login")
+    resp = _redirect("/login")
+    resp.set_cookie(_OWNER_COOKIE, "", max_age=0, path="/")
+    return resp
+
 
 
 _demo_cache: dict | None = None

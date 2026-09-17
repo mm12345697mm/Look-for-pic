@@ -87,3 +87,5 @@ Expo 版（`Look-for-pic`）有確認主作品、多選相關步驟。本 Web �
 ## 私人站
 
 請在 Railway 設定環境變數 `SITE_PASSWORD`。打開網站會先要求輸入此密碼；只有你分享密碼的人能用。登出路徑：`/logout`。
+
+主人手機免密：設定 `OWNER_DEVICE_TOKEN` 後，用 Safari 打開一次 `https://你的網域/d/<token>`，可加入主畫面；之後此裝置免輸入分享密碼。訪客仍走 `/login`。
