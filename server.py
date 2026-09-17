@@ -3341,7 +3341,7 @@ def attach_related_by_title(
                 rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
                 if rc:
                     seen_codes.add(rc)
-            kw_budget = max(4.0, min(7.0, float(budget_sec) if budget_sec else 6.0))
+            kw_budget = max(6.0, min(10.0, float(budget_sec) if budget_sec else 8.0))
             for r in _find_related_by_keywords(
                 str(title or ""),
                 exclude_code=str(code) if code else None,
