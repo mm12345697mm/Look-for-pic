@@ -48,13 +48,17 @@ body {
 .screen { display: none; }
 .screen.active { display: block; }
 
-/* Keep progress sticky/visible above gallery after success */
+/* Progress above gallery: collapsed bar only; never permanently sticky-cover content */
 #app:has(#screen-gallery.active) #progress-panel:not(.hidden) {
   display: block;
-  position: sticky;
-  top: 0;
-  z-index: 40;
+  position: relative; /* not sticky — avoid covering covers/stills/pager */
+  top: auto;
+  z-index: 5;
   margin-bottom: 8px;
+}
+#app:has(#screen-gallery.active) #progress-panel.is-complete:not(.hidden) {
+  /* Compact success strip before auto-hide */
+  margin-top: 0;
 }
 
 .header {
@@ -250,6 +254,10 @@ label.btn {
 }
 
 /* Gallery */
+#screen-gallery.active {
+  /* Extra bottom room so carousel hint/pager is scrollable into view */
+  padding-bottom: calc(72px + var(--safe-bottom));
+}
 .gallery-top {
   display: flex;
   align-items: center;
@@ -684,21 +692,17 @@ label.btn {
   margin-top: 4px;
 }
 
-/* --- Sticky user screenshots above gallery results --- */
+/* --- User screenshots above gallery (scroll with content; do not cover bottom) --- */
 .user-shots-panel {
-  position: sticky;
-  top: 0;
-  z-index: 30;
+  position: relative;
+  top: auto;
+  z-index: 1;
   margin: 0 0 10px;
   padding: 10px 0 8px;
   background: linear-gradient(180deg, var(--bg) 85%, rgba(15,15,18,0.95));
   border-bottom: 1px solid var(--border);
 }
 .user-shots-panel.hidden { display: none; }
-/* Sit below sticky progress when both visible */
-#app:has(#progress-panel:not(.hidden)):has(#screen-gallery.active) .user-shots-panel:not(.hidden) {
-  top: 52px; /* approx collapsed progress head; still usable when expanded */
-}
 .user-shots-head {
   font-size: 0.82rem;
   font-weight: 600;
@@ -977,7 +981,7 @@ body.lightbox-open {
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
-  padding: 8px 2px 0;
+  padding: 10px 2px 12px;
 }
 .work-carousel-hint {
   font-size: 0.78rem;

@@ -68,6 +68,21 @@ class TestEnforceVisualSameWork(unittest.TestCase):
         self.assertTrue(vm["same_work"])
         self.assertGreaterEqual(vm["confidence"], 0.9)
 
+    def test_demotes_low_confidence_same_work(self):
+        vm = S.enforce_visual_same_work(
+            {
+                "same_work": True,
+                "confidence": 0.42,
+                "match_person": True,
+                "match_face": True,
+                "match_accessories": True,
+                "match_clothes": True,
+                "match_pose": True,
+            }
+        )
+        self.assertFalse(vm["same_work"])
+        self.assertLessEqual(vm["confidence"], 0.42)
+
     def test_score_penalizes_wrong_person(self):
         good = S.visual_match_score(
             {

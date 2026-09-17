@@ -76,32 +76,34 @@ VISION_PROMPT = """你是 AV／JAV 列表截圖辨識助手。圖片可能是 JA
 5. 只輸出一行合法 JSON。
 """
 
-VISUAL_MATCH_PROMPT = """你是 AV／JAV 封面比對助手。Image A 是使用者上傳的封面裁切／截圖；Image B 是目錄封面圖。
+VISUAL_MATCH_PROMPT = """你是 AV／JAV 視覺核對助手。Image A 是使用者上傳的「原始截圖／劇照／封面裁切」；Image B 是候選作品的封面或劇照。
 
-請判斷兩者是否為「同一作品」的封面／劇照。同系列常換女優，身材／版面相似不夠；必須同一人、同一套衣服、姿勢與飾品大致對得上。
+任務：判斷 Image B 是否與 Image A 為「同一作品」的同一畫面／同一裝扮瞬間。同系列、同女優、標題相似都不足夠。
 只回傳 JSON（不要 markdown、不要程式碼圍欄）：
 {"same_work":true,"confidence":0.0,"reason":"簡短中文或日文理由","match_person":true,"match_face":true,"match_accessories":true,"match_clothes":true,"match_pose":true}
 
 規則：
-1. same_work=true 僅在同一女優＋服裝＋姿勢大致對得上時。
-2. 必須細看臉：唇形、眼型、髮際／瀏海；以及項鍊、耳環、手飾等飾品。臉或飾品明顯不同 → match_face/match_accessories=false，same_work=false，confidence≤0.35。
-3. 同系列、身材／場景相似但不同女優 → same_work=false，confidence≤0.30。
-4. confidence 必須嚴格：幾乎同一張圖才 ≥0.85；僅同系列相似 ≤0.4。
-5. 只輸出一行合法 JSON。
+1. 必須以使用者原圖為準，逐項核對：人物（臉／身材特徵）、衣服顏色與款式、表情、飾品、姿勢／拍攝角度。
+2. 衣服顏色或款式不同（例如白背心 vs 淺藍色上衣、正面封面 vs 背面劇照裝扮不同）→ match_clothes=false，same_work=false，confidence≤0.30。
+3. 使用者圖是背面／側背／劇照裁切時：不可只因同系列封面「看起來像」就 same_work=true；必須與劇照裝扮／姿勢對得上。
+4. 同系列換集／換女優／僅場景相似 → same_work=false，confidence≤0.30。
+5. confidence：幾乎同一裁切 ≥0.85；僅同系列相似 ≤0.35。
+6. 只輸出一行合法 JSON。
 """
 
-VISUAL_RANK_BATCH_PROMPT = """你是 AV／JAV 封面比對助手。第一張圖是使用者上傳的封面裁切／截圖；後面依序是候選目錄封面 Cover0、Cover1、…
+VISUAL_RANK_BATCH_PROMPT = """你是 AV／JAV 視覺核對助手。第一張圖是使用者「原始上傳圖」（可能是劇照背面／側拍／封面裁切）；後面依序是候選 Cover0、Cover1、…（可能是封面或劇照）。
 
-同系列常換女優，身材／版面／場景相似很容易誤判。使用者圖可能是封面裁切或劇照截圖。請優先比對：唇形、眼型、臉型、項鍊／耳環等飾品，再比服裝與姿勢。僅在人物＋衣服＋姿勢／飾品對得上時標 same_work。
+必須以使用者原圖為準交叉比對，不可只靠同系列／同女優／標題相似。優先核對：衣服顏色與款式、姿勢／角度、臉／表情、飾品；再考慮場景。
 只回傳 JSON（不要 markdown）：
 {"best_index":0,"rankings":[{"index":0,"same_work":true,"confidence":0.0,"match_person":true,"match_face":true,"match_accessories":true,"match_clothes":true,"match_pose":true,"reason":"..."}]}
 
 規則：
 1. rankings 必須涵蓋每一個 Cover index（0..N-1）。
-2. 最多只能有 1 個 same_work=true；其餘 false。臉或飾品對不上者不得 same_work=true。
-3. best_index 必須是最可能同一人／同一作品者；若所有候選臉都不像，best_index 仍可給最接近者但全部 same_work=false 且 confidence≤0.35。
-4. 同系列不同女優 → 絕對不要標 same_work。
-5. confidence 要拉開差距（不要全部 1.0）。
+2. 最多只能有 1 個 same_work=true；其餘 false。衣服顏色／款式對不上 → 不得 same_work=true。
+3. 使用者圖是背面／劇照時：正面封面若衣服不同，即使同女優同系列也 same_work=false。
+4. best_index 為最接近者；若無人衣服＋人物都對得上，全部 same_work=false 且 confidence≤0.35。
+5. 同系列不同集／不同女優 → 絕對不要標 same_work。
+6. confidence 要拉開差距（不要全部 1.0）。
 """
 
 
@@ -1192,11 +1194,12 @@ def parse_visual_match_json(text: str) -> dict[str, Any]:
 
 
 def enforce_visual_same_work(vm: dict) -> dict:
-    """Require person/clothes/(face|accessories|pose) agreement — not mere same-series vibe.
+    """Require person+clothes and real identity cues vs the *original user image*.
 
-    Mutates and returns vm. same_work stays true only when the user shot matches
-    the cover/still on identity + outfit (and at least one of face/accessories/pose
-    when those flags are present).
+    Cover/stills similarity or same-series vibe is not enough. same_work stays
+    true only when the user shot matches identity + outfit, with face/accessories
+    /pose support when those flags are present. Explicit clothes or person miss
+    always rejects (series siblings must not win).
     """
     if not isinstance(vm, dict):
         return {
@@ -1212,40 +1215,48 @@ def enforce_visual_same_work(vm: dict) -> dict:
     pose = bool(vm.get("match_pose"))
     face = vm.get("match_face")
     accessories = vm.get("match_accessories")
-    # When face/accessories were omitted, fall back to pose; when present, any true helps.
+    # Detail: prefer face/accessories; pose alone only if face/accessories omitted.
     detail_ok = False
-    if face is True or accessories is True or pose:
+    if face is True or accessories is True:
         detail_ok = True
     elif face is None and accessories is None:
-        # Older responses without face/accessories keys: person+clothes+pose enough
         detail_ok = pose or (person and clothes)
     else:
-        # Explicit false on face/accessories with no pose → reject
-        detail_ok = pose
+        # Explicit false on face and accessories → need strong pose+clothes+person
+        detail_ok = bool(pose and person and clothes)
 
     try:
         conf = float(vm.get("confidence") or 0.0)
     except (TypeError, ValueError):
         conf = 0.0
 
-    if not (person and clothes and detail_ok):
+    # Hard rejects for series-sibling traps
+    if not clothes:
         vm["same_work"] = False
-        # Same-series lookalikes often come back with inflated confidence
-        if not person or face is False:
-            conf = min(conf, 0.30)
-        elif not clothes:
-            conf = min(conf, 0.35)
-        else:
-            conf = min(conf, 0.40)
+        vm["confidence"] = min(conf, 0.30)
+        return vm
+    if not person:
+        vm["same_work"] = False
+        vm["confidence"] = min(conf, 0.28)
+        return vm
+    if face is False and accessories is False and not pose:
+        vm["same_work"] = False
+        vm["confidence"] = min(conf, 0.32)
+        return vm
+    if not detail_ok:
+        vm["same_work"] = False
+        conf = min(conf, 0.38)
         vm["confidence"] = conf
         return vm
 
-    # person+clothes+detail ok — still require model same_work OR high confidence
-    if vm.get("same_work") and conf < 0.45:
-        # Soft: keep same_work but don't trust ultra-low conf
-        pass
-    if not vm.get("same_work") and conf >= 0.85 and person and clothes and (face is True or accessories is True):
-        # Near-duplicate crop vs cover: allow same_work when flags strongly agree
+    # person+clothes+detail ok — still require model same_work OR very high confidence
+    if vm.get("same_work") and conf < 0.50:
+        # Low confidence "same_work" from series vibe → demote
+        vm["same_work"] = False
+        vm["confidence"] = min(conf, 0.42)
+        return vm
+    if not vm.get("same_work") and conf >= 0.88 and person and clothes and (face is True or accessories is True):
+        # Near-duplicate crop vs cover/still: allow when flags strongly agree
         vm["same_work"] = True
     return vm
 
@@ -1816,7 +1827,7 @@ def rank_candidates_by_visual(
         for c in (candidates or [])
         if c.get("code") and parse_code_parts(str(c["code"]))
     ]
-    if len(coded) < 2:
+    if len(coded) < 1:
         return list(candidates or []), meta
 
     # Preserve original title scores
@@ -1824,23 +1835,32 @@ def rank_candidates_by_visual(
         if c.get("title_score") is None and c.get("score") is not None:
             c["title_score"] = float(c.get("score") or 0)
 
-    collision_idxs = same_series_collision_indices(coded)
-    # Always include index 0; expand to full collision set, capped by max_n
-    want = sorted(set(collision_idxs) | {0})
-    # Prefer higher title_score within the collision set when truncating
-    want_sorted = sorted(
-        want,
-        key=lambda i: float(coded[i].get("title_score") or coded[i].get("score") or 0),
-        reverse=True,
-    )
-    # Same-series collisions: compare as many covers as budget allows (up to 8)
-    n_cap = max(2, min(int(max_n), 8, len(want_sorted), len(coded)))
-    pick_idxs = want_sorted[:n_cap]
-    # Keep original relative order for stable Cover0.. labels among picks
-    pick_idxs = sorted(pick_idxs)
-    top = [coded[i] for i in pick_idxs]
-    pick_set = set(pick_idxs)
-    rest = [dict(c) for i, c in enumerate(coded) if i not in pick_set]
+    if len(coded) == 1:
+        # Single candidate: still verify cover (+stills path below) against user original
+        collision_idxs = [0]
+        want_sorted = [0]
+        n_cap = 1
+        pick_idxs = [0]
+        top = [coded[0]]
+        rest = []
+    else:
+        collision_idxs = same_series_collision_indices(coded)
+        # Always include index 0; expand to full collision set, capped by max_n
+        want = sorted(set(collision_idxs) | {0})
+        # Prefer higher title_score within the collision set when truncating
+        want_sorted = sorted(
+            want,
+            key=lambda i: float(coded[i].get("title_score") or coded[i].get("score") or 0),
+            reverse=True,
+        )
+        # Same-series collisions: compare as many covers as budget allows (up to 8)
+        n_cap = max(2, min(int(max_n), 8, len(want_sorted), len(coded)))
+        pick_idxs = want_sorted[:n_cap]
+        # Keep original relative order for stable Cover0.. labels among picks
+        pick_idxs = sorted(pick_idxs)
+        top = [coded[i] for i in pick_idxs]
+        pick_set = set(pick_idxs)
+        rest = [dict(c) for i, c in enumerate(coded) if i not in pick_set]
     t0 = time.monotonic()
 
     pairs: list[tuple[dict, bytes]] = []
@@ -1871,8 +1891,8 @@ def rank_candidates_by_visual(
             continue
         pairs.append((item, blob))
 
-    if len(pairs) < 2:
-        meta["note"] = "need_2_covers"
+    if len(pairs) < 1:
+        meta["note"] = "need_cover"
         return list(candidates or []), meta
 
     def _attach(item: dict, vm: dict) -> tuple[float, dict]:
@@ -1896,10 +1916,6 @@ def rank_candidates_by_visual(
         item["score"] = round(vs * 0.92 + title_sc * 0.08, 4)
         return (float(item["score"]), item)
 
-    remain = budget_s - (time.monotonic() - t0)
-    meta["mode"] = "batch"
-    meta["compared_codes"] = [str(it.get("code") or "") for it, _b in pairs]
-
     def _run_batch(chunk: list[tuple[dict, bytes]], timeout: float) -> list[dict] | None:
         if len(chunk) < 2:
             return None
@@ -1922,12 +1938,39 @@ def rank_candidates_by_visual(
             return None
         return vms_local
 
+    ranked_pairs: list[tuple[float, dict]] = []
+    _single_verify_done = False
+
+    if len(pairs) == 1:
+        # Single cover: verify vs user original, then stills cross-check below
+        meta["mode"] = "single_verify"
+        (item0, blob0) = pairs[0]
+        vms0 = gemini_rank_covers_batch(
+            user_image_bytes,
+            [blob0],
+            key,
+            timeout=max(8.0, min(18.0, budget_s - 0.5)),
+            labels=[str(item0.get("code") or "")],
+        )
+        if not vms0:
+            meta["note"] = "single_verify_fail"
+            return list(candidates or []), meta
+        ranked_pairs = [_attach(item0, vms0[0])]
+        meta["compared"] = 1
+        meta["compared_codes"] = [str(item0.get("code") or "")]
+        _single_verify_done = True
+
+    remain = budget_s - (time.monotonic() - t0)
+
     # Chunk size 4 keeps JSON short enough for Flash; tournament covers 5–8 codes
     CHUNK = 4
-    ranked_pairs: list[tuple[float, dict]] = []
     scored: dict[str, tuple[float, dict]] = {}
 
-    if len(pairs) <= CHUNK:
+    if _single_verify_done:
+        pass  # ranked_pairs already set; skip multi-cover batch
+    elif len(pairs) <= CHUNK:
+        meta["mode"] = "batch"
+        meta["compared_codes"] = [str(it.get("code") or "") for it, _b in pairs]
         timeout = max(10.0, min(22.0, remain - 0.8))
         vms = _run_batch(pairs, timeout)
         if vms:
@@ -2035,18 +2078,14 @@ def rank_candidates_by_visual(
 
     ranked_pairs.sort(key=lambda x: x[0], reverse=True)
 
-    # Stills fallback: when cover compare finds no person+clothes same_work,
-    # re-check top candidates against jp-1 still (user shot may be a still crop).
+    # Always cross-check top candidates against stills vs the *original user image*.
+    # User shots are often still crops (rear/side); cover-only same_work false-positives
+    # on series siblings must be revoked when stills disagree on clothes/person.
     remain = budget_s - (time.monotonic() - t0)
-    top_vms_ok = any(
-        (it.get("visual") or {}).get("same_work")
-        and (it.get("visual") or {}).get("match_person")
-        and (it.get("visual") or {}).get("match_clothes")
-        for _, it in ranked_pairs[:3]
-    )
-    if (not top_vms_ok) and ranked_pairs and remain >= 7.0 and len(ranked_pairs) >= 2:
+    if ranked_pairs and remain >= 6.5:
         still_pairs: list[tuple[dict, bytes]] = []
-        for _sc, it in ranked_pairs[: min(4, len(ranked_pairs))]:
+        n_still = min(4, len(ranked_pairs)) if len(ranked_pairs) >= 2 else 1
+        for _sc, it in ranked_pairs[:n_still]:
             cid = str(it.get("cid") or "") or None
             if not cid:
                 code = format_display_code(str(it.get("code") or ""))
@@ -2054,7 +2093,7 @@ def rank_candidates_by_visual(
             urls = []
             if cid:
                 try:
-                    urls = still_urls(cid, 2)
+                    urls = still_urls(cid, 3)
                 except Exception:
                     urls = []
             blob = None
@@ -2064,11 +2103,26 @@ def rank_candidates_by_visual(
                     break
             if blob:
                 still_pairs.append((dict(it), blob))
-        if len(still_pairs) >= 2:
+        if len(still_pairs) >= 1:
             meta["mode"] = (meta.get("mode") or "batch") + "+stills"
             timeout = max(7.0, min(16.0, remain - 0.5))
-            vms = _run_batch(still_pairs, timeout)
-            if vms:
+            # Batch path needs 2+; for a single top candidate, duplicate-call via batch of 1
+            # by pairing with a tiny second download if needed — else pairwise attach.
+            vms = None
+            if len(still_pairs) >= 2:
+                vms = _run_batch(still_pairs, timeout)
+            elif len(still_pairs) == 1:
+                # Single still vs user: reuse batch API with one cover list via private path
+                only_item, only_blob = still_pairs[0]
+                vms_one = gemini_rank_covers_batch(
+                    user_image_bytes,
+                    [only_blob],
+                    key,
+                    timeout=timeout,
+                    labels=[str(only_item.get("code") or "")],
+                )
+                vms = vms_one if vms_one else None
+            if vms and len(vms) == len(still_pairs):
                 meta["compared"] += len(still_pairs)
                 meta["note_stills"] = True
                 by_code: dict[str, tuple[float, dict]] = {
@@ -2079,20 +2133,67 @@ def rank_candidates_by_visual(
                     sc, attached = _attach(item, vm)
                     code_k = format_display_code(str(attached.get("code") or ""))
                     prev = by_code.get(code_k)
-                    # Prefer stills result when it confirms same_work with person+clothes,
-                    # or when it scores clearly higher than the cover pass.
-                    if prev is None or sc > prev[0] + 0.05 or (
-                        (attached.get("visual") or {}).get("same_work")
-                        and (attached.get("visual") or {}).get("match_person")
-                        and (attached.get("visual") or {}).get("match_clothes")
-                    ):
-                        # Keep the better of cover vs stills
-                        if prev is not None and prev[0] > sc and not (
-                            (attached.get("visual") or {}).get("same_work")
-                        ):
-                            pass
-                        else:
-                            by_code[code_k] = (sc, attached)
+                    still_vm = attached.get("visual") or {}
+                    still_ok = bool(
+                        still_vm.get("same_work")
+                        and still_vm.get("match_person")
+                        and still_vm.get("match_clothes")
+                    )
+                    if prev is None:
+                        by_code[code_k] = (sc, attached)
+                        continue
+                    prev_sc, prev_it = prev
+                    prev_vm = prev_it.get("visual") or {}
+                    prev_ok = bool(
+                        prev_vm.get("same_work")
+                        and prev_vm.get("match_person")
+                        and prev_vm.get("match_clothes")
+                    )
+                    # Stills confirm → prefer stills
+                    if still_ok:
+                        by_code[code_k] = (max(sc, prev_sc + 0.01), attached)
+                        continue
+                    # Cover claimed same_work but stills reject clothes/person → revoke
+                    if prev_ok and not still_ok:
+                        revoked = dict(prev_it)
+                        rvm = dict(prev_vm)
+                        rvm["same_work"] = False
+                        if still_vm.get("match_clothes") is False:
+                            rvm["match_clothes"] = False
+                        if still_vm.get("match_person") is False:
+                            rvm["match_person"] = False
+                        if still_vm.get("match_face") is False:
+                            rvm["match_face"] = False
+                        if still_vm.get("match_pose") is False:
+                            rvm["match_pose"] = False
+                        rvm["confidence"] = min(float(rvm.get("confidence") or 0), 0.34)
+                        reason_bit = str(still_vm.get("reason") or "stills mismatch")
+                        rvm["reason"] = (
+                            str(rvm.get("reason") or "")
+                            + f"｜劇照核對否決：{reason_bit}"
+                        )[:240]
+                        rvm = enforce_visual_same_work(rvm)
+                        revoked["visual"] = {
+                            "same_work": rvm.get("same_work"),
+                            "confidence": rvm.get("confidence"),
+                            "reason": rvm.get("reason"),
+                            "match_person": rvm.get("match_person"),
+                            "match_face": rvm.get("match_face"),
+                            "match_accessories": rvm.get("match_accessories"),
+                            "match_clothes": rvm.get("match_clothes"),
+                            "match_pose": rvm.get("match_pose"),
+                        }
+                        revoked["visual_score"] = visual_match_score(rvm)
+                        ts = float(revoked.get("title_score") or revoked.get("score") or 0)
+                        revoked["score"] = round(
+                            float(revoked["visual_score"]) * 0.92 + ts * 0.08, 4
+                        )
+                        by_code[code_k] = (float(revoked["score"]), revoked)
+                        meta["stills_revoked"] = True
+                        continue
+                    # Otherwise take higher score
+                    if sc > prev_sc + 0.05:
+                        by_code[code_k] = (sc, attached)
                 ranked_pairs = sorted(by_code.values(), key=lambda x: x[0], reverse=True)
 
     # Append non-compared codes after visually ranked ones (still list them),
@@ -2112,9 +2213,16 @@ def rank_candidates_by_visual(
         best_code = str(ranked_list[0].get("code") or "")
         ncmp = meta["compared"]
         still_bit = "＋劇照" if meta.get("note_stills") else ""
+        revoke_bit = "；已否決封面誤判" if meta.get("stills_revoked") else ""
+        best_vm = (ranked_list[0].get("visual") or {}) if ranked_list else {}
+        lock_bit = (
+            "視覺鎖定"
+            if best_vm.get("same_work") and best_vm.get("match_clothes")
+            else "僅排序未鎖定"
+        )
         meta["note"] = (
-            f"同系列可能混淆，已比對 {ncmp} 張封面{still_bit}"
-            f"（主選 {best_code}；依臉／服飾／姿勢／飾品）"
+            f"已對照使用者原圖比對 {ncmp} 張封面{still_bit}"
+            f"（主選 {best_code}；{lock_bit}；依人物／衣服／表情／飾品／姿勢{revoke_bit}）"
         )
     return ranked_list, meta
 
@@ -2848,14 +2956,19 @@ def apply_visual_rank_to_hit(
     *,
     api_key: str | None = None,
 ) -> dict:
-    """Reorder hit.candidates via visual compare when 2+ codes and user image exist."""
+    """Reorder/verify hit.candidates vs *original user image* (1+ coded candidates).
+
+    Locks 番號/片名 onto the visual winner only when same_work + clothes/person
+    gates pass (visual_confident). Otherwise still reorders by visual score but
+    marks visual_confident=False so UI/message can show 未鎖定.
+    """
     if not hit or not user_image_bytes:
         return hit
     cands = list(hit.get("candidates") or [])
-    if len(cands) < 2 and hit.get("code"):
-        cands = cands or [hit]
+    if not cands and hit.get("code"):
+        cands = [hit]
     coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
-    if len(coded) < 2:
+    if len(coded) < 1:
         return hit
     ranked, meta = rank_candidates_by_visual(
         user_image_bytes, coded, api_key=api_key
@@ -2868,25 +2981,41 @@ def apply_visual_rank_to_hit(
     out = dict(hit)
     # Candidates already sorted by visual score; expose that ordering as main
     out["candidates"] = ranked
-    out["code"] = best.get("code") or out.get("code")
-    out["title"] = best.get("title") or out.get("title")
-    out["actress"] = best.get("actress") or out.get("actress")
-    out["studio"] = best.get("studio") or out.get("studio")
-    out["cover"] = best.get("cover") or out.get("cover")
-    out["cid"] = best.get("cid") or out.get("cid")
-    out["source"] = best.get("source") or out.get("source")
+    vm0 = best.get("visual") or {}
+    locked = bool(
+        vm0.get("same_work")
+        and vm0.get("match_person")
+        and vm0.get("match_clothes")
+    )
+    # Always expose visual ranking; only *lock* identity fields when gates pass
+    out["visual_meta"] = meta
+    out["visual_best_code"] = format_display_code(str(best.get("code") or ""))
     out["score"] = (
         best.get("visual_score")
         if best.get("visual_score") is not None
         else best.get("score") or out.get("score")
     )
-    out["visual_meta"] = meta
-    out["visual_best_code"] = format_display_code(str(best.get("code") or ""))
-    # Strong single visual winner: still keep others if close
+    if locked:
+        out["code"] = best.get("code") or out.get("code")
+        out["title"] = best.get("title") or out.get("title")
+        out["actress"] = best.get("actress") or out.get("actress")
+        out["studio"] = best.get("studio") or out.get("studio")
+        out["cover"] = best.get("cover") or out.get("cover")
+        out["cid"] = best.get("cid") or out.get("cid")
+        out["source"] = best.get("source") or out.get("source")
+    elif len(ranked) >= 2:
+        # Multi-candidate: still promote visual best for display order, but keep
+        # title-search code if visual did not confirm same_work.
+        out["code"] = best.get("code") or out.get("code")
+        out["title"] = best.get("title") or out.get("title")
+        out["actress"] = best.get("actress") or out.get("actress")
+        out["studio"] = best.get("studio") or out.get("studio")
+        out["cover"] = best.get("cover") or out.get("cover")
+        out["cid"] = best.get("cid") or out.get("cid")
+        out["source"] = best.get("source") or out.get("source")
     top_vs = float(best.get("visual_score") or 0)
     second = float(ranked[1].get("visual_score") or 0) if len(ranked) > 1 else 0.0
-    vm0 = best.get("visual") or {}
-    if vm0.get("same_work") and top_vs >= 0.55 and (top_vs - second) >= 0.18:
+    if locked and top_vs >= 0.55 and (len(ranked) < 2 or (top_vs - second) >= 0.18):
         out["visual_confident"] = True
     else:
         out["visual_confident"] = False
@@ -5013,9 +5142,9 @@ def run_identify_pipeline(
 
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
             # Visual rank when multiple same-series candidates
-            n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")])
-            if n_pre >= 2 and image_bytes:
-                _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+            n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
+            if n_pre >= 1 and image_bytes:
+                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
             search_mode = "title"
@@ -5042,14 +5171,14 @@ def run_identify_pipeline(
             coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
             if len(coded) >= 1:
                 hit2 = hit or {"candidates": coded, "title": vtitle}
-                if len(coded) >= 2 and image_bytes:
-                    _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+                if len(coded) >= 1 and image_bytes:
+                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
                     hit2 = apply_visual_rank_to_hit(hit2, image_bytes, api_key=api_key)
                     vmeta = hit2.get("visual_meta") or {}
                     if vmeta.get("visual_ranked"):
                         extra_msg = (
                             (extra_msg + " " if extra_msg else "")
-                            + (vmeta.get("note") or "已依人物／衣服／姿勢排序")
+                            + (vmeta.get("note") or "已對照原圖依人物／衣服／姿勢核對")
                         )
                 payload = multi_candidate_payload(
                     query_title=vtitle,
@@ -5122,9 +5251,9 @@ def run_identify_pipeline(
             extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
 
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
-            n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")])
-            if n_pre >= 2 and image_bytes:
-                _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+            n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
+            if n_pre >= 1 and image_bytes:
+                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
             title_search_hit = hit
@@ -5155,14 +5284,14 @@ def run_identify_pipeline(
             coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
             if coded:
                 hit2 = hit
-                if len(coded) >= 2 and image_bytes:
-                    _progress(on_progress, "cover", "active", "比對封面人物／衣服／姿勢…", 4 / 6)
+                if len(coded) >= 1 and image_bytes:
+                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
                     hit2 = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
                     vmeta = hit2.get("visual_meta") or {}
                     if vmeta.get("visual_ranked"):
                         extra_msg = (
                             (extra_msg + " " if extra_msg else "")
-                            + (vmeta.get("note") or "已依人物／衣服／姿勢排序")
+                            + (vmeta.get("note") or "已對照原圖依人物／衣服／姿勢核對")
                         )
                 payload = multi_candidate_payload(
                     query_title=user_title,

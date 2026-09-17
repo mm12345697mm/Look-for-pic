@@ -276,7 +276,8 @@
       progressPanel.classList.add('is-complete');
       progressPanel.classList.remove('is-failed');
       progressFinished = true;
-      setProgressCollapsed(false);
+      // Collapse so sticky expanded panel does not eat the gallery viewport
+      setProgressCollapsed(true);
       progressPanel.setAttribute('aria-busy', 'false');
     } else if (status === 'done' || status === 'skipped') {
       if (!progressFinished) {
@@ -857,7 +858,8 @@
 
     showScreen('gallery');
     setStatus('');
-    window.scrollTo(0, 0);
+    // Reset scroll so carousel hint / pager clear sticky chrome + safe area
+    try { window.scrollTo(0, 0); } catch (_) {}
   }
 
   // --- Pending multi files ---
@@ -1279,7 +1281,8 @@
       });
       const go = () => {
         if (myRun !== runId) return;
-        setProgressCollapsed(false);
+        // Keep progress collapsed (not expanded) above gallery; auto-hide shortly
+        setProgressCollapsed(true);
         if (progressPanel) {
           progressPanel.classList.remove('hidden');
           progressPanel.classList.add('is-complete');
@@ -1291,6 +1294,14 @@
         appendHistoryFromIdentify(data, imgs).catch(() => {});
         // Clear pending selection but keep sticky shots until 重新開始
         clearPending(false);
+        // Auto-hide progress so it cannot permanently cover gallery bottom/footer
+        const hideRun = myRun;
+        setTimeout(() => {
+          if (hideRun !== runId) return;
+          if (progressPanel && progressPanel.classList.contains('is-complete')) {
+            hideProgress();
+          }
+        }, 1400);
       };
       setTimeout(go, 280);
     };
