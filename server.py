@@ -941,6 +941,10 @@ def _install_recovered_helpers() -> None:
     from pathlib import Path as _P
 
     blob_path = _P(__file__).resolve().parent / "_recovered_helpers.marshal"
+    if not blob_path.is_file():
+        raise FileNotFoundError(
+            f"missing {blob_path.name}; commit _recovered_helpers.marshal with the app"
+        )
     blob = marshal.loads(blob_path.read_bytes())
     g = globals()
     for _name, _co in blob.items():
