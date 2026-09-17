@@ -107,6 +107,107 @@ VISUAL_RANK_BATCH_PROMPT = """你是 AV／JAV 封面比對助手。第一張圖�
 
 app = Flask(__name__, static_folder=None)
 
+# Private site gate: only people with SITE_PASSWORD can use it.
+# Set SITE_PASSWORD (and optional SECRET_KEY) in Railway variables.
+import secrets as _secrets
+from functools import wraps as _wraps
+from flask import session as _session, redirect as _redirect, request as _request, make_response as _make_response
+
+app.secret_key = (os.environ.get("SECRET_KEY") or os.environ.get("SITE_PASSWORD") or _secrets.token_hex(32))
+app.config["PERMANENT_SESSION_LIFETIME"] = 60 * 60 * 24 * 30  # 30 days
+
+
+def _site_password() -> str:
+    return (os.environ.get("SITE_PASSWORD") or "").strip()
+
+
+def _is_authed() -> bool:
+    pw = _site_password()
+    if not pw:
+        # Fail closed in production-like hosts: require password when unset on Railway
+        if (os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT")) and not os.environ.get("ALLOW_PUBLIC"):
+            return False
+        return True
+    return bool(_session.get("site_ok") is True)
+
+
+@app.before_request
+def _require_site_password():
+    if _request.endpoint in {"login", "logout", "healthz"}:
+        return None
+    path = (_request.path or "/")
+    if path in {"/login", "/logout", "/api/health", "/healthz"}:
+        return None
+    # Allow PWA icons/manifest without auth so home-screen install still works after login cookies
+    if path.startswith("/icons/") or path in {"/manifest.webmanifest", "/favicon.ico"}:
+        return None
+    if _is_authed():
+        return None
+    if path.startswith("/api/"):
+        return jsonify({"ok": False, "message": "需要登入才能使用（私人站）"}), 401
+    nxt = path if path != "/login" else "/"
+    return _redirect("/login?next=" + nxt)
+
+
+@app.route("/healthz")
+def healthz():
+    return jsonify({"ok": True, "private": bool(_site_password())})
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    pw = _site_password()
+    err = ""
+    if _request.method == "POST":
+        got = (_request.form.get("password") or "").strip()
+        if pw and got == pw:
+            _session["site_ok"] = True
+            _session.permanent = True
+            nxt = (_request.args.get("next") or _request.form.get("next") or "/").strip() or "/"
+            if not nxt.startswith("/"):
+                nxt = "/"
+            return _redirect(nxt)
+        err = "密碼錯誤"
+    elif not pw:
+        err = "主機尚未設定 SITE_PASSWORD（私人站無法開放）"
+    html = f"""<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="robots" content="noindex,nofollow"/>
+<title>Look-for-pic 私人登入</title>
+<style>
+body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#0b0b12;color:#f2f2f7;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}}
+.card{{width:100%;max-width:360px;background:#161622;border:1px solid #2a2a3a;border-radius:16px;padding:24px;box-shadow:0 10px 40px rgba(0,0,0,.35)}}
+h1{{font-size:1.15rem;margin:0 0 8px}}
+p{{margin:0 0 16px;color:#a0a0b8;font-size:.92rem;line-height:1.45}}
+input{{width:100%;box-sizing:border-box;padding:14px 12px;border-radius:12px;border:1px solid #3a3a50;background:#0f0f18;color:#fff;font-size:1rem;margin-bottom:12px}}
+button{{width:100%;padding:14px;border:0;border-radius:12px;background:#7c5cff;color:#fff;font-weight:600;font-size:1rem}}
+.err{{color:#ff8e8e;margin:0 0 12px;font-size:.9rem}}
+</style>
+</head>
+<body>
+<form class="card" method="post" action="/login">
+<h1>私人站登入</h1>
+<p>只有你或你分享密碼的人可以使用 Look-for-pic。</p>
+{"<p class=err>"+err+"</p>" if err else ""}
+<input type="password" name="password" placeholder="分享密碼" autocomplete="current-password" required autofocus/>
+<button type="submit">進入</button>
+</form>
+</body>
+</html>"""
+    resp = _make_response(html)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@app.route("/logout")
+def logout():
+    _session.clear()
+    return _redirect("/login")
+
+
 _demo_cache: dict | None = None
 
 

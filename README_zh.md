@@ -83,3 +83,7 @@ look-for-pic-web/
 ## 與 Expo 版差異
 
 Expo 版（`Look-for-pic`）有確認主作品、多選相關步驟。本 Web 版依需求**自動全選並跳轉畫廊**。
+
+## 私人站
+
+請在 Railway 設定環境變數 `SITE_PASSWORD`。打開網站會先要求輸入此密碼；只有你分享密碼的人能用。登出路徑：`/logout`。
