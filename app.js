@@ -671,7 +671,7 @@
     else if (hasKeyword) heading.textContent = '相關作品（關鍵字）';
     else heading.textContent = '相關作品（依片名）';
     sec.appendChild(heading);
-    relatedList.slice(0, 5).forEach((rw) => {
+    relatedList.slice(0, 8).forEach((rw) => {
       const item = document.createElement('div');
       item.className = 'related-title-item';
       const meta = document.createElement('div');
@@ -922,7 +922,7 @@
 
     const userShots = await buildUserShotThumbs(userFiles || []);
     const related = Array.isArray(data.related_by_title)
-      ? data.related_by_title.slice(0, 5).map((r) => ({
+      ? data.related_by_title.slice(0, 8).map((r) => ({
           code: r.code || '',
           title: r.title || '',
           cover: r.cover || '',
@@ -949,7 +949,7 @@
         stills: Array.isArray(item.stills) ? item.stills.slice(0, 12) : (data.stills || []).slice(0, 12),
         userShots: userShots,
         related: item.related_by_title
-          ? item.related_by_title.slice(0, 5).map((r) => ({
+          ? item.related_by_title.slice(0, 8).map((r) => ({
               code: r.code || '',
               title: r.title || '',
               cover: r.cover || '',
@@ -1091,7 +1091,7 @@
           const list = loadHistory();
           const idx = list.findIndex((x) => x.id === id);
           if (idx >= 0) {
-            list[idx].related = data.related_by_title.slice(0, 5).map((r) => ({
+            list[idx].related = data.related_by_title.slice(0, 8).map((r) => ({
               code: r.code || '',
               title: r.title || '',
               cover: r.cover || '',

@@ -2856,7 +2856,7 @@ def _find_related_by_keywords(
     *,
     exclude_code: str | None = None,
     actress: str | None = None,
-    max_n: int = 2,
+    max_n: int = 5,
     budget_sec: float = 6.0,
     already: set[str] | None = None,
 ) -> list[dict]:
@@ -3052,7 +3052,7 @@ def find_related_by_title(
 ) -> list[dict]:
     """Up to max_n works similar by title/theme (not the main code).
 
-    Title/theme first for every work; when empty, same-actress plus up to 2 keyword-theme works (ranked by hit count).
+    Title/theme first for every work; when empty, same-actress plus up to 5 keyword-theme works (ranked by hit count).
     Soft deadline (default ~8s; multi uses a shorter budget) so identify stays responsive.
     """
     import time as _time
@@ -3199,12 +3199,12 @@ def find_related_by_title(
     # Keywords first (catalog queries need the reserved time); actress fills after.
     # Keyword ranking = more overlapping theme tokens first.
     if not out:
-        actress_cap = max_n
-        keyword_cap = 2
+        actress_cap = 3
+        keyword_cap = 5
         combined: list[dict] = []
         seen_fb: set[str] = set(seen)
         leftover = max(0.0, _left())
-        kw_budget = min(7.0, max(4.5, leftover * 0.6)) if leftover >= 2.0 else max(1.5, leftover * 0.6)
+        kw_budget = min(10.0, max(6.0, leftover * 0.65)) if leftover >= 2.0 else max(2.0, leftover * 0.65)
         act_budget = max(1.0, leftover - kw_budget) if (actress or "").strip() else 0.0
 
         # Keyword extras for every title that lacked name siblings (universal rule).
@@ -3267,7 +3267,7 @@ def find_related_by_title(
         other_items = [x for x in combined if x not in actress_items and x not in keyword_items]
         out = actress_items + keyword_items + other_items
 
-    return out[: max(max_n + 2, len(out))]
+    return out[: max(max_n + 5, len(out))]
 
 
 def attach_related_by_title(
@@ -3314,11 +3314,11 @@ def attach_related_by_title(
             item = enrich_title_candidate(r, why=str(r.get("why") or "片名相近"))
             item["line"] = r.get("line") or "theme"
             cleaned.append(item)
-            if len(cleaned) >= 5:
+            if len(cleaned) >= 8:
                 break
         result["related_by_title"] = cleaned
 
-    # Universal rule: if title/theme siblings are missing, ensure up to 2 keyword extras
+    # Universal rule: if title/theme siblings are missing, ensure up to 5 keyword extras
     # (in addition to same-actress). Re-runs are cheap when keywords already present.
     try:
         rel = list(result.get("related_by_title") or [])
@@ -3346,7 +3346,7 @@ def attach_related_by_title(
                 str(title or ""),
                 exclude_code=str(code) if code else None,
                 actress=result.get("actress"),
-                max_n=2,
+                max_n=5,
                 budget_sec=kw_budget,
                 already=seen_codes,
             ):
@@ -3355,9 +3355,10 @@ def attach_related_by_title(
                     continue
                 seen_codes.add(rc)
                 rel.append(r)
-                if sum(1 for x in rel if str(x.get("line")) == "keyword" or "關鍵字" in str(x.get("why") or "")) >= 2:
+                if sum(1 for x in rel if str(x.get("line")) == "keyword" or "關鍵字" in str(x.get("why") or "")) >= 5:
                     break
-            result["related_by_title"] = rel[:5]
+            # Actress (≤3) + keyword (≤5) → up to 8 cards
+            result["related_by_title"] = rel[:8]
     except Exception:
         pass
     if not per_item:
