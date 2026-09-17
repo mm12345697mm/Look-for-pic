@@ -3195,37 +3195,20 @@ def find_related_by_title(
         except Exception:
             pass
 
-    # 4) ANY title with no name/theme siblings: keyword theme extras + same-actress.
-    # Keywords first (catalog queries need the reserved time); actress fills after.
-    # Keyword ranking = more overlapping theme tokens first.
+    # 4) ANY title with no name/theme siblings: same-actress (3) then keyword (3–5).
+    # Actress first with reserved time so keyword search cannot starve it.
     if not out:
         actress_cap = 3
         keyword_cap = 5
         combined: list[dict] = []
         seen_fb: set[str] = set(seen)
         leftover = max(0.0, _left())
-        kw_budget = min(10.0, max(6.0, leftover * 0.65)) if leftover >= 2.0 else max(2.0, leftover * 0.65)
-        act_budget = max(1.0, leftover - kw_budget) if (actress or "").strip() else 0.0
+        has_actress = bool((actress or "").strip())
+        # Reserve actress time first (usually 1–2 fast queries), then keywords.
+        act_budget = min(5.0, max(3.0, leftover * 0.35)) if has_actress and leftover >= 2.0 else (min(3.0, leftover * 0.4) if has_actress else 0.0)
+        kw_budget = max(3.0, leftover - act_budget) if leftover >= 2.0 else max(1.5, leftover * 0.6)
 
-        # Keyword extras for every title that lacked name siblings (universal rule).
-        try:
-            for r in _find_related_by_keywords(
-                title,
-                exclude_code=exclude or None,
-                actress=actress,
-                max_n=keyword_cap,
-                budget_sec=max(kw_budget, min(_left(), 7.0)),
-                already=seen_fb,
-            ):
-                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-                if not code or code in seen_fb:
-                    continue
-                seen_fb.add(code)
-                combined.append(r)
-        except Exception:
-            pass
-
-        if actress and act_budget >= 1.0:
+        if has_actress and act_budget >= 1.0:
             try:
                 for r in _find_related_by_actress(
                     actress,
@@ -3240,6 +3223,24 @@ def find_related_by_title(
                     combined.append(r)
             except Exception:
                 pass
+
+        # Keyword extras (3–5) after actress, using remaining budget.
+        try:
+            for r in _find_related_by_keywords(
+                title,
+                exclude_code=exclude or None,
+                actress=actress,
+                max_n=keyword_cap,
+                budget_sec=max(kw_budget, min(_left(), 10.0)),
+                already=seen_fb,
+            ):
+                code = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
+                if not code or code in seen_fb:
+                    continue
+                seen_fb.add(code)
+                combined.append(r)
+        except Exception:
+            pass
 
         # Demo actress siblings for MIDA when online actress search is empty
         if actress and not any(str(x.get("line")) == "actress" for x in combined) and exclude and is_mida616(exclude):
@@ -3843,16 +3844,40 @@ def run_multi_identify_pipeline(
         "封面就緒" if payload.get("cover") else "部分無封面",
         0.92,
     )
-    # Single related pass on main only, short budget (avoid N×8s timeouts)
-    _progress(on_progress, "done", "active", "補齊片名相關作品…", 0.94)
-    payload = attach_related_by_title(payload, budget_sec=14.0, per_item=False)
-    # Mirror top-level related onto main results[0] for galleryFromIdentify
+    # Related for EVERY main hit (each screenshot row gets its own carousel siblings).
+    _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94)
+    total_rel = 0
+    n_ok = sum(1 for r in results if isinstance(r, dict) and r.get("ok") and not r.get("stub"))
+    # Split budget across works; keep a floor so later rows still get actress+keyword.
+    per_budget = 12.0 if n_ok <= 1 else max(8.0, min(12.0, 36.0 / max(n_ok, 1)))
+    for i, row in enumerate(results):
+        if not isinstance(row, dict) or not row.get("ok") or row.get("stub"):
+            if isinstance(row, dict):
+                row.setdefault("related_by_title", [])
+            continue
+        try:
+            _progress(
+                on_progress,
+                "done",
+                "active",
+                f"相關作品 {i + 1}/{len(results)}…",
+                0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
+            )
+            filled = attach_related_by_title(row, budget_sec=per_budget, per_item=False)
+            rel = list(filled.get("related_by_title") or [])
+            row["related_by_title"] = rel
+            total_rel += len(rel)
+        except Exception:
+            row.setdefault("related_by_title", [])
+    # Top-level related mirrors first work (compat); gallery uses each results[].related_by_title
     if results and isinstance(results[0], dict):
-        results[0]["related_by_title"] = list(payload.get("related_by_title") or [])
-    n_rel = len(payload.get("related_by_title") or [])
+        payload["related_by_title"] = list(results[0].get("related_by_title") or [])
+    else:
+        payload["related_by_title"] = []
+    payload["results"] = results
     done_detail = f"完成，列出 {len(results)} 部"
-    if n_rel:
-        done_detail += f"；片名相關 {n_rel}"
+    if total_rel:
+        done_detail += f"；相關共 {total_rel}"
     _progress(on_progress, "done", "done", done_detail, 1.0)
     return payload, 200
 

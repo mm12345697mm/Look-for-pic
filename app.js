@@ -123,7 +123,16 @@
         ? stillUrls(cid, 10)
         : [];
     const relatedByTitle = Array.isArray(raw.related_by_title)
-      ? raw.related_by_title.map((r) => workFromApi(r, 'theme'))
+      ? raw.related_by_title.map((r) => {
+          const why = String((r && r.why) || '');
+          let rl = (r && r.line) || '';
+          if (!rl) {
+            if (/演員|女優|actress/i.test(why)) rl = 'actress';
+            else if (/關鍵字|keyword/i.test(why)) rl = 'keyword';
+            else rl = 'theme';
+          }
+          return workFromApi(r, rl);
+        })
       : [];
     return {
       code,
@@ -423,8 +432,21 @@
     // Prefer explicit results[] from multi-identify
     if (Array.isArray(data.results) && data.results.length) {
       const items = data.results.map((r, i) => workFromApi(r, i === 0 ? 'main' : 'multi'));
-      items.forEach((w) => {
+      items.forEach((w, i) => {
         if (w.code && !w.titleOnly) seenCodes.add(String(w.code).toUpperCase());
+        // Ensure related_by_title from this result row (not only first / top-level)
+        if ((!w.relatedByTitle || !w.relatedByTitle.length) && data.results[i] && Array.isArray(data.results[i].related_by_title)) {
+          w.relatedByTitle = data.results[i].related_by_title.map((r) => {
+            const why = String((r && r.why) || '');
+            let rl = (r && r.line) || '';
+            if (!rl) {
+              if (/演員|女優|actress/i.test(why)) rl = 'actress';
+              else if (/關鍵字|keyword/i.test(why)) rl = 'keyword';
+              else rl = 'theme';
+            }
+            return workFromApi(r, rl);
+          });
+        }
       });
       // Also merge non-multi related from first payload (theme/actress/candidates)
       const relatedRaw = Array.isArray(data.related) ? data.related.slice() : [];
