@@ -650,57 +650,33 @@
     parent.appendChild(stills);
   }
 
-  function appendRelatedByTitle(card, relatedList) {
-    if (!relatedList || !relatedList.length) return;
-    const sec = document.createElement('div');
-    sec.className = 'related-title-section';
-    const heading = document.createElement('div');
-    heading.className = 'related-title-heading';
-    const hasActress = relatedList.some((rw) => {
+  function relatedHeadingForList(relatedList) {
+    const hasActress = (relatedList || []).some((rw) => {
       const why = String((rw && rw.why) || '');
       const line = String((rw && rw.line) || '');
       return line === 'actress' || why.includes('演員') || why.includes('女優');
     });
-    const hasKeyword = relatedList.some((rw) => {
+    const hasKeyword = (relatedList || []).some((rw) => {
       const why = String((rw && rw.why) || '');
       const line = String((rw && rw.line) || '');
       return line === 'keyword' || why.includes('關鍵字');
     });
-    if (hasActress && hasKeyword) heading.textContent = '相關作品（同演員／關鍵字）';
-    else if (hasActress) heading.textContent = '相關作品（同演員）';
-    else if (hasKeyword) heading.textContent = '相關作品（關鍵字）';
-    else heading.textContent = '相關作品（依片名）';
-    sec.appendChild(heading);
-    relatedList.slice(0, 8).forEach((rw) => {
-      const item = document.createElement('div');
-      item.className = 'related-title-item';
-      const meta = document.createElement('div');
-      meta.className = 'card-meta';
-      meta.innerHTML =
-        '<p class="card-code">' +
-        escapeHtml(rw.code) +
-        '</p>' +
-        '<p class="card-title">' +
-        escapeHtml(rw.title || '（無標題）') +
-        '</p>';
-      const coverWrap = document.createElement('div');
-      coverWrap.className = 'cover-wrap';
-      appendCover(coverWrap, rw);
-      item.appendChild(meta);
-      item.appendChild(coverWrap);
-      appendStillsScroll(item, rw, '劇照（橫滑）');
-      sec.appendChild(item);
-    });
-    card.appendChild(sec);
+    if (hasActress && hasKeyword) return '同演員／關鍵字';
+    if (hasActress) return '同演員';
+    if (hasKeyword) return '關鍵字';
+    return '依片名';
   }
 
-  function buildWorkCard(w) {
+  /** Single work card (cover + stills). Related works are NOT nested here. */
+  function buildWorkCard(w, opts) {
+    opts = opts || {};
     const card = document.createElement('article');
-    card.className = 'card';
+    card.className = 'card' + (opts.slide ? ' work-slide-card' : '');
 
     const meta = document.createElement('div');
     meta.className = 'card-meta';
     const lineClass = w.line === 'multi' ? ' card-line line-multi' : ' card-line';
+    const badge = opts.badgeLabel || lineLabel(w.line);
     meta.innerHTML =
       '<p class="card-code">' +
       escapeHtml(w.code) +
@@ -716,7 +692,7 @@
       '<span class="' +
       lineClass.trim() +
       '">' +
-      escapeHtml(lineLabel(w.line)) +
+      escapeHtml(badge) +
       '</span>';
 
     const coverWrap = document.createElement('div');
@@ -726,10 +702,95 @@
     card.appendChild(meta);
     card.appendChild(coverWrap);
     appendStillsScroll(card, w, '劇照（橫滑）');
-    if (w.relatedByTitle && w.relatedByTitle.length) {
-      appendRelatedByTitle(card, w.relatedByTitle);
-    }
     return card;
+  }
+
+  /**
+   * One screenshot/main hit as a horizontal strip:
+   * 主作品 ↔️ 相關1 ↔️ 相關2 … (stills inside each card still scroll sideways).
+   * Multiple mains stack vertically in the gallery.
+   */
+  function buildWorkCarousel(mainWork) {
+    const related = Array.isArray(mainWork.relatedByTitle)
+      ? mainWork.relatedByTitle.slice(0, 8)
+      : [];
+    const block = document.createElement('section');
+    block.className = 'work-carousel-block';
+
+    const head = document.createElement('div');
+    head.className = 'work-carousel-head';
+    const hint = document.createElement('div');
+    hint.className = 'work-carousel-hint';
+    const total = 1 + related.length;
+    if (related.length) {
+      hint.textContent =
+        '左右滑 · 主作品 ↔️ 相關（' +
+        relatedHeadingForList(related) +
+        '）· ' +
+        total +
+        ' 張';
+    } else {
+      hint.textContent = '主作品（尚無相關可左右滑）';
+    }
+    const pager = document.createElement('div');
+    pager.className = 'work-carousel-pager';
+    pager.textContent = '1 / ' + total;
+    head.appendChild(hint);
+    head.appendChild(pager);
+    block.appendChild(head);
+
+    const track = document.createElement('div');
+    track.className = 'work-carousel-track';
+    track.setAttribute('aria-label', '主作品與相關作品橫向切換');
+
+    const slides = [];
+    const mainSlide = document.createElement('div');
+    mainSlide.className = 'work-carousel-slide';
+    mainSlide.appendChild(
+      buildWorkCard(mainWork, { slide: true, badgeLabel: lineLabel(mainWork.line || 'main') })
+    );
+    track.appendChild(mainSlide);
+    slides.push(mainSlide);
+
+    related.forEach((rw, i) => {
+      const slide = document.createElement('div');
+      slide.className = 'work-carousel-slide';
+      const why = String((rw && rw.why) || '');
+      const line = String((rw && rw.line) || '');
+      let badge = '相關 ' + (i + 1);
+      if (line === 'actress' || why.includes('演員') || why.includes('女優')) badge = '同演員';
+      else if (line === 'keyword' || why.includes('關鍵字')) badge = '關鍵字';
+      else if (line === 'theme' || why.includes('片名')) badge = '片名相近';
+      slide.appendChild(buildWorkCard(rw, { slide: true, badgeLabel: badge }));
+      track.appendChild(slide);
+      slides.push(slide);
+    });
+
+    const updatePager = () => {
+      if (!slides.length) return;
+      const left = track.scrollLeft;
+      const w = track.clientWidth || 1;
+      let idx = Math.round(left / w);
+      if (idx < 0) idx = 0;
+      if (idx > slides.length - 1) idx = slides.length - 1;
+      pager.textContent = idx + 1 + ' / ' + slides.length;
+    };
+    track.addEventListener('scroll', () => {
+      window.requestAnimationFrame(updatePager);
+    }, { passive: true });
+
+    block.appendChild(track);
+    return block;
+  }
+
+  // Back-compat alias (history detail may still call this name)
+  function appendRelatedByTitle(card, relatedList) {
+    // Prefer carousel: if card is already inside a carousel, skip.
+    // Legacy: replace nested list with a note — callers should use buildWorkCarousel.
+    if (!relatedList || !relatedList.length) return;
+    const parent = card.parentElement;
+    if (parent && parent.classList.contains('work-carousel-slide')) return;
+    // Wrap this single card's parent insertion site is handled by callers now.
   }
 
   function renderGallery(result) {
@@ -745,8 +806,9 @@
       galleryNotice.textContent = '';
     }
 
+    // Vertical: each screenshot/main hit. Horizontal: main ↔️ related works.
     for (const w of items) {
-      galleryCards.appendChild(buildWorkCard(w));
+      galleryCards.appendChild(buildWorkCarousel(w));
     }
 
     showScreen('gallery');
@@ -1070,8 +1132,7 @@
       },
       'main'
     );
-    const card = buildWorkCard(w);
-    // If no stored related, try fetch
+    // If no stored related, try fetch then show carousel
     if ((!rec.related || !rec.related.length) && rec.title) {
       try {
         const qs =
@@ -1083,11 +1144,7 @@
         const res = await fetch(qs);
         const data = await res.json();
         if (data && data.ok && Array.isArray(data.related_by_title) && data.related_by_title.length) {
-          appendRelatedByTitle(
-            card,
-            data.related_by_title.map((r) => workFromApi(r, 'theme'))
-          );
-          // Persist back
+          w.relatedByTitle = data.related_by_title.map((r) => workFromApi(r, 'theme'));
           const list = loadHistory();
           const idx = list.findIndex((x) => x.id === id);
           if (idx >= 0) {
@@ -1096,13 +1153,15 @@
               title: r.title || '',
               cover: r.cover || '',
               stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
+              why: r.why || '',
+              line: r.line || '',
             }));
             saveHistory(list);
           }
         }
       } catch (_) {}
     }
-    historyDetailEl.appendChild(card);
+    historyDetailEl.appendChild(buildWorkCarousel(w));
     showScreen('history-detail');
     hideUserShots();
     hideProgress();

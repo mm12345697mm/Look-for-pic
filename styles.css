@@ -966,3 +966,60 @@ body.lightbox-open {
 .history-detail .stills-scroll img {
   cursor: zoom-in;
 }
+
+
+/* --- Main ↔️ related horizontal carousel (vertical stack of mains) --- */
+.work-carousel-block {
+  margin-bottom: 8px;
+}
+.work-carousel-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 0 2px 8px;
+}
+.work-carousel-hint {
+  font-size: 0.78rem;
+  color: var(--muted);
+  line-height: 1.35;
+  flex: 1;
+}
+.work-carousel-pager {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: var(--accent2);
+  background: #2a2440;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+.work-carousel-track {
+  display: flex;
+  gap: 12px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  scroll-snap-type: x mandatory;
+  scroll-padding-inline: 0;
+  padding-bottom: 2px;
+  overscroll-behavior-x: contain;
+}
+.work-carousel-slide {
+  flex: 0 0 100%;
+  width: 100%;
+  max-width: 100%;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+  box-sizing: border-box;
+}
+.work-carousel-slide .card {
+  height: 100%;
+}
+/* Keep stills horizontal; isolate nested sideways scroll from the work carousel */
+.stills-scroll {
+  overscroll-behavior-x: contain;
+  touch-action: pan-x;
+}
+.work-carousel-track {
+  touch-action: pan-x;
+}
