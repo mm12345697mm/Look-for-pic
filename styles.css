@@ -854,7 +854,12 @@ label.btn {
   gap: 18px;
 }
 .history-detail .user-shots-scroll {
+  display: flex;
+  gap: 8px;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
   margin-bottom: 0;
+  scroll-snap-type: x mandatory;
 }
 .history-detail .work-carousel-block {
   margin-bottom: 0;

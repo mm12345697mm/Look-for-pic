@@ -17,6 +17,8 @@
   const HISTORY_KEY = 'lfp_identify_history_v1';
   const HISTORY_MAX = 50;
   const THUMB_MAX_BYTES = 150 * 1024;
+  const USER_SHOT_THUMB_MAX_SIDE = 480;
+  const USER_SHOT_SESSION_MAX = 20;
 
   let runId = 0;
 
@@ -1916,29 +1918,131 @@
     }
   }
 
-  function saveHistory(list) {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_MAX)));
-    } catch (e) {
-      // Quota: drop older thumbs
-      try {
-        const slim = list.slice(0, Math.min(20, list.length)).map((r) => ({
-          ...r,
-          userShots: (r.userShots || []).slice(0, 1),
-          stills: (r.stills || []).slice(0, 6),
-          related: (r.related || []).slice(0, 8),
-          works: (r.works || []).map((w) => ({
-            ...w,
-            stills: (w.stills || []).slice(0, 6),
-            related: (w.related || []).slice(0, 8),
-          })),
-        }));
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(slim));
-      } catch (_) {}
+  /** All persisted user-upload previews for a session. Legacy single-shot rows OK. */
+  function historyUserShots(rec) {
+    if (!rec) return [];
+    let raw = rec.userShots;
+    if (raw == null) raw = rec.userShot;
+    if (raw == null) raw = rec.user_shots;
+    if (typeof raw === 'string') raw = raw.trim() ? [raw] : [];
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    const seen = {};
+    for (let i = 0; i < raw.length; i++) {
+      const s = String(raw[i] || '').trim();
+      if (!s || seen[s]) continue;
+      seen[s] = true;
+      out.push(s);
     }
+    return out;
   }
 
-  function downscaleFileToDataUrl(file, maxBytes) {
+  function userShotThumbLimits(count) {
+    const n = Math.max(1, count || 1);
+    if (n <= 1) return { maxBytes: 96 * 1024, maxSide: 640 };
+    if (n <= 3) return { maxBytes: 48 * 1024, maxSide: 480 };
+    return { maxBytes: 28 * 1024, maxSide: 360 };
+  }
+
+  function isQuotaError(err) {
+    if (!err) return false;
+    const name = err.name;
+    const code = err.code;
+    const msg = String(err.message || '');
+    return (
+      name === 'QuotaExceededError' ||
+      name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+      code === 22 ||
+      code === 1014 ||
+      /quota/i.test(msg)
+    );
+  }
+
+  function slimWorkMedia(w, stillN, relN) {
+    if (!w) return w;
+    return Object.assign({}, w, {
+      stills: Array.isArray(w.stills) ? w.stills.slice(0, stillN) : [],
+      related: Array.isArray(w.related) ? w.related.slice(0, relN) : [],
+    });
+  }
+
+  function slimRecordMedia(r, stillN, relN) {
+    return Object.assign({}, r, {
+      stills: Array.isArray(r.stills) ? r.stills.slice(0, stillN) : [],
+      related: Array.isArray(r.related) ? r.related.slice(0, relN) : [],
+      works: (r.works || []).map(function (w) {
+        return slimWorkMedia(w, stillN, relN);
+      }),
+    });
+  }
+
+  function withUserShots(r, shots) {
+    return Object.assign({}, r, { userShots: shots });
+  }
+
+  function writeHistoryList(list) {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+  }
+
+  function saveHistory(list) {
+    let next = Array.isArray(list) ? list.slice(0, HISTORY_MAX) : [];
+    try {
+      writeHistoryList(next);
+      return true;
+    } catch (e) {
+      if (!isQuotaError(e)) {
+        try {
+          writeHistoryList(next);
+          return true;
+        } catch (_) {}
+      }
+    }
+    try {
+      next = next.map(function (r, i) {
+        return slimRecordMedia(r, i === 0 ? 10 : 4, i === 0 ? 8 : 3);
+      });
+      writeHistoryList(next);
+      return true;
+    } catch (_) {}
+    try {
+      next = next.map(function (r, i) {
+        const shots = historyUserShots(r);
+        return withUserShots(
+          slimRecordMedia(r, i === 0 ? 8 : 2, i === 0 ? 5 : 0),
+          i === 0 ? shots : shots.slice(0, 1)
+        );
+      });
+      writeHistoryList(next);
+      return true;
+    } catch (_) {}
+    try {
+      next = next.map(function (r, i) {
+        return withUserShots(
+          slimRecordMedia(r, i === 0 ? 4 : 0, 0),
+          i === 0 ? historyUserShots(r) : []
+        );
+      });
+      writeHistoryList(next);
+      return true;
+    } catch (_) {}
+    for (let n = Math.min(next.length, 12); n >= 1; n--) {
+      try {
+        const keep = next.slice(0, n).map(function (r, i) {
+          return withUserShots(
+            slimRecordMedia(r, i === 0 ? 4 : 0, 0),
+            i === 0 ? historyUserShots(r) : []
+          );
+        });
+        writeHistoryList(keep);
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function downscaleFileToDataUrl(file, maxBytes, maxSide) {
+    const cap = Math.max(8 * 1024, maxBytes || THUMB_MAX_BYTES);
+    const side = Math.max(64, maxSide || USER_SHOT_THUMB_MAX_SIDE);
     return new Promise((resolve) => {
       const url = URL.createObjectURL(file);
       const img = new Image();
@@ -1947,26 +2051,27 @@
           const canvas = document.createElement('canvas');
           let w = img.naturalWidth || img.width;
           let h = img.naturalHeight || img.height;
-          const maxSide = 720;
-          const scale = Math.min(1, maxSide / Math.max(w, h));
+          const scale = Math.min(1, side / Math.max(w, h, 1));
           w = Math.max(1, Math.round(w * scale));
           h = Math.max(1, Math.round(h * scale));
           canvas.width = w;
           canvas.height = h;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, w, h);
-          let q = 0.72;
+          const maxChars = Math.ceil(cap * 1.37);
+          let q = 0.7;
           let dataUrl = canvas.toDataURL('image/jpeg', q);
-          while (dataUrl.length > maxBytes * 1.37 && q > 0.35) {
+          while (dataUrl.length > maxChars && q > 0.28) {
             q -= 0.08;
             dataUrl = canvas.toDataURL('image/jpeg', q);
           }
-          // If still huge, shrink more
-          if (dataUrl.length > maxBytes * 1.37) {
-            canvas.width = Math.round(w * 0.6);
-            canvas.height = Math.round(h * 0.6);
+          let shrink = 0;
+          while (dataUrl.length > maxChars && shrink < 3) {
+            canvas.width = Math.max(48, Math.round(canvas.width * 0.65));
+            canvas.height = Math.max(48, Math.round(canvas.height * 0.65));
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            dataUrl = canvas.toDataURL('image/jpeg', 0.55);
+            dataUrl = canvas.toDataURL('image/jpeg', 0.48);
+            shrink += 1;
           }
           URL.revokeObjectURL(url);
           resolve(dataUrl);
@@ -1983,10 +2088,34 @@
     });
   }
 
+  function smallFileDataUrl(file, maxBytes) {
+    const cap = Math.max(8 * 1024, maxBytes || THUMB_MAX_BYTES);
+    if (!file || file.size > cap) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      if (typeof FileReader !== 'function') {
+        resolve(null);
+        return;
+      }
+      const fr = new FileReader();
+      fr.onload = () => {
+        resolve(typeof fr.result === 'string' && fr.result ? fr.result : null);
+      };
+      fr.onerror = () => resolve(null);
+      try {
+        fr.readAsDataURL(file);
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
   async function buildUserShotThumbs(files) {
+    const list = (files || []).filter(Boolean).slice(0, USER_SHOT_SESSION_MAX);
+    const limits = userShotThumbLimits(list.length);
     const out = [];
-    for (const f of files || []) {
-      const d = await downscaleFileToDataUrl(f, THUMB_MAX_BYTES);
+    for (let i = 0; i < list.length; i++) {
+      let d = await downscaleFileToDataUrl(list[i], limits.maxBytes, limits.maxSide);
+      if (!d) d = await smallFileDataUrl(list[i], limits.maxBytes);
       if (d) out.push(d);
     }
     return out;
@@ -2066,7 +2195,7 @@
       const thumbSrc =
         rec.cover ||
         first.cover ||
-        (rec.userShots && rec.userShots[0]) ||
+        historyUserShots(rec)[0] ||
         '';
       let thumbHtml;
       if (thumbSrc) {
@@ -2222,17 +2351,20 @@
       notice.textContent = String(rec.message);
       historyDetailEl.appendChild(notice);
     }
-    if (rec.userShots && rec.userShots.length) {
+    const shots = historyUserShots(rec);
+    if (shots.length) {
       const head = document.createElement('div');
       head.className = 'user-shots-head';
       head.textContent = '你的截圖';
       const scroll = document.createElement('div');
       scroll.className = 'user-shots-scroll';
-      rec.userShots.forEach((u, i) => {
+      shots.forEach((u, i) => {
         const img = document.createElement('img');
         img.src = u;
-        img.alt = '截圖 ' + (i + 1);
-        bindLightboxable(img, rec.userShots, i);
+        img.alt = '你的截圖 ' + (i + 1);
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        bindLightboxable(img, shots, i);
         scroll.appendChild(img);
       });
       historyDetailEl.appendChild(head);
@@ -2778,6 +2910,12 @@
       historyRecordIsOpenable,
       renderHistoryList,
       openHistoryDetail,
+      paintHistoryDetail,
+      historyUserShots,
+      userShotThumbLimits,
+      saveHistory,
+      loadHistory,
+      appendHistoryFromIdentify,
       relatedNeedsTitleZh,
       relatedBucketsNeedFill,
       workNeedsTitleZh,

@@ -112,6 +112,7 @@ function getEl(id) {
 
 const store = {};
 let anchorClicks = 0;
+let canvasThumbN = 0;
 const context = {
   window: {},
   document: {
@@ -125,6 +126,17 @@ const context = {
         el.click = function (ev) {
           anchorClicks += 1;
           return origClick(ev);
+        };
+      }
+      if (String(tag).toLowerCase() === 'canvas') {
+        el.width = 0;
+        el.height = 0;
+        el.getContext = () => ({
+          drawImage() {},
+        });
+        el.toDataURL = () => {
+          canvasThumbN += 1;
+          return 'data:image/jpeg;base64,thumb' + canvasThumbN;
         };
       }
       return el;
@@ -153,7 +165,40 @@ const context = {
       ? File
       : class File extends (typeof Blob !== 'undefined' ? Blob : class Blob {}) {},
   fetch: async () => ({ ok: true, json: async () => ({}) }),
-  Image: class Image {},
+  Image: class Image {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.naturalWidth = 400;
+      this.naturalHeight = 300;
+      this.width = 400;
+      this.height = 300;
+    }
+    set src(v) {
+      this._src = v;
+      const self = this;
+      setTimeout(() => {
+        if (typeof self.onload === 'function') self.onload();
+      }, 0);
+    }
+    get src() {
+      return this._src;
+    }
+  },
+  FileReader: class FileReader {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.result = null;
+    }
+    readAsDataURL(file) {
+      this.result = 'data:image/jpeg;base64,file-' + ((file && file.name) || 'x');
+      const self = this;
+      setTimeout(() => {
+        if (typeof self.onload === 'function') self.onload();
+      }, 0);
+    }
+  },
   confirm: () => false,
   navigator: { userAgent: 'node-test', clipboard: { writeText: async () => {} } },
   console,
@@ -414,6 +459,91 @@ function related(n, line) {
   assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
 }
 
+// Multi-shot history: persist and render every user upload; legacy single-shot still OK
+{
+  function shotsOf(rec) {
+    return Array.from(H.historyUserShots(rec), (s) => '' + s);
+  }
+  assert.strictEqual(shotsOf({ userShots: ['data:a', 'data:b', '', 'data:a'] }).join(','), 'data:a,data:b');
+  assert.strictEqual(shotsOf({ userShot: 'data:only' }).join(','), 'data:only');
+  assert.strictEqual(shotsOf({ user_shots: 'data:legacy' }).join(','), 'data:legacy');
+  assert.strictEqual(shotsOf({ userShots: [] }).join(','), '');
+  assert.ok(H.userShotThumbLimits(5).maxBytes < H.userShotThumbLimits(1).maxBytes);
+
+  const work = {
+    code: 'AAA-001',
+    title: 'Main',
+    related: related(1, 'theme'),
+    line: 'main',
+  };
+  H.saveHistory([
+    {
+      id: 'h-multi',
+      kind: 'session',
+      code: 'AAA-001',
+      title: 'Main',
+      userShots: ['data:shot-1', 'data:shot-2', 'data:shot-3'],
+      works: [work],
+    },
+  ]);
+  const saved = H.loadHistory();
+  assert.strictEqual(H.historyUserShots(saved[0]).length, 3, 'new save keeps all shots');
+
+  H.paintHistoryDetail(saved[0]);
+  const detail = getEl('history-detail');
+  const scroll = detail.children.find((c) => c.className === 'user-shots-scroll');
+  assert.ok(scroll, '你的截圖 strip is painted');
+  assert.strictEqual(scroll.children.length, 3, 'every stored shot is rendered');
+  assert.ok(scroll.children.every((c) => c.tagName === 'IMG'));
+
+  H.paintHistoryDetail({
+    id: 'h-legacy',
+    userShot: 'data:one-only',
+    works: [work],
+  });
+  const legacyScroll = getEl('history-detail').children.find((c) => c.className === 'user-shots-scroll');
+  assert.strictEqual(legacyScroll.children.length, 1, 'legacy single shot still shows');
+}
+
+// Quota: drop older thumbs, never slice the newest session to one shot
+{
+  const origSet = context.localStorage.setItem;
+  context.localStorage.setItem = (k, v) => {
+    const parsed = JSON.parse(v);
+    const total = parsed.reduce((n, r) => n + ((r.userShots && r.userShots.length) || 0), 0);
+    if (total > 3) {
+      const err = new Error('quota');
+      err.name = 'QuotaExceededError';
+      throw err;
+    }
+    store[k] = String(v);
+  };
+  const newest = {
+    id: 'h-new',
+    userShots: ['n1', 'n2', 'n3'],
+    works: [{ code: 'BBB-001', title: 'New', related: related(2, 'theme'), stills: ['s1', 's2'] }],
+  };
+  const older = {
+    id: 'h-old',
+    userShots: ['o1', 'o2'],
+    works: [{ code: 'CCC-001', title: 'Old', related: related(2, 'theme') }],
+  };
+  const ok = H.saveHistory([newest, older]);
+  assert.strictEqual(ok, true);
+  const loaded = H.loadHistory();
+  assert.strictEqual(loaded[0].id, 'h-new');
+  assert.strictEqual(
+    (loaded[0].userShots || []).map((s) => '' + s).join(','),
+    'n1,n2,n3',
+    'newest keeps all shots under quota'
+  );
+  assert.ok(
+    !loaded[1] || (loaded[1].userShots || []).length <= 1,
+    'older session may be thinned'
+  );
+  context.localStorage.setItem = origSet.bind(context.localStorage);
+}
+
 // Download: jpeg filenames, never a zip; share payload is files-only
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
@@ -461,6 +591,28 @@ function related(n, line) {
   const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
   const work = { code: 'AAA-001', cover: cover, stills: [still] };
   const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+
+  // appendHistoryFromIdentify stores a thumb per uploaded file
+  {
+    canvasThumbN = 0;
+    store.lfp_identify_history_v1 = JSON.stringify([]);
+    const files = [
+      new File([jpegBytes], 'a.jpg', { type: 'image/jpeg' }),
+      new File([jpegBytes], 'b.jpg', { type: 'image/jpeg' }),
+      new File([jpegBytes], 'c.jpg', { type: 'image/jpeg' }),
+    ];
+    await H.appendHistoryFromIdentify(
+      { ok: true, code: 'DDD-001', title: 'Multi', stills: [] },
+      files
+    );
+    const recs = H.loadHistory();
+    assert.ok(recs.length >= 1);
+    assert.strictEqual(
+      H.historyUserShots(recs[0]).length,
+      3,
+      'session stores one thumb per uploaded file: ' + H.historyUserShots(recs[0]).length
+    );
+  }
 
   function mockCdnFetch(fetched) {
     context.fetch = async (url) => {
