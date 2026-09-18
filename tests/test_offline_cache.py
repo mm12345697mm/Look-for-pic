@@ -485,6 +485,69 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         self.assertEqual(out.get("title_zh"), "已有中文")
         t, k, a = S._related_bucket_counts(out.get("related_by_title") or [])
         self.assertEqual((t, k, a), (5, 5, 3))
+        self.assertFalse(S._payload_needs_enrichment(out))
+
+    def test_enrich_retries_when_flags_set_but_zh_missing(self):
+        """Flags must not freeze incomplete related Chinese titles."""
+        payload = self._stored_payload(title_zh="中文主標")
+        payload["cache_backfilled"] = True
+        payload["chinese_titles_attached"] = True
+        self.assertTrue(S._payload_needs_title_zh(payload))
+        with self._keep_seed_related(), mock.patch.object(
+            S, "resolve_chinese_title", side_effect=self._fake_resolve
+        ):
+            out = S.enrich_offline_cache_hit(payload)
+        self.assertEqual(out.get("title_zh"), "中文主標")
+        self.assertEqual(out["related_by_title"][0].get("title_zh"), "中文相關")
+
+    def test_enrich_retries_underfilled_buckets_despite_flags(self):
+        payload = self._stored_payload(
+            title_zh="中文主標",
+            actress="誰か",
+            related_by_title=[
+                {
+                    "code": "NHDTC-100",
+                    "title": "関連作",
+                    "title_zh": "中文相關",
+                    "line": "theme",
+                    "why": "片名相近",
+                    "cover": "https://example.com/r.jpg",
+                }
+            ],
+        )
+        payload["cache_backfilled"] = True
+        payload["chinese_titles_attached"] = True
+        extra = {
+            "code": "NHDTC-101",
+            "title": "new",
+            "title_zh": "新中文",
+            "line": "theme",
+            "why": "片名相近",
+            "cover": "https://example.com/n.jpg",
+        }
+
+        def fake_find(*args, **kwargs):
+            seed = list(kwargs.get("seed") or [])
+            return seed + [extra]
+
+        with mock.patch.object(S, "find_related_by_title", side_effect=fake_find), mock.patch.object(
+            S, "resolve_chinese_title", side_effect=AssertionError("zh already present on coded rows")
+        ):
+            out = S.enrich_offline_cache_hit(payload)
+        codes = [r["code"] for r in out.get("related_by_title") or []]
+        self.assertIn("NHDTC-100", codes)
+        self.assertIn("NHDTC-101", codes)
+
+    def test_payload_needs_title_zh_only_for_coded(self):
+        self.assertFalse(S._payload_needs_title_zh({"ok": True, "title": "no-code"}))
+        self.assertTrue(
+            S._payload_needs_title_zh({"ok": True, "code": "AAA-001", "title": "x"})
+        )
+        self.assertFalse(
+            S._payload_needs_title_zh(
+                {"ok": True, "code": "AAA-001", "title": "x", "title_zh": "中文"}
+            )
+        )
 
     def test_enrich_does_not_cache_title_only(self):
         """Cover gate: filling zh must not persist a payload without a real cover."""
@@ -705,6 +768,77 @@ class TestIncrementalRelatedBackfill(unittest.TestCase):
         finally:
             S._OFFLINE_CACHE_PATH = None
             tmp.cleanup()
+
+
+class TestRelatedByTitleApi(unittest.TestCase):
+    def _full_related(self, *, with_zh: bool):
+        items = []
+        for i in range(5):
+            items.append(
+                {
+                    "code": f"THM-{i+1:03d}",
+                    "title": "テーマ作品タイトル",
+                    "title_zh": "主題中文" if with_zh else "",
+                    "line": "theme",
+                    "why": "片名相近",
+                    "cover": f"https://example.com/t{i}.jpg",
+                    "cid": f"thm{i+1:03d}",
+                }
+            )
+        for i in range(5):
+            items.append(
+                {
+                    "code": f"KEY-{i+1:03d}",
+                    "title": "キーワード作品タイトル",
+                    "title_zh": "關鍵字中文" if with_zh else "",
+                    "line": "keyword",
+                    "why": "關鍵字",
+                    "cover": f"https://example.com/k{i}.jpg",
+                    "cid": f"key{i+1:03d}",
+                }
+            )
+        for i in range(3):
+            items.append(
+                {
+                    "code": f"ACT-{i+1:03d}",
+                    "title": "女優作タイトルです",
+                    "title_zh": "同演員中文" if with_zh else "",
+                    "line": "actress",
+                    "why": "同演員",
+                    "cover": f"https://example.com/a{i}.jpg",
+                    "cid": f"act{i+1:03d}",
+                }
+            )
+        return items
+
+    def test_post_seed_at_cap_skips_search_and_fills_zh(self):
+        seed = self._full_related(with_zh=False)
+        resolved = []
+
+        def fake_resolve(code, title_ja=None, existing_zh=None, user_title=None):
+            resolved.append(str(code or ""))
+            return "補中文"
+
+        with mock.patch.object(
+            S, "find_related_by_title", side_effect=AssertionError("buckets full — no search")
+        ), mock.patch.object(S, "resolve_chinese_title", side_effect=fake_resolve):
+            client = S.app.test_client()
+            res = client.post(
+                "/api/related-by-title",
+                json={
+                    "title": "テーマ作品タイトル",
+                    "code": "MAIN-001",
+                    "actress": "誰か",
+                    "seed": seed,
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data.get("ok"))
+        related = data.get("related_by_title") or []
+        self.assertEqual(len(related), 13)
+        self.assertTrue(all(str(r.get("title_zh") or "").strip() for r in related))
+        self.assertTrue(resolved)
 
 
 class TestEntryId(unittest.TestCase):

@@ -377,4 +377,29 @@ function related(n, line) {
   assert.ok(getEl('screen-history-detail').classList.contains('active'));
 }
 
+// Related gap fingerprint: missing title_zh still needs a pass even at cap
+{
+  const full = related(5, 'theme').concat(related(5, 'keyword'), related(3, 'actress'));
+  assert.ok(!H.relatedBucketsNeedFill(full, { title: 'テーマ', actress: '誰か' }));
+  const fullNoZh = full.map((r) => Object.assign({}, r, { title_zh: '' }));
+  assert.ok(H.relatedNeedsTitleZh(fullNoZh));
+  assert.ok(H.relatedBucketsNeedFill([], { title: 'テーマ' }));
+  assert.ok(!H.relatedBucketsNeedFill([], { title: '' }));
+  assert.ok(H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '' }));
+  assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
+}
+
+// Download: individual jpeg names, never a zip
+{
+  const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
+  const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
+  assert.strictEqual(H.workDownloadFilename('AAA-001', cover, 0, cover), 'AAA-001-cover.jpg');
+  assert.strictEqual(H.workDownloadFilename('AAA-001', still, 1, cover), 'AAA-001-jp-01.jpg');
+  assert.ok(!H.workDownloadFilename('AAA-001', cover, 0, cover).endsWith('.zip'));
+  const urls = H.workDownloadUrls({ cover: cover, stills: [still] });
+  assert.strictEqual(urls.length, 2);
+  assert.strictEqual(urls[0], cover);
+  assert.strictEqual(urls[1], still);
+}
+
 console.log('test_history_session.js: ok');
