@@ -4,11 +4,15 @@
 from __future__ import annotations
 
 import base64
+import fcntl
+import hashlib
 import json
 import os
 import re
 import subprocess
 import tempfile
+import threading
+import time
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -1486,8 +1490,23 @@ def fetch_avbase_by_code(code: str) -> dict | None:
         return None
     headers = _avbase_headers()
     work = None
+    # Lookup slugs: keep display as-is, also try common zero-padding (NHDTC-99 → NHDTC-099)
+    _parts = parse_code_parts(display)
+    _slugs = [display, display.lower(), display.replace("-", "")]
+    if _parts:
+        _lab, _num = _parts
+        for width in (3, 4, 5):
+            padded = f"{_lab}-{_num.zfill(width)}"
+            if padded not in _slugs:
+                _slugs.append(padded)
+            compact = f"{_lab}{_num.zfill(width)}"
+            if compact not in _slugs:
+                _slugs.append(compact)
+            low = padded.lower()
+            if low not in _slugs:
+                _slugs.append(low)
     # Prefer exact work page (stable even when search ranking is odd)
-    for slug in (display, display.lower(), display.replace("-", "")):
+    for slug in _slugs:
         try:
             url = f"https://www.avbase.net/works/{quote(slug)}"
             r = requests.get(url, headers=headers, timeout=10, verify=False)
@@ -1500,7 +1519,14 @@ def fetch_avbase_by_code(code: str) -> dict | None:
             cand = ((data.get("props") or {}).get("pageProps") or {}).get("work")
             if isinstance(cand, dict) and str(cand.get("work_id") or "").strip():
                 wid = format_display_code(str(cand.get("work_id")))
-                if wid == display:
+                # Same 品番 if letters match and numeric values equal (099 == 99)
+                same = wid == display
+                if not same:
+                    pa, pb = parse_code_parts(wid), parse_code_parts(display)
+                    if pa and pb and pa[0] == pb[0] and int(pa[1] or 0) == int(pb[1] or 0):
+                        same = True
+                        display = wid  # prefer catalog form with its zeros
+                if same:
                     work = cand
                     break
         except Exception:
@@ -2633,6 +2659,290 @@ def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
     return payload
 
 
+
+# --- Offline identify cache (server-side, persists successful lookups) ---
+OFFLINE_CACHE_MAX = 500
+_OFFLINE_CACHE_MEM_LOCK = threading.Lock()
+_OFFLINE_CACHE_PATH: Path | None = None
+
+
+def _offline_cache_resolve_path() -> Path:
+    """Prefer data/offline-cache.json; fall back to /tmp if data/ is not writable."""
+    global _OFFLINE_CACHE_PATH
+    if _OFFLINE_CACHE_PATH is not None:
+        return _OFFLINE_CACHE_PATH
+    preferred = ROOT / "data" / "offline-cache.json"
+    fallback = Path("/tmp/lfp-offline-cache.json")
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        probe = preferred.parent / ".offline-cache-writetest"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        _OFFLINE_CACHE_PATH = preferred
+    except Exception:
+        _OFFLINE_CACHE_PATH = fallback
+    return _OFFLINE_CACHE_PATH
+
+
+def _offline_cache_entry_id(code: str) -> str | None:
+    """Canonical entry id: LABEL|int so NHDTC-99 and NHDTC-099 share one slot."""
+    parts = parse_code_parts(code)
+    if not parts:
+        return None
+    lab, num = parts
+    try:
+        return f"{lab}|{int(num)}"
+    except ValueError:
+        return f"{lab}|{num}"
+
+
+def _offline_cache_index_keys(code: str | None = None, image_hash: str | None = None) -> list[str]:
+    keys: list[str] = []
+    if code:
+        display = format_display_code(str(code))
+        if display:
+            keys.append(f"code:{display}")
+        parts = parse_code_parts(display or str(code))
+        if parts:
+            lab, num = parts
+            try:
+                keys.append(f"code_num:{lab}-{int(num)}")
+            except ValueError:
+                keys.append(f"code_num:{lab}-{num}")
+            # Also index common zero-padded display forms
+            for width in (2, 3, 4, 5):
+                padded = f"{lab}-{num.zfill(width)}"
+                k = f"code:{padded}"
+                if k not in keys:
+                    keys.append(k)
+    if image_hash:
+        h = str(image_hash).strip().lower()
+        if h:
+            keys.append(f"img:{h}")
+    # de-dupe preserve order
+    seen: set[str] = set()
+    out: list[str] = []
+    for k in keys:
+        if k not in seen:
+            seen.add(k)
+            out.append(k)
+    return out
+
+
+def _slim_related_for_cache(items: list | None) -> list[dict]:
+    slim: list[dict] = []
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        code = it.get("code")
+        slim.append(
+            {
+                "code": format_display_code(str(code)) if code and parse_code_parts(str(code)) else code,
+                "title": it.get("title"),
+                "title_zh": it.get("title_zh"),
+                "actress": it.get("actress"),
+                "cover": it.get("cover"),
+                "cid": it.get("cid"),
+                "line": it.get("line"),
+                "why": it.get("why"),
+            }
+        )
+        if len(slim) >= 13:
+            break
+    return slim
+
+
+def _offline_cache_payload_ok(payload: dict) -> bool:
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False
+    code = payload.get("code")
+    if not code or str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code)):
+        return False
+    title = (payload.get("title") or "").strip() if payload.get("title") else ""
+    cover = (payload.get("cover") or "").strip() if payload.get("cover") else ""
+    return bool(title or cover)
+
+
+def _offline_cache_build_value(payload: dict) -> dict:
+    code = payload.get("code")
+    display = format_display_code(str(code)) if code and parse_code_parts(str(code)) else code
+    stills = payload.get("stills") if isinstance(payload.get("stills"), list) else []
+    return {
+        "ok": True,
+        "code": display,
+        "title": payload.get("title"),
+        "title_zh": payload.get("title_zh"),
+        "actress": payload.get("actress"),
+        "studio": payload.get("studio"),
+        "cid": payload.get("cid"),
+        "cover": payload.get("cover"),
+        "stills": list(stills)[:20],
+        "related_by_title": _slim_related_for_cache(
+            payload.get("related_by_title") or payload.get("related")
+        ),
+        "message": payload.get("message") or "",
+        "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+
+
+def _offline_cache_read_unlocked(path: Path) -> dict:
+    if not path.is_file():
+        return {"version": 1, "by_key": {}, "entries": {}}
+    try:
+        raw = path.read_text(encoding="utf-8")
+        data = json.loads(raw) if raw.strip() else {}
+        if not isinstance(data, dict):
+            return {"version": 1, "by_key": {}, "entries": {}}
+        data.setdefault("version", 1)
+        data.setdefault("by_key", {})
+        data.setdefault("entries", {})
+        if not isinstance(data["by_key"], dict):
+            data["by_key"] = {}
+        if not isinstance(data["entries"], dict):
+            data["entries"] = {}
+        return data
+    except Exception:
+        return {"version": 1, "by_key": {}, "entries": {}}
+
+
+def _offline_cache_write_unlocked(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+    payload = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(payload)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+def _offline_cache_prune(data: dict, max_n: int = OFFLINE_CACHE_MAX) -> None:
+    entries = data.get("entries") or {}
+    if len(entries) <= max_n:
+        return
+    ranked = sorted(
+        entries.items(),
+        key=lambda kv: float((kv[1] or {}).get("touched_at") or 0),
+    )
+    drop_ids = {eid for eid, _ in ranked[: max(0, len(entries) - max_n)]}
+    for eid in drop_ids:
+        entries.pop(eid, None)
+    by_key = data.get("by_key") or {}
+    dead = [k for k, v in by_key.items() if v in drop_ids]
+    for k in dead:
+        by_key.pop(k, None)
+
+
+def offline_cache_get(
+    *,
+    code: str | None = None,
+    image_hash: str | None = None,
+) -> dict | None:
+    """Return a gallery-ready payload from offline cache, or None."""
+    keys = _offline_cache_index_keys(code=code, image_hash=image_hash)
+    if not keys:
+        return None
+    path = _offline_cache_resolve_path()
+    with _OFFLINE_CACHE_MEM_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                data = _offline_cache_read_unlocked(path)
+                by_key = data.get("by_key") or {}
+                entries = data.get("entries") or {}
+                entry_id = None
+                for k in keys:
+                    entry_id = by_key.get(k)
+                    if entry_id and entry_id in entries:
+                        break
+                    entry_id = None
+                if not entry_id:
+                    return None
+                entry = entries.get(entry_id)
+                if not isinstance(entry, dict):
+                    return None
+                # touch for LRU
+                entry["touched_at"] = time.time()
+                entries[entry_id] = entry
+                try:
+                    _offline_cache_write_unlocked(path, data)
+                except Exception:
+                    pass
+                out = dict(entry)
+                out.pop("touched_at", None)
+                out["ok"] = True
+                out["from_offline_cache"] = True
+                msg = str(out.get("message") or "").strip()
+                if "離線快取" not in msg:
+                    out["message"] = "離線快取" + (f"：{msg}" if msg else "")
+                else:
+                    out["message"] = msg or "離線快取"
+                out.setdefault("related", [])
+                out.setdefault("stills", out.get("stills") or [])
+                out.setdefault("related_by_title", out.get("related_by_title") or [])
+                return out
+        except Exception:
+            return None
+
+
+def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
+    """Persist a successful identify result for later offline hits."""
+    if not _offline_cache_payload_ok(payload):
+        return
+    code = str(payload.get("code") or "")
+    entry_id = _offline_cache_entry_id(code)
+    if not entry_id:
+        return
+    value = _offline_cache_build_value(payload)
+    value["touched_at"] = time.time()
+    index_keys = _offline_cache_index_keys(code=code, image_hash=image_hash)
+    # Prefer catalog display form already in value
+    if value.get("code"):
+        for k in _offline_cache_index_keys(code=str(value["code"])):
+            if k not in index_keys:
+                index_keys.append(k)
+    path = _offline_cache_resolve_path()
+    with _OFFLINE_CACHE_MEM_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                data = _offline_cache_read_unlocked(path)
+                entries = data.setdefault("entries", {})
+                by_key = data.setdefault("by_key", {})
+                # merge: keep richer title/cover if new is thinner
+                prev = entries.get(entry_id)
+                if isinstance(prev, dict):
+                    for field in ("title", "title_zh", "actress", "studio", "cid", "cover"):
+                        if not value.get(field) and prev.get(field):
+                            value[field] = prev[field]
+                    if not value.get("stills") and prev.get("stills"):
+                        value["stills"] = prev["stills"]
+                    if not value.get("related_by_title") and prev.get("related_by_title"):
+                        value["related_by_title"] = prev["related_by_title"]
+                entries[entry_id] = value
+                for k in index_keys:
+                    by_key[k] = entry_id
+                _offline_cache_prune(data, OFFLINE_CACHE_MAX)
+                _offline_cache_write_unlocked(path, data)
+        except Exception:
+            return
+
+
+def image_content_hash(image_bytes: bytes | None) -> str | None:
+    if not image_bytes:
+        return None
+    try:
+        return hashlib.sha256(image_bytes).hexdigest()
+    except Exception:
+        return None
+
+
 def identify_code(
     code: str,
     ocr_preview: str | None = None,
@@ -2657,6 +2967,18 @@ def identify_code(
             },
             vision_meta,
         )
+
+    # Offline cache hit — skip slow network (manual user_code benefits too)
+    try:
+        cached = offline_cache_get(code=display)
+    except Exception:
+        cached = None
+    if cached and cached.get("ok"):
+        cached = dict(cached)
+        cached["ocr_text_preview"] = ocr_preview
+        cached.setdefault("related", [])
+        cached.setdefault("related_note", None)
+        return apply_vision_meta(cached, vision_meta)
 
     cid = code_to_cid(display)
     related: list[dict] = []
@@ -2862,7 +3184,7 @@ def identify_code(
     except Exception:
         title_zh = None
 
-    return {
+    out = {
         "ok": True,
         "code": display,
         "title": title,
@@ -2877,6 +3199,12 @@ def identify_code(
         "message": message,
         "related_note": related_note,
     }
+    try:
+        if title or cover:
+            offline_cache_put(out)
+    except Exception:
+        pass
+    return out
 
 
 def empty_identify(
@@ -3373,26 +3701,37 @@ def resolve_chinese_title(
     return None
 
 
-def attach_chinese_titles(payload: dict, *, related_network: bool = True) -> dict:
+def attach_chinese_titles(
+    payload: dict,
+    *,
+    related_network: bool = True,
+    related_budget_sec: float = 3.0,
+) -> dict:
     """Fill title_zh on main work (and optionally related) when missing.
 
-    related_network=True (default): also resolve title_zh for related works so the
-    gallery shows 日本語（中文）on related slides. Pass False to skip network for related.
+    related_network=True: also try title_zh for related slides, but with a hard
+    wall-clock budget so MissAV/JAVLibrary stalls cannot wipe the whole identify.
     """
+    import time as _time
+
     if not isinstance(payload, dict):
         return payload
     code = payload.get("code")
     if code and (str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code))):
         code = None
     if not payload.get("title_zh"):
-        zh = resolve_chinese_title(
-            str(code) if code else None,
-            title_ja=payload.get("title"),
-            existing_zh=payload.get("title_zh"),
-            user_title=payload.get("user_title") or payload.get("query_title"),
-        )
+        try:
+            zh = resolve_chinese_title(
+                str(code) if code else None,
+                title_ja=payload.get("title"),
+                existing_zh=payload.get("title_zh"),
+                user_title=payload.get("user_title") or payload.get("query_title"),
+            )
+        except Exception:
+            zh = None
         if zh:
             payload["title_zh"] = zh
+    t_rel0 = _time.monotonic()
     for key in ("related_by_title", "related"):
         items = payload.get(key)
         if not isinstance(items, list):
@@ -3410,6 +3749,8 @@ def attach_chinese_titles(payload: dict, *, related_network: bool = True) -> dic
                 continue
             if not related_network:
                 continue
+            if related_budget_sec and (_time.monotonic() - t_rel0) > float(related_budget_sec):
+                break
             icode = item.get("code")
             if not icode or not parse_code_parts(str(icode)):
                 continue
@@ -4975,6 +5316,50 @@ def run_identify_pipeline(
         1 / 6,
     )
 
+    img_hash = image_content_hash(image_bytes) if image_bytes else None
+    # Same screenshot → reuse offline cache (skip vision/network)
+    if img_hash and not code and not user_title:
+        try:
+            cached_img = offline_cache_get(image_hash=img_hash)
+        except Exception:
+            cached_img = None
+        if cached_img and cached_img.get("ok"):
+            _progress(on_progress, "vision", "skipped", "離線快取（同圖）", 2 / 6)
+            _progress(on_progress, "parse", "done", f"番號：{cached_img.get('code') or '—'}", 3 / 6)
+            _progress(on_progress, "search", "done", "離線快取", 4 / 6)
+            if cached_img.get("cover"):
+                _progress(on_progress, "cover", "done", "封面（快取）", 5 / 6)
+            else:
+                _progress(on_progress, "cover", "skipped", "無封面", 5 / 6)
+            cached_img = dict(cached_img)
+            cached_img["vision_used"] = False
+            cached_img["search_mode"] = "code"
+            cached_img.setdefault("related_by_title", cached_img.get("related_by_title") or [])
+            _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
+            return cached_img, 200
+
+    # Manual code: try offline cache before vision/network (fast path)
+    if code and parse_code_parts(code):
+        try:
+            cached_code = offline_cache_get(code=code)
+        except Exception:
+            cached_code = None
+        if cached_code and cached_code.get("ok") and not image_bytes:
+            disp_c = format_display_code(code)
+            _progress(on_progress, "vision", "skipped", "無圖片，略過看圖辨識", 2 / 6)
+            _progress(on_progress, "parse", "done", f"番號：{disp_c}", 3 / 6)
+            _progress(on_progress, "search", "done", "離線快取", 4 / 6)
+            if cached_code.get("cover"):
+                _progress(on_progress, "cover", "done", "封面（快取）", 5 / 6)
+            else:
+                _progress(on_progress, "cover", "skipped", "無封面", 5 / 6)
+            cached_code = dict(cached_code)
+            cached_code["vision_used"] = False
+            cached_code["search_mode"] = "manual" if user_code else "code"
+            cached_code.setdefault("related_by_title", cached_code.get("related_by_title") or [])
+            _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
+            return cached_code, 200
+
     # Step 2: vision (or skip)
     if image_bytes is not None:
         mime = detect_image_mime(image_bytes, filename)
@@ -5398,8 +5783,11 @@ def run_identify_pipeline(
         detail = "完成，進入畫廊"
         if n_extra >= 2:
             detail = f"完成，列出 {n_extra} 個番號候選"
-        # related_by_title (max 3) — title/theme siblings, excluding main
-        if not skip_related:
+        # related_by_title — skip network re-attach when served from offline cache
+        if result.get("from_offline_cache"):
+            result.setdefault("related_by_title", result.get("related_by_title") or [])
+            detail = "完成（離線快取）"
+        elif not skip_related:
             try:
                 result = attach_related_by_title(result, budget_sec=14.0)
                 n_rel = len(result.get("related_by_title") or [])
@@ -5409,6 +5797,10 @@ def run_identify_pipeline(
                 result.setdefault("related_by_title", [])
         else:
             result.setdefault("related_by_title", [])
+        try:
+            offline_cache_put(result, image_hash=img_hash)
+        except Exception:
+            pass
         _progress(on_progress, "done", "done", detail, 1.0)
     else:
         result.setdefault("related_by_title", [])
@@ -5435,7 +5827,7 @@ def identify():
             user_code=user_code,
             user_title=user_title,
         )
-        result = attach_related_by_title(result, budget_sec=14.0)
+        # related_by_title already attached inside pipeline — do not run twice
     else:
         result, status = run_identify_pipeline(
             image_bytes=None,
@@ -5443,7 +5835,7 @@ def identify():
             user_code=user_code,
             user_title=user_title,
         )
-        result = attach_related_by_title(result, budget_sec=14.0)
+        # related_by_title already attached inside pipeline — do not run twice
     return jsonify(result), status
 
 
@@ -5501,7 +5893,7 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                    result = attach_related_by_title(result, budget_sec=14.0)
+                    # related already attached in pipeline
                 else:
                     result, status = run_identify_pipeline(
                         image_bytes=None,
@@ -5510,7 +5902,7 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                    result = attach_related_by_title(result, budget_sec=14.0)
+                    # related already attached in pipeline
                 q.put(("result", {"type": "result", "data": result, "status": status}))
             except Exception as e:
                 q.put(

@@ -91,6 +91,28 @@
     return `${parts.label}-${parts.number}`;
   }
 
+  /** Same 品番 if label matches and numeric values equal (099 == 99). */
+  function codesMatch(a, b) {
+    const pa = parseCodeParts(a);
+    const pb = parseCodeParts(b);
+    if (!pa || !pb) return formatDisplayCode(a) === formatDisplayCode(b);
+    return pa.label === pb.label && Number(pa.number) === Number(pb.number);
+  }
+
+  /** Local history hit with title+cover for instant gallery (server remains source of truth). */
+  function findHistoryByCode(code) {
+    if (!code || !parseCodeParts(code)) return null;
+    const list = loadHistory();
+    for (const rec of list) {
+      if (!rec || !rec.code) continue;
+      if (!codesMatch(rec.code, code)) continue;
+      if ((rec.title && String(rec.title).trim()) || (rec.cover && String(rec.cover).trim())) {
+        return rec;
+      }
+    }
+    return null;
+  }
+
   function coverUrl(cid) {
     return `${DMM_PICS}/${cid}/${cid}pl.jpg`;
   }
@@ -1249,6 +1271,32 @@
       return hit ? hit.url : URL.createObjectURL(f);
     });
     if (previewUrls.length) showUserShots(previewUrls);
+
+    // Code-only: if local history has title+cover, show gallery immediately (server still refreshes)
+    let historyPreviewShown = false;
+    if (code && !imgs.length && !title) {
+      const hist = findHistoryByCode(code);
+      if (hist && (hist.title || hist.cover)) {
+        try {
+          const previewData = {
+            ok: true,
+            code: hist.code,
+            title: hist.title || '',
+            title_zh: hist.title_zh || '',
+            actress: hist.actress || '',
+            cover: hist.cover || '',
+            stills: Array.isArray(hist.stills) ? hist.stills : [],
+            related_by_title: Array.isArray(hist.related) ? hist.related : [],
+            message: '瀏覽紀錄快取（等候伺服器確認）',
+            from_offline_cache: true,
+          };
+          const result = galleryFromIdentify(previewData);
+          renderGallery(result);
+          setStatus('瀏覽紀錄快取 · 伺服器查詢中…', 'busy');
+          historyPreviewShown = true;
+        } catch (_) {}
+      }
+    }
 
     const handleResult = (data) => {
       if (myRun !== runId) return;

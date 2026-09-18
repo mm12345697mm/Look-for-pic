@@ -7,3 +7,6 @@ __pycache__/
 .DS_Store
 
 !_recovered_helpers.marshal
+
+# Server offline identify cache (runtime)
+data/offline-cache.json
