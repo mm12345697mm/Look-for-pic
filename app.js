@@ -99,18 +99,23 @@
     return pa.label === pb.label && Number(pa.number) === Number(pb.number);
   }
 
-  /** Local history hit with title+cover for instant gallery (server remains source of truth). */
+  /** Local history hit with a real cover for instant gallery (server remains source of truth). */
   function findHistoryByCode(code) {
     if (!code || !parseCodeParts(code)) return null;
     const list = loadHistory();
     for (const rec of list) {
       if (!rec || !rec.code) continue;
       if (!codesMatch(rec.code, code)) continue;
-      if ((rec.title && String(rec.title).trim()) || (rec.cover && String(rec.cover).trim())) {
+      const cover = rec.cover && String(rec.cover).trim();
+      if (cover && !isNowPrintingUrl(cover)) {
         return rec;
       }
     }
     return null;
+  }
+
+  function isNowPrintingUrl(url) {
+    return /now_printing/i.test(String(url || ''));
   }
 
   function coverUrl(cid) {
@@ -150,15 +155,21 @@
         ? '片名搜尋'
         : formatDisplayCode(rawCode)
       : formatDisplayCode(rawCode);
-    const cid = titleOnly
-      ? String(raw.cid || '')
-      : String(raw.cid || codeToCid(code) || '');
-    const cover = String(raw.cover || raw.cover_url || (cid ? coverUrl(cid) : ''));
-    const stills = Array.isArray(raw.stills) && raw.stills.length
-      ? raw.stills.slice()
-      : cid
-        ? stillUrls(cid, 10)
-        : [];
+    // Never invent DMM CID from the display code: padded guesses (dosd00008)
+    // often redirect to now_printing after the server already cleared cover.
+    const cid = String(raw.cid || '');
+    let cover = String(raw.cover || raw.cover_url || '').trim();
+    if (isNowPrintingUrl(cover)) cover = '';
+    if (!cover && cid && !isNowPrintingUrl(cid)) {
+      cover = coverUrl(cid);
+      if (isNowPrintingUrl(cover)) cover = '';
+    }
+    let stills = Array.isArray(raw.stills) && raw.stills.length
+      ? raw.stills.map((u) => String(u || '')).filter((u) => u && !isNowPrintingUrl(u))
+      : [];
+    if (!stills.length && cid) {
+      stills = stillUrls(cid, 10);
+    }
     const relatedByTitle = Array.isArray(raw.related_by_title)
       ? raw.related_by_title.map((r) => {
           const why = String((r && r.why) || '');

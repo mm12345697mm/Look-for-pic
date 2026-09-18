@@ -21,9 +21,66 @@ class TestDisplayZeros(unittest.TestCase):
         self.assertEqual(S.format_display_code("NHDTC-029"), "NHDTC-029")
         self.assertEqual(S.format_display_code("nhdtc029"), "NHDTC-029")
         self.assertEqual(S.format_display_code("NHDTC-99"), "NHDTC-99")
+        self.assertEqual(S.format_display_code("DOSD-008"), "DOSD-008")
 
     def test_cid_still_pads(self):
         self.assertTrue(S.code_to_cid("NHDTC-029").endswith("00029") or "029" in S.code_to_cid("NHDTC-029"))
+        self.assertEqual(S.code_to_cid("DOSD-008"), "dosd00008")
+
+    def test_prefer_keeps_query_zeros(self):
+        self.assertEqual(S.prefer_display_code("DOSD-008", "DOSD-8"), "DOSD-008")
+        self.assertEqual(S.prefer_display_code("NHDTC-99", "NHDTC-099"), "NHDTC-099")
+        self.assertTrue(S.codes_numeric_equal("DOSD-008", "DOSD-8"))
+
+
+class TestCoverAndSlugVariants(unittest.TestCase):
+    def test_lookup_slugs_include_stripped_and_display(self):
+        slugs = S.code_lookup_slugs("DOSD-008")
+        self.assertEqual(slugs[0], "DOSD-008")
+        self.assertIn("DOSD-8", slugs)
+        self.assertIn("dosd-008", slugs)
+        self.assertEqual(S.code_stripped_form("DOSD-008"), "DOSD-8")
+        self.assertIsNone(S.code_stripped_form("DOSD-8"))
+
+    def test_cid_candidates_include_stripped_pads(self):
+        cids = S.cover_cid_candidates("DOSD-008")
+        for expected in ("dosd00008", "1dosd00008", "dosd008", "dosd8", "dosd08"):
+            self.assertIn(expected, cids, msg=f"missing {expected} in {cids}")
+        # Display must stay padded even while CID guesses strip/pad
+        self.assertEqual(S.format_display_code("DOSD-008"), "DOSD-008")
+
+    def test_now_printing_not_usable(self):
+        self.assertFalse(S.usable_cover_url(""))
+        self.assertFalse(S.usable_cover_url(None))
+        self.assertFalse(
+            S.usable_cover_url(
+                "https://pics.dmm.co.jp/digital/video/dosd00008/now_printing.jpg"
+            )
+        )
+        self.assertFalse(
+            S.usable_cover_url(
+                "https://imgsrc.dmm.com/pics/mono/movie/n/now_printing/now_printing.jpg"
+            )
+        )
+        self.assertTrue(S.usable_cover_url("https://example.com/c.jpg"))
+        self.assertFalse(S._offline_cache_payload_ok({
+            "ok": True,
+            "code": "DOSD-008",
+            "title": "gemini only",
+            "cover": None,
+        }))
+        self.assertFalse(S._offline_cache_payload_ok({
+            "ok": True,
+            "code": "DOSD-008",
+            "title": "gemini only",
+            "cover": "https://pics.dmm.co.jp/x/now_printing.jpg",
+        }))
+        self.assertTrue(S._offline_cache_payload_ok({
+            "ok": True,
+            "code": "DOSD-008",
+            "title": None,
+            "cover": "https://example.com/c.jpg",
+        }))
 
 
 class TestOfflineCache(unittest.TestCase):
@@ -126,6 +183,101 @@ class TestOfflineCache(unittest.TestCase):
     def test_reject_empty(self):
         S.offline_cache_put({"ok": True, "code": "AAA-001"})  # no title/cover
         self.assertIsNone(S.offline_cache_get(code="AAA-001"))
+
+    def test_reject_title_only(self):
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "DOSD-008",
+                "title": "weak gemini title",
+                "cid": None,
+                "cover": None,
+                "stills": [],
+            }
+        )
+        self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
+        self.assertFalse(self.cache_path.is_file() and self.cache_path.stat().st_size > 2)
+
+    def test_reject_now_printing_cover(self):
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "DOSD-008",
+                "title": "has placeholder cover",
+                "cid": "dosd00008",
+                "cover": "https://pics.dmm.co.jp/digital/video/dosd00008/now_printing.jpg",
+            }
+        )
+        self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
+
+    def test_get_purges_incomplete_poison(self):
+        """Old cache files may store title-only; get must miss and delete them."""
+        eid = S._offline_cache_entry_id("DOSD-008")
+        data = {
+            "version": 1,
+            "by_key": {
+                "code:DOSD-008": eid,
+                "code_num:DOSD-8": eid,
+            },
+            "entries": {
+                eid: {
+                    "ok": True,
+                    "code": "DOSD-008",
+                    "title": "gemini title only",
+                    "cover": "",
+                    "stills": [],
+                    "message": "來源：gemini",
+                    "touched_at": 1.0,
+                }
+            },
+        }
+        self.cache_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
+        saved = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        self.assertNotIn(eid, saved.get("entries") or {})
+        self.assertNotIn("code:DOSD-008", saved.get("by_key") or {})
+
+    def test_get_purges_now_printing_entry(self):
+        eid = S._offline_cache_entry_id("DOSD-008")
+        data = {
+            "version": 1,
+            "by_key": {"code:DOSD-008": eid},
+            "entries": {
+                eid: {
+                    "ok": True,
+                    "code": "DOSD-008",
+                    "title": "t",
+                    "cover": "https://imgsrc.dmm.com/pics/mono/movie/n/now_printing/now_printing.jpg",
+                    "touched_at": 1.0,
+                }
+            },
+        }
+        self.cache_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
+        saved = json.loads(self.cache_path.read_text(encoding="utf-8"))
+        self.assertNotIn(eid, saved.get("entries") or {})
+
+    def test_put_does_not_overwrite_good_cover_with_title_only(self):
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "DOSD-008",
+                "title": "real",
+                "cover": "https://example.com/real.jpg",
+            }
+        )
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "DOSD-008",
+                "title": "gemini retry",
+                "cover": None,
+            }
+        )
+        hit = S.offline_cache_get(code="DOSD-008")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit["cover"], "https://example.com/real.jpg")
+        self.assertEqual(hit["title"], "real")
 
 
 class TestEntryId(unittest.TestCase):
