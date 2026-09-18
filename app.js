@@ -942,12 +942,17 @@
       return;
     }
     const coverImg = document.createElement('img');
-    coverImg.src = url;
     coverImg.alt = w.code + ' 封面';
     coverImg.loading = 'lazy';
     coverImg.decoding = 'async';
+    // Display: the browser loads pics.dmm.co.jp directly (no CORS).
+    // Share/download: fetch('/api/cdn-file') on the Railway server.
+    // JUFE-271 can paint here while the proxy is blocked — do not require
+    // the proxy for on-screen cover, and warm a same-origin blob in parallel.
     coverImg.referrerPolicy = 'no-referrer';
+    coverImg.src = url;
     coverImg.addEventListener('error', () => onImgError(coverImg));
+    warmCoverFromProxy(coverImg, url);
     coverWrap.appendChild(coverImg);
     const set = workImageSet(w);
     bindLightboxable(coverImg, set, 0);
@@ -1379,6 +1384,7 @@
   function displayedCoverLooksReady(img) {
     if (!img) return false;
     if (img.classList && img.classList.contains('img-broken')) return false;
+    if (img._lfpCoverBlob && img._lfpCoverBlob.size) return true;
     const src = String(img.currentSrc || img.src || '');
     if (/^(blob:|data:)/i.test(src)) return true;
     const w = img.naturalWidth || img.width;
@@ -1404,6 +1410,39 @@
       if (code && img.alt === code + ' 封面') return img;
     }
     return null;
+  }
+
+  const warmedCoverByUrl = Object.create(null);
+
+  function rememberWarmedCover(url, blob) {
+    const k = String(url || '').trim();
+    if (!k || !blob || !blob.size) return;
+    warmedCoverByUrl[k] = blob;
+  }
+
+  function warmedCoverBlob(url) {
+    const k = String(url || '').trim();
+    return (k && warmedCoverByUrl[k]) || null;
+  }
+
+  /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file. */
+  function warmCoverFromProxy(img, url) {
+    const u = String(url || '').trim();
+    if (!u || isNowPrintingUrl(u)) return;
+    fetchWorkImageBuffer(u)
+      .then(function (buf) {
+        if (!buf) return;
+        let blob = null;
+        try {
+          blob = new Blob([buf], { type: 'image/jpeg' });
+        } catch (_) {
+          blob = null;
+        }
+        if (!blob || !blob.size) return;
+        rememberWarmedCover(u, blob);
+        if (img) img._lfpCoverBlob = blob;
+      })
+      .catch(function () {});
   }
 
   function blobFromCanvas(canvas) {
@@ -1446,9 +1485,52 @@
     return blob;
   }
 
+  async function canvasExportDrawn(imgLike) {
+    const w0 = imgLike.naturalWidth || imgLike.width;
+    const h0 = imgLike.naturalHeight || imgLike.height;
+    if (!w0 || !h0) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = w0;
+    canvas.height = h0;
+    const ctx = canvas.getContext && canvas.getContext('2d');
+    if (!ctx || !ctx.drawImage) return null;
+    ctx.drawImage(imgLike, 0, 0, w0, h0);
+    const blob = await blobFromCanvas(canvas);
+    return blob && blob.size ? blob : null;
+  }
+
+  function loadCorsCoverImage(src) {
+    return new Promise(function (resolve, reject) {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.referrerPolicy = 'no-referrer';
+      im.onload = function () {
+        resolve(im);
+      };
+      im.onerror = function () {
+        reject(new Error('cors-img'));
+      };
+      im.src = src;
+    });
+  }
+
+  /**
+   * When the jacket is already on the card, export that bitmap as JPEG.
+   * Display used a no-CORS DMM <img>; canvas/currentSrc can still work for
+   * blob:/same-origin/CORS-clean images, and for a warmed /api/cdn-file blob.
+   */
   async function captureDisplayedCoverBlob(w, opts) {
     const img = findDisplayedCoverImg(w, opts);
+    const cover = String((w && w.cover) || '').trim();
+    if (img && img._lfpCoverBlob && img._lfpCoverBlob.size) return img._lfpCoverBlob;
+    const warmed = warmedCoverBlob(cover) || (img && warmedCoverBlob(img.currentSrc || img.src));
+    if (warmed && warmed.size) return warmed;
     if (!img) return null;
+    if (typeof img.decode === 'function') {
+      try {
+        await img.decode();
+      } catch (_) {}
+    }
     const src = String(img.currentSrc || img.src || '');
     if (/^(blob:|data:)/i.test(src) || (src && src.indexOf('/api/cdn-file') !== -1)) {
       try {
@@ -1456,21 +1538,25 @@
         if (blob && blob.size) return blob;
       } catch (_) {}
     }
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bmp = await createImageBitmap(img);
+        const blob = await canvasExportDrawn(bmp);
+        if (typeof bmp.close === 'function') bmp.close();
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
     try {
-      const canvas = document.createElement('canvas');
-      const w0 = img.naturalWidth || img.width;
-      const h0 = img.naturalHeight || img.height;
-      if (w0 && h0 && canvas) {
-        canvas.width = w0;
-        canvas.height = h0;
-        const ctx = canvas.getContext && canvas.getContext('2d');
-        if (ctx && ctx.drawImage) {
-          ctx.drawImage(img, 0, 0);
-          const blob = await blobFromCanvas(canvas);
-          if (blob && blob.size) return blob;
-        }
-      }
+      const blob = await canvasExportDrawn(img);
+      if (blob && blob.size) return blob;
     } catch (_) {}
+    if (src && /^https?:/i.test(src)) {
+      try {
+        const clone = await loadCorsCoverImage(src);
+        const blob = await canvasExportDrawn(clone);
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
     if (src) {
       try {
         const blob = await blobFromSrc(src);
@@ -1480,6 +1566,11 @@
     return null;
   }
 
+  /**
+   * Jacket bytes: /api/cdn-file first (retries + pl/ps / mono variants), then
+   * the bitmap already shown on the card. Display ≠ download: <img> talks to
+   * DMM; this function talks to the Railway proxy unless the fallback hits.
+   */
   async function fetchCoverImageBuffer(item, w, opts) {
     const urls = dmmCoverVariantUrls(item && item.url);
     let lastErr = null;
