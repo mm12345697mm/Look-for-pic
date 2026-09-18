@@ -321,13 +321,21 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
             return "中文相關"
         return None
 
+    def _keep_seed_related(self):
+        def keep_seed(*args, **kwargs):
+            return list(kwargs.get("seed") or [])
+
+        return mock.patch.object(S, "find_related_by_title", side_effect=keep_seed)
+
     def test_enrich_fills_main_and_related_then_puts(self):
         S.offline_cache_put(self._stored_payload())
         hit = S.offline_cache_get(code="NHDTC-099")
         self.assertIsNotNone(hit)
         self.assertFalse(hit.get("title_zh"))
         self.assertFalse((hit.get("related_by_title") or [{}])[0].get("title_zh"))
-        with mock.patch.object(S, "resolve_chinese_title", side_effect=self._fake_resolve):
+        with self._keep_seed_related(), mock.patch.object(
+            S, "resolve_chinese_title", side_effect=self._fake_resolve
+        ):
             out = S.enrich_offline_cache_hit(hit)
         self.assertEqual(out.get("title_zh"), "中文主標")
         self.assertEqual(out["related_by_title"][0].get("title_zh"), "中文相關")
@@ -345,7 +353,9 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
 
     def test_identify_code_cache_hit_no_longer_skips_zh(self):
         S.offline_cache_put(self._stored_payload())
-        with mock.patch.object(S, "resolve_chinese_title", side_effect=self._fake_resolve):
+        with self._keep_seed_related(), mock.patch.object(
+            S, "resolve_chinese_title", side_effect=self._fake_resolve
+        ):
             out = S.identify_code("NHDTC-099")
         self.assertTrue(out.get("from_offline_cache"))
         self.assertEqual(out.get("title_zh"), "中文主標")
@@ -355,7 +365,9 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
 
     def test_pipeline_manual_code_cache_hit_enriches(self):
         S.offline_cache_put(self._stored_payload())
-        with mock.patch.object(S, "resolve_chinese_title", side_effect=self._fake_resolve):
+        with self._keep_seed_related(), mock.patch.object(
+            S, "resolve_chinese_title", side_effect=self._fake_resolve
+        ):
             result, status = S.run_identify_pipeline(
                 image_bytes=None,
                 filename=None,
@@ -428,16 +440,51 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         self.assertEqual(hit.get("stills"), ["https://example.com/1.jpg"])
 
     def test_enrich_skips_network_when_already_filled(self):
-        payload = self._stored_payload(title_zh="已有中文")
-        payload["related_by_title"][0]["title_zh"] = "相關中文"
+        items = []
+        for i in range(5):
+            items.append(
+                {
+                    "code": f"THM-{i+1:03d}",
+                    "title": "テーマ",
+                    "title_zh": "主題",
+                    "line": "theme",
+                    "cover": f"https://example.com/t{i}.jpg",
+                }
+            )
+        for i in range(5):
+            items.append(
+                {
+                    "code": f"KEY-{i+1:03d}",
+                    "title": "キーワード",
+                    "title_zh": "關鍵字",
+                    "line": "keyword",
+                    "cover": f"https://example.com/k{i}.jpg",
+                }
+            )
+        for i in range(3):
+            items.append(
+                {
+                    "code": f"ACT-{i+1:03d}",
+                    "title": "女優作",
+                    "title_zh": "同演員",
+                    "line": "actress",
+                    "cover": f"https://example.com/a{i}.jpg",
+                }
+            )
+        payload = self._stored_payload(title_zh="已有中文", related_by_title=items)
         S.offline_cache_put(payload)
         hit = S.offline_cache_get(code="NHDTC-099")
         with mock.patch.object(
-            S, "resolve_chinese_title", side_effect=AssertionError("should not fetch")
+            S, "resolve_chinese_title", side_effect=AssertionError("should not fetch zh")
+        ), mock.patch.object(
+            S, "find_related_by_title", side_effect=AssertionError("should not fetch related")
+        ), mock.patch.object(
+            S, "search_by_title", side_effect=AssertionError("should not search")
         ):
             out = S.enrich_offline_cache_hit(hit)
         self.assertEqual(out.get("title_zh"), "已有中文")
-        self.assertEqual(out["related_by_title"][0].get("title_zh"), "相關中文")
+        t, k, a = S._related_bucket_counts(out.get("related_by_title") or [])
+        self.assertEqual((t, k, a), (5, 5, 3))
 
     def test_enrich_does_not_cache_title_only(self):
         """Cover gate: filling zh must not persist a payload without a real cover."""
@@ -451,10 +498,213 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
                 {"code": "DOSD-009", "title": "rel"},
             ],
         }
-        with mock.patch.object(S, "resolve_chinese_title", return_value="中文"):
+        with self._keep_seed_related(), mock.patch.object(S, "resolve_chinese_title", return_value="中文"):
             out = S.enrich_offline_cache_hit(payload)
         self.assertEqual(out.get("title_zh"), "中文")
         self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
+
+
+class TestIncrementalRelatedBackfill(unittest.TestCase):
+    def test_cap_related_buckets_maxima_not_quotas(self):
+        items = []
+        for i in range(7):
+            items.append({"code": f"AAA-{i+1:03d}", "line": "theme", "why": "片名相近"})
+        for i in range(6):
+            items.append(
+                {
+                    "code": f"BBB-{i+1:03d}",
+                    "line": "keyword",
+                    "why": "名稱關鍵字",
+                    "keyword_hits": i,
+                }
+            )
+        for i in range(5):
+            items.append({"code": f"CCC-{i+1:03d}", "line": "actress", "why": "同演員"})
+        ordered = S._cap_related_buckets(items)
+        t, k, a = S._related_bucket_counts(ordered)
+        self.assertEqual((t, k, a), (5, 5, 3))
+        self.assertEqual(ordered[0]["line"], "theme")
+        self.assertEqual(ordered[5]["line"], "keyword")
+        self.assertEqual(ordered[10]["line"], "actress")
+        self.assertLessEqual(len(ordered), 13)
+
+    def test_seed_keeps_existing_and_fills_remaining_theme(self):
+        title = "息子の家庭教師とセックスしています"
+        seed = [
+            {
+                "code": f"AAA-{i:03d}",
+                "title": title,
+                "title_zh": f"中文{i}",
+                "cover": f"https://example.com/{i}.jpg",
+                "line": "theme",
+                "why": "片名相近",
+            }
+            for i in range(1, 4)
+        ]
+        extra_cands = [
+            {"code": "AAA-004", "title": title, "score": 0.95, "cover": "https://example.com/4.jpg"},
+            {"code": "AAA-005", "title": title, "score": 0.94, "cover": "https://example.com/5.jpg"},
+        ]
+        hit = {
+            "code": "AAA-004",
+            "title": title,
+            "score": 0.95,
+            "cover": "https://example.com/4.jpg",
+            "candidates": extra_cands,
+        }
+
+        def fake_enrich(c, why="片名相近"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        with mock.patch.object(S, "search_by_title", return_value=hit), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ), mock.patch.object(S, "_find_related_by_keywords", return_value=[]), mock.patch.object(
+            S, "_find_related_by_actress", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+            out = S.find_related_by_title(
+                title,
+                exclude_code="MAIN-001",
+                seed=seed,
+                fill_keyword=False,
+                fill_actress=False,
+                budget_sec=20.0,
+            )
+        codes = [x["code"] for x in out]
+        self.assertEqual(codes[:3], ["AAA-001", "AAA-002", "AAA-003"])
+        self.assertIn("AAA-004", codes)
+        self.assertIn("AAA-005", codes)
+        self.assertEqual(out[0].get("title_zh"), "中文1")
+        self.assertEqual(out[0].get("cover"), "https://example.com/1.jpg")
+        t, k, a = S._related_bucket_counts(out)
+        self.assertEqual(t, 5)
+        self.assertEqual(k, 0)
+        self.assertEqual(a, 0)
+
+    def test_full_buckets_skip_related_network(self):
+        seed = []
+        for i in range(5):
+            seed.append({"code": f"THM-{i+1:03d}", "title": "t", "line": "theme", "why": "片名相近"})
+        for i in range(5):
+            seed.append({"code": f"KEY-{i+1:03d}", "title": "k", "line": "keyword", "why": "名稱關鍵字"})
+        for i in range(3):
+            seed.append({"code": f"ACT-{i+1:03d}", "title": "a", "line": "actress", "why": "同演員"})
+        with mock.patch.object(
+            S, "search_by_title", side_effect=AssertionError("theme bucket full")
+        ), mock.patch.object(
+            S, "fetch_avbase_title_results", side_effect=AssertionError("theme bucket full")
+        ), mock.patch.object(
+            S, "_find_related_by_keywords", side_effect=AssertionError("keyword bucket full")
+        ), mock.patch.object(
+            S, "_find_related_by_actress", side_effect=AssertionError("actress bucket full")
+        ):
+            out = S.find_related_by_title(
+                "息子の家庭教師とセックスしています",
+                exclude_code="MAIN-001",
+                seed=seed,
+                actress="誰か",
+                budget_sec=20.0,
+            )
+        t, k, a = S._related_bucket_counts(out)
+        self.assertEqual((t, k, a), (5, 5, 3))
+        self.assertEqual(out[0]["code"], "THM-001")
+
+    def test_stills_backfill_keeps_existing(self):
+        payload = {
+            "ok": True,
+            "code": "NHDTC-099",
+            "cid": "1nhdtc00099",
+            "stills": ["https://example.com/keep.jpg"],
+        }
+        S._backfill_main_stills(payload)
+        self.assertEqual(payload["stills"][0], "https://example.com/keep.jpg")
+        self.assertGreaterEqual(len(payload["stills"]), 2)
+        self.assertTrue(all("keep.jpg" in u or "1nhdtc00099" in u for u in payload["stills"]))
+
+    def test_put_unions_stills_without_wipe(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            S._OFFLINE_CACHE_PATH = Path(tmp.name) / "offline-cache.json"
+            S.offline_cache_put(
+                {
+                    "ok": True,
+                    "code": "NHDTC-099",
+                    "title": "t",
+                    "cover": "https://example.com/c.jpg",
+                    "stills": ["https://example.com/old.jpg"],
+                }
+            )
+            S.offline_cache_put(
+                {
+                    "ok": True,
+                    "code": "NHDTC-099",
+                    "title": "t",
+                    "cover": "https://example.com/c.jpg",
+                    "stills": ["https://example.com/new.jpg"],
+                }
+            )
+            hit = S.offline_cache_get(code="NHDTC-099")
+            self.assertIn("https://example.com/old.jpg", hit["stills"])
+            self.assertIn("https://example.com/new.jpg", hit["stills"])
+        finally:
+            S._OFFLINE_CACHE_PATH = None
+            tmp.cleanup()
+
+    def test_enrich_adds_related_without_dropping_seed(self):
+        tmp = tempfile.TemporaryDirectory()
+        try:
+            S._OFFLINE_CACHE_PATH = Path(tmp.name) / "offline-cache.json"
+            seed_rel = [
+                {
+                    "code": "AAA-001",
+                    "title": "keep me",
+                    "title_zh": "留下",
+                    "cover": "https://example.com/1.jpg",
+                    "line": "theme",
+                    "why": "片名相近",
+                }
+            ]
+            S.offline_cache_put(
+                {
+                    "ok": True,
+                    "code": "NHDTC-099",
+                    "title": "息子の家庭教師とセックスしています",
+                    "title_zh": "主中文",
+                    "cover": "https://example.com/c.jpg",
+                    "stills": ["https://example.com/s.jpg"],
+                    "related_by_title": seed_rel,
+                    "actress": "誰か",
+                }
+            )
+            extra = [
+                {
+                    "code": "AAA-002",
+                    "title": "new theme",
+                    "line": "theme",
+                    "why": "片名相近",
+                    "cover": "https://example.com/2.jpg",
+                }
+            ]
+
+            def fake_find(*args, **kwargs):
+                seed = list(kwargs.get("seed") or [])
+                return seed + extra
+
+            hit = S.offline_cache_get(code="NHDTC-099")
+            with mock.patch.object(S, "find_related_by_title", side_effect=fake_find), mock.patch.object(
+                S, "resolve_chinese_title", side_effect=AssertionError("zh already present")
+            ):
+                out = S.enrich_offline_cache_hit(hit)
+            codes = [r["code"] for r in out["related_by_title"]]
+            self.assertEqual(codes[0], "AAA-001")
+            self.assertIn("AAA-002", codes)
+            self.assertEqual(out["related_by_title"][0]["title_zh"], "留下")
+            self.assertEqual(out["stills"][0], "https://example.com/s.jpg")
+        finally:
+            S._OFFLINE_CACHE_PATH = None
+            tmp.cleanup()
 
 
 class TestEntryId(unittest.TestCase):

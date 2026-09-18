@@ -2749,6 +2749,13 @@ def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
 OFFLINE_CACHE_MAX = 500
 # Soft wall-clock for filling missing title_zh on cache hits (main + related).
 OFFLINE_CACHE_TITLE_ZH_BUDGET = 3.0
+# Incremental related top-up on cache hits (skip buckets already at cap).
+OFFLINE_CACHE_RELATED_BUDGET = 8.0
+# Related maxima (caps, not quotas — never pad with junk).
+RELATED_THEME_CAP = 5
+RELATED_KEYWORD_CAP = 5
+RELATED_ACTRESS_CAP = 3
+STILLS_TARGET = 10
 _OFFLINE_CACHE_MEM_LOCK = threading.Lock()
 _OFFLINE_CACHE_PATH: Path | None = None
 
@@ -2845,27 +2852,103 @@ def _related_cache_item_key(it: dict | None) -> str | None:
     return _offline_cache_entry_id(str(it.get("code"))) or str(it.get("code"))
 
 
+def _related_line_of(x: dict | None) -> str:
+    if not isinstance(x, dict):
+        return "theme"
+    ln = str(x.get("line") or "")
+    why = str(x.get("why") or "")
+    if ln in {"theme", "title"} or "片名" in why or "主題" in why:
+        return "theme"
+    if ln == "keyword" or "關鍵字" in why:
+        return "keyword"
+    if ln == "actress" or "演員" in why or "女優" in why:
+        return "actress"
+    return ln or "theme"
+
+
+def _related_bucket_counts(items) -> tuple[int, int, int]:
+    t = k = a = 0
+    for x in items or []:
+        if not isinstance(x, dict):
+            continue
+        ln = _related_line_of(x)
+        if ln == "theme":
+            t += 1
+        elif ln == "keyword":
+            k += 1
+        elif ln == "actress":
+            a += 1
+    return t, k, a
+
+
+def _cap_related_buckets(items) -> list[dict]:
+    """Keep existing order within each bucket; enforce 5+5+3 maxima; no padding."""
+    theme: list[dict] = []
+    keyword: list[dict] = []
+    actress: list[dict] = []
+    seen: set[str] = set()
+    for x in items or []:
+        if not isinstance(x, dict) or not x.get("code"):
+            continue
+        rc = (
+            format_display_code(str(x.get("code")))
+            if parse_code_parts(str(x.get("code")))
+            else ""
+        )
+        if not rc or rc in seen:
+            continue
+        seen.add(rc)
+        item = dict(x)
+        item["code"] = rc
+        item["line"] = _related_line_of(item)
+        ln = item["line"]
+        if ln == "theme" and len(theme) < RELATED_THEME_CAP:
+            theme.append(item)
+        elif ln == "keyword" and len(keyword) < RELATED_KEYWORD_CAP:
+            keyword.append(item)
+        elif ln == "actress" and len(actress) < RELATED_ACTRESS_CAP:
+            actress.append(item)
+    keyword.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
+    return theme + keyword[:RELATED_KEYWORD_CAP] + actress
+
+
+def _merge_unique_urls(primary, secondary, *, cap: int = 20) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for u in list(primary or []) + list(secondary or []):
+        s = str(u or "").strip()
+        if not s or is_now_printing_url(s) or s in seen:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= cap:
+            break
+    return out
+
+
 def _merge_related_for_cache(prev_items, new_items) -> list:
-    """Keep new related order; fill missing title_zh/cover from the previous entry."""
-    if not new_items:
-        return list(prev_items or []) if prev_items else []
-    prev_by: dict = {}
-    for it in prev_items or []:
-        k = _related_cache_item_key(it) if isinstance(it, dict) else None
-        if k:
-            prev_by[k] = it
-    out: list[dict] = []
-    for it in new_items:
+    """Union by code: keep existing good fields, append new codes, then cap 5+5+3."""
+    by_key: dict = {}
+    order: list[str] = []
+    for it in list(prev_items or []) + list(new_items or []):
         if not isinstance(it, dict):
             continue
-        merged = dict(it)
-        prev = prev_by.get(_related_cache_item_key(merged) or "")
-        if isinstance(prev, dict):
-            for field in ("title", "title_zh", "actress", "cover", "cid", "line", "why"):
-                if not merged.get(field) and prev.get(field):
-                    merged[field] = prev[field]
-        out.append(merged)
-    return out
+        k = _related_cache_item_key(it)
+        if not k:
+            continue
+        if k not in by_key:
+            by_key[k] = dict(it)
+            order.append(k)
+            continue
+        merged = dict(by_key[k])
+        incoming = dict(it)
+        for field in ("title", "title_zh", "actress", "cover", "cid", "line", "why"):
+            if not merged.get(field) and incoming.get(field):
+                merged[field] = incoming[field]
+        if incoming.get("stills"):
+            merged["stills"] = _merge_unique_urls(merged.get("stills"), incoming.get("stills"))
+        by_key[k] = merged
+    return _cap_related_buckets([by_key[k] for k in order])
 
 
 def _payload_needs_title_zh(payload: dict) -> bool:
@@ -2889,40 +2972,97 @@ def _payload_needs_title_zh(payload: dict) -> bool:
     return False
 
 
-def _count_title_zh_fields(payload: dict) -> int:
-    n = 1 if str(payload.get("title_zh") or "").strip() else 0
-    seen: set[str] = set()
-    for key in ("related_by_title", "related"):
-        items = payload.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            k = _related_cache_item_key(item)
-            if k and k in seen:
-                continue
-            if k:
-                seen.add(k)
-            if str(item.get("title_zh") or "").strip():
-                n += 1
-    return n
+def _related_needs_backfill(payload: dict) -> bool:
+    """True when a related bucket is under its cap and we have a way to fill it."""
+    rel = payload.get("related_by_title") or payload.get("related") or []
+    if not isinstance(rel, list):
+        rel = []
+    t, k, a = _related_bucket_counts(rel)
+    title = str(payload.get("title") or "")
+    actress = str(payload.get("actress") or "").strip()
+    if t < RELATED_THEME_CAP and is_usable_title(title):
+        return True
+    if k < RELATED_KEYWORD_CAP and is_usable_title(title):
+        return True
+    if a < RELATED_ACTRESS_CAP and actress:
+        return True
+    return False
+
+
+def _backfill_main_stills(payload: dict) -> None:
+    """Keep existing stills; only add unique CDN URLs if under STILLS_TARGET.
+
+    Does not download — still_urls are deterministic CDN paths from cid.
+    """
+    existing = payload.get("stills") if isinstance(payload.get("stills"), list) else []
+    kept = _merge_unique_urls(existing, [], cap=20)
+    if len(kept) >= STILLS_TARGET:
+        payload["stills"] = kept
+        return
+    cid = str(payload.get("cid") or "").strip()
+    extra = still_urls(cid, STILLS_TARGET) if cid else []
+    payload["stills"] = _merge_unique_urls(kept, extra, cap=20)
+
+
+def _payload_enrichment_fingerprint(payload: dict) -> tuple:
+    rel = payload.get("related_by_title") if isinstance(payload.get("related_by_title"), list) else []
+    keys = tuple(
+        _related_cache_item_key(x) or ""
+        for x in rel
+        if isinstance(x, dict)
+    )
+    zh = tuple(str((x or {}).get("title_zh") or "") for x in rel if isinstance(x, dict))
+    return (
+        str(payload.get("title_zh") or ""),
+        tuple(str(u) for u in (payload.get("stills") or [])),
+        keys,
+        zh,
+    )
 
 
 def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) -> dict:
-    """Fill missing title_zh on a cache hit, then merge back into offline cache.
+    """Incremental backfill for a cache/history hit, then merge-put.
 
-    Live identify runs attach_chinese_titles via attach_related_by_title.
-    Cache hits used to return early (identify_code / pipeline) and skip that,
-    so related stayed Japanese-only — including entries stored before title_zh.
+    Keep existing cover/stills/related. Only fill gaps: missing title_zh,
+    related buckets under 5/5/3, extra still URLs if under target.
+    Skip network for buckets already at cap.
     """
     if not isinstance(payload, dict):
         return payload
-    if payload.get("chinese_titles_attached"):
+    if payload.get("cache_backfilled") or payload.get("chinese_titles_attached"):
         return payload
-    payload.setdefault("related_by_title", payload.get("related_by_title") or [])
+    payload.setdefault(
+        "related_by_title",
+        payload.get("related_by_title") or payload.get("related") or [],
+    )
     payload.setdefault("related", payload.get("related") or [])
-    before = _count_title_zh_fields(payload)
+    before = _payload_enrichment_fingerprint(payload)
+    try:
+        _backfill_main_stills(payload)
+    except Exception:
+        pass
+    try:
+        if _related_needs_backfill(payload):
+            rel = [x for x in (payload.get("related_by_title") or []) if isinstance(x, dict)]
+            t, k, a = _related_bucket_counts(rel)
+            filled = find_related_by_title(
+                payload.get("title"),
+                exclude_code=str(payload.get("code") or "") if payload.get("code") else None,
+                max_n=RELATED_THEME_CAP,
+                actress=payload.get("actress"),
+                budget_sec=OFFLINE_CACHE_RELATED_BUDGET,
+                seed=rel,
+                fill_theme=t < RELATED_THEME_CAP,
+                fill_keyword=k < RELATED_KEYWORD_CAP,
+                fill_actress=a < RELATED_ACTRESS_CAP,
+            )
+            payload["related_by_title"] = _merge_related_for_cache(rel, filled)
+        else:
+            payload["related_by_title"] = _cap_related_buckets(
+                payload.get("related_by_title") or []
+            )
+    except Exception:
+        pass
     try:
         if _payload_needs_title_zh(payload):
             attach_chinese_titles(
@@ -2932,9 +3072,10 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
             )
     except Exception:
         pass
+    payload["cache_backfilled"] = True
     payload["chinese_titles_attached"] = True
     try:
-        if _count_title_zh_fields(payload) > before:
+        if _payload_enrichment_fingerprint(payload) != before:
             offline_cache_put(payload, image_hash=image_hash)
     except Exception:
         pass
@@ -3144,8 +3285,7 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                             value[field] = prev[field]
                     if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
                         value["cover"] = prev.get("cover")
-                    if not value.get("stills") and prev.get("stills"):
-                        value["stills"] = prev["stills"]
+                    value["stills"] = _merge_unique_urls(prev.get("stills"), value.get("stills"), cap=20)
                     value["related_by_title"] = _merge_related_for_cache(
                         prev.get("related_by_title"),
                         value.get("related_by_title"),
@@ -4547,6 +4687,11 @@ def find_related_by_title(
     max_n: int = 5,
     actress: str | None = None,
     budget_sec: float = 8.0,
+    *,
+    seed: list | None = None,
+    fill_theme: bool | None = None,
+    fill_keyword: bool | None = None,
+    fill_actress: bool | None = None,
 ) -> list[dict]:
     """Related works in three independent buckets (caps, not quotas):
 
@@ -4556,26 +4701,33 @@ def find_related_by_title(
 
     Order: title → keyword → actress. Deduplicate by code. Never pad with junk;
     empty/short buckets are fine. Soft deadline for identify.
+
+    seed: existing related to keep (incremental backfill). fill_* default to
+    True only when that bucket is under its cap after seeding.
     """
     import time as _time
 
     title = normalize_ocr_title(title) or (title or "").strip()
-    title_cap = max(0, min(int(max_n) if max_n else 5, 5))
-    keyword_cap = 5
-    actress_cap = 3
+    title_cap = max(0, min(int(max_n) if max_n else RELATED_THEME_CAP, RELATED_THEME_CAP))
+    keyword_cap = RELATED_KEYWORD_CAP
+    actress_cap = RELATED_ACTRESS_CAP
     if title_cap <= 0 or not is_usable_title(title):
-        # Still allow actress-only when title unusable but actress known
-        if (actress or "").strip():
+        # Keep any seeded related; only actress-fill if that bucket is short
+        seeded = _cap_related_buckets(seed or [])
+        _t, _k, a_n = _related_bucket_counts(seeded)
+        want_act = fill_actress if fill_actress is not None else True
+        if want_act and (actress or "").strip() and a_n < actress_cap:
             try:
-                return _find_related_by_actress(
+                extra = _find_related_by_actress(
                     actress,
                     exclude_code=exclude_code,
-                    max_n=actress_cap,
+                    max_n=actress_cap - a_n,
                     budget_sec=min(5.0, float(budget_sec) if budget_sec else 5.0),
-                )[:actress_cap]
+                )
+                seeded = _cap_related_buckets(list(seeded) + list(extra or []))
             except Exception:
-                return []
-        return []
+                pass
+        return seeded
     t0 = _time.monotonic()
     budget = float(budget_sec) if budget_sec and budget_sec > 0 else 8.0
 
@@ -4593,6 +4745,27 @@ def find_related_by_title(
         exclude = format_display_code(str(exclude_code))
     seen: set[str] = {exclude} if exclude else set()
     out: list[dict] = []
+    for raw in seed or []:
+        if not isinstance(raw, dict):
+            continue
+        code_raw = str(raw.get("code") or "").strip()
+        if not code_raw or not parse_code_parts(code_raw):
+            continue
+        code = format_display_code(code_raw)
+        if code in seen:
+            continue
+        seen.add(code)
+        item = dict(raw)
+        item["code"] = code
+        item["line"] = _related_line_of(item)
+        out.append(item)
+    theme_n0, keyword_n0, actress_n0 = _related_bucket_counts(out)
+    if fill_theme is None:
+        fill_theme = theme_n0 < title_cap
+    if fill_keyword is None:
+        fill_keyword = keyword_n0 < keyword_cap
+    if fill_actress is None:
+        fill_actress = actress_n0 < actress_cap
     keywords = _extract_title_theme_keywords(title, actress=actress)
     phrases = _title_sibling_phrases(title)
 
@@ -4612,7 +4785,7 @@ def find_related_by_title(
 
     # --- 1) Title / same-series (cap 5, no pad) ---
     hit = None
-    if _left_title() > 1.0:
+    if fill_theme and _left_title() > 1.0:
         try:
             hit = search_by_title(title, actress=actress)
         except Exception:
@@ -4661,7 +4834,7 @@ def find_related_by_title(
 
     # Sibling phrase catalog search (series templates / mid-title hooks)
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
-    if theme_n < title_cap and _left_title() > 1.2:
+    if fill_theme and theme_n < title_cap and _left_title() > 1.2:
         queries: list[str] = []
         try:
             for q in title_query_variants(title)[1:6]:
@@ -4708,7 +4881,7 @@ def find_related_by_title(
 
     # Demo theme package ONLY for the MIDA-616 offline demo path
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
-    if theme_n < title_cap and exclude and is_mida616(exclude):
+    if fill_theme and theme_n < title_cap and exclude and is_mida616(exclude):
         try:
             for r in related_from_demo():
                 why = str(r.get("why") or "")
@@ -4725,7 +4898,7 @@ def find_related_by_title(
 
     # --- 2) Keywords — independent bucket (cap 5), always try when keywords exist ---
     keyword_items_added = 0
-    if keywords and _left() >= 1.2:
+    if fill_keyword and keywords and _left() >= 1.2:
         try:
             for r in _find_related_by_keywords(
                 title,
@@ -4754,7 +4927,7 @@ def find_related_by_title(
     keyword_n = sum(1 for x in out if str(x.get("line")) == "keyword")
 
     # --- 3) Actress — independent bucket (cap 3), always try when actress known ---
-    if (actress or "").strip() and _left() >= 0.8:
+    if fill_actress and (actress or "").strip() and _left() >= 0.8:
         try:
             for r in _find_related_by_actress(
                 actress,
@@ -4771,7 +4944,8 @@ def find_related_by_title(
 
     # Demo actress siblings for MIDA when online actress search is empty
     if (
-        actress
+        fill_actress
+        and actress
         and not any(str(x.get("line")) == "actress" for x in out)
         and exclude
         and is_mida616(exclude)
@@ -4824,148 +4998,44 @@ def attach_related_by_title(
     code = result.get("code")
     if code and (str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code))):
         code = None
-    if "related_by_title" not in result:
+    existing = result.get("related_by_title")
+    had_existing = isinstance(existing, list) and bool(existing)
+    if not had_existing:
         try:
             result["related_by_title"] = find_related_by_title(
                 title,
                 exclude_code=str(code) if code else None,
-                max_n=5,
+                max_n=RELATED_THEME_CAP,
                 actress=result.get("actress"),
                 budget_sec=max(budget_sec, 16.0),
             )
         except Exception:
             result["related_by_title"] = []
     else:
-        main = format_display_code(str(code)) if code and parse_code_parts(str(code)) else ""
-        cleaned = []
-        seen: set[str] = {main} if main else set()
-        for r in result.get("related_by_title") or []:
-            if not isinstance(r, dict):
-                continue
-            rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-            if not rc or rc in seen:
-                continue
-            seen.add(rc)
-            item = enrich_title_candidate(r, why=str(r.get("why") or "片名相近"))
-            item["line"] = r.get("line") or "theme"
-            if r.get("title_zh") and not item.get("title_zh"):
-                item["title_zh"] = r.get("title_zh")
-            cleaned.append(item)
-            if len(cleaned) >= 13:
-                break
-        result["related_by_title"] = cleaned
-
-    # Ensure each independent bucket is filled up to its cap when possible
-    try:
-        rel = list(result.get("related_by_title") or [])
-        seen_codes: set[str] = set()
-        main = format_display_code(str(code)) if code and parse_code_parts(str(code)) else ""
-        if main:
-            seen_codes.add(main)
-        for r in rel:
-            rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-            if rc:
-                seen_codes.add(rc)
-
-        def _line_of(x: dict) -> str:
-            ln = str(x.get("line") or "")
-            why = str(x.get("why") or "")
-            if ln in {"theme", "title"} or "片名" in why or "主題" in why:
-                return "theme"
-            if ln == "keyword" or "關鍵字" in why:
-                return "keyword"
-            if ln == "actress" or "演員" in why or "女優" in why:
-                return "actress"
-            return ln or "theme"
-
-        theme_n = sum(1 for x in rel if _line_of(x) == "theme")
-        kw_n = sum(1 for x in rel if _line_of(x) == "keyword")
-        act_n = sum(1 for x in rel if _line_of(x) == "actress")
-        title_cap, keyword_cap, actress_cap = 5, 5, 3
-
-        # Keywords: independent top-up to cap 5 (only real matches)
-        if (
-            kw_n < keyword_cap
-            and is_usable_title(str(title or ""))
-        ):
-            kw_budget = max(3.0, min(7.0, float(budget_sec) if budget_sec else 6.0))
-            phrases = _title_sibling_phrases(str(title or ""))
-            kws = _extract_title_theme_keywords(str(title or ""), actress=result.get("actress"))
-            if kws:
-                for r in _find_related_by_keywords(
-                    str(title or ""),
+        # Keep existing related as-is (no re-probe / no wipe); cap 5+5+3
+        result["related_by_title"] = _cap_related_buckets(existing)
+        # Incremental top-up: only buckets still under cap (skip network when full)
+        try:
+            rel = list(result.get("related_by_title") or [])
+            t, k, a = _related_bucket_counts(rel)
+            need_theme = t < RELATED_THEME_CAP and is_usable_title(str(title or ""))
+            need_kw = k < RELATED_KEYWORD_CAP and is_usable_title(str(title or ""))
+            need_act = a < RELATED_ACTRESS_CAP and bool((result.get("actress") or "").strip())
+            if need_theme or need_kw or need_act:
+                filled = find_related_by_title(
+                    title,
                     exclude_code=str(code) if code else None,
+                    max_n=RELATED_THEME_CAP,
                     actress=result.get("actress"),
-                    max_n=keyword_cap - kw_n,
-                    budget_sec=kw_budget,
-                    already=seen_codes,
-                ):
-                    rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-                    if not rc or rc in seen_codes:
-                        continue
-                    ok, _sc = _is_title_theme_match(
-                        str(title or ""), str(r.get("title") or ""), keywords=kws, phrases=phrases
-                    )
-                    if ok and theme_n < title_cap:
-                        r = dict(r)
-                        r["line"] = "theme"
-                        r["why"] = "片名相近"
-                        theme_n += 1
-                    else:
-                        r = dict(r)
-                        r["line"] = "keyword"
-                        r["why"] = str(r.get("why") or "名稱關鍵字")
-                        kw_n += 1
-                    seen_codes.add(rc)
-                    rel.append(r)
-                    if theme_n >= title_cap and kw_n >= keyword_cap:
-                        break
-                    if kw_n >= keyword_cap and theme_n >= title_cap:
-                        break
-
-        theme_n = sum(1 for x in rel if _line_of(x) == "theme")
-        kw_n = sum(1 for x in rel if _line_of(x) == "keyword")
-        act_n = sum(1 for x in rel if _line_of(x) == "actress")
-
-        # Actress: independent top-up to cap 3
-        if act_n < actress_cap and (result.get("actress") or "").strip():
-            for r in _find_related_by_actress(
-                result.get("actress"),
-                exclude_code=str(code) if code else None,
-                max_n=actress_cap - act_n,
-                budget_sec=min(4.0, float(budget_sec) if budget_sec else 4.0),
-                already=seen_codes,
-            ):
-                rc = format_display_code(str(r.get("code") or "")) if r.get("code") else ""
-                if not rc or rc in seen_codes:
-                    continue
-                seen_codes.add(rc)
-                r = dict(r)
-                r["line"] = "actress"
-                r["why"] = str(r.get("why") or "同演員")
-                rel.append(r)
-                act_n += 1
-                if act_n >= actress_cap:
-                    break
-
-        theme_items = [x for x in rel if _line_of(x) == "theme"][:title_cap]
-        keyword_items = [x for x in rel if _line_of(x) == "keyword"][:keyword_cap]
-        actress_items = [x for x in rel if _line_of(x) == "actress"][:actress_cap]
-        keyword_items.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
-        ordered = []
-        seen_o: set[str] = set()
-        for bucket in (theme_items, keyword_items, actress_items):
-            for x in bucket:
-                rc = format_display_code(str(x.get("code") or "")) if x.get("code") else ""
-                if not rc or rc in seen_o:
-                    continue
-                seen_o.add(rc)
-                x = dict(x)
-                x["line"] = _line_of(x)
-                ordered.append(x)
-        result["related_by_title"] = ordered[:13]
-    except Exception:
-        pass
+                    budget_sec=max(budget_sec, 16.0),
+                    seed=rel,
+                    fill_theme=need_theme,
+                    fill_keyword=need_kw,
+                    fill_actress=need_act,
+                )
+                result["related_by_title"] = _merge_related_for_cache(rel, filled)
+        except Exception:
+            pass
 
     # Attach Chinese titles on related + main when missing
     try:
@@ -6053,11 +6123,11 @@ def run_identify_pipeline(
         detail = "完成，進入畫廊"
         if n_extra >= 2:
             detail = f"完成，列出 {n_extra} 個番號候選"
-        # related_by_title — skip network re-search when served from offline cache,
-        # but still fill missing Chinese titles (old cache entries may lack title_zh).
+        # related_by_title — skip full re-search when served from offline cache;
+        # incremental backfill fills title_zh + remaining 5/5/3 related slots.
         if result.get("from_offline_cache"):
             result.setdefault("related_by_title", result.get("related_by_title") or [])
-            if not result.get("chinese_titles_attached"):
+            if not result.get("cache_backfilled") and not result.get("chinese_titles_attached"):
                 result = enrich_offline_cache_hit(result, image_hash=img_hash)
             detail = "完成（離線快取）"
         elif not skip_related:

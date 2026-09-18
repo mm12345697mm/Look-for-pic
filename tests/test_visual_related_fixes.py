@@ -112,7 +112,6 @@ class TestEnforceVisualSameWork(unittest.TestCase):
 
 class TestRelatedCaps(unittest.TestCase):
     def test_bucket_reorder_and_caps(self):
-        # Simulate find_related_by_title final ordering logic with caps
         items = []
         for i in range(7):
             items.append({"code": f"AAA-{i+1:03d}", "line": "theme", "why": "片名相近"})
@@ -121,16 +120,11 @@ class TestRelatedCaps(unittest.TestCase):
         for i in range(5):
             items.append({"code": f"CCC-{i+1:03d}", "line": "actress", "why": "同演員"})
 
-        title_cap, keyword_cap, actress_cap = 5, 5, 3
-        theme_items = [x for x in items if x["line"] == "theme"][:title_cap]
-        keyword_items = [x for x in items if x["line"] == "keyword"][:keyword_cap]
-        actress_items = [x for x in items if x["line"] == "actress"][:actress_cap]
-        keyword_items.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
-        ordered = theme_items + keyword_items + actress_items
+        ordered = S._cap_related_buckets(items)
 
-        self.assertEqual(len(theme_items), 5)
-        self.assertEqual(len(keyword_items), 5)
-        self.assertEqual(len(actress_items), 3)
+        self.assertEqual(sum(1 for x in ordered if x["line"] == "theme"), 5)
+        self.assertEqual(sum(1 for x in ordered if x["line"] == "keyword"), 5)
+        self.assertEqual(sum(1 for x in ordered if x["line"] == "actress"), 3)
         self.assertEqual(ordered[0]["line"], "theme")
         self.assertEqual(ordered[5]["line"], "keyword")
         self.assertEqual(ordered[10]["line"], "actress")
