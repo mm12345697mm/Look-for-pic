@@ -2765,9 +2765,12 @@ def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
 # --- Offline identify cache (server-side, persists successful lookups) ---
 OFFLINE_CACHE_MAX = 500
 # Soft wall-clock for filling missing title_zh on cache hits (main + related).
-OFFLINE_CACHE_TITLE_ZH_BUDGET = 3.0
+# Staged across visits: skip items that already have title_zh, fill more next open.
+OFFLINE_CACHE_TITLE_ZH_BUDGET = 8.0
 # Incremental related top-up on cache hits (skip buckets already at cap).
 OFFLINE_CACHE_RELATED_BUDGET = 8.0
+# History / related-by-title API: Chinese fill for related slides this request.
+HISTORY_RELATED_TITLE_ZH_BUDGET = 8.0
 # Related maxima (caps, not quotas — never pad with junk).
 RELATED_THEME_CAP = 5
 RELATED_KEYWORD_CAP = 5
@@ -2856,6 +2859,7 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "cid": it.get("cid"),
                 "line": it.get("line"),
                 "why": it.get("why"),
+                "stills": list(it.get("stills") or [])[:10] if isinstance(it.get("stills"), list) else [],
             }
         )
         if len(slim) >= 13:
@@ -2968,23 +2972,28 @@ def _merge_related_for_cache(prev_items, new_items) -> list:
     return _cap_related_buckets([by_key[k] for k in order])
 
 
+def _item_needs_title_zh(item: dict | None) -> bool:
+    """True when a coded work is missing title_zh. Never invent Chinese."""
+    if not isinstance(item, dict):
+        return False
+    code = item.get("code")
+    if not code or str(code) in ("TITLE-SEARCH", "片名搜尋") or not parse_code_parts(str(code)):
+        return False
+    return not str(item.get("title_zh") or "").strip()
+
+
 def _payload_needs_title_zh(payload: dict) -> bool:
     """True when main or any coded related slide is missing title_zh."""
     if not isinstance(payload, dict):
         return False
-    if not str(payload.get("title_zh") or "").strip():
+    if _item_needs_title_zh(payload):
         return True
     for key in ("related_by_title", "related"):
         items = payload.get(key)
         if not isinstance(items, list):
             continue
         for item in items:
-            if not isinstance(item, dict):
-                continue
-            code = item.get("code")
-            if not code or not parse_code_parts(str(code)):
-                continue
-            if not str(item.get("title_zh") or "").strip():
+            if _item_needs_title_zh(item):
                 return True
     return False
 
@@ -3006,19 +3015,51 @@ def _related_needs_backfill(payload: dict) -> bool:
     return False
 
 
-def _backfill_main_stills(payload: dict) -> None:
-    """Keep existing stills; only add unique CDN URLs if under STILLS_TARGET.
+def _payload_stills_need_fill(payload: dict) -> bool:
+    """True when main or a related item with cid is under STILLS_TARGET."""
+    if not isinstance(payload, dict):
+        return False
+    stills = payload.get("stills") if isinstance(payload.get("stills"), list) else []
+    cid = str(payload.get("cid") or "").strip()
+    if cid and len(_merge_unique_urls(stills, [], cap=20)) < STILLS_TARGET:
+        return True
+    for item in payload.get("related_by_title") or payload.get("related") or []:
+        if not isinstance(item, dict):
+            continue
+        icid = str(item.get("cid") or "").strip()
+        if not icid:
+            continue
+        istills = item.get("stills") if isinstance(item.get("stills"), list) else []
+        if len(_merge_unique_urls(istills, [], cap=20)) < STILLS_TARGET:
+            return True
+    return False
 
-    Does not download — still_urls are deterministic CDN paths from cid.
-    """
-    existing = payload.get("stills") if isinstance(payload.get("stills"), list) else []
+
+def _payload_needs_enrichment(payload: dict) -> bool:
+    """Fingerprint of remaining gaps — skip network only when nothing is left to fill."""
+    return (
+        _payload_needs_title_zh(payload)
+        or _related_needs_backfill(payload)
+        or _payload_stills_need_fill(payload)
+    )
+
+
+def _backfill_item_stills(item: dict) -> None:
+    if not isinstance(item, dict):
+        return
+    existing = item.get("stills") if isinstance(item.get("stills"), list) else []
     kept = _merge_unique_urls(existing, [], cap=20)
     if len(kept) >= STILLS_TARGET:
-        payload["stills"] = kept
+        item["stills"] = kept
         return
-    cid = str(payload.get("cid") or "").strip()
+    cid = str(item.get("cid") or "").strip()
     extra = still_urls(cid, STILLS_TARGET) if cid else []
-    payload["stills"] = _merge_unique_urls(kept, extra, cap=20)
+    item["stills"] = _merge_unique_urls(kept, extra, cap=20)
+
+
+def _backfill_main_stills(payload: dict) -> None:
+    """Keep existing stills; only add unique CDN URLs if under STILLS_TARGET."""
+    _backfill_item_stills(payload)
 
 
 def _payload_enrichment_fingerprint(payload: dict) -> tuple:
@@ -3043,10 +3084,13 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     Keep existing cover/stills/related. Only fill gaps: missing title_zh,
     related buckets under 5/5/3, extra still URLs if under target.
     Skip network for buckets already at cap.
+
+    cache_backfilled / chinese_titles_attached mean "attempted this request"
+    only — they must not freeze an incomplete payload on later re-query.
     """
     if not isinstance(payload, dict):
         return payload
-    if payload.get("cache_backfilled") or payload.get("chinese_titles_attached"):
+    if not _payload_needs_enrichment(payload):
         return payload
     payload.setdefault(
         "related_by_title",
@@ -3055,7 +3099,9 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     payload.setdefault("related", payload.get("related") or [])
     before = _payload_enrichment_fingerprint(payload)
     try:
-        _backfill_main_stills(payload)
+        _backfill_item_stills(payload)
+        for item in payload.get("related_by_title") or []:
+            _backfill_item_stills(item)
     except Exception:
         pass
     try:
@@ -3089,6 +3135,7 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
             )
     except Exception:
         pass
+    # Attempt markers for this request only — next open still checks gaps.
     payload["cache_backfilled"] = True
     payload["chinese_titles_attached"] = True
     try:
@@ -5054,9 +5101,13 @@ def attach_related_by_title(
         except Exception:
             pass
 
-    # Attach Chinese titles on related + main when missing
+    # Attach Chinese titles on related + main when missing (per-request budget)
     try:
-        attach_chinese_titles(result)
+        attach_chinese_titles(
+            result,
+            related_network=True,
+            related_budget_sec=OFFLINE_CACHE_TITLE_ZH_BUDGET,
+        )
     except Exception:
         pass
 
@@ -5074,7 +5125,11 @@ def attach_related_by_title(
                 fixed.append(enrich_title_candidate(r, why=str(r.get("why") or "片名相近")))
             item["related_by_title"] = fixed[:13]
             try:
-                attach_chinese_titles(item)
+                attach_chinese_titles(
+                    item,
+                    related_network=True,
+                    related_budget_sec=OFFLINE_CACHE_TITLE_ZH_BUDGET,
+                )
             except Exception:
                 pass
             continue
@@ -5090,7 +5145,11 @@ def attach_related_by_title(
                 actress=item.get("actress"),
                 budget_sec=min(budget_sec, 10.0),
             )
-            attach_chinese_titles(item)
+            attach_chinese_titles(
+                item,
+                related_network=True,
+                related_budget_sec=OFFLINE_CACHE_TITLE_ZH_BUDGET,
+            )
         except Exception:
             item["related_by_title"] = []
     return result
@@ -6144,8 +6203,9 @@ def run_identify_pipeline(
         # incremental backfill fills title_zh + remaining 5/5/3 related slots.
         if result.get("from_offline_cache"):
             result.setdefault("related_by_title", result.get("related_by_title") or [])
-            if not result.get("cache_backfilled") and not result.get("chinese_titles_attached"):
-                result = enrich_offline_cache_hit(result, image_hash=img_hash)
+            # Always gap-check: flags from an earlier pass in this request
+            # must not freeze incomplete title_zh / 5/5/3 / stills.
+            result = enrich_offline_cache_hit(result, image_hash=img_hash)
             detail = "完成（離線快取）"
         elif not skip_related:
             try:
@@ -6302,26 +6362,77 @@ def cdn_file():
     )
 
 
-@app.get("/api/related-by-title")
+@app.route("/api/related-by-title", methods=["GET", "POST"])
 def related_by_title_api():
-    """Fetch related works: title≤5 + keyword≤5 + actress≤3 (caps; history detail)."""
-    title = (request.args.get("title") or "").strip()
-    code = (request.args.get("code") or request.args.get("exclude") or "").strip()
-    actress = (request.args.get("actress") or "").strip() or None
+    """Fetch related works: title≤5 + keyword≤5 + actress≤3 (caps; history detail).
+
+    POST may include seed related so we skip filled buckets and fill missing
+    title_zh on existing slides within HISTORY_RELATED_TITLE_ZH_BUDGET.
+    """
+    body = request.get_json(silent=True) if request.method == "POST" else None
+    body = body if isinstance(body, dict) else {}
+    title = (body.get("title") or request.args.get("title") or "").strip()
+    code = (
+        body.get("code")
+        or body.get("exclude")
+        or request.args.get("code")
+        or request.args.get("exclude")
+        or ""
+    ).strip()
+    actress = (body.get("actress") or request.args.get("actress") or "").strip() or None
+    seed = body.get("seed") or body.get("related") or body.get("related_by_title") or []
+    if not isinstance(seed, list):
+        seed = []
+    wrap: dict = {
+        "ok": True,
+        "code": code or None,
+        "title": title,
+        "related_by_title": _cap_related_buckets(seed),
+    }
     try:
-        items = find_related_by_title(title, exclude_code=code or None, max_n=5, actress=actress, budget_sec=16.0)
-        # Light Chinese title attach for API consumers
-        wrap = {"ok": True, "code": code or None, "title": title, "related_by_title": items}
+        rel = wrap["related_by_title"]
+        t, k, a = _related_bucket_counts(rel)
+        need_related = (
+            (t < RELATED_THEME_CAP and is_usable_title(title))
+            or (k < RELATED_KEYWORD_CAP and is_usable_title(title))
+            or (a < RELATED_ACTRESS_CAP and bool(actress))
+        )
+        # Skip the 16s related search when buckets are already at cap so this
+        # pass can spend its wall-clock on missing title_zh instead.
+        if need_related:
+            try:
+                items = find_related_by_title(
+                    title,
+                    exclude_code=code or None,
+                    max_n=5,
+                    actress=actress,
+                    budget_sec=16.0,
+                    seed=rel,
+                    fill_theme=t < RELATED_THEME_CAP,
+                    fill_keyword=k < RELATED_KEYWORD_CAP,
+                    fill_actress=a < RELATED_ACTRESS_CAP,
+                )
+                wrap["related_by_title"] = _merge_related_for_cache(rel, items)
+            except Exception:
+                pass
+        for item in wrap.get("related_by_title") or []:
+            try:
+                _backfill_item_stills(item)
+            except Exception:
+                pass
         try:
-            attach_chinese_titles(wrap)
-            items = wrap.get("related_by_title") or items
+            attach_chinese_titles(
+                wrap,
+                related_network=True,
+                related_budget_sec=HISTORY_RELATED_TITLE_ZH_BUDGET,
+            )
         except Exception:
             pass
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
     return jsonify({
         "ok": True,
-        "related_by_title": items,
+        "related_by_title": wrap.get("related_by_title") or [],
         "title": title,
         "title_zh": wrap.get("title_zh"),
         "exclude": code,

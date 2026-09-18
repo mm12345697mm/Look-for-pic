@@ -127,6 +127,7 @@
       title: r.title || '',
       title_zh: r.title_zh || r.titleZh || '',
       cover: r.cover || '',
+      cid: r.cid || '',
       stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
       why: r.why || '',
       line: relatedLineFromRaw(r),
@@ -186,13 +187,52 @@
     return (related || []).some((r) => r && r.code && !String(r.title_zh || r.titleZh || '').trim());
   }
 
-  function relatedBucketsNeedFill(related) {
+  function relatedBucketsNeedFill(related, opts) {
+    opts = opts || {};
     const counts = { theme: 0, keyword: 0, actress: 0 };
     (related || []).forEach((r) => {
       const ln = relatedLineFromRaw(r);
       if (counts[ln] != null) counts[ln] += 1;
     });
-    return counts.theme < 5 || counts.keyword < 5 || counts.actress < 3;
+    const hasTitle = !!(opts.title && String(opts.title).trim());
+    const hasActress = !!(opts.actress && String(opts.actress).trim());
+    if (hasTitle && counts.theme < 5) return true;
+    if (hasTitle && counts.keyword < 5) return true;
+    if (hasActress && counts.actress < 3) return true;
+    return false;
+  }
+
+  function workNeedsTitleZh(w) {
+    if (!w) return false;
+    const code = String(w.code || '').trim();
+    if (!code || code === '片名搜尋' || !parseCodeParts(code)) return false;
+    return !String(w.title_zh || w.titleZh || '').trim();
+  }
+
+  function workNeedsStillsFill(w) {
+    if (!w || !String(w.cid || '').trim()) return false;
+    const n = (Array.isArray(w.stills) ? w.stills : []).filter(Boolean).length;
+    return n < 10;
+  }
+
+  function backfillWorkStillsLocal(w) {
+    if (!workNeedsStillsFill(w)) return w;
+    const extra = stillUrls(String(w.cid), 10);
+    return Object.assign({}, w, { stills: mergeStillsKeepExisting(w.stills, extra) });
+  }
+
+  function backfillWorkTreeLocal(w) {
+    if (!w) return w;
+    let next = backfillWorkStillsLocal(w);
+    const rel = next.related || [];
+    let relChanged = false;
+    const nextRel = rel.map((r) => {
+      const fr = backfillWorkStillsLocal(r);
+      if (fr !== r) relChanged = true;
+      return fr;
+    });
+    if (relChanged) next = Object.assign({}, next, { related: nextRel });
+    return next;
   }
 
   function mergeStillsKeepExisting(prev, incoming) {
@@ -240,7 +280,7 @@
         return;
       }
       const cur = byKey[k];
-      ['title', 'title_zh', 'cover', 'why', 'line', 'actress'].forEach((f) => {
+      ['title', 'title_zh', 'cover', 'why', 'line', 'actress', 'cid'].forEach((f) => {
         if (!cur[f] && r[f]) cur[f] = r[f];
       });
       cur.stills = mergeStillsKeepExisting(cur.stills, r.stills);
@@ -306,6 +346,7 @@
         cover: rec.cover,
         stills: rec.stills,
         actress: rec.actress,
+        cid: rec.cid || '',
         related: rec.related || [],
         line: 'main',
       },
@@ -326,6 +367,7 @@
       title: src.title || fb.title || '',
       title_zh: src.title_zh || src.titleZh || fb.title_zh || '',
       cover: src.cover || fb.cover || '',
+      cid: src.cid || fb.cid || '',
       stills: Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
       actress: src.actress || fb.actress || '',
       line: lineOut,
@@ -1121,7 +1163,7 @@
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = filename || 'download';
+    a.download = filename || 'image.jpg';
     a.rel = 'noopener';
     document.body.appendChild(a);
     a.click();
@@ -1133,24 +1175,30 @@
     }, 4000);
   }
 
-  async function downloadWorkSequential(w) {
-    const urls = workDownloadUrls(w);
-    if (!urls.length) {
-      showToast('沒有可下載的圖片');
-      return;
-    }
-    for (let i = 0; i < urls.length; i++) {
-      const a = document.createElement('a');
-      a.href = '/api/cdn-file?url=' + encodeURIComponent(urls[i]);
-      a.target = '_blank';
-      a.rel = 'noopener';
-      a.download = '';
-      document.body.appendChild(a);
-      a.click();
-      a.remove();
-      if (i < urls.length - 1) await sleep(350);
-    }
-    showToast('下載中');
+  function workDownloadFilename(code, url, index, coverUrl) {
+    const stem = (code && parseCodeParts(code) ? formatDisplayCode(code) : code) || 'work';
+    const safe = String(stem).replace(/[^A-Za-z0-9._-]+/g, '_') || 'work';
+    if (index === 0 && coverUrl && url === coverUrl) return safe + '-cover.jpg';
+    const n = coverUrl && index > 0 ? index : index + 1;
+    return safe + '-jp-' + String(n).padStart(2, '0') + '.jpg';
+  }
+
+  async function downloadOneImage(url, filename) {
+    const res = await fetch('/api/cdn-file?url=' + encodeURIComponent(url));
+    if (!res.ok) throw new Error('cdn');
+    const buf = await res.arrayBuffer();
+    const blob = new Blob([buf], { type: 'image/jpeg' });
+    triggerBlobDownload(blob, filename);
+  }
+
+  function clickCdnDownload(url, filename) {
+    const a = document.createElement('a');
+    a.href = '/api/cdn-file?url=' + encodeURIComponent(url);
+    a.download = filename || 'image.jpg';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   }
 
   async function downloadWorkMedia(w) {
@@ -1159,26 +1207,18 @@
       showToast('沒有可下載的圖片');
       return;
     }
-    showToast('下載中');
-    try {
-      const res = await fetch('/api/work-zip', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          code: w.code || 'work',
-          cover: w.cover || '',
-          stills: (w.stills || []).slice(0, 12),
-        }),
-      });
-      if (!res.ok) throw new Error('zip_failed');
-      const blob = await res.blob();
-      if (!blob || !blob.size) throw new Error('empty_zip');
-      const stem = (w.code && parseCodeParts(w.code) ? formatDisplayCode(w.code) : w.code) || 'work';
-      triggerBlobDownload(blob, stem + '.zip');
-      showToast('下載中');
-    } catch (_) {
-      await downloadWorkSequential(w);
+    const total = urls.length;
+    for (let i = 0; i < total; i++) {
+      showToast('下載中（' + (i + 1) + '/' + total + '）');
+      const fname = workDownloadFilename(w.code, urls[i], i, w.cover);
+      try {
+        await downloadOneImage(urls[i], fname);
+      } catch (_) {
+        clickCdnDownload(urls[i], fname);
+      }
+      if (i < total - 1) await sleep(450);
     }
+    showToast('下載中（' + total + '/' + total + '）');
   }
 
   /**
@@ -1616,6 +1656,7 @@
         title: w.title,
         title_zh: w.title_zh,
         actress: w.actress,
+        cid: w.cid,
         cover: w.cover,
         stills: w.stills || [],
         related_by_title: w.related || [],
@@ -1624,42 +1665,58 @@
     };
   }
 
+  function persistHistoryWork(recId, workIndex, patch) {
+    const list = loadHistory();
+    const idx = list.findIndex((x) => x.id === recId);
+    if (idx < 0) return;
+    const works = historySessionWorks(list[idx]);
+    if (works[workIndex]) works[workIndex] = Object.assign({}, works[workIndex], patch);
+    list[idx].works = works;
+    if (workIndex === 0 && patch.related) list[idx].related = patch.related;
+    if (patch.title_zh && !list[idx].title_zh) list[idx].title_zh = patch.title_zh;
+    saveHistory(list);
+  }
+
   async function fillWorkRelatedGaps(work, recId, workIndex) {
+    const before = work;
+    work = backfillWorkTreeLocal(work);
+    if (work !== before) {
+      const localPatch = { stills: work.stills, cid: work.cid };
+      if (Array.isArray(work.related)) localPatch.related = work.related;
+      persistHistoryWork(recId, workIndex, localPatch);
+    }
     const related = work.related || [];
     const need =
-      !!work.title &&
-      ((!related || !related.length) || relatedNeedsTitleZh(related) || relatedBucketsNeedFill(related));
+      relatedNeedsTitleZh(related) ||
+      relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
+      workNeedsTitleZh(work);
     if (!need) return work;
     try {
-      const qs =
-        '/api/related-by-title?title=' +
-        encodeURIComponent(work.title) +
-        '&code=' +
-        encodeURIComponent(work.code || '') +
-        (work.actress ? '&actress=' + encodeURIComponent(work.actress) : '');
-      const res = await fetch(qs);
+      const res = await fetch('/api/related-by-title', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          title: work.title || '',
+          code: work.code || '',
+          actress: work.actress || '',
+          seed: related,
+        }),
+      });
       const data = await res.json();
-      if (data && data.ok && Array.isArray(data.related_by_title) && data.related_by_title.length) {
+      if (data && data.ok && Array.isArray(data.related_by_title)) {
         const incoming = data.related_by_title;
         const merged = related && related.length
           ? mergeRelatedIncremental(related, incoming)
           : slimRelatedForHistory(incoming);
-        const patch = { related: merged };
+        const patch = { related: merged, stills: work.stills, cid: work.cid };
         const incomingZh = String(data.title_zh || '').trim();
         if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
           patch.title_zh = incomingZh;
         }
-        work = Object.assign({}, work, patch);
-        const list = loadHistory();
-        const idx = list.findIndex((x) => x.id === recId);
-        if (idx >= 0) {
-          const works = historySessionWorks(list[idx]);
-          if (works[workIndex]) works[workIndex] = Object.assign({}, works[workIndex], patch);
-          list[idx].works = works;
-          if (workIndex === 0) list[idx].related = merged;
-          if (incomingZh && !list[idx].title_zh) list[idx].title_zh = incomingZh;
-          saveHistory(list);
-        }
+        work = backfillWorkTreeLocal(Object.assign({}, work, patch));
+        patch.stills = work.stills;
+        patch.related = work.related;
+        persistHistoryWork(recId, workIndex, patch);
       }
     } catch (_) {}
     return work;
@@ -2229,6 +2286,11 @@
       historyRecordIsOpenable,
       renderHistoryList,
       openHistoryDetail,
+      relatedNeedsTitleZh,
+      relatedBucketsNeedFill,
+      workNeedsTitleZh,
+      workDownloadFilename,
+      workDownloadUrls,
     };
   } catch (_) {}
 })();
