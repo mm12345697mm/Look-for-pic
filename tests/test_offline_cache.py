@@ -280,6 +280,183 @@ class TestOfflineCache(unittest.TestCase):
         self.assertEqual(hit["title"], "real")
 
 
+class TestOfflineCacheChineseTitles(unittest.TestCase):
+    """Cache hits must still fill title_zh on main + related, then merge-put."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.cache_path = Path(self.tmp.name) / "offline-cache.json"
+        S._OFFLINE_CACHE_PATH = self.cache_path
+
+    def tearDown(self):
+        S._OFFLINE_CACHE_PATH = None
+        self.tmp.cleanup()
+
+    def _stored_payload(self, **extra):
+        base = {
+            "ok": True,
+            "code": "NHDTC-099",
+            "title": "日本語タイトル",
+            "cover": "https://example.com/c.jpg",
+            "stills": ["https://example.com/1.jpg"],
+            "related_by_title": [
+                {
+                    "code": "NHDTC-100",
+                    "title": "関連作",
+                    "cover": "https://example.com/r.jpg",
+                    "cid": "x",
+                    "line": "theme",
+                    "why": "片名相近",
+                }
+            ],
+        }
+        base.update(extra)
+        return base
+
+    def _fake_resolve(self, code, title_ja=None, existing_zh=None, user_title=None):
+        c = str(code or "")
+        if c in ("NHDTC-099", "NHDTC-99"):
+            return "中文主標"
+        if c in ("NHDTC-100", "NHDTC-0100"):
+            return "中文相關"
+        return None
+
+    def test_enrich_fills_main_and_related_then_puts(self):
+        S.offline_cache_put(self._stored_payload())
+        hit = S.offline_cache_get(code="NHDTC-099")
+        self.assertIsNotNone(hit)
+        self.assertFalse(hit.get("title_zh"))
+        self.assertFalse((hit.get("related_by_title") or [{}])[0].get("title_zh"))
+        with mock.patch.object(S, "resolve_chinese_title", side_effect=self._fake_resolve):
+            out = S.enrich_offline_cache_hit(hit)
+        self.assertEqual(out.get("title_zh"), "中文主標")
+        self.assertEqual(out["related_by_title"][0].get("title_zh"), "中文相關")
+        self.assertEqual(out.get("cover"), "https://example.com/c.jpg")
+        self.assertEqual(out.get("stills"), ["https://example.com/1.jpg"])
+        # Next get already has Chinese without another network fetch
+        with mock.patch.object(
+            S, "resolve_chinese_title", side_effect=AssertionError("cache should already have zh")
+        ):
+            hit2 = S.offline_cache_get(code="NHDTC-099")
+        self.assertEqual(hit2.get("title_zh"), "中文主標")
+        self.assertEqual(hit2["related_by_title"][0].get("title_zh"), "中文相關")
+        self.assertEqual(hit2.get("cover"), "https://example.com/c.jpg")
+        self.assertEqual(hit2.get("stills"), ["https://example.com/1.jpg"])
+
+    def test_identify_code_cache_hit_no_longer_skips_zh(self):
+        S.offline_cache_put(self._stored_payload())
+        with mock.patch.object(S, "resolve_chinese_title", side_effect=self._fake_resolve):
+            out = S.identify_code("NHDTC-099")
+        self.assertTrue(out.get("from_offline_cache"))
+        self.assertEqual(out.get("title_zh"), "中文主標")
+        rel = out.get("related_by_title") or []
+        self.assertEqual(len(rel), 1)
+        self.assertEqual(rel[0].get("title_zh"), "中文相關")
+
+    def test_pipeline_manual_code_cache_hit_enriches(self):
+        S.offline_cache_put(self._stored_payload())
+        with mock.patch.object(S, "resolve_chinese_title", side_effect=self._fake_resolve):
+            result, status = S.run_identify_pipeline(
+                image_bytes=None,
+                filename=None,
+                user_code="NHDTC-099",
+            )
+        self.assertEqual(status, 200)
+        self.assertTrue(result.get("from_offline_cache"))
+        self.assertEqual(result.get("title_zh"), "中文主標")
+        self.assertEqual(result["related_by_title"][0].get("title_zh"), "中文相關")
+        # cover gate still holds
+        self.assertTrue(S.usable_cover_url(result.get("cover")))
+
+    def test_put_merges_related_title_zh_without_wiping_cover(self):
+        S.offline_cache_put(self._stored_payload(title_zh="中文主標"))
+        # Simulate a thinner put (related missing zh, same cover)
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "NHDTC-099",
+                "title": "日本語タイトル",
+                "title_zh": "中文主標",
+                "cover": "https://example.com/c.jpg",
+                "stills": ["https://example.com/1.jpg"],
+                "related_by_title": [
+                    {
+                        "code": "NHDTC-100",
+                        "title": "関連作",
+                        "cover": "https://example.com/r.jpg",
+                        "line": "theme",
+                    }
+                ],
+            }
+        )
+        # Inject zh on related via first put then merge
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "NHDTC-099",
+                "title": "日本語タイトル",
+                "cover": "https://example.com/c.jpg",
+                "related_by_title": [
+                    {
+                        "code": "NHDTC-100",
+                        "title": "関連作",
+                        "title_zh": "中文相關",
+                        "cover": "https://example.com/r.jpg",
+                        "line": "theme",
+                    }
+                ],
+            }
+        )
+        thinner = {
+            "ok": True,
+            "code": "NHDTC-099",
+            "title": "日本語タイトル",
+            "cover": "https://example.com/c.jpg",
+            "related_by_title": [
+                {
+                    "code": "NHDTC-100",
+                    "title": "関連作",
+                    "cover": "https://example.com/r.jpg",
+                    "line": "theme",
+                }
+            ],
+        }
+        S.offline_cache_put(thinner)
+        hit = S.offline_cache_get(code="NHDTC-099")
+        self.assertEqual(hit.get("cover"), "https://example.com/c.jpg")
+        self.assertEqual(hit["related_by_title"][0].get("title_zh"), "中文相關")
+        self.assertEqual(hit.get("stills"), ["https://example.com/1.jpg"])
+
+    def test_enrich_skips_network_when_already_filled(self):
+        payload = self._stored_payload(title_zh="已有中文")
+        payload["related_by_title"][0]["title_zh"] = "相關中文"
+        S.offline_cache_put(payload)
+        hit = S.offline_cache_get(code="NHDTC-099")
+        with mock.patch.object(
+            S, "resolve_chinese_title", side_effect=AssertionError("should not fetch")
+        ):
+            out = S.enrich_offline_cache_hit(hit)
+        self.assertEqual(out.get("title_zh"), "已有中文")
+        self.assertEqual(out["related_by_title"][0].get("title_zh"), "相關中文")
+
+    def test_enrich_does_not_cache_title_only(self):
+        """Cover gate: filling zh must not persist a payload without a real cover."""
+        payload = {
+            "ok": True,
+            "code": "DOSD-008",
+            "title": "gemini only",
+            "title_zh": None,
+            "cover": None,
+            "related_by_title": [
+                {"code": "DOSD-009", "title": "rel"},
+            ],
+        }
+        with mock.patch.object(S, "resolve_chinese_title", return_value="中文"):
+            out = S.enrich_offline_cache_hit(payload)
+        self.assertEqual(out.get("title_zh"), "中文")
+        self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
+
+
 class TestEntryId(unittest.TestCase):
     def test_same_entry_id(self):
         self.assertEqual(S._offline_cache_entry_id("NHDTC-99"), S._offline_cache_entry_id("NHDTC-099"))

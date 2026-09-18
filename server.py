@@ -2747,6 +2747,8 @@ def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
 
 # --- Offline identify cache (server-side, persists successful lookups) ---
 OFFLINE_CACHE_MAX = 500
+# Soft wall-clock for filling missing title_zh on cache hits (main + related).
+OFFLINE_CACHE_TITLE_ZH_BUDGET = 3.0
 _OFFLINE_CACHE_MEM_LOCK = threading.Lock()
 _OFFLINE_CACHE_PATH: Path | None = None
 
@@ -2835,6 +2837,108 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
         if len(slim) >= 13:
             break
     return slim
+
+
+def _related_cache_item_key(it: dict | None) -> str | None:
+    if not isinstance(it, dict) or not it.get("code"):
+        return None
+    return _offline_cache_entry_id(str(it.get("code"))) or str(it.get("code"))
+
+
+def _merge_related_for_cache(prev_items, new_items) -> list:
+    """Keep new related order; fill missing title_zh/cover from the previous entry."""
+    if not new_items:
+        return list(prev_items or []) if prev_items else []
+    prev_by: dict = {}
+    for it in prev_items or []:
+        k = _related_cache_item_key(it) if isinstance(it, dict) else None
+        if k:
+            prev_by[k] = it
+    out: list[dict] = []
+    for it in new_items:
+        if not isinstance(it, dict):
+            continue
+        merged = dict(it)
+        prev = prev_by.get(_related_cache_item_key(merged) or "")
+        if isinstance(prev, dict):
+            for field in ("title", "title_zh", "actress", "cover", "cid", "line", "why"):
+                if not merged.get(field) and prev.get(field):
+                    merged[field] = prev[field]
+        out.append(merged)
+    return out
+
+
+def _payload_needs_title_zh(payload: dict) -> bool:
+    """True when main or any coded related slide is missing title_zh."""
+    if not isinstance(payload, dict):
+        return False
+    if not str(payload.get("title_zh") or "").strip():
+        return True
+    for key in ("related_by_title", "related"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            code = item.get("code")
+            if not code or not parse_code_parts(str(code)):
+                continue
+            if not str(item.get("title_zh") or "").strip():
+                return True
+    return False
+
+
+def _count_title_zh_fields(payload: dict) -> int:
+    n = 1 if str(payload.get("title_zh") or "").strip() else 0
+    seen: set[str] = set()
+    for key in ("related_by_title", "related"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            k = _related_cache_item_key(item)
+            if k and k in seen:
+                continue
+            if k:
+                seen.add(k)
+            if str(item.get("title_zh") or "").strip():
+                n += 1
+    return n
+
+
+def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) -> dict:
+    """Fill missing title_zh on a cache hit, then merge back into offline cache.
+
+    Live identify runs attach_chinese_titles via attach_related_by_title.
+    Cache hits used to return early (identify_code / pipeline) and skip that,
+    so related stayed Japanese-only — including entries stored before title_zh.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    if payload.get("chinese_titles_attached"):
+        return payload
+    payload.setdefault("related_by_title", payload.get("related_by_title") or [])
+    payload.setdefault("related", payload.get("related") or [])
+    before = _count_title_zh_fields(payload)
+    try:
+        if _payload_needs_title_zh(payload):
+            attach_chinese_titles(
+                payload,
+                related_network=True,
+                related_budget_sec=OFFLINE_CACHE_TITLE_ZH_BUDGET,
+            )
+    except Exception:
+        pass
+    payload["chinese_titles_attached"] = True
+    try:
+        if _count_title_zh_fields(payload) > before:
+            offline_cache_put(payload, image_hash=image_hash)
+    except Exception:
+        pass
+    return payload
 
 
 def _offline_cache_payload_ok(payload: dict) -> bool:
@@ -3032,7 +3136,7 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                 data = _offline_cache_read_unlocked(path)
                 entries = data.setdefault("entries", {})
                 by_key = data.setdefault("by_key", {})
-                # merge: keep richer title/cover if new is thinner
+                # merge: keep richer title/cover if new is thinner; never wipe stills/cover
                 prev = entries.get(entry_id)
                 if isinstance(prev, dict):
                     for field in ("title", "title_zh", "actress", "studio", "cid"):
@@ -3042,8 +3146,10 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                         value["cover"] = prev.get("cover")
                     if not value.get("stills") and prev.get("stills"):
                         value["stills"] = prev["stills"]
-                    if not value.get("related_by_title") and prev.get("related_by_title"):
-                        value["related_by_title"] = prev["related_by_title"]
+                    value["related_by_title"] = _merge_related_for_cache(
+                        prev.get("related_by_title"),
+                        value.get("related_by_title"),
+                    )
                 if not usable_cover_url(value.get("cover")):
                     # Do not persist title-only / now_printing after merge
                     return
@@ -3121,6 +3227,9 @@ def identify_code(
         cached["ocr_text_preview"] = ocr_preview
         cached.setdefault("related", [])
         cached.setdefault("related_note", None)
+        cached.setdefault("related_by_title", cached.get("related_by_title") or [])
+        # Still fill missing title_zh (main + related); live path used to skip this
+        cached = enrich_offline_cache_hit(cached)
         return apply_vision_meta(cached, vision_meta)
 
     cid = code_to_cid(display)
@@ -5494,6 +5603,7 @@ def run_identify_pipeline(
             cached_img["vision_used"] = False
             cached_img["search_mode"] = "code"
             cached_img.setdefault("related_by_title", cached_img.get("related_by_title") or [])
+            cached_img = enrich_offline_cache_hit(cached_img, image_hash=img_hash)
             _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
             return cached_img, 200
 
@@ -5516,6 +5626,7 @@ def run_identify_pipeline(
             cached_code["vision_used"] = False
             cached_code["search_mode"] = "manual" if user_code else "code"
             cached_code.setdefault("related_by_title", cached_code.get("related_by_title") or [])
+            cached_code = enrich_offline_cache_hit(cached_code)
             _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
             return cached_code, 200
 
@@ -5942,9 +6053,12 @@ def run_identify_pipeline(
         detail = "完成，進入畫廊"
         if n_extra >= 2:
             detail = f"完成，列出 {n_extra} 個番號候選"
-        # related_by_title — skip network re-attach when served from offline cache
+        # related_by_title — skip network re-search when served from offline cache,
+        # but still fill missing Chinese titles (old cache entries may lack title_zh).
         if result.get("from_offline_cache"):
             result.setdefault("related_by_title", result.get("related_by_title") or [])
+            if not result.get("chinese_titles_attached"):
+                result = enrich_offline_cache_hit(result, image_hash=img_hash)
             detail = "完成（離線快取）"
         elif not skip_related:
             try:
