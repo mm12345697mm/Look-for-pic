@@ -1033,7 +1033,7 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    card.appendChild(buildWorkActions(w));
+    card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
     appendStillsScroll(card, w, '劇照（橫滑）');
     return card;
@@ -1059,7 +1059,7 @@
     });
   }
 
-  function buildWorkActions(w) {
+  function buildWorkActions(w, coverWrap) {
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
@@ -1074,7 +1074,18 @@
         label: '複製番號與名稱',
         run: () => copyWorkField(formatCodeTitleClipboard(w.code, displayTitle), '已複製'),
       },
-      { mark: '', icon: ICON_DL, label: '下載封面與劇照', run: () => downloadWorkMedia(w) },
+      {
+        mark: '',
+        icon: ICON_DL,
+        label: '下載封面與劇照',
+        run: () =>
+          downloadWorkMedia(w, {
+            coverImg:
+              coverWrap && typeof coverWrap.querySelector === 'function'
+                ? coverWrap.querySelector('img')
+                : null,
+          }),
+      },
     ];
     specs.forEach((spec) => {
       const btn = document.createElement('button');
@@ -1245,6 +1256,54 @@
     return '/api/cdn-file?url=' + encodeURIComponent(url);
   }
 
+  /**
+   * Same-work DMM jacket variants only (pl ↔ ps, digital ↔ mono/movie).
+   * Never invent jp/js sample stills as a "cover".
+   */
+  function dmmCoverVariantUrls(url) {
+    const primary = String(url || '').trim();
+    const out = [];
+    const seen = {};
+    function add(u) {
+      const s = String(u || '').trim();
+      if (!s || seen[s]) return;
+      seen[s] = true;
+      out.push(s);
+    }
+    add(primary);
+    if (!primary) return out;
+
+    function swapJacketSuffix(u, from, to) {
+      const re = new RegExp(from + '\\.jpg(\\?.*)?$', 'i');
+      if (!re.test(u)) return '';
+      return u.replace(re, to + '.jpg$1');
+    }
+
+    add(swapJacketSuffix(primary, 'pl', 'ps'));
+    add(swapJacketSuffix(primary, 'ps', 'pl'));
+
+    const pics = 'https://pics.dmm.co.jp';
+    let m = primary.match(
+      /^https?:\/\/pics\.dmm\.co\.jp\/digital\/video\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
+    );
+    if (m) {
+      const cid = m[1];
+      const q = m[3] || '';
+      add(pics + '/mono/movie/adult/' + cid + '/' + cid + 'pl.jpg' + q);
+      add(pics + '/mono/movie/adult/' + cid + '/' + cid + 'ps.jpg' + q);
+    }
+    m = primary.match(
+      /^https?:\/\/pics\.dmm\.co\.jp\/mono\/movie\/adult\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
+    );
+    if (m) {
+      const cid = m[1];
+      const q = m[3] || '';
+      add(DMM_PICS + '/' + cid + '/' + cid + 'pl.jpg' + q);
+      add(DMM_PICS + '/' + cid + '/' + cid + 'ps.jpg' + q);
+    }
+    return out;
+  }
+
   function jpegFileFromBytes(buf, filename) {
     const fileName = filename || 'image.jpg';
     const parts = buf ? [buf] : [];
@@ -1315,44 +1374,209 @@
     throw lastErr || new Error('cdn');
   }
 
-  function prefetchProgressToast(okCount, total, failed) {
+  function displayedCoverLooksReady(img) {
+    if (!img) return false;
+    if (img.classList && img.classList.contains('img-broken')) return false;
+    const src = String(img.currentSrc || img.src || '');
+    if (/^(blob:|data:)/i.test(src)) return true;
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    return !!(w && h);
+  }
+
+  function findDisplayedCoverImg(w, opts) {
+    if (opts && displayedCoverLooksReady(opts.coverImg)) return opts.coverImg;
+    const code = w && w.code ? String(w.code) : '';
+    const cover = String((w && w.cover) || '').trim();
+    let nodes = [];
+    try {
+      const list =
+        document.querySelectorAll && document.querySelectorAll('.cover-wrap img');
+      if (list && list.length) nodes = list;
+    } catch (_) {}
+    for (let i = 0; i < nodes.length; i++) {
+      const img = nodes[i];
+      if (!displayedCoverLooksReady(img)) continue;
+      const src = String(img.currentSrc || img.src || (img.getAttribute && img.getAttribute('src')) || '');
+      if (cover && (src === cover || src.indexOf(cover) !== -1)) return img;
+      if (code && img.alt === code + ' 封面') return img;
+    }
+    return null;
+  }
+
+  function blobFromCanvas(canvas) {
+    return new Promise(function (resolve, reject) {
+      if (!canvas) {
+        reject(new Error('canvas'));
+        return;
+      }
+      if (typeof canvas.toBlob === 'function') {
+        canvas.toBlob(
+          function (b) {
+            if (b) resolve(b);
+            else reject(new Error('toBlob'));
+          },
+          'image/jpeg',
+          0.92
+        );
+        return;
+      }
+      try {
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+        fetch(dataUrl)
+          .then(function (r) {
+            return r.blob();
+          })
+          .then(resolve, reject);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function blobFromSrc(src) {
+    const u = String(src || '').trim();
+    if (!u) return null;
+    const res = await fetch(u);
+    if (!res.ok) throw new Error('src');
+    const blob = await res.blob();
+    if (!blob || !blob.size) throw new Error('empty');
+    return blob;
+  }
+
+  async function captureDisplayedCoverBlob(w, opts) {
+    const img = findDisplayedCoverImg(w, opts);
+    if (!img) return null;
+    const src = String(img.currentSrc || img.src || '');
+    if (/^(blob:|data:)/i.test(src) || (src && src.indexOf('/api/cdn-file') !== -1)) {
+      try {
+        const blob = await blobFromSrc(src);
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
+    try {
+      const canvas = document.createElement('canvas');
+      const w0 = img.naturalWidth || img.width;
+      const h0 = img.naturalHeight || img.height;
+      if (w0 && h0 && canvas) {
+        canvas.width = w0;
+        canvas.height = h0;
+        const ctx = canvas.getContext && canvas.getContext('2d');
+        if (ctx && ctx.drawImage) {
+          ctx.drawImage(img, 0, 0);
+          const blob = await blobFromCanvas(canvas);
+          if (blob && blob.size) return blob;
+        }
+      }
+    } catch (_) {}
+    if (src) {
+      try {
+        const blob = await blobFromSrc(src);
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  async function fetchCoverImageBuffer(item, w, opts) {
+    const urls = dmmCoverVariantUrls(item && item.url);
+    let lastErr = null;
+    for (let i = 0; i < urls.length; i++) {
+      const tries = i === 0 ? 2 : 1;
+      try {
+        return await fetchWorkImageBufferTries(urls[i], tries);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    try {
+      const blob = await captureDisplayedCoverBlob(w, opts);
+      if (blob) {
+        if (typeof blob.arrayBuffer === 'function') {
+          const buf = await blob.arrayBuffer();
+          if (buf && buf.byteLength) return buf;
+        }
+        return blob;
+      }
+    } catch (_) {}
+    throw lastErr || new Error('cover');
+  }
+
+  function prefetchProgressToast(okCount, total, failed, meta) {
     let msg = '準備中（' + okCount + '/' + total + '）';
-    if (failed) msg += ' · 失敗 ' + failed;
+    if (meta && meta.coverFailed) {
+      msg += ' · 封面失敗';
+      if (failed > 1) msg += ' · 失敗 ' + failed;
+    } else if (failed) {
+      msg += ' · 失敗 ' + failed;
+    }
     showToast(msg, { persist: true });
   }
 
-  async function prefetchWorkImageFiles(w, onProgress) {
+  function shareReadyMessage(result) {
+    if (result && result.coverExpected && result.coverFailed) {
+      const n = (result.files && result.files.length) || 0;
+      let msg = '封面失敗，已準備劇照 ' + n + ' 張';
+      if (result.failed) msg += ' · 失敗 ' + result.failed;
+      msg += ' · 點一下儲存';
+      return msg;
+    }
+    if (result && result.failed) {
+      return (
+        '準備完成（' +
+        result.files.length +
+        '/' +
+        result.total +
+        '）· 點一下儲存到相簿'
+      );
+    }
+    return '準備完成 · 點一下儲存到相簿';
+  }
+
+  async function prefetchWorkImageFiles(w, onProgress, opts) {
     const items = workDownloadItems(w);
     const total = items.length;
     const slots = new Array(total);
     let ok = 0;
     let failed = 0;
     let done = 0;
+    const coverIdx = items.findIndex(function (it) {
+      return it.role === 'cover';
+    });
+    let coverAttempted = coverIdx < 0;
 
     function report() {
-      if (onProgress) onProgress(ok, total, { ok: ok, failed: failed, done: done, total: total });
+      const coverFailedNow = coverIdx >= 0 && coverAttempted && !slots[coverIdx];
+      if (onProgress)
+        onProgress(ok, total, {
+          ok: ok,
+          failed: failed,
+          done: done,
+          total: total,
+          coverFailed: coverFailedNow,
+        });
     }
     report();
 
-    async function fillSlot(i, tries) {
-      const buf = await fetchWorkImageBufferTries(items[i].url, tries);
+    async function fillSlot(i, tries, buffer) {
+      const buf = buffer || (await fetchWorkImageBufferTries(items[i].url, tries));
       const file = jpegFileFromBytes(buf, items[i].filename);
       if (!file) throw new Error('file');
       slots[i] = file;
     }
 
-    const coverIdx = items.findIndex(function (it) {
-      return it.role === 'cover';
-    });
-    // Jacket first (own retry) so a flaky CDN slot cannot silently drop it.
+    // Jacket first: retry /api/cdn-file, then pl/ps / mono jacket variants,
+    // then the bitmap already on the card. A failed cover must not skip stills.
     if (coverIdx >= 0) {
       try {
-        await fillSlot(coverIdx, 2);
+        const buf = await fetchCoverImageBuffer(items[coverIdx], w, opts);
+        await fillSlot(coverIdx, 1, buf);
         ok += 1;
       } catch (_) {
         slots[coverIdx] = null;
         failed += 1;
       }
+      coverAttempted = true;
       done += 1;
       report();
     }
@@ -1451,7 +1675,7 @@
 
   let downloadBusy = false;
 
-  async function downloadWorkMedia(w) {
+  async function downloadWorkMedia(w, opts) {
     const items = workDownloadItems(w);
     if (!items.length) {
       showToast('沒有可下載的圖片');
@@ -1465,20 +1689,21 @@
     const total = items.length;
     try {
       prefetchProgressToast(0, total, 0);
-      const result = await prefetchWorkImageFiles(w, function (okCount, tot, meta) {
-        prefetchProgressToast(okCount, tot, meta && meta.failed);
-      });
-      if (result.coverExpected && result.coverFailed) {
-        showToast('封面下載失敗');
-        return { ok: false, reason: 'cover' };
-      }
+      const result = await prefetchWorkImageFiles(
+        w,
+        function (okCount, tot, meta) {
+          prefetchProgressToast(okCount, tot, meta && meta.failed, meta);
+        },
+        opts
+      );
       if (!result.files.length) {
-        showToast('下載失敗');
-        return { ok: false, reason: 'fetch' };
+        showToast(
+          result.coverExpected && result.coverFailed ? '封面失敗，沒有可儲存的圖片' : '下載失敗'
+        );
+        return { ok: false, reason: result.coverFailed ? 'cover' : 'fetch' };
       }
-      const readyMsg = result.failed
-        ? '準備完成（' + result.files.length + '/' + result.total + '）· 點一下儲存到相簿'
-        : null;
+      // Cover-fail no longer blocks stills. Only abort when every image failed.
+      const readyMsg = shareReadyMessage(result);
       return await offerSaveImageFiles(result.files, readyMsg);
     } catch (_) {
       showToast('下載失敗');
@@ -2559,9 +2784,11 @@
       workDownloadFilename,
       workDownloadUrls,
       workDownloadItems,
+      dmmCoverVariantUrls,
       shareSheetPayload,
       canShareImageFiles,
       jpegFileFromBlob,
+      shareReadyMessage,
       downloadWorkMedia,
       offerSaveImageFiles,
     };
