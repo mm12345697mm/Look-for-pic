@@ -112,6 +112,7 @@ function getEl(id) {
 
 const store = {};
 let anchorClicks = 0;
+let canvasThumbN = 0;
 const context = {
   window: {},
   document: {
@@ -125,6 +126,23 @@ const context = {
         el.click = function (ev) {
           anchorClicks += 1;
           return origClick(ev);
+        };
+      }
+      if (String(tag).toLowerCase() === 'canvas') {
+        el.width = 0;
+        el.height = 0;
+        el.getContext = () => ({
+          drawImage() {},
+        });
+        el.toDataURL = () => {
+          canvasThumbN += 1;
+          return 'data:image/jpeg;base64,thumb' + canvasThumbN;
+        };
+        el.toBlob = (cb) => {
+          const blob = new Blob([new Uint8Array([0xff, 0xd8, 0xff, 0xd9])], {
+            type: 'image/jpeg',
+          });
+          setTimeout(() => cb && cb(blob), 0);
         };
       }
       return el;
@@ -153,7 +171,40 @@ const context = {
       ? File
       : class File extends (typeof Blob !== 'undefined' ? Blob : class Blob {}) {},
   fetch: async () => ({ ok: true, json: async () => ({}) }),
-  Image: class Image {},
+  Image: class Image {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.naturalWidth = 400;
+      this.naturalHeight = 300;
+      this.width = 400;
+      this.height = 300;
+    }
+    set src(v) {
+      this._src = v;
+      const self = this;
+      setTimeout(() => {
+        if (typeof self.onload === 'function') self.onload();
+      }, 0);
+    }
+    get src() {
+      return this._src;
+    }
+  },
+  FileReader: class FileReader {
+    constructor() {
+      this.onload = null;
+      this.onerror = null;
+      this.result = null;
+    }
+    readAsDataURL(file) {
+      this.result = 'data:image/jpeg;base64,file-' + ((file && file.name) || 'x');
+      const self = this;
+      setTimeout(() => {
+        if (typeof self.onload === 'function') self.onload();
+      }, 0);
+    }
+  },
   confirm: () => false,
   navigator: { userAgent: 'node-test', clipboard: { writeText: async () => {} } },
   console,
@@ -414,6 +465,91 @@ function related(n, line) {
   assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
 }
 
+// Multi-shot history: persist and render every user upload; legacy single-shot still OK
+{
+  function shotsOf(rec) {
+    return Array.from(H.historyUserShots(rec), (s) => '' + s);
+  }
+  assert.strictEqual(shotsOf({ userShots: ['data:a', 'data:b', '', 'data:a'] }).join(','), 'data:a,data:b');
+  assert.strictEqual(shotsOf({ userShot: 'data:only' }).join(','), 'data:only');
+  assert.strictEqual(shotsOf({ user_shots: 'data:legacy' }).join(','), 'data:legacy');
+  assert.strictEqual(shotsOf({ userShots: [] }).join(','), '');
+  assert.ok(H.userShotThumbLimits(5).maxBytes < H.userShotThumbLimits(1).maxBytes);
+
+  const work = {
+    code: 'AAA-001',
+    title: 'Main',
+    related: related(1, 'theme'),
+    line: 'main',
+  };
+  H.saveHistory([
+    {
+      id: 'h-multi',
+      kind: 'session',
+      code: 'AAA-001',
+      title: 'Main',
+      userShots: ['data:shot-1', 'data:shot-2', 'data:shot-3'],
+      works: [work],
+    },
+  ]);
+  const saved = H.loadHistory();
+  assert.strictEqual(H.historyUserShots(saved[0]).length, 3, 'new save keeps all shots');
+
+  H.paintHistoryDetail(saved[0]);
+  const detail = getEl('history-detail');
+  const scroll = detail.children.find((c) => c.className === 'user-shots-scroll');
+  assert.ok(scroll, '你的截圖 strip is painted');
+  assert.strictEqual(scroll.children.length, 3, 'every stored shot is rendered');
+  assert.ok(scroll.children.every((c) => c.tagName === 'IMG'));
+
+  H.paintHistoryDetail({
+    id: 'h-legacy',
+    userShot: 'data:one-only',
+    works: [work],
+  });
+  const legacyScroll = getEl('history-detail').children.find((c) => c.className === 'user-shots-scroll');
+  assert.strictEqual(legacyScroll.children.length, 1, 'legacy single shot still shows');
+}
+
+// Quota: drop older thumbs, never slice the newest session to one shot
+{
+  const origSet = context.localStorage.setItem;
+  context.localStorage.setItem = (k, v) => {
+    const parsed = JSON.parse(v);
+    const total = parsed.reduce((n, r) => n + ((r.userShots && r.userShots.length) || 0), 0);
+    if (total > 3) {
+      const err = new Error('quota');
+      err.name = 'QuotaExceededError';
+      throw err;
+    }
+    store[k] = String(v);
+  };
+  const newest = {
+    id: 'h-new',
+    userShots: ['n1', 'n2', 'n3'],
+    works: [{ code: 'BBB-001', title: 'New', related: related(2, 'theme'), stills: ['s1', 's2'] }],
+  };
+  const older = {
+    id: 'h-old',
+    userShots: ['o1', 'o2'],
+    works: [{ code: 'CCC-001', title: 'Old', related: related(2, 'theme') }],
+  };
+  const ok = H.saveHistory([newest, older]);
+  assert.strictEqual(ok, true);
+  const loaded = H.loadHistory();
+  assert.strictEqual(loaded[0].id, 'h-new');
+  assert.strictEqual(
+    (loaded[0].userShots || []).map((s) => '' + s).join(','),
+    'n1,n2,n3',
+    'newest keeps all shots under quota'
+  );
+  assert.ok(
+    !loaded[1] || (loaded[1].userShots || []).length <= 1,
+    'older session may be thinned'
+  );
+  context.localStorage.setItem = origSet.bind(context.localStorage);
+}
+
 // Download: jpeg filenames, never a zip; share payload is files-only
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
@@ -461,6 +597,28 @@ function related(n, line) {
   const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
   const work = { code: 'AAA-001', cover: cover, stills: [still] };
   const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+
+  // appendHistoryFromIdentify stores a thumb per uploaded file
+  {
+    canvasThumbN = 0;
+    store.lfp_identify_history_v1 = JSON.stringify([]);
+    const files = [
+      new File([jpegBytes], 'a.jpg', { type: 'image/jpeg' }),
+      new File([jpegBytes], 'b.jpg', { type: 'image/jpeg' }),
+      new File([jpegBytes], 'c.jpg', { type: 'image/jpeg' }),
+    ];
+    await H.appendHistoryFromIdentify(
+      { ok: true, code: 'DDD-001', title: 'Multi', stills: [] },
+      files
+    );
+    const recs = H.loadHistory();
+    assert.ok(recs.length >= 1);
+    assert.strictEqual(
+      H.historyUserShots(recs[0]).length,
+      3,
+      'session stores one thumb per uploaded file: ' + H.historyUserShots(recs[0]).length
+    );
+  }
 
   function mockCdnFetch(fetched) {
     context.fetch = async (url) => {
@@ -548,6 +706,41 @@ function related(n, line) {
     return (files || []).map((f) => String(f.name || ''));
   }
 
+  function isJacketUrl(u) {
+    return /(pl|ps)\.jpg/i.test(u) || /mono\/movie/i.test(u);
+  }
+
+  {
+    const urls = H.dmmCoverVariantUrls(
+      'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg'
+    );
+    assert.ok(urls[0].indexOf('jufe00271pl.jpg') !== -1);
+    assert.ok(
+      urls.some((u) => u.indexOf('jufe00271ps.jpg') !== -1),
+      'pl failure should try the same-cid ps jacket: ' + urls.join(',')
+    );
+    assert.ok(
+      urls.some((u) => /mono\/movie\/adult\/jufe00271\/jufe00271pl\.jpg/.test(u)),
+      'digital pl also tries mono jacket: ' + urls.join(',')
+    );
+    assert.ok(
+      urls.every((u) => !/j[ps]-\d+\.jpg/i.test(u)),
+      'must not invent jp/js stills as cover: ' + urls.join(',')
+    );
+    const ready = H.shareReadyMessage({
+      coverExpected: true,
+      coverFailed: true,
+      files: [{ name: 'x-jp-01.jpg' }, { name: 'x-jp-02.jpg' }],
+      failed: 1,
+      total: 3,
+    });
+    assert.ok(/封面失敗/.test(ready), ready);
+    assert.ok(/劇照 2 張/.test(ready), ready);
+    assert.ok(/失敗 1/.test(ready), ready);
+    assert.ok(/點一下儲存/.test(ready), ready);
+    assert.ok(!/準備完成/.test(ready), 'must not imply total success: ' + ready);
+  }
+
   // Cover fetch fails once, then succeeds on the same /api/cdn-file retry
   {
     const fetched = [];
@@ -580,12 +773,16 @@ function related(n, line) {
     fetched.forEach((u) => assert.ok(u.indexOf('/api/cdn-file?') !== -1, u));
   }
 
-  // Cover never arrives: do not share stills as if 11/11 succeeded
+  // Cover never arrives: still share stills (do not block the whole set)
   {
     const shareCalls = [];
+    const fetched = [];
+    const toasts = [];
     context.fetch = async (url) => {
       const u = String(url);
-      if (u.indexOf('aaa00001pl.jpg') !== -1) {
+      fetched.push(u);
+      toasts.push(String(getEl('lfp-toast').textContent));
+      if (isJacketUrl(u)) {
         return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
       }
       return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
@@ -597,13 +794,237 @@ function related(n, line) {
     context.navigator.userActivation = { isActive: true };
 
     const result = await H.downloadWorkMedia(work);
-    assert.strictEqual(result.ok, false);
-    assert.strictEqual(result.reason, 'cover');
-    assert.strictEqual(shareCalls.length, 0, 'must not open share without the jacket');
+    assert.strictEqual(result.ok, true, 'stills still share when cover fails');
+    assert.strictEqual(result.reason, 'shared');
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 1);
+    assert.ok(namesOf(shareCalls[0].files).indexOf('AAA-001-jp-01.jpg') !== -1);
+    assert.ok(namesOf(shareCalls[0].files).indexOf('AAA-001-cover.jpg') === -1);
     assert.ok(
-      String(getEl('lfp-toast').textContent).indexOf('封面下載失敗') !== -1,
-      getEl('lfp-toast').textContent
+      fetched.some((u) => u.indexOf('aaa00001ps.jpg') !== -1),
+      'cover fail tries ps via /api/cdn-file: ' + fetched.join(' | ')
     );
+    assert.ok(
+      toasts.some((t) => /封面失敗/.test(t)),
+      'progress mentions cover fail: ' + toasts.join(' | ')
+    );
+    assert.ok(
+      toasts.every((t) => !/準備完成/.test(t) || /封面失敗/.test(t)),
+      'must not toast bare 準備完成: ' + toasts.join(' | ')
+    );
+  }
+
+  // Cover fail + follow-up tap: toast names stills, includes 失敗, then one share
+  {
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (isJacketUrl(u)) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: false };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.reason, 'tap');
+    assert.strictEqual(shareCalls.length, 0);
+    const toast = String(getEl('lfp-toast').textContent);
+    assert.ok(/封面失敗/.test(toast), toast);
+    assert.ok(/劇照 1 張/.test(toast), toast);
+    assert.ok(/失敗/.test(toast), toast);
+    assert.ok(/點一下儲存/.test(toast), toast);
+    assert.ok(!/準備完成/.test(toast), toast);
+    getEl('lfp-toast').click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 1);
+    assert.ok(namesOf(shareCalls[0].files).indexOf('AAA-001-jp-01.jpg') !== -1);
+  }
+
+  // Zero images succeeded → abort entirely
+  {
+    const shareCalls = [];
+    context.fetch = async () => ({ ok: false, arrayBuffer: async () => new ArrayBuffer(0) });
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(shareCalls.length, 0);
+    assert.ok(/失敗/.test(String(getEl('lfp-toast').textContent)));
+  }
+
+  // JUFE-271: primary pl fails, same-cid ps jacket succeeds as *-cover.jpg (last in list)
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const jufeStills = Array.from({ length: 6 }, (_, i) =>
+      'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-' + (i + 1) + '.jpg'
+    );
+    const jufeWork = { code: 'JUFE-271', cover: jufeCover, stills: jufeStills };
+    const fetched = [];
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      fetched.push(u);
+      if (u.indexOf('jufe00271pl.jpg') !== -1) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(jufeWork);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 7, '6 stills + ps jacket');
+    const names = namesOf(shareCalls[0].files);
+    assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg', names.join(','));
+    assert.strictEqual(names.filter((n) => /-jp-\d+\.jpg$/.test(n)).length, 6);
+    assert.ok(
+      fetched.filter((u) => u.indexOf('jufe00271pl.jpg') !== -1).length >= 2,
+      'pl retried via /api/cdn-file'
+    );
+    assert.ok(
+      fetched.some((u) => u.indexOf('/api/cdn-file?') !== -1 && u.indexOf('jufe00271ps.jpg') !== -1),
+      'ps jacket via /api/cdn-file: ' + fetched.join(' | ')
+    );
+  }
+
+  // All cover CDN URLs fail: export the already-displayed card <img> as CODE-cover.jpg
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const shareCalls = [];
+    const fetched = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      fetched.push(u);
+      if (u.indexOf('blob:displayed-jufe-cover') !== -1) {
+        const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+        return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer, blob: async () => blob };
+      }
+      if (isJacketUrl(u)) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const coverImg = {
+      currentSrc: 'blob:displayed-jufe-cover',
+      src: jufeCover,
+      alt: 'JUFE-271 封面',
+      naturalWidth: 800,
+      naturalHeight: 538,
+      classList: { contains: () => false },
+    };
+    const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    const names = namesOf(shareCalls[0].files);
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, names.join(','));
+    assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
+    assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
+    assert.ok(fetched.some((u) => u.indexOf('blob:displayed-jufe-cover') !== -1));
+  }
+
+  // Warmed same-origin blob on the displayed <img> is used when the proxy is down
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (isJacketUrl(u)) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const coverImg = {
+      currentSrc: jufeCover,
+      src: jufeCover,
+      alt: 'JUFE-271 封面',
+      naturalWidth: 800,
+      naturalHeight: 538,
+      classList: { contains: () => false },
+      _lfpCoverBlob: new Blob([jpegBytes], { type: 'image/jpeg' }),
+    };
+    const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    const names = namesOf(shareCalls[0].files);
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, names.join(','));
+    assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
+  }
+
+  // Displayed DMM <img> canvas export → CODE-cover.jpg when /api/cdn-file jackets 404
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (isJacketUrl(u)) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const coverImg = {
+      currentSrc: jufeCover,
+      src: jufeCover,
+      alt: 'JUFE-271 封面',
+      naturalWidth: 800,
+      naturalHeight: 538,
+      classList: { contains: () => false },
+      decode: async () => {},
+    };
+    const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    const names = namesOf(shareCalls[0].files);
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, 'canvas/decode export: ' + names.join(','));
+    assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
+    assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
   }
 
   // HAWA-367: 1 jacket + 10 jp stills all go into one share, cover named *-cover.jpg

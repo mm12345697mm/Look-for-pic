@@ -17,6 +17,8 @@
   const HISTORY_KEY = 'lfp_identify_history_v1';
   const HISTORY_MAX = 50;
   const THUMB_MAX_BYTES = 150 * 1024;
+  const USER_SHOT_THUMB_MAX_SIDE = 480;
+  const USER_SHOT_SESSION_MAX = 20;
 
   let runId = 0;
 
@@ -940,12 +942,17 @@
       return;
     }
     const coverImg = document.createElement('img');
-    coverImg.src = url;
     coverImg.alt = w.code + ' 封面';
     coverImg.loading = 'lazy';
     coverImg.decoding = 'async';
+    // Display: the browser loads pics.dmm.co.jp directly (no CORS).
+    // Share/download: fetch('/api/cdn-file') on the Railway server.
+    // JUFE-271 can paint here while the proxy is blocked — do not require
+    // the proxy for on-screen cover, and warm a same-origin blob in parallel.
     coverImg.referrerPolicy = 'no-referrer';
+    coverImg.src = url;
     coverImg.addEventListener('error', () => onImgError(coverImg));
+    warmCoverFromProxy(coverImg, url);
     coverWrap.appendChild(coverImg);
     const set = workImageSet(w);
     bindLightboxable(coverImg, set, 0);
@@ -1033,7 +1040,7 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    card.appendChild(buildWorkActions(w));
+    card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
     appendStillsScroll(card, w, '劇照（橫滑）');
     return card;
@@ -1059,7 +1066,7 @@
     });
   }
 
-  function buildWorkActions(w) {
+  function buildWorkActions(w, coverWrap) {
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
@@ -1074,7 +1081,18 @@
         label: '複製番號與名稱',
         run: () => copyWorkField(formatCodeTitleClipboard(w.code, displayTitle), '已複製'),
       },
-      { mark: '', icon: ICON_DL, label: '下載封面與劇照', run: () => downloadWorkMedia(w) },
+      {
+        mark: '',
+        icon: ICON_DL,
+        label: '下載封面與劇照',
+        run: () =>
+          downloadWorkMedia(w, {
+            coverImg:
+              coverWrap && typeof coverWrap.querySelector === 'function'
+                ? coverWrap.querySelector('img')
+                : null,
+          }),
+      },
     ];
     specs.forEach((spec) => {
       const btn = document.createElement('button');
@@ -1245,6 +1263,54 @@
     return '/api/cdn-file?url=' + encodeURIComponent(url);
   }
 
+  /**
+   * Same-work DMM jacket variants only (pl ↔ ps, digital ↔ mono/movie).
+   * Never invent jp/js sample stills as a "cover".
+   */
+  function dmmCoverVariantUrls(url) {
+    const primary = String(url || '').trim();
+    const out = [];
+    const seen = {};
+    function add(u) {
+      const s = String(u || '').trim();
+      if (!s || seen[s]) return;
+      seen[s] = true;
+      out.push(s);
+    }
+    add(primary);
+    if (!primary) return out;
+
+    function swapJacketSuffix(u, from, to) {
+      const re = new RegExp(from + '\\.jpg(\\?.*)?$', 'i');
+      if (!re.test(u)) return '';
+      return u.replace(re, to + '.jpg$1');
+    }
+
+    add(swapJacketSuffix(primary, 'pl', 'ps'));
+    add(swapJacketSuffix(primary, 'ps', 'pl'));
+
+    const pics = 'https://pics.dmm.co.jp';
+    let m = primary.match(
+      /^https?:\/\/pics\.dmm\.co\.jp\/digital\/video\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
+    );
+    if (m) {
+      const cid = m[1];
+      const q = m[3] || '';
+      add(pics + '/mono/movie/adult/' + cid + '/' + cid + 'pl.jpg' + q);
+      add(pics + '/mono/movie/adult/' + cid + '/' + cid + 'ps.jpg' + q);
+    }
+    m = primary.match(
+      /^https?:\/\/pics\.dmm\.co\.jp\/mono\/movie\/adult\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
+    );
+    if (m) {
+      const cid = m[1];
+      const q = m[3] || '';
+      add(DMM_PICS + '/' + cid + '/' + cid + 'pl.jpg' + q);
+      add(DMM_PICS + '/' + cid + '/' + cid + 'ps.jpg' + q);
+    }
+    return out;
+  }
+
   function jpegFileFromBytes(buf, filename) {
     const fileName = filename || 'image.jpg';
     const parts = buf ? [buf] : [];
@@ -1315,44 +1381,295 @@
     throw lastErr || new Error('cdn');
   }
 
-  function prefetchProgressToast(okCount, total, failed) {
+  function displayedCoverLooksReady(img) {
+    if (!img) return false;
+    if (img.classList && img.classList.contains('img-broken')) return false;
+    if (img._lfpCoverBlob && img._lfpCoverBlob.size) return true;
+    const src = String(img.currentSrc || img.src || '');
+    if (/^(blob:|data:)/i.test(src)) return true;
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    return !!(w && h);
+  }
+
+  function findDisplayedCoverImg(w, opts) {
+    if (opts && displayedCoverLooksReady(opts.coverImg)) return opts.coverImg;
+    const code = w && w.code ? String(w.code) : '';
+    const cover = String((w && w.cover) || '').trim();
+    let nodes = [];
+    try {
+      const list =
+        document.querySelectorAll && document.querySelectorAll('.cover-wrap img');
+      if (list && list.length) nodes = list;
+    } catch (_) {}
+    for (let i = 0; i < nodes.length; i++) {
+      const img = nodes[i];
+      if (!displayedCoverLooksReady(img)) continue;
+      const src = String(img.currentSrc || img.src || (img.getAttribute && img.getAttribute('src')) || '');
+      if (cover && (src === cover || src.indexOf(cover) !== -1)) return img;
+      if (code && img.alt === code + ' 封面') return img;
+    }
+    return null;
+  }
+
+  const warmedCoverByUrl = Object.create(null);
+
+  function rememberWarmedCover(url, blob) {
+    const k = String(url || '').trim();
+    if (!k || !blob || !blob.size) return;
+    warmedCoverByUrl[k] = blob;
+  }
+
+  function warmedCoverBlob(url) {
+    const k = String(url || '').trim();
+    return (k && warmedCoverByUrl[k]) || null;
+  }
+
+  /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file. */
+  function warmCoverFromProxy(img, url) {
+    const u = String(url || '').trim();
+    if (!u || isNowPrintingUrl(u)) return;
+    fetchWorkImageBuffer(u)
+      .then(function (buf) {
+        if (!buf) return;
+        let blob = null;
+        try {
+          blob = new Blob([buf], { type: 'image/jpeg' });
+        } catch (_) {
+          blob = null;
+        }
+        if (!blob || !blob.size) return;
+        rememberWarmedCover(u, blob);
+        if (img) img._lfpCoverBlob = blob;
+      })
+      .catch(function () {});
+  }
+
+  function blobFromCanvas(canvas) {
+    return new Promise(function (resolve, reject) {
+      if (!canvas) {
+        reject(new Error('canvas'));
+        return;
+      }
+      if (typeof canvas.toBlob === 'function') {
+        canvas.toBlob(
+          function (b) {
+            if (b) resolve(b);
+            else reject(new Error('toBlob'));
+          },
+          'image/jpeg',
+          0.92
+        );
+        return;
+      }
+      try {
+        const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+        fetch(dataUrl)
+          .then(function (r) {
+            return r.blob();
+          })
+          .then(resolve, reject);
+      } catch (err) {
+        reject(err);
+      }
+    });
+  }
+
+  async function blobFromSrc(src) {
+    const u = String(src || '').trim();
+    if (!u) return null;
+    const res = await fetch(u);
+    if (!res.ok) throw new Error('src');
+    const blob = await res.blob();
+    if (!blob || !blob.size) throw new Error('empty');
+    return blob;
+  }
+
+  async function canvasExportDrawn(imgLike) {
+    const w0 = imgLike.naturalWidth || imgLike.width;
+    const h0 = imgLike.naturalHeight || imgLike.height;
+    if (!w0 || !h0) return null;
+    const canvas = document.createElement('canvas');
+    canvas.width = w0;
+    canvas.height = h0;
+    const ctx = canvas.getContext && canvas.getContext('2d');
+    if (!ctx || !ctx.drawImage) return null;
+    ctx.drawImage(imgLike, 0, 0, w0, h0);
+    const blob = await blobFromCanvas(canvas);
+    return blob && blob.size ? blob : null;
+  }
+
+  function loadCorsCoverImage(src) {
+    return new Promise(function (resolve, reject) {
+      const im = new Image();
+      im.crossOrigin = 'anonymous';
+      im.referrerPolicy = 'no-referrer';
+      im.onload = function () {
+        resolve(im);
+      };
+      im.onerror = function () {
+        reject(new Error('cors-img'));
+      };
+      im.src = src;
+    });
+  }
+
+  /**
+   * When the jacket is already on the card, export that bitmap as JPEG.
+   * Display used a no-CORS DMM <img>; canvas/currentSrc can still work for
+   * blob:/same-origin/CORS-clean images, and for a warmed /api/cdn-file blob.
+   */
+  async function captureDisplayedCoverBlob(w, opts) {
+    const img = findDisplayedCoverImg(w, opts);
+    const cover = String((w && w.cover) || '').trim();
+    if (img && img._lfpCoverBlob && img._lfpCoverBlob.size) return img._lfpCoverBlob;
+    const warmed = warmedCoverBlob(cover) || (img && warmedCoverBlob(img.currentSrc || img.src));
+    if (warmed && warmed.size) return warmed;
+    if (!img) return null;
+    if (typeof img.decode === 'function') {
+      try {
+        await img.decode();
+      } catch (_) {}
+    }
+    const src = String(img.currentSrc || img.src || '');
+    if (/^(blob:|data:)/i.test(src) || (src && src.indexOf('/api/cdn-file') !== -1)) {
+      try {
+        const blob = await blobFromSrc(src);
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bmp = await createImageBitmap(img);
+        const blob = await canvasExportDrawn(bmp);
+        if (typeof bmp.close === 'function') bmp.close();
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
+    try {
+      const blob = await canvasExportDrawn(img);
+      if (blob && blob.size) return blob;
+    } catch (_) {}
+    if (src && /^https?:/i.test(src)) {
+      try {
+        const clone = await loadCorsCoverImage(src);
+        const blob = await canvasExportDrawn(clone);
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
+    if (src) {
+      try {
+        const blob = await blobFromSrc(src);
+        if (blob && blob.size) return blob;
+      } catch (_) {}
+    }
+    return null;
+  }
+
+  /**
+   * Jacket bytes: /api/cdn-file first (retries + pl/ps / mono variants), then
+   * the bitmap already shown on the card. Display ≠ download: <img> talks to
+   * DMM; this function talks to the Railway proxy unless the fallback hits.
+   */
+  async function fetchCoverImageBuffer(item, w, opts) {
+    const urls = dmmCoverVariantUrls(item && item.url);
+    let lastErr = null;
+    for (let i = 0; i < urls.length; i++) {
+      const tries = i === 0 ? 2 : 1;
+      try {
+        return await fetchWorkImageBufferTries(urls[i], tries);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    try {
+      const blob = await captureDisplayedCoverBlob(w, opts);
+      if (blob) {
+        if (typeof blob.arrayBuffer === 'function') {
+          const buf = await blob.arrayBuffer();
+          if (buf && buf.byteLength) return buf;
+        }
+        return blob;
+      }
+    } catch (_) {}
+    throw lastErr || new Error('cover');
+  }
+
+  function prefetchProgressToast(okCount, total, failed, meta) {
     let msg = '準備中（' + okCount + '/' + total + '）';
-    if (failed) msg += ' · 失敗 ' + failed;
+    if (meta && meta.coverFailed) {
+      msg += ' · 封面失敗';
+      if (failed > 1) msg += ' · 失敗 ' + failed;
+    } else if (failed) {
+      msg += ' · 失敗 ' + failed;
+    }
     showToast(msg, { persist: true });
   }
 
-  async function prefetchWorkImageFiles(w, onProgress) {
+  function shareReadyMessage(result) {
+    if (result && result.coverExpected && result.coverFailed) {
+      const n = (result.files && result.files.length) || 0;
+      let msg = '封面失敗，已準備劇照 ' + n + ' 張';
+      if (result.failed) msg += ' · 失敗 ' + result.failed;
+      msg += ' · 點一下儲存';
+      return msg;
+    }
+    if (result && result.failed) {
+      return (
+        '準備完成（' +
+        result.files.length +
+        '/' +
+        result.total +
+        '）· 點一下儲存到相簿'
+      );
+    }
+    return '準備完成 · 點一下儲存到相簿';
+  }
+
+  async function prefetchWorkImageFiles(w, onProgress, opts) {
     const items = workDownloadItems(w);
     const total = items.length;
     const slots = new Array(total);
     let ok = 0;
     let failed = 0;
     let done = 0;
+    const coverIdx = items.findIndex(function (it) {
+      return it.role === 'cover';
+    });
+    let coverAttempted = coverIdx < 0;
 
     function report() {
-      if (onProgress) onProgress(ok, total, { ok: ok, failed: failed, done: done, total: total });
+      const coverFailedNow = coverIdx >= 0 && coverAttempted && !slots[coverIdx];
+      if (onProgress)
+        onProgress(ok, total, {
+          ok: ok,
+          failed: failed,
+          done: done,
+          total: total,
+          coverFailed: coverFailedNow,
+        });
     }
     report();
 
-    async function fillSlot(i, tries) {
-      const buf = await fetchWorkImageBufferTries(items[i].url, tries);
+    async function fillSlot(i, tries, buffer) {
+      const buf = buffer || (await fetchWorkImageBufferTries(items[i].url, tries));
       const file = jpegFileFromBytes(buf, items[i].filename);
       if (!file) throw new Error('file');
       slots[i] = file;
     }
 
-    const coverIdx = items.findIndex(function (it) {
-      return it.role === 'cover';
-    });
-    // Jacket first (own retry) so a flaky CDN slot cannot silently drop it.
+    // Jacket first: retry /api/cdn-file, then pl/ps / mono jacket variants,
+    // then the bitmap already on the card. A failed cover must not skip stills.
     if (coverIdx >= 0) {
       try {
-        await fillSlot(coverIdx, 2);
+        const buf = await fetchCoverImageBuffer(items[coverIdx], w, opts);
+        await fillSlot(coverIdx, 1, buf);
         ok += 1;
       } catch (_) {
         slots[coverIdx] = null;
         failed += 1;
       }
+      coverAttempted = true;
       done += 1;
       report();
     }
@@ -1451,7 +1768,7 @@
 
   let downloadBusy = false;
 
-  async function downloadWorkMedia(w) {
+  async function downloadWorkMedia(w, opts) {
     const items = workDownloadItems(w);
     if (!items.length) {
       showToast('沒有可下載的圖片');
@@ -1465,20 +1782,21 @@
     const total = items.length;
     try {
       prefetchProgressToast(0, total, 0);
-      const result = await prefetchWorkImageFiles(w, function (okCount, tot, meta) {
-        prefetchProgressToast(okCount, tot, meta && meta.failed);
-      });
-      if (result.coverExpected && result.coverFailed) {
-        showToast('封面下載失敗');
-        return { ok: false, reason: 'cover' };
-      }
+      const result = await prefetchWorkImageFiles(
+        w,
+        function (okCount, tot, meta) {
+          prefetchProgressToast(okCount, tot, meta && meta.failed, meta);
+        },
+        opts
+      );
       if (!result.files.length) {
-        showToast('下載失敗');
-        return { ok: false, reason: 'fetch' };
+        showToast(
+          result.coverExpected && result.coverFailed ? '封面失敗，沒有可儲存的圖片' : '下載失敗'
+        );
+        return { ok: false, reason: result.coverFailed ? 'cover' : 'fetch' };
       }
-      const readyMsg = result.failed
-        ? '準備完成（' + result.files.length + '/' + result.total + '）· 點一下儲存到相簿'
-        : null;
+      // Cover-fail no longer blocks stills. Only abort when every image failed.
+      const readyMsg = shareReadyMessage(result);
       return await offerSaveImageFiles(result.files, readyMsg);
     } catch (_) {
       showToast('下載失敗');
@@ -1691,29 +2009,131 @@
     }
   }
 
-  function saveHistory(list) {
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(list.slice(0, HISTORY_MAX)));
-    } catch (e) {
-      // Quota: drop older thumbs
-      try {
-        const slim = list.slice(0, Math.min(20, list.length)).map((r) => ({
-          ...r,
-          userShots: (r.userShots || []).slice(0, 1),
-          stills: (r.stills || []).slice(0, 6),
-          related: (r.related || []).slice(0, 8),
-          works: (r.works || []).map((w) => ({
-            ...w,
-            stills: (w.stills || []).slice(0, 6),
-            related: (w.related || []).slice(0, 8),
-          })),
-        }));
-        localStorage.setItem(HISTORY_KEY, JSON.stringify(slim));
-      } catch (_) {}
+  /** All persisted user-upload previews for a session. Legacy single-shot rows OK. */
+  function historyUserShots(rec) {
+    if (!rec) return [];
+    let raw = rec.userShots;
+    if (raw == null) raw = rec.userShot;
+    if (raw == null) raw = rec.user_shots;
+    if (typeof raw === 'string') raw = raw.trim() ? [raw] : [];
+    if (!Array.isArray(raw)) return [];
+    const out = [];
+    const seen = {};
+    for (let i = 0; i < raw.length; i++) {
+      const s = String(raw[i] || '').trim();
+      if (!s || seen[s]) continue;
+      seen[s] = true;
+      out.push(s);
     }
+    return out;
   }
 
-  function downscaleFileToDataUrl(file, maxBytes) {
+  function userShotThumbLimits(count) {
+    const n = Math.max(1, count || 1);
+    if (n <= 1) return { maxBytes: 96 * 1024, maxSide: 640 };
+    if (n <= 3) return { maxBytes: 48 * 1024, maxSide: 480 };
+    return { maxBytes: 28 * 1024, maxSide: 360 };
+  }
+
+  function isQuotaError(err) {
+    if (!err) return false;
+    const name = err.name;
+    const code = err.code;
+    const msg = String(err.message || '');
+    return (
+      name === 'QuotaExceededError' ||
+      name === 'NS_ERROR_DOM_QUOTA_REACHED' ||
+      code === 22 ||
+      code === 1014 ||
+      /quota/i.test(msg)
+    );
+  }
+
+  function slimWorkMedia(w, stillN, relN) {
+    if (!w) return w;
+    return Object.assign({}, w, {
+      stills: Array.isArray(w.stills) ? w.stills.slice(0, stillN) : [],
+      related: Array.isArray(w.related) ? w.related.slice(0, relN) : [],
+    });
+  }
+
+  function slimRecordMedia(r, stillN, relN) {
+    return Object.assign({}, r, {
+      stills: Array.isArray(r.stills) ? r.stills.slice(0, stillN) : [],
+      related: Array.isArray(r.related) ? r.related.slice(0, relN) : [],
+      works: (r.works || []).map(function (w) {
+        return slimWorkMedia(w, stillN, relN);
+      }),
+    });
+  }
+
+  function withUserShots(r, shots) {
+    return Object.assign({}, r, { userShots: shots });
+  }
+
+  function writeHistoryList(list) {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(list));
+  }
+
+  function saveHistory(list) {
+    let next = Array.isArray(list) ? list.slice(0, HISTORY_MAX) : [];
+    try {
+      writeHistoryList(next);
+      return true;
+    } catch (e) {
+      if (!isQuotaError(e)) {
+        try {
+          writeHistoryList(next);
+          return true;
+        } catch (_) {}
+      }
+    }
+    try {
+      next = next.map(function (r, i) {
+        return slimRecordMedia(r, i === 0 ? 10 : 4, i === 0 ? 8 : 3);
+      });
+      writeHistoryList(next);
+      return true;
+    } catch (_) {}
+    try {
+      next = next.map(function (r, i) {
+        const shots = historyUserShots(r);
+        return withUserShots(
+          slimRecordMedia(r, i === 0 ? 8 : 2, i === 0 ? 5 : 0),
+          i === 0 ? shots : shots.slice(0, 1)
+        );
+      });
+      writeHistoryList(next);
+      return true;
+    } catch (_) {}
+    try {
+      next = next.map(function (r, i) {
+        return withUserShots(
+          slimRecordMedia(r, i === 0 ? 4 : 0, 0),
+          i === 0 ? historyUserShots(r) : []
+        );
+      });
+      writeHistoryList(next);
+      return true;
+    } catch (_) {}
+    for (let n = Math.min(next.length, 12); n >= 1; n--) {
+      try {
+        const keep = next.slice(0, n).map(function (r, i) {
+          return withUserShots(
+            slimRecordMedia(r, i === 0 ? 4 : 0, 0),
+            i === 0 ? historyUserShots(r) : []
+          );
+        });
+        writeHistoryList(keep);
+        return true;
+      } catch (_) {}
+    }
+    return false;
+  }
+
+  function downscaleFileToDataUrl(file, maxBytes, maxSide) {
+    const cap = Math.max(8 * 1024, maxBytes || THUMB_MAX_BYTES);
+    const side = Math.max(64, maxSide || USER_SHOT_THUMB_MAX_SIDE);
     return new Promise((resolve) => {
       const url = URL.createObjectURL(file);
       const img = new Image();
@@ -1722,26 +2142,27 @@
           const canvas = document.createElement('canvas');
           let w = img.naturalWidth || img.width;
           let h = img.naturalHeight || img.height;
-          const maxSide = 720;
-          const scale = Math.min(1, maxSide / Math.max(w, h));
+          const scale = Math.min(1, side / Math.max(w, h, 1));
           w = Math.max(1, Math.round(w * scale));
           h = Math.max(1, Math.round(h * scale));
           canvas.width = w;
           canvas.height = h;
           const ctx = canvas.getContext('2d');
           ctx.drawImage(img, 0, 0, w, h);
-          let q = 0.72;
+          const maxChars = Math.ceil(cap * 1.37);
+          let q = 0.7;
           let dataUrl = canvas.toDataURL('image/jpeg', q);
-          while (dataUrl.length > maxBytes * 1.37 && q > 0.35) {
+          while (dataUrl.length > maxChars && q > 0.28) {
             q -= 0.08;
             dataUrl = canvas.toDataURL('image/jpeg', q);
           }
-          // If still huge, shrink more
-          if (dataUrl.length > maxBytes * 1.37) {
-            canvas.width = Math.round(w * 0.6);
-            canvas.height = Math.round(h * 0.6);
+          let shrink = 0;
+          while (dataUrl.length > maxChars && shrink < 3) {
+            canvas.width = Math.max(48, Math.round(canvas.width * 0.65));
+            canvas.height = Math.max(48, Math.round(canvas.height * 0.65));
             ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-            dataUrl = canvas.toDataURL('image/jpeg', 0.55);
+            dataUrl = canvas.toDataURL('image/jpeg', 0.48);
+            shrink += 1;
           }
           URL.revokeObjectURL(url);
           resolve(dataUrl);
@@ -1758,10 +2179,34 @@
     });
   }
 
+  function smallFileDataUrl(file, maxBytes) {
+    const cap = Math.max(8 * 1024, maxBytes || THUMB_MAX_BYTES);
+    if (!file || file.size > cap) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      if (typeof FileReader !== 'function') {
+        resolve(null);
+        return;
+      }
+      const fr = new FileReader();
+      fr.onload = () => {
+        resolve(typeof fr.result === 'string' && fr.result ? fr.result : null);
+      };
+      fr.onerror = () => resolve(null);
+      try {
+        fr.readAsDataURL(file);
+      } catch (_) {
+        resolve(null);
+      }
+    });
+  }
+
   async function buildUserShotThumbs(files) {
+    const list = (files || []).filter(Boolean).slice(0, USER_SHOT_SESSION_MAX);
+    const limits = userShotThumbLimits(list.length);
     const out = [];
-    for (const f of files || []) {
-      const d = await downscaleFileToDataUrl(f, THUMB_MAX_BYTES);
+    for (let i = 0; i < list.length; i++) {
+      let d = await downscaleFileToDataUrl(list[i], limits.maxBytes, limits.maxSide);
+      if (!d) d = await smallFileDataUrl(list[i], limits.maxBytes);
       if (d) out.push(d);
     }
     return out;
@@ -1841,7 +2286,7 @@
       const thumbSrc =
         rec.cover ||
         first.cover ||
-        (rec.userShots && rec.userShots[0]) ||
+        historyUserShots(rec)[0] ||
         '';
       let thumbHtml;
       if (thumbSrc) {
@@ -1997,17 +2442,20 @@
       notice.textContent = String(rec.message);
       historyDetailEl.appendChild(notice);
     }
-    if (rec.userShots && rec.userShots.length) {
+    const shots = historyUserShots(rec);
+    if (shots.length) {
       const head = document.createElement('div');
       head.className = 'user-shots-head';
       head.textContent = '你的截圖';
       const scroll = document.createElement('div');
       scroll.className = 'user-shots-scroll';
-      rec.userShots.forEach((u, i) => {
+      shots.forEach((u, i) => {
         const img = document.createElement('img');
         img.src = u;
-        img.alt = '截圖 ' + (i + 1);
-        bindLightboxable(img, rec.userShots, i);
+        img.alt = '你的截圖 ' + (i + 1);
+        img.loading = 'lazy';
+        img.decoding = 'async';
+        bindLightboxable(img, shots, i);
         scroll.appendChild(img);
       });
       historyDetailEl.appendChild(head);
@@ -2553,15 +3001,23 @@
       historyRecordIsOpenable,
       renderHistoryList,
       openHistoryDetail,
+      paintHistoryDetail,
+      historyUserShots,
+      userShotThumbLimits,
+      saveHistory,
+      loadHistory,
+      appendHistoryFromIdentify,
       relatedNeedsTitleZh,
       relatedBucketsNeedFill,
       workNeedsTitleZh,
       workDownloadFilename,
       workDownloadUrls,
       workDownloadItems,
+      dmmCoverVariantUrls,
       shareSheetPayload,
       canShareImageFiles,
       jpegFileFromBlob,
+      shareReadyMessage,
       downloadWorkMedia,
       offerSaveImageFiles,
     };
