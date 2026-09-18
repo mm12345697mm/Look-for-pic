@@ -6343,7 +6343,7 @@ def work_zip():
 
 @app.get("/api/cdn-file")
 def cdn_file():
-    """Same-origin attachment for one allowed CDN image (sequential-download fallback)."""
+    """Same-origin JPEG proxy so the client can prefetch cover/stills as Blobs."""
     url = (request.args.get("url") or "").strip()
     if not allowed_media_url(url):
         return jsonify({"ok": False, "message": "不支援的圖片網址"}), 400

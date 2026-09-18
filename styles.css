@@ -1118,6 +1118,12 @@ body.lightbox-open {
   pointer-events: none;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
 }
+.lfp-toast.is-action {
+  pointer-events: auto;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
 .lfp-toast.hidden,
 .lfp-toast[hidden] {
   display: none !important;
