@@ -126,41 +126,106 @@
       cover: r.cover || '',
       stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
       why: r.why || '',
-      line: r.line || '',
+      line: relatedLineFromRaw(r),
     }));
+  }
+
+  function relatedLineFromRaw(r) {
+    const why = String((r && r.why) || '');
+    let rl = (r && r.line) || '';
+    if (!rl) {
+      if (/演員|女優|actress/i.test(why)) rl = 'actress';
+      else if (/關鍵字|keyword/i.test(why)) rl = 'keyword';
+      else rl = 'theme';
+    }
+    if (rl === 'title') rl = 'theme';
+    return rl || 'theme';
   }
 
   function relatedNeedsTitleZh(related) {
     return (related || []).some((r) => r && r.code && !String(r.title_zh || r.titleZh || '').trim());
   }
 
-  function mergeTitleZhIntoRelated(existing, incoming) {
-    const zhBy = new Map();
-    for (const r of incoming || []) {
-      if (!r || !r.code) continue;
-      const zh = String(r.title_zh || r.titleZh || '').trim();
-      if (!zh) continue;
-      zhBy.set(String(r.code), zh);
-      if (parseCodeParts(String(r.code))) zhBy.set(formatDisplayCode(String(r.code)), zh);
-    }
-    return (existing || []).map((r) => {
-      if (!r || String(r.title_zh || r.titleZh || '').trim()) return r;
-      const key = r.code && parseCodeParts(String(r.code)) ? formatDisplayCode(String(r.code)) : String(r.code || '');
-      const zh = zhBy.get(key) || zhBy.get(String(r.code || ''));
-      return zh ? Object.assign({}, r, { title_zh: zh }) : r;
+  function relatedBucketsNeedFill(related) {
+    const counts = { theme: 0, keyword: 0, actress: 0 };
+    (related || []).forEach((r) => {
+      const ln = relatedLineFromRaw(r);
+      if (counts[ln] != null) counts[ln] += 1;
     });
+    return counts.theme < 5 || counts.keyword < 5 || counts.actress < 3;
+  }
+
+  function mergeStillsKeepExisting(prev, incoming) {
+    const out = [];
+    const seen = {};
+    (Array.isArray(prev) ? prev : []).concat(Array.isArray(incoming) ? incoming : []).forEach((u) => {
+      const s = String(u || '').trim();
+      if (!s || /now_printing/i.test(s) || seen[s]) return;
+      seen[s] = true;
+      out.push(s);
+    });
+    return out.slice(0, 20);
+  }
+
+  function capRelatedBuckets(items) {
+    const buckets = { theme: [], keyword: [], actress: [] };
+    const caps = { theme: 5, keyword: 5, actress: 3 };
+    const seen = {};
+    (items || []).forEach((r) => {
+      if (!r || !r.code) return;
+      const key = parseCodeParts(String(r.code)) ? formatDisplayCode(String(r.code)) : String(r.code);
+      if (seen[key]) return;
+      const line = relatedLineFromRaw(r);
+      if (!buckets[line] || buckets[line].length >= caps[line]) return;
+      seen[key] = true;
+      buckets[line].push(Object.assign({}, r, { line: line }));
+    });
+    return buckets.theme.concat(buckets.keyword, buckets.actress);
+  }
+
+  function mergeRelatedIncremental(existing, incoming) {
+    const byKey = {};
+    const order = [];
+    function keyOf(r) {
+      return r && r.code && parseCodeParts(String(r.code))
+        ? formatDisplayCode(String(r.code))
+        : String((r && r.code) || '');
+    }
+    slimRelatedForHistory(existing).concat(slimRelatedForHistory(incoming)).forEach((r) => {
+      const k = keyOf(r);
+      if (!k) return;
+      if (!byKey[k]) {
+        byKey[k] = Object.assign({}, r);
+        order.push(k);
+        return;
+      }
+      const cur = byKey[k];
+      ['title', 'title_zh', 'cover', 'why', 'line', 'actress'].forEach((f) => {
+        if (!cur[f] && r[f]) cur[f] = r[f];
+      });
+      cur.stills = mergeStillsKeepExisting(cur.stills, r.stills);
+    });
+    return capRelatedBuckets(order.map((k) => byKey[k]));
+  }
+
+  function mergeTitleZhIntoRelated(existing, incoming) {
+    return mergeRelatedIncremental(existing, incoming);
   }
 
   function backfillHistoryTitleZh(list, donor) {
     if (!donor || !Array.isArray(list)) return list;
     const donorRelated = donor.related_by_title || donor.related || [];
     const donorZh = String(donor.title_zh || donor.titleZh || '').trim();
+    const donorStills = Array.isArray(donor.stills) ? donor.stills : [];
     return list.map((rec) => {
       if (!rec || !rec.code || !donor.code || !codesMatch(rec.code, donor.code)) return rec;
       const next = Object.assign({}, rec);
       if (!String(next.title_zh || '').trim() && donorZh) next.title_zh = donorZh;
-      if (Array.isArray(next.related) && next.related.length && donorRelated.length) {
-        next.related = mergeTitleZhIntoRelated(next.related, donorRelated);
+      if (donorStills.length) next.stills = mergeStillsKeepExisting(next.stills, donorStills);
+      if (donorRelated.length) {
+        next.related = next.related && next.related.length
+          ? mergeRelatedIncremental(next.related, donorRelated)
+          : slimRelatedForHistory(donorRelated);
       }
       return next;
     });
@@ -178,7 +243,7 @@
   }
 
 
-  /** 日本語タイトル（中文片名）— omit empty parentheses when no Chinese title */
+  /** 日本語（中文）on main AND related, including offline-cache / history replay. */
   function formatDisplayTitle(titleJa, titleZh) {
     const ja = (titleJa || '').trim();
     const zh = (titleZh || '').trim();
@@ -598,7 +663,9 @@
     // Ensure main carries related_by_title from top-level if missing
     if (items[0] && (!items[0].relatedByTitle || !items[0].relatedByTitle.length)) {
       if (Array.isArray(data.related_by_title) && data.related_by_title.length) {
-        items[0].relatedByTitle = data.related_by_title.map((r) => workFromApi(r, 'theme'));
+        items[0].relatedByTitle = data.related_by_title.map((r) =>
+          workFromApi(r, relatedLineFromRaw(r))
+        );
       }
     }
 
@@ -1255,10 +1322,12 @@
       },
       'main'
     );
-    // Empty related, or related missing title_zh: fill from server (API already attaches Chinese)
+    // Gaps: empty related, missing title_zh, or buckets under 5/5/3 — merge, never wipe
     const needRelatedFetch =
       !!rec.title &&
-      ((!rec.related || !rec.related.length) || relatedNeedsTitleZh(rec.related));
+      ((!rec.related || !rec.related.length) ||
+        relatedNeedsTitleZh(rec.related) ||
+        relatedBucketsNeedFill(rec.related));
     if (needRelatedFetch) {
       try {
         const qs =
@@ -1271,22 +1340,15 @@
         const data = await res.json();
         if (data && data.ok && Array.isArray(data.related_by_title) && data.related_by_title.length) {
           const incoming = data.related_by_title;
-          if (!rec.related || !rec.related.length) {
-            w.relatedByTitle = incoming.map((r) => workFromApi(r, 'theme'));
-          } else {
-            const merged = mergeTitleZhIntoRelated(rec.related, incoming);
-            w.relatedByTitle = merged.map((r) => workFromApi(r, r.line || 'theme'));
-          }
+          const merged = rec.related && rec.related.length
+            ? mergeRelatedIncremental(rec.related, incoming)
+            : slimRelatedForHistory(incoming);
+          w.relatedByTitle = merged.map((r) => workFromApi(r, relatedLineFromRaw(r)));
           const list = loadHistory();
           const idx = list.findIndex((x) => x.id === id);
           if (idx >= 0) {
-            if (!list[idx].related || !list[idx].related.length) {
-              list[idx].related = slimRelatedForHistory(incoming);
-            } else {
-              list[idx].related = slimRelatedForHistory(
-                mergeTitleZhIntoRelated(list[idx].related, incoming)
-              );
-            }
+            list[idx].related = merged;
+            if (data.title_zh && !list[idx].title_zh) list[idx].title_zh = data.title_zh;
             saveHistory(list);
           }
         }
