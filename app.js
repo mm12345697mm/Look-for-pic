@@ -87,7 +87,8 @@
   function formatDisplayCode(code) {
     const parts = parseCodeParts(code);
     if (!parts) return normalizeCode(code);
-    return `${parts.label}-${parts.number.replace(/^0+/, '') || '0'}`;
+    // Keep leading zeros (e.g. 029), do not strip
+    return `${parts.label}-${parts.number}`;
   }
 
   function coverUrl(cid) {

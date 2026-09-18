@@ -458,8 +458,8 @@ def format_display_code(code: str) -> str:
     if not parts:
         return normalize_code(code)
     label, number = parts
-    stripped = number.lstrip("0") or "0"
-    return f"{label}-{stripped}"
+    # Keep leading zeros in the numeric part (e.g. 029 → 029, not 29)
+    return f"{label}-{number}"
 
 
 def code_to_cid(code: str) -> str | None:
