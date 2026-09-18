@@ -3373,11 +3373,11 @@ def resolve_chinese_title(
     return None
 
 
-def attach_chinese_titles(payload: dict, *, related_network: bool = False) -> dict:
+def attach_chinese_titles(payload: dict, *, related_network: bool = True) -> dict:
     """Fill title_zh on main work (and optionally related) when missing.
 
-    related_network=False (default): only keep already-known title_zh on related
-    to avoid N× catalog round-trips during identify. Set True for single-item APIs.
+    related_network=True (default): also resolve title_zh for related works so the
+    gallery shows 日本語（中文）on related slides. Pass False to skip network for related.
     """
     if not isinstance(payload, dict):
         return payload
