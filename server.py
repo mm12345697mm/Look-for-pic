@@ -470,6 +470,19 @@ def format_display_code(code: str) -> str:
     return f"{label}-{number}"
 
 
+def is_mida616(code: str | None) -> bool:
+    """Demo-package sentinel (MIDA-616 / mida00616)."""
+    if not code:
+        return False
+    parts = parse_code_parts(str(code))
+    if not parts:
+        return False
+    try:
+        return parts[0] == "MIDA" and int(parts[1]) == 616
+    except ValueError:
+        return False
+
+
 def codes_numeric_equal(a: str | None, b: str | None) -> bool:
     """True if both parse as the same label + integer (NHDTC-99 == NHDTC-099)."""
     if not a or not b:

@@ -55,7 +55,11 @@ class TestBuildWorkZip(unittest.TestCase):
         self.assertIn("AAA-001/cover.jpg", names)
         self.assertIn("AAA-001/still-01.jpg", names)
 
-    def test_empty_when_nothing_allowed(self):
+    def test_is_mida616(self):
+        self.assertTrue(S.is_mida616("MIDA-616"))
+        self.assertTrue(S.is_mida616("mida616"))
+        self.assertFalse(S.is_mida616("MIDA-617"))
+        self.assertFalse(S.is_mida616(""))
         data, n, fname = S.build_work_zip_bytes(
             "BBB-002",
             "https://example.com/cover.jpg",

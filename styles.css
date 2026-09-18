@@ -1065,9 +1065,9 @@ body.lightbox-open {
   justify-content: center;
   gap: 1px;
   width: auto;
-  min-width: 1.45em;
-  height: 1.45em;
-  padding: 0 4px;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 5px;
   border: 1px solid var(--border);
   border-radius: 5px;
   background: #222230;
@@ -1081,6 +1081,10 @@ body.lightbox-open {
   touch-action: manipulation;
   -webkit-user-select: none;
   user-select: none;
+}
+.work-action svg,
+.work-action-mark {
+  pointer-events: none;
 }
 .work-action svg {
   width: 0.92em;

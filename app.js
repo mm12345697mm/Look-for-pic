@@ -1061,7 +1061,7 @@
     toastTimer = setTimeout(() => {
       el.classList.add('hidden');
       el.hidden = true;
-    }, 1800);
+    }, 2400);
   }
 
   function copyTextFallback(str) {
@@ -1545,9 +1545,11 @@
       } else {
         thumbHtml = '<div class="history-thumb placeholder">無圖</div>';
       }
-      const codeLabel = rec.code || first.code || '—';
+      const codeLabel = rec.code || first.code || (rec.ok === false ? '未找到' : '—');
       const titleJa = rec.title || first.title || '';
       const titleZh = rec.title_zh || first.title_zh || first.titleZh || '';
+      let titleText = formatDisplayTitle(titleJa, titleZh);
+      if (titleText === '（無標題）' && rec.message) titleText = String(rec.message);
       row.innerHTML =
         thumbHtml +
         '<div class="history-meta">' +
@@ -1556,7 +1558,7 @@
         (works.length > 1 ? ' <span class="badge">' + works.length + ' 部</span>' : '') +
         '</p>' +
         '<p class="history-title">' +
-        escapeHtml(formatDisplayTitle(titleJa, titleZh)) +
+        escapeHtml(titleText) +
         '</p>' +
         '<p class="history-ts">' +
         escapeHtml(formatTs(rec.ts)) +
