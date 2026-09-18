@@ -1090,20 +1090,61 @@
   }
 
   let toastTimer = null;
-  function showToast(msg) {
+  let toastClickHandler = null;
+
+  function clearToastAction(el) {
+    if (!el) return;
+    el.classList.remove('is-action');
+    el.setAttribute('role', 'status');
+    el.removeAttribute('tabindex');
+    if (toastClickHandler) {
+      el.removeEventListener('click', toastClickHandler);
+      toastClickHandler = null;
+    }
+  }
+
+  function hideToast() {
+    const el = $('lfp-toast');
+    if (toastTimer) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    if (!el) return;
+    clearToastAction(el);
+    el.classList.add('hidden');
+    el.hidden = true;
+  }
+
+  function showToast(msg, opts) {
+    opts = opts || {};
     const el = $('lfp-toast');
     if (!el) {
       setStatus(msg, 'ok');
       return;
     }
+    if (toastTimer) {
+      clearTimeout(toastTimer);
+      toastTimer = null;
+    }
+    clearToastAction(el);
     el.textContent = msg;
     el.classList.remove('hidden');
     el.hidden = false;
-    if (toastTimer) clearTimeout(toastTimer);
-    toastTimer = setTimeout(() => {
-      el.classList.add('hidden');
-      el.hidden = true;
-    }, 2400);
+    if (typeof opts.onClick === 'function') {
+      el.classList.add('is-action');
+      el.setAttribute('role', 'button');
+      el.setAttribute('tabindex', '0');
+      toastClickHandler = function (e) {
+        if (e && e.preventDefault) e.preventDefault();
+        const fn = opts.onClick;
+        hideToast();
+        fn();
+      };
+      el.addEventListener('click', toastClickHandler);
+    }
+    if (opts.persist) return;
+    const ms = typeof opts.ms === 'number' ? opts.ms : 2400;
+    toastTimer = setTimeout(hideToast, ms);
   }
 
   function copyTextFallback(str) {
@@ -1159,22 +1200,6 @@
     return urls;
   }
 
-  function triggerBlobDownload(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename || 'image.jpg';
-    a.rel = 'noopener';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => {
-      try {
-        URL.revokeObjectURL(url);
-      } catch (_) {}
-    }, 4000);
-  }
-
   function workDownloadFilename(code, url, index, coverUrl) {
     const stem = (code && parseCodeParts(code) ? formatDisplayCode(code) : code) || 'work';
     const safe = String(stem).replace(/[^A-Za-z0-9._-]+/g, '_') || 'work';
@@ -1183,42 +1208,169 @@
     return safe + '-jp-' + String(n).padStart(2, '0') + '.jpg';
   }
 
-  async function downloadOneImage(url, filename) {
-    const res = await fetch('/api/cdn-file?url=' + encodeURIComponent(url));
-    if (!res.ok) throw new Error('cdn');
-    const buf = await res.arrayBuffer();
-    const blob = new Blob([buf], { type: 'image/jpeg' });
-    triggerBlobDownload(blob, filename);
+  function cdnProxyUrl(url) {
+    return '/api/cdn-file?url=' + encodeURIComponent(url);
   }
 
-  function clickCdnDownload(url, filename) {
-    const a = document.createElement('a');
-    a.href = '/api/cdn-file?url=' + encodeURIComponent(url);
-    a.download = filename || 'image.jpg';
-    a.rel = 'noopener';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
+  function jpegFileFromBlob(blob, filename) {
+    const fileName = filename || 'image.jpg';
+    const parts = blob ? [blob] : [];
+    try {
+      return new File(parts, fileName, { type: 'image/jpeg' });
+    } catch (_) {
+      return new Blob(parts, { type: 'image/jpeg' });
+    }
   }
+
+  function shareSheetPayload(files) {
+    // Files only: iOS hides「儲存影像」if text/url are mixed in.
+    return { files: files };
+  }
+
+  function canShareImageFiles(files) {
+    if (!files || !files.length) return false;
+    if (typeof navigator.share !== 'function') return false;
+    if (typeof navigator.canShare !== 'function') return true;
+    try {
+      return !!navigator.canShare({ files: files });
+    } catch (_) {
+      return false;
+    }
+  }
+
+  function hasTransientUserActivation() {
+    try {
+      if (navigator.userActivation && typeof navigator.userActivation.isActive === 'boolean') {
+        return navigator.userActivation.isActive;
+      }
+    } catch (_) {}
+    return true;
+  }
+
+  function isShareAbort(err) {
+    const name = err && err.name;
+    const msg = String((err && err.message) || '');
+    return name === 'AbortError' || /abort|cancel/i.test(msg);
+  }
+
+  async function fetchWorkImageBlob(url) {
+    const res = await fetch(cdnProxyUrl(url));
+    if (!res.ok) throw new Error('cdn');
+    const buf = await res.arrayBuffer();
+    if (!buf || !buf.byteLength) throw new Error('empty');
+    return new Blob([buf], { type: 'image/jpeg' });
+  }
+
+  async function prefetchWorkImageFiles(w, onProgress) {
+    const urls = workDownloadUrls(w);
+    const total = urls.length;
+    const slots = new Array(total);
+    let done = 0;
+    let cursor = 0;
+    const workers = Math.min(3, total) || 0;
+    if (onProgress) onProgress(0, total);
+
+    async function worker() {
+      while (cursor < total) {
+        const i = cursor++;
+        const fname = workDownloadFilename(w.code, urls[i], i, w.cover);
+        try {
+          const blob = await fetchWorkImageBlob(urls[i]);
+          slots[i] = jpegFileFromBlob(blob, fname);
+        } catch (_) {
+          slots[i] = null;
+        }
+        done += 1;
+        if (onProgress) onProgress(done, total);
+      }
+    }
+
+    const jobs = [];
+    for (let n = 0; n < workers; n++) jobs.push(worker());
+    await Promise.all(jobs);
+    const files = [];
+    for (let i = 0; i < slots.length; i++) {
+      if (slots[i]) files.push(slots[i]);
+    }
+    return files;
+  }
+
+  function armTapToShare(files) {
+    showToast('準備完成 · 點一下儲存到相簿', {
+      persist: true,
+      onClick: function () {
+        if (typeof navigator.share !== 'function') {
+          showToast('請用 Safari 一次存入相簿（網頁無法直接寫入）');
+          return;
+        }
+        Promise.resolve(navigator.share(shareSheetPayload(files))).catch(function (err) {
+          if (isShareAbort(err)) return;
+          showToast('此瀏覽器無法一次存入相簿，請用 Safari');
+        });
+      },
+    });
+  }
+
+  async function offerSaveImageFiles(files) {
+    if (!files || !files.length) {
+      showToast('沒有可下載的圖片');
+      return { ok: false, reason: 'empty' };
+    }
+    if (typeof navigator.share !== 'function') {
+      showToast('請用 Safari 一次存入相簿（網頁無法直接寫入）');
+      return { ok: false, reason: 'no-share' };
+    }
+
+    const shareable = canShareImageFiles(files);
+    if (shareable && hasTransientUserActivation()) {
+      try {
+        await navigator.share(shareSheetPayload(files));
+        hideToast();
+        return { ok: true, reason: 'shared' };
+      } catch (err) {
+        if (isShareAbort(err)) {
+          hideToast();
+          return { ok: true, reason: 'abort' };
+        }
+      }
+    }
+
+    // Prefetch consumes the original tap; one follow-up tap opens one share sheet
+    // for the whole set (iOS: 儲存影像). Never fire N <a download> clicks.
+    armTapToShare(files);
+    return { ok: true, reason: 'tap' };
+  }
+
+  let downloadBusy = false;
 
   async function downloadWorkMedia(w) {
     const urls = workDownloadUrls(w);
     if (!urls.length) {
       showToast('沒有可下載的圖片');
-      return;
+      return { ok: false, reason: 'empty' };
     }
+    if (downloadBusy) {
+      showToast('仍在準備圖片…');
+      return { ok: false, reason: 'busy' };
+    }
+    downloadBusy = true;
     const total = urls.length;
-    for (let i = 0; i < total; i++) {
-      showToast('下載中（' + (i + 1) + '/' + total + '）');
-      const fname = workDownloadFilename(w.code, urls[i], i, w.cover);
-      try {
-        await downloadOneImage(urls[i], fname);
-      } catch (_) {
-        clickCdnDownload(urls[i], fname);
+    try {
+      showToast('準備中（0/' + total + '）', { persist: true });
+      const files = await prefetchWorkImageFiles(w, function (done, tot) {
+        showToast('準備中（' + done + '/' + tot + '）', { persist: true });
+      });
+      if (!files.length) {
+        showToast('下載失敗');
+        return { ok: false, reason: 'fetch' };
       }
-      if (i < total - 1) await sleep(450);
+      return await offerSaveImageFiles(files);
+    } catch (_) {
+      showToast('下載失敗');
+      return { ok: false, reason: 'error' };
+    } finally {
+      downloadBusy = false;
     }
-    showToast('下載中（' + total + '/' + total + '）');
   }
 
   /**
@@ -2291,6 +2443,11 @@
       workNeedsTitleZh,
       workDownloadFilename,
       workDownloadUrls,
+      shareSheetPayload,
+      canShareImageFiles,
+      jpegFileFromBlob,
+      downloadWorkMedia,
+      offerSaveImageFiles,
     };
   } catch (_) {}
 })();

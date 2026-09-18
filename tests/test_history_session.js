@@ -66,6 +66,17 @@ function makeEl(tag, id) {
     addEventListener(type, fn) {
       (this._listeners[type] = this._listeners[type] || []).push(fn);
     },
+    removeEventListener(type, fn) {
+      const list = this._listeners[type] || [];
+      this._listeners[type] = list.filter((x) => x !== fn);
+    },
+    remove() {
+      if (!this.parentNode) return;
+      const kids = this.parentNode.children || [];
+      const i = kids.indexOf(this);
+      if (i >= 0) kids.splice(i, 1);
+      this.parentNode = null;
+    },
     setAttribute(k, v) {
       this._attrs[k] = v;
     },
@@ -100,6 +111,7 @@ function getEl(id) {
 }
 
 const store = {};
+let anchorClicks = 0;
 const context = {
   window: {},
   document: {
@@ -107,7 +119,15 @@ const context = {
       return getEl(id);
     },
     createElement(tag) {
-      return makeEl(tag);
+      const el = makeEl(tag);
+      if (String(tag).toLowerCase() === 'a') {
+        const origClick = el.click.bind(el);
+        el.click = function (ev) {
+          anchorClicks += 1;
+          return origClick(ev);
+        };
+      }
+      return el;
     },
     addEventListener() {},
     body: makeEl('body'),
@@ -127,6 +147,11 @@ const context = {
     revokeObjectURL() {},
   },
   FormData: class FormData {},
+  Blob: typeof Blob !== 'undefined' ? Blob : class Blob {},
+  File:
+    typeof File !== 'undefined'
+      ? File
+      : class File extends (typeof Blob !== 'undefined' ? Blob : class Blob {}) {},
   fetch: async () => ({ ok: true, json: async () => ({}) }),
   Image: class Image {},
   confirm: () => false,
@@ -389,7 +414,7 @@ function related(n, line) {
   assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
 }
 
-// Download: individual jpeg names, never a zip
+// Download: jpeg filenames, never a zip; share payload is files-only
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
   const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
@@ -400,6 +425,120 @@ function related(n, line) {
   assert.strictEqual(urls.length, 2);
   assert.strictEqual(urls[0], cover);
   assert.strictEqual(urls[1], still);
+  const fakeFiles = [{ name: 'AAA-001-cover.jpg', type: 'image/jpeg' }];
+  const payload = H.shareSheetPayload(fakeFiles);
+  assert.deepStrictEqual(Object.keys(payload), ['files']);
+  assert.strictEqual(payload.files, fakeFiles);
+  assert.strictEqual(payload.text, undefined);
+  assert.strictEqual(payload.url, undefined);
 }
 
-console.log('test_history_session.js: ok');
+(async function () {
+  const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
+  const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
+  const work = { code: 'AAA-001', cover: cover, stills: [still] };
+  const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+
+  function mockCdnFetch(fetched) {
+    context.fetch = async (url) => {
+      fetched.push(String(url));
+      return {
+        ok: true,
+        arrayBuffer: async () => jpegBytes.slice().buffer,
+      };
+    };
+  }
+
+  // Prefetch via /api/cdn-file then one multi-file share — no zip, no N downloads
+  {
+    const fetched = [];
+    const shareCalls = [];
+    const toasts = [];
+    mockCdnFetch(fetched);
+    const innerFetch = context.fetch;
+    context.fetch = async (url) => {
+      toasts.push(String(getEl('lfp-toast').textContent));
+      return innerFetch(url);
+    };
+    anchorClicks = 0;
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.reason, 'shared');
+    assert.strictEqual(shareCalls.length, 1, 'one share sheet for the whole set');
+    assert.strictEqual(shareCalls[0].files.length, 2);
+    assert.strictEqual(shareCalls[0].text, undefined);
+    assert.strictEqual(shareCalls[0].url, undefined);
+    shareCalls[0].files.forEach((f) => {
+      const name = String(f.name || '');
+      assert.ok(name.endsWith('.jpg'), name);
+      assert.ok(!name.endsWith('.zip'), name);
+      assert.strictEqual(f.type, 'image/jpeg');
+    });
+    assert.strictEqual(anchorClicks, 0, 'must not fire sequential <a download> clicks');
+    assert.ok(fetched.length >= 2);
+    fetched.forEach((u) => {
+      assert.ok(u.indexOf('/api/cdn-file?') !== -1, u);
+      assert.ok(u.indexOf('work-zip') === -1, u);
+      assert.ok(u.indexOf('.zip') === -1, u);
+    });
+    assert.ok(
+      toasts.some((t) => /準備中（\d+\/2）/.test(t)),
+      'progress toast while prefetching: ' + toasts.join(' | ')
+    );
+  }
+
+  // Lost user activation → one tappable toast, then one share (not N dialogs)
+  {
+    const fetched = [];
+    const shareCalls = [];
+    mockCdnFetch(fetched);
+    anchorClicks = 0;
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: false };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.reason, 'tap');
+    assert.strictEqual(shareCalls.length, 0, 'share waits for the follow-up tap');
+    const toast = getEl('lfp-toast');
+    assert.ok(String(toast.textContent).indexOf('點一下') !== -1, toast.textContent);
+    assert.ok(toast.classList.contains('is-action'));
+    toast.click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 2);
+    assert.strictEqual(anchorClicks, 0);
+  }
+
+  // No Web Share API: toast Safari limitation, still no zip / no N downloads
+  {
+    const fetched = [];
+    mockCdnFetch(fetched);
+    anchorClicks = 0;
+    delete context.navigator.share;
+    delete context.navigator.canShare;
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.ok, false);
+    assert.ok(String(getEl('lfp-toast').textContent).indexOf('Safari') !== -1);
+    assert.strictEqual(anchorClicks, 0);
+    fetched.forEach((u) => {
+      assert.ok(u.indexOf('/api/cdn-file?') !== -1, u);
+      assert.ok(u.indexOf('work-zip') === -1, u);
+    });
+  }
+
+  console.log('test_history_session.js: ok');
+})().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});
