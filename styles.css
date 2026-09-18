@@ -783,6 +783,11 @@ label.btn {
   color: inherit;
   font: inherit;
   -webkit-appearance: none;
+  appearance: none;
+  position: relative;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .history-item:active { opacity: 0.88; }
 .history-thumb {
@@ -793,6 +798,7 @@ label.btn {
   object-fit: cover;
   background: #111;
   border: 1px solid var(--border);
+  pointer-events: none;
 }
 .history-thumb.placeholder {
   display: flex;
@@ -838,6 +844,9 @@ label.btn {
   color: var(--danger);
   font-size: 1rem;
   cursor: pointer;
+  pointer-events: auto;
+  position: relative;
+  z-index: 1;
 }
 .history-detail {
   display: flex;
@@ -1040,4 +1049,76 @@ body.lightbox-open {
 }
 .work-carousel-track {
   touch-action: pan-x;
+}
+
+/* Tiny per-work copy / download (one-character scale; stop carousel swipe) */
+.work-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 14px 10px;
+  touch-action: manipulation;
+}
+.work-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 1px;
+  width: auto;
+  min-width: 28px;
+  height: 28px;
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: #222230;
+  color: var(--accent2);
+  font-size: 0.68rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+  touch-action: manipulation;
+  -webkit-user-select: none;
+  user-select: none;
+}
+.work-action svg,
+.work-action-mark {
+  pointer-events: none;
+}
+.work-action svg {
+  width: 0.92em;
+  height: 0.92em;
+  display: block;
+  flex-shrink: 0;
+}
+.work-action-mark {
+  font-size: 0.62rem;
+  font-weight: 700;
+  letter-spacing: 0;
+}
+.work-action:active {
+  background: #2a2440;
+  transform: scale(0.96);
+}
+.lfp-toast {
+  position: fixed;
+  left: 50%;
+  bottom: calc(16px + var(--safe-bottom));
+  transform: translateX(-50%);
+  z-index: 2000;
+  max-width: calc(100vw - 32px);
+  padding: 8px 14px;
+  border-radius: 999px;
+  background: rgba(40, 40, 52, 0.94);
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-size: 0.85rem;
+  font-weight: 600;
+  pointer-events: none;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+}
+.lfp-toast.hidden,
+.lfp-toast[hidden] {
+  display: none !important;
 }
