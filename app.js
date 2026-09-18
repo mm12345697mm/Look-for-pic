@@ -376,17 +376,34 @@
   }
 
 
-  /** 日本語（中文）on main AND related, including offline-cache / history replay. */
+  function stripEmptyParens(s) {
+    return String(s || '')
+      .replace(/[（(]\s*[）)]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  /**
+   * Display title: 日本語（中文）only when title_zh is a real source string.
+   * Missing Chinese → Japanese only (no empty （）). Never invent Chinese.
+   */
   function formatDisplayTitle(titleJa, titleZh) {
-    const ja = (titleJa || '').trim();
-    const zh = (titleZh || '').trim();
+    let ja = stripEmptyParens(titleJa);
+    let zh = stripEmptyParens(titleZh);
+    if (zh && ja && zh === ja) zh = '';
     if (!ja && !zh) return '（無標題）';
     if (!zh) return ja || '（無標題）';
     if (!ja) return zh;
-    // Avoid duplicating when OCR already Chinese-only or identical
-    if (ja === zh) return ja;
     if (ja.includes('（' + zh + '）') || ja.includes('(' + zh + ')')) return ja;
     return ja + '（' + zh + '）';
+  }
+
+  /** Clipboard string for 番號+名稱: CODE then newline then the on-screen title. */
+  function formatCodeTitleClipboard(code, displayTitle) {
+    const c = String(code || '').trim();
+    const t = String(displayTitle || '').trim();
+    if (c && t) return c + '\n' + t;
+    return c || t;
   }
 
   function workFromApi(raw, line) {
@@ -427,7 +444,7 @@
     return {
       code,
       title: raw.title ? String(raw.title) : '',
-      titleZh: raw.title_zh ? String(raw.title_zh) : (raw.titleZh ? String(raw.titleZh) : ''),
+      titleZh: String(raw.title_zh || raw.titleZh || '').trim(),
       actress: raw.actress ? String(raw.actress) : '',
       studio: raw.studio ? String(raw.studio) : '',
       cid,
@@ -974,9 +991,194 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
+    card.appendChild(buildWorkActions(w));
     card.appendChild(coverWrap);
     appendStillsScroll(card, w, '劇照（橫滑）');
     return card;
+  }
+
+  const ICON_COPY =
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.2" y="3" width="7.6" height="10.2" rx="1.4" fill="none" stroke="currentColor" stroke-width="1.35"/><path d="M3.4 5.4h1.4v8.4c0 .7.5 1.2 1.15 1.2H11" fill="none" stroke="currentColor" stroke-width="1.35"/></svg>';
+  const ICON_DL =
+    '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M8 2.2v8.2" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/><path d="M4.6 8.4 8 11.8l3.4-3.4" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.2 13.8h9.6" fill="none" stroke="currentColor" stroke-width="1.45" stroke-linecap="round"/></svg>';
+
+  function stopCarouselBubble(e) {
+    if (!e) return;
+    if (e.stopPropagation) e.stopPropagation();
+  }
+
+  function bindWorkAction(btn, handler) {
+    btn.addEventListener('pointerdown', stopCarouselBubble);
+    btn.addEventListener('touchstart', stopCarouselBubble, { passive: true });
+    btn.addEventListener('click', (e) => {
+      stopCarouselBubble(e);
+      if (e && e.preventDefault) e.preventDefault();
+      handler(e);
+    });
+  }
+
+  function buildWorkActions(w) {
+    const bar = document.createElement('div');
+    bar.className = 'work-actions';
+    bar.setAttribute('role', 'group');
+    bar.setAttribute('aria-label', '複製與下載');
+    const displayTitle = formatDisplayTitle(w.title, w.titleZh);
+    const specs = [
+      { mark: '番', icon: ICON_COPY, label: '複製番號', run: () => copyWorkField(w.code, '已複製') },
+      { mark: '名', icon: ICON_COPY, label: '複製名稱', run: () => copyWorkField(displayTitle, '已複製') },
+      {
+        mark: '合',
+        icon: ICON_COPY,
+        label: '複製番號與名稱',
+        run: () => copyWorkField(formatCodeTitleClipboard(w.code, displayTitle), '已複製'),
+      },
+      { mark: '', icon: ICON_DL, label: '下載封面與劇照', run: () => downloadWorkMedia(w) },
+    ];
+    specs.forEach((spec) => {
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'work-action' + (spec.mark ? '' : ' work-action-dl');
+      btn.setAttribute('aria-label', spec.label);
+      btn.title = spec.label;
+      btn.innerHTML = spec.icon + (spec.mark ? '<span class="work-action-mark">' + spec.mark + '</span>' : '');
+      bindWorkAction(btn, spec.run);
+      bar.appendChild(btn);
+    });
+    return bar;
+  }
+
+  let toastTimer = null;
+  function showToast(msg) {
+    const el = $('lfp-toast');
+    if (!el) {
+      setStatus(msg, 'ok');
+      return;
+    }
+    el.textContent = msg;
+    el.classList.remove('hidden');
+    el.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      el.classList.add('hidden');
+      el.hidden = true;
+    }, 1800);
+  }
+
+  function copyTextFallback(str) {
+    return new Promise((resolve, reject) => {
+      const ta = document.createElement('textarea');
+      ta.value = str;
+      ta.setAttribute('readonly', '');
+      ta.setAttribute('aria-hidden', 'true');
+      ta.style.cssText =
+        'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0.01;padding:0;border:0;z-index:9999;';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      try {
+        ta.setSelectionRange(0, str.length);
+      } catch (_) {}
+      let ok = false;
+      try {
+        ok = document.execCommand('copy');
+      } catch (_) {}
+      document.body.removeChild(ta);
+      if (ok) resolve();
+      else reject(new Error('copy_failed'));
+    });
+  }
+
+  function copyTextToClipboard(text) {
+    const str = String(text == null ? '' : text);
+    if (!str) return Promise.reject(new Error('empty'));
+    if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+      return navigator.clipboard.writeText(str).catch(() => copyTextFallback(str));
+    }
+    return copyTextFallback(str);
+  }
+
+  function copyWorkField(text, okMsg) {
+    copyTextToClipboard(text)
+      .then(() => showToast(okMsg || '已複製'))
+      .catch(() => showToast('複製失敗'));
+  }
+
+  function workDownloadUrls(w) {
+    const urls = [];
+    const seen = {};
+    function add(u) {
+      const s = String(u || '').trim();
+      if (!s || isNowPrintingUrl(s) || seen[s]) return;
+      seen[s] = true;
+      urls.push(s);
+    }
+    add(w && w.cover);
+    (w && w.stills ? w.stills : []).forEach(add);
+    return urls;
+  }
+
+  function triggerBlobDownload(blob, filename) {
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || 'download';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(url);
+      } catch (_) {}
+    }, 4000);
+  }
+
+  async function downloadWorkSequential(w) {
+    const urls = workDownloadUrls(w);
+    if (!urls.length) {
+      showToast('沒有可下載的圖片');
+      return;
+    }
+    for (let i = 0; i < urls.length; i++) {
+      const a = document.createElement('a');
+      a.href = '/api/cdn-file?url=' + encodeURIComponent(urls[i]);
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      if (i < urls.length - 1) await sleep(350);
+    }
+    showToast('下載中');
+  }
+
+  async function downloadWorkMedia(w) {
+    const urls = workDownloadUrls(w);
+    if (!urls.length) {
+      showToast('沒有可下載的圖片');
+      return;
+    }
+    showToast('下載中');
+    try {
+      const res = await fetch('/api/work-zip', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: w.code || 'work',
+          cover: w.cover || '',
+          stills: (w.stills || []).slice(0, 12),
+        }),
+      });
+      if (!res.ok) throw new Error('zip_failed');
+      const blob = await res.blob();
+      if (!blob || !blob.size) throw new Error('empty_zip');
+      const stem = (w.code && parseCodeParts(w.code) ? formatDisplayCode(w.code) : w.code) || 'work';
+      triggerBlobDownload(blob, stem + '.zip');
+      showToast('下載中');
+    } catch (_) {
+      await downloadWorkSequential(w);
+    }
   }
 
   /**
@@ -1308,6 +1510,11 @@
     }
   }
 
+  /** Every stored row can open — success/failure, session or legacy. Cover/title/ok do not gate. */
+  function historyRecordIsOpenable(rec) {
+    return !!(rec && rec.id);
+  }
+
   function renderHistoryList() {
     const list = loadHistory();
     historyList.innerHTML = '';
@@ -1318,27 +1525,38 @@
     }
     historyEmpty.hidden = true;
     list.forEach((rec) => {
-      const row = document.createElement('button');
-      row.type = 'button';
+      const works = historySessionWorks(rec);
+      const first = works[0] || rec || {};
+      const row = document.createElement('div');
       row.className = 'history-item';
-      const thumbSrc = rec.cover || (rec.userShots && rec.userShots[0]) || '';
+      row.setAttribute('role', 'button');
+      row.tabIndex = 0;
+      const thumbSrc =
+        rec.cover ||
+        first.cover ||
+        (rec.userShots && rec.userShots[0]) ||
+        '';
       let thumbHtml;
       if (thumbSrc) {
-        thumbHtml = '<img class="history-thumb" src="' + escapeHtml(thumbSrc) + '" alt="" loading="lazy" referrerpolicy="no-referrer" />';
+        thumbHtml =
+          '<img class="history-thumb" src="' +
+          escapeHtml(thumbSrc) +
+          '" alt="" loading="lazy" referrerpolicy="no-referrer" />';
       } else {
         thumbHtml = '<div class="history-thumb placeholder">無圖</div>';
       }
+      const codeLabel = rec.code || first.code || '—';
+      const titleJa = rec.title || first.title || '';
+      const titleZh = rec.title_zh || first.title_zh || first.titleZh || '';
       row.innerHTML =
         thumbHtml +
         '<div class="history-meta">' +
         '<p class="history-code">' +
-        escapeHtml(rec.code || '—') +
-        (historySessionWorks(rec).length > 1
-          ? ' <span class="badge">' + historySessionWorks(rec).length + ' 部</span>'
-          : '') +
+        escapeHtml(codeLabel) +
+        (works.length > 1 ? ' <span class="badge">' + works.length + ' 部</span>' : '') +
         '</p>' +
         '<p class="history-title">' +
-        escapeHtml(formatDisplayTitle(rec.title, rec.title_zh)) +
+        escapeHtml(formatDisplayTitle(titleJa, titleZh)) +
         '</p>' +
         '<p class="history-ts">' +
         escapeHtml(formatTs(rec.ts)) +
@@ -1357,7 +1575,21 @@
         renderHistoryList();
       });
       row.appendChild(del);
-      row.addEventListener('click', () => openHistoryDetail(rec.id));
+      const open = (e) => {
+        if (e) {
+          e.preventDefault();
+          e.stopPropagation();
+        }
+        if (!historyRecordIsOpenable(rec)) return;
+        openHistoryDetail(rec.id);
+      };
+      row.addEventListener('click', open);
+      row.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          open(e);
+        }
+      });
       historyList.appendChild(row);
     });
   }
@@ -1410,15 +1642,20 @@
         const merged = related && related.length
           ? mergeRelatedIncremental(related, incoming)
           : slimRelatedForHistory(incoming);
-        work = Object.assign({}, work, { related: merged });
+        const patch = { related: merged };
+        const incomingZh = String(data.title_zh || '').trim();
+        if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
+          patch.title_zh = incomingZh;
+        }
+        work = Object.assign({}, work, patch);
         const list = loadHistory();
         const idx = list.findIndex((x) => x.id === recId);
         if (idx >= 0) {
           const works = historySessionWorks(list[idx]);
-          if (works[workIndex]) works[workIndex] = Object.assign({}, works[workIndex], { related: merged });
+          if (works[workIndex]) works[workIndex] = Object.assign({}, works[workIndex], patch);
           list[idx].works = works;
           if (workIndex === 0) list[idx].related = merged;
-          if (data.title_zh && !list[idx].title_zh) list[idx].title_zh = data.title_zh;
+          if (incomingZh && !list[idx].title_zh) list[idx].title_zh = incomingZh;
           saveHistory(list);
         }
       }
@@ -1426,12 +1663,14 @@
     return work;
   }
 
-  async function openHistoryDetail(id) {
-    const rec = loadHistory().find((x) => x.id === id);
-    if (!rec) return;
-    viewingHistoryId = id;
+  function paintHistoryDetail(rec) {
     historyDetailEl.innerHTML = '';
-
+    if (rec.ok === false && rec.message) {
+      const notice = document.createElement('div');
+      notice.className = 'notice';
+      notice.textContent = String(rec.message);
+      historyDetailEl.appendChild(notice);
+    }
     if (rec.userShots && rec.userShots.length) {
       const head = document.createElement('div');
       head.className = 'user-shots-head';
@@ -1448,19 +1687,54 @@
       historyDetailEl.appendChild(head);
       historyDetailEl.appendChild(scroll);
     }
-
-    let works = historySessionWorks(rec);
-    for (let i = 0; i < works.length; i++) {
-      works[i] = await fillWorkRelatedGaps(works[i], id, i);
+    const works = historySessionWorks(rec);
+    if (!works.length) {
+      const empty = document.createElement('div');
+      empty.className = 'notice';
+      empty.textContent = rec.message || '此筆沒有可顯示的作品。';
+      historyDetailEl.appendChild(empty);
+      return;
     }
-    const payload = identifyPayloadFromHistory(Object.assign({}, rec, { works: works }));
+    const payload = identifyPayloadFromHistory(rec);
     const result = galleryFromIdentify(payload);
     (result.items || []).forEach((w) => {
       historyDetailEl.appendChild(buildWorkCarousel(w));
     });
+  }
+
+  async function enrichHistoryDetail(rec, id) {
+    try {
+      const works = historySessionWorks(rec);
+      let changed = false;
+      const nextWorks = [];
+      for (let i = 0; i < works.length; i++) {
+        const next = await fillWorkRelatedGaps(works[i], id, i);
+        if (
+          next !== works[i] ||
+          JSON.stringify(next && next.related) !== JSON.stringify(works[i] && works[i].related) ||
+          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '')
+        ) {
+          changed = true;
+        }
+        nextWorks.push(next);
+      }
+      if (viewingHistoryId !== id) return;
+      if (!changed) return;
+      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: nextWorks });
+      paintHistoryDetail(fresh);
+    } catch (_) {}
+  }
+
+  function openHistoryDetail(id) {
+    const rec = loadHistory().find((x) => x.id === id);
+    if (!rec) return false;
+    viewingHistoryId = id;
+    paintHistoryDetail(rec);
     showScreen('history-detail');
     hideUserShots();
     hideProgress();
+    enrichHistoryDetail(rec, id);
+    return true;
   }
 
   async function runIdentify({ images, image, code, title } = {}, myRun) {
@@ -1937,6 +2211,11 @@
       galleryFromIdentify,
       historySessionWorks,
       isRelatedBucketItem,
+      formatDisplayTitle,
+      formatCodeTitleClipboard,
+      historyRecordIsOpenable,
+      renderHistoryList,
+      openHistoryDetail,
     };
   } catch (_) {}
 })();

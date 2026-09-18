@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import fcntl
 import hashlib
+import io
 import json
 import os
 import re
@@ -13,9 +14,11 @@ import subprocess
 import tempfile
 import threading
 import time
+import zipfile
 from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 import urllib3
@@ -27,6 +30,7 @@ ROOT = Path(__file__).resolve().parent
 DEMO_PATH = ROOT / "data" / "demo-package.json"
 
 DMM_PICS = "https://pics.dmm.co.jp/digital/video"
+CDN_MEDIA_HOSTS = {"pics.dmm.co.jp"}
 PREFIX_ONE_LABELS = {
     "nhdtc", "nhdtb", "nhdta", "nhdts", "nhdt",
     # SOD-style digital CIDs need leading "1" (curl-verified: without → now_printing)
@@ -6182,6 +6186,109 @@ def identify():
     return jsonify(result), status
 
 
+def allowed_media_url(url: str | None) -> bool:
+    """True only for DMM CDN image URLs (cover/stills download)."""
+    u = (url or "").strip()
+    if not u.startswith("http://") and not u.startswith("https://"):
+        return False
+    if is_now_printing_url(u):
+        return False
+    try:
+        host = (urlparse(u).hostname or "").lower()
+    except Exception:
+        return False
+    return host in CDN_MEDIA_HOSTS
+
+
+def _safe_zip_stem(code: str) -> str:
+    raw = format_display_code(code or "") or "work"
+    stem = re.sub(r"[^A-Za-z0-9._-]+", "_", str(raw)).strip("._") or "work"
+    return stem[:40]
+
+
+def build_work_zip_bytes(
+    code: str,
+    cover: str | None,
+    stills: list | None,
+    *,
+    fetch_bytes=None,
+) -> tuple[bytes, int, str]:
+    """Zip one work's cover + stills. Returns (zip_bytes, file_count, filename)."""
+    fetcher = fetch_bytes or download_cover_bytes
+    stem = _safe_zip_stem(code)
+    names_urls: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def add(name: str, url: str | None) -> None:
+        u = (url or "").strip()
+        if not u or u in seen or not allowed_media_url(u):
+            return
+        seen.add(u)
+        names_urls.append((name, u))
+
+    if cover:
+        add("cover", cover)
+    for i, u in enumerate(stills or []):
+        add(f"still-{i + 1:02d}", str(u or ""))
+        if len(names_urls) >= 16:
+            break
+
+    buf = io.BytesIO()
+    n = 0
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_STORED) as zf:
+        for name, url in names_urls:
+            try:
+                blob = fetcher(url, timeout=8.0)
+            except TypeError:
+                blob = fetcher(url)
+            if not blob:
+                continue
+            zf.writestr(f"{stem}/{name}.jpg", blob)
+            n += 1
+    return buf.getvalue(), n, f"{stem}.zip"
+
+
+@app.post("/api/work-zip")
+def work_zip():
+    """Download cover + stills for a single work as a zip (not the whole session)."""
+    body = request.get_json(silent=True) or {}
+    code = str(body.get("code") or "").strip()
+    cover = str(body.get("cover") or "").strip()
+    stills = body.get("stills") if isinstance(body.get("stills"), list) else []
+    data, n, fname = build_work_zip_bytes(code, cover, stills)
+    if n <= 0:
+        return jsonify({"ok": False, "message": "沒有可下載的圖片"}), 404
+    return Response(
+        data,
+        mimetype="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
+@app.get("/api/cdn-file")
+def cdn_file():
+    """Same-origin attachment for one allowed CDN image (sequential-download fallback)."""
+    url = (request.args.get("url") or "").strip()
+    if not allowed_media_url(url):
+        return jsonify({"ok": False, "message": "不支援的圖片網址"}), 400
+    blob = download_cover_bytes(url, timeout=8.0)
+    if not blob:
+        return jsonify({"ok": False, "message": "下載失敗"}), 404
+    fname = (url.rsplit("/", 1)[-1] or "image.jpg").split("?")[0]
+    fname = re.sub(r"[^A-Za-z0-9._-]+", "_", fname)[:80] or "image.jpg"
+    return Response(
+        blob,
+        mimetype="image/jpeg",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Cache-Control": "no-store",
+        },
+    )
+
+
 @app.get("/api/related-by-title")
 def related_by_title_api():
     """Fetch related works: title≤5 + keyword≤5 + actress≤3 (caps; history detail)."""
@@ -6199,7 +6306,13 @@ def related_by_title_api():
             pass
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
-    return jsonify({"ok": True, "related_by_title": items, "title": title, "exclude": code})
+    return jsonify({
+        "ok": True,
+        "related_by_title": items,
+        "title": title,
+        "title_zh": wrap.get("title_zh"),
+        "exclude": code,
+    })
 
 
 @app.post("/api/identify/stream")
