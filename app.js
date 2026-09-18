@@ -1690,14 +1690,25 @@
       historyDetailEl.appendChild(scroll);
     }
     const works = historySessionWorks(rec);
-    if (!works.length) {
-      const empty = document.createElement('div');
-      empty.className = 'notice';
-      empty.textContent = rec.message || '此筆沒有可顯示的作品。';
-      historyDetailEl.appendChild(empty);
+    const paintWorks = works.filter((w) => {
+      if (!w) return false;
+      const code = String(w.code || '').trim();
+      if (code && code !== '片名搜尋') return true;
+      if (String(w.title || '').trim()) return true;
+      if (String(w.cover || '').trim()) return true;
+      if (Array.isArray(w.stills) && w.stills.length) return true;
+      return false;
+    });
+    if (!paintWorks.length) {
+      if (!(rec.ok === false && rec.message)) {
+        const empty = document.createElement('div');
+        empty.className = 'notice';
+        empty.textContent = rec.message || '此筆沒有可顯示的作品。';
+        historyDetailEl.appendChild(empty);
+      }
       return;
     }
-    const payload = identifyPayloadFromHistory(rec);
+    const payload = identifyPayloadFromHistory(Object.assign({}, rec, { works: paintWorks }));
     const result = galleryFromIdentify(payload);
     (result.items || []).forEach((w) => {
       historyDetailEl.appendChild(buildWorkCarousel(w));
