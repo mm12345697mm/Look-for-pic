@@ -6349,6 +6349,8 @@ def cdn_file():
         return jsonify({"ok": False, "message": "不支援的圖片網址"}), 400
     blob = download_cover_bytes(url, timeout=8.0)
     if not blob:
+        blob = download_cover_bytes(url, timeout=12.0)
+    if not blob:
         return jsonify({"ok": False, "message": "下載失敗"}), 404
     fname = (url.rsplit("/", 1)[-1] or "image.jpg").split("?")[0]
     fname = re.sub(r"[^A-Za-z0-9._-]+", "_", fname)[:80] or "image.jpg"
