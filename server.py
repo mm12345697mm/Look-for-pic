@@ -466,6 +466,88 @@ def format_display_code(code: str) -> str:
     return f"{label}-{number}"
 
 
+def codes_numeric_equal(a: str | None, b: str | None) -> bool:
+    """True if both parse as the same label + integer (NHDTC-99 == NHDTC-099)."""
+    if not a or not b:
+        return False
+    pa, pb = parse_code_parts(str(a)), parse_code_parts(str(b))
+    if not pa or not pb:
+        return format_display_code(str(a)) == format_display_code(str(b))
+    try:
+        return pa[0] == pb[0] and int(pa[1] or 0) == int(pb[1] or 0)
+    except ValueError:
+        return pa[0] == pb[0] and pa[1] == pb[1]
+
+
+def prefer_display_code(query: str, catalog: str | None = None) -> str:
+    """Keep leading zeros: when numeric-equal, prefer the longer digit form (008 > 8)."""
+    q = format_display_code(query)
+    if not catalog:
+        return q
+    c = format_display_code(str(catalog))
+    if not codes_numeric_equal(q, c):
+        return q
+    pq, pc = parse_code_parts(q), parse_code_parts(c)
+    if not pq:
+        return c
+    if not pc:
+        return q
+    if len(pc[1]) > len(pq[1]):
+        return c
+    return q
+
+
+def code_lookup_slugs(code: str, *, limit: int = 12) -> list[str]:
+    """
+    Catalog/URL slug variants for a 品番.
+    Display form (with its zeros) is first; also try stripped zeros and common pads.
+    Example: DOSD-008 → DOSD-008, DOSD-8, DOSD-00008, …
+    """
+    parts = parse_code_parts(code)
+    display = format_display_code(code) if parts else normalize_code(code)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(s: str) -> None:
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+
+    add(display)
+    add(display.lower())
+    add(display.replace("-", ""))
+    add(display.replace("-", "").lower())
+    if parts:
+        lab, num = parts
+        stripped = num.lstrip("0") or "0"
+        # Catalog pages often omit leading zeros (DOSD-008 → DOSD-8)
+        if stripped != num:
+            add(f"{lab}-{stripped}")
+            add(f"{lab}{stripped}")
+            add(f"{lab}-{stripped}".lower())
+            add(f"{lab}{stripped}".lower())
+        for width in (3, 4, 5):
+            padded = stripped.zfill(width) if len(stripped) <= width else stripped
+            add(f"{lab}-{padded}")
+            add(f"{lab}{padded}")
+            add(f"{lab}-{padded}".lower())
+            if len(out) >= limit:
+                break
+    return out[:limit]
+
+
+def code_stripped_form(code: str) -> str | None:
+    """DOSD-008 → DOSD-8; None if already unpadded."""
+    parts = parse_code_parts(code)
+    if not parts:
+        return None
+    lab, num = parts
+    stripped = num.lstrip("0") or "0"
+    if stripped == num:
+        return None
+    return f"{lab}-{stripped}"
+
+
 def code_to_cid(code: str) -> str | None:
     parts = parse_code_parts(code)
     if not parts:
@@ -493,6 +575,16 @@ TITLE_CODE_MATCH_MIN = 0.45
 def is_now_printing_url(url: str | None) -> bool:
     """True if URL is DMM's placeholder / missing-cover image."""
     return "now_printing" in (url or "").lower()
+
+
+def usable_cover_url(url: object) -> bool:
+    """True if cover is an http(s) URL and not DMM's now_printing placeholder."""
+    s = str(url or "").strip()
+    if not (s.lower().startswith("http://") or s.lower().startswith("https://")):
+        return False
+    if is_now_printing_url(s):
+        return False
+    return True
 
 
 def probe_cover_url(url: str, timeout: float = COVER_PROBE_TIMEOUT) -> tuple[bool, str | None]:
@@ -556,11 +648,16 @@ def cover_cid_candidates(code: str) -> list[str]:
     stripped = number.lstrip("0") or "0"
     pads: list[str] = []
     seen_p: set[str] = set()
-    for w in (5, 4, 3):
-        p = stripped.zfill(w) if len(stripped) <= w else stripped
-        if p not in seen_p:
-            seen_p.add(p)
-            pads.append(p)
+    # Include original digits (008), common DMM pads, and stripped (8 / 08)
+    for raw in (number, stripped):
+        if raw not in seen_p:
+            seen_p.add(raw)
+            pads.append(raw)
+        for w in (5, 4, 3, 2):
+            p = raw.zfill(w) if len(raw) <= w else raw
+            if p not in seen_p:
+                seen_p.add(p)
+                pads.append(p)
     out: list[str] = []
     seen: set[str] = set()
 
@@ -634,13 +731,18 @@ def sanitize_cover_fields(
 def fetch_catalog_title_for_code(code: str) -> dict | None:
     """Lightweight code→official title for cross-check (jav321 / javlibrary / ddg)."""
     display = format_display_code(code)
-    for fetcher in (fetch_javbus, fetch_javlibrary, fetch_duckduckgo):
-        try:
-            meta = fetcher(display)
-        except Exception:
-            meta = None
-        if meta and (meta.get("title") or "").strip():
-            return meta
+    slugs = [display]
+    alt = code_stripped_form(display)
+    if alt:
+        slugs.append(alt)
+    for slug in slugs:
+        for fetcher in (fetch_javbus, fetch_javlibrary, fetch_duckduckgo):
+            try:
+                meta = fetcher(slug)
+            except Exception:
+                meta = None
+            if meta and (meta.get("title") or "").strip():
+                return meta
     return None
 
 
@@ -1012,11 +1114,9 @@ def _install_recovered_helpers() -> None:
     from pathlib import Path as _P
 
     # Marshal blob is CPython 3.13 bytecode; wrong minor version SIGSEGVs under gunicorn.
+    # Skip (don't crash) on other Pythons so unit tests can import cache/cover helpers.
     if sys.version_info[:2] != (3, 13):
-        raise RuntimeError(
-            "_recovered_helpers.marshal requires Python 3.13 "
-            f"(got {sys.version_info.major}.{sys.version_info.minor})"
-        )
+        return
 
     blob_path = _P(__file__).resolve().parent / "_recovered_helpers.marshal"
     if not blob_path.is_file():
@@ -1486,25 +1586,13 @@ def fetch_avbase_by_code(code: str) -> dict | None:
     from urllib.parse import quote
 
     display = format_display_code(code) if parse_code_parts(code) else (code or "").strip().upper()
+    query_display = display
     if not display or not parse_code_parts(display):
         return None
     headers = _avbase_headers()
     work = None
-    # Lookup slugs: keep display as-is, also try common zero-padding (NHDTC-99 → NHDTC-099)
-    _parts = parse_code_parts(display)
-    _slugs = [display, display.lower(), display.replace("-", "")]
-    if _parts:
-        _lab, _num = _parts
-        for width in (3, 4, 5):
-            padded = f"{_lab}-{_num.zfill(width)}"
-            if padded not in _slugs:
-                _slugs.append(padded)
-            compact = f"{_lab}{_num.zfill(width)}"
-            if compact not in _slugs:
-                _slugs.append(compact)
-            low = padded.lower()
-            if low not in _slugs:
-                _slugs.append(low)
+    # Lookup slugs: keep display zeros, also try stripped (DOSD-008 → DOSD-8) and pads
+    _slugs = code_lookup_slugs(display)
     # Prefer exact work page (stable even when search ranking is odd)
     for slug in _slugs:
         try:
@@ -1520,13 +1608,8 @@ def fetch_avbase_by_code(code: str) -> dict | None:
             if isinstance(cand, dict) and str(cand.get("work_id") or "").strip():
                 wid = format_display_code(str(cand.get("work_id")))
                 # Same 品番 if letters match and numeric values equal (099 == 99)
-                same = wid == display
-                if not same:
-                    pa, pb = parse_code_parts(wid), parse_code_parts(display)
-                    if pa and pb and pa[0] == pb[0] and int(pa[1] or 0) == int(pb[1] or 0):
-                        same = True
-                        display = wid  # prefer catalog form with its zeros
-                if same:
+                if codes_numeric_equal(wid, query_display):
+                    display = prefer_display_code(query_display, wid)
                     work = cand
                     break
         except Exception:
@@ -1537,7 +1620,9 @@ def fetch_avbase_by_code(code: str) -> dict | None:
         except Exception:
             rows = []
         for row in rows:
-            if format_display_code(str(row.get("code") or "")) == display:
+            row_code = str(row.get("code") or "")
+            if codes_numeric_equal(row_code, query_display):
+                display = prefer_display_code(query_display, row_code)
                 # Normalize to identify_code meta shape
                 return {
                     "code": display,
@@ -2753,14 +2838,29 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
 
 
 def _offline_cache_payload_ok(payload: dict) -> bool:
+    """Cache only gallery-ready hits: valid 品番 + a real (non-now_printing) cover.
+
+    Title-only / Gemini-only failures must not be stored, or re-query would
+    stick on 「離線快取」 with no photos.
+    """
     if not isinstance(payload, dict) or not payload.get("ok"):
         return False
     code = payload.get("code")
     if not code or str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code)):
         return False
-    title = (payload.get("title") or "").strip() if payload.get("title") else ""
-    cover = (payload.get("cover") or "").strip() if payload.get("cover") else ""
-    return bool(title or cover)
+    return usable_cover_url(payload.get("cover"))
+
+
+def _offline_cache_drop_entry(data: dict, entry_id: str | None) -> None:
+    """Remove an entry and every index key that points at it."""
+    if not entry_id:
+        return
+    entries = data.get("entries") or {}
+    entries.pop(entry_id, None)
+    by_key = data.get("by_key") or {}
+    dead = [k for k, v in by_key.items() if v == entry_id]
+    for k in dead:
+        by_key.pop(k, None)
 
 
 def _offline_cache_build_value(payload: dict) -> dict:
@@ -2775,7 +2875,7 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "actress": payload.get("actress"),
         "studio": payload.get("studio"),
         "cid": payload.get("cid"),
-        "cover": payload.get("cover"),
+        "cover": payload.get("cover") if usable_cover_url(payload.get("cover")) else None,
         "stills": list(stills)[:20],
         "related_by_title": _slim_related_for_cache(
             payload.get("related_by_title") or payload.get("related")
@@ -2853,16 +2953,33 @@ def offline_cache_get(
                 data = _offline_cache_read_unlocked(path)
                 by_key = data.get("by_key") or {}
                 entries = data.get("entries") or {}
+                dirty = False
                 entry_id = None
                 for k in keys:
                     entry_id = by_key.get(k)
                     if entry_id and entry_id in entries:
                         break
+                    if entry_id and entry_id not in entries:
+                        by_key.pop(k, None)
+                        dirty = True
                     entry_id = None
                 if not entry_id:
+                    if dirty:
+                        try:
+                            _offline_cache_write_unlocked(path, data)
+                        except Exception:
+                            pass
                     return None
                 entry = entries.get(entry_id)
-                if not isinstance(entry, dict):
+                check = dict(entry) if isinstance(entry, dict) else {}
+                check.setdefault("ok", True)
+                if not isinstance(entry, dict) or not _offline_cache_payload_ok(check):
+                    # Incomplete / now_printing / title-only: treat as miss and purge
+                    _offline_cache_drop_entry(data, entry_id)
+                    try:
+                        _offline_cache_write_unlocked(path, data)
+                    except Exception:
+                        pass
                     return None
                 # touch for LRU
                 entry["touched_at"] = time.time()
@@ -2918,13 +3035,18 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                 # merge: keep richer title/cover if new is thinner
                 prev = entries.get(entry_id)
                 if isinstance(prev, dict):
-                    for field in ("title", "title_zh", "actress", "studio", "cid", "cover"):
+                    for field in ("title", "title_zh", "actress", "studio", "cid"):
                         if not value.get(field) and prev.get(field):
                             value[field] = prev[field]
+                    if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
+                        value["cover"] = prev.get("cover")
                     if not value.get("stills") and prev.get("stills"):
                         value["stills"] = prev["stills"]
                     if not value.get("related_by_title") and prev.get("related_by_title"):
                         value["related_by_title"] = prev["related_by_title"]
+                if not usable_cover_url(value.get("cover")):
+                    # Do not persist title-only / now_printing after merge
+                    return
                 entries[entry_id] = value
                 for k in index_keys:
                     by_key[k] = entry_id
@@ -2941,6 +3063,27 @@ def image_content_hash(image_bytes: bytes | None) -> str | None:
         return hashlib.sha256(image_bytes).hexdigest()
     except Exception:
         return None
+
+
+def _fetch_titled_meta_for_code(fetcher, display: str) -> dict | None:
+    """Call a code→meta fetcher with display first, then stripped-zero slug."""
+    if not callable(fetcher):
+        return None
+    slugs = [display]
+    alt = code_stripped_form(display)
+    if alt:
+        slugs.append(alt)
+    last = None
+    for slug in slugs:
+        try:
+            m = fetcher(slug)
+        except Exception:
+            m = None
+        if m:
+            last = m
+            if (m.get("title") or "").strip():
+                return m
+    return last
 
 
 def identify_code(
@@ -3080,19 +3223,19 @@ def identify_code(
 
     if not _has_title(meta) and _budget_left() > 0.5:
         try:
-            meta = fetch_javlibrary(display)
+            meta = _fetch_titled_meta_for_code(fetch_javlibrary, display)
         except Exception:
             meta = meta
     if not _has_title(meta) and _budget_left() > 0.5:
         try:
-            jb = fetch_javbus(display)
+            jb = _fetch_titled_meta_for_code(fetch_javbus, display)
         except Exception:
             jb = None
         _merge_title(jb, (jb or {}).get("source") or "javbus")
 
     if not _has_title(meta) and _budget_left() > 1.0:
         try:
-            ddg = fetch_duckduckgo(display)
+            ddg = _fetch_titled_meta_for_code(fetch_duckduckgo, display)
         except Exception:
             ddg = None
         _merge_title(ddg, "duckduckgo")
@@ -3200,8 +3343,7 @@ def identify_code(
         "related_note": related_note,
     }
     try:
-        if title or cover:
-            offline_cache_put(out)
+        offline_cache_put(out)
     except Exception:
         pass
     return out
@@ -3610,60 +3752,77 @@ def fetch_missav_chinese_title(code: str) -> str | None:
     if not code or not parse_code_parts(str(code)):
         return None
     disp = format_display_code(str(code))
-    slug = disp.lower()
-    hosts = (
-        f"https://missav.ai/{slug}",
-        f"https://missav.ws/{slug}",
-        f"https://missav.live/{slug}",
+    slugs = [disp.lower()]
+    alt = code_stripped_form(disp)
+    if alt:
+        slugs.append(alt.lower())
+    host_bases = (
+        "https://missav.ai",
+        "https://missav.ws",
+        "https://missav.live",
     )
-    for url in hosts:
-        html = http_get(url, timeout=8.0)
-        if not html:
-            continue
-        # og:title / h1 often: "CODE 中文标题" or "中文标题 - CODE"
-        for pat in (
-            r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
-            r'content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']',
-            r"<h1[^>]*>(.*?)</h1>",
-            r"<title[^>]*>([^<]+)</title>",
-        ):
-            m = re.search(pat, html, flags=re.I | re.S)
-            if not m:
+    for slug in slugs:
+        for host in host_bases:
+            url = f"{host}/{slug}"
+            html = http_get(url, timeout=8.0)
+            if not html:
                 continue
-            raw = re.sub(r"<[^>]+>", "", m.group(1))
-            zh = _clean_title_zh(raw, code=disp)
-            if zh:
-                return zh
+            # og:title / h1 often: "CODE 中文标题" or "中文标题 - CODE"
+            for pat in (
+                r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
+                r'content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']',
+                r"<h1[^>]*>(.*?)</h1>",
+                r"<title[^>]*>([^<]+)</title>",
+            ):
+                m = re.search(pat, html, flags=re.I | re.S)
+                if not m:
+                    continue
+                raw = re.sub(r"<[^>]+>", "", m.group(1))
+                zh = _clean_title_zh(raw, code=disp)
+                if zh:
+                    return zh
     return None
 
 
 def fetch_javlibrary_chinese_title(code: str) -> str | None:
     """Best-effort Chinese title from JAVLibrary CN search/detail."""
+    from urllib.parse import quote
+
     if not code or not parse_code_parts(str(code)):
         return None
     disp = format_display_code(str(code))
-    url = f"https://www.javlibrary.com/cn/vl_searchbyid.php?keyword={quote(disp)}"
-    html = http_get(url, timeout=8.0, headers={"Referer": "https://www.javlibrary.com/cn/"})
-    if not html:
-        return None
-    # Direct detail redirect page
-    tm = re.search(r'id="video_title".*?<a[^>]*>([^<]+)</a>', html, flags=re.I | re.S)
-    if tm:
-        zh = _clean_title_zh(tm.group(1), code=disp)
-        if zh:
-            return zh
-    # Search result cards: title="CODE 中文..."
-    for m in re.finditer(
-        r'class="video"[^>]*>.*?title="([^"]+)"', html, flags=re.I | re.S
-    ):
-        raw = m.group(1)
-        if disp.replace("-", "").upper() not in re.sub(r"[\s\-]", "", raw).upper() and disp.upper() not in raw.upper():
-            # still accept if starts with code-ish
-            if not re.match(re.escape(disp.split("-")[0]), raw, flags=re.I):
-                continue
-        zh = _clean_title_zh(raw, code=disp)
-        if zh:
-            return zh
+    keywords = [disp]
+    alt = code_stripped_form(disp)
+    if alt:
+        keywords.append(alt)
+    for kw in keywords:
+        url = f"https://www.javlibrary.com/cn/vl_searchbyid.php?keyword={quote(kw)}"
+        html = http_get(url, timeout=8.0, headers={"Referer": "https://www.javlibrary.com/cn/"})
+        if not html:
+            continue
+        # Direct detail redirect page
+        tm = re.search(r'id="video_title".*?<a[^>]*>([^<]+)</a>', html, flags=re.I | re.S)
+        if tm:
+            zh = _clean_title_zh(tm.group(1), code=disp)
+            if zh:
+                return zh
+        # Search result cards: title="CODE 中文..."
+        for m in re.finditer(
+            r'class="video"[^>]*>.*?title="([^"]+)"', html, flags=re.I | re.S
+        ):
+            raw = m.group(1)
+            blob = re.sub(r"[\s\-]", "", raw).upper()
+            if (
+                disp.replace("-", "").upper() not in blob
+                and disp.upper() not in raw.upper()
+                and (not alt or alt.replace("-", "").upper() not in blob)
+            ):
+                # still accept if starts with code-ish
+                if not re.match(re.escape(disp.split("-")[0]), raw, flags=re.I):
+                    continue
+            zh = _clean_title_zh(raw, code=disp)
+            if zh:
+                return zh
     return None
 
 
