@@ -1186,40 +1186,81 @@
       .catch(() => showToast('複製失敗'));
   }
 
-  function workDownloadUrls(w) {
-    const urls = [];
-    const seen = {};
-    function add(u) {
-      const s = String(u || '').trim();
-      if (!s || isNowPrintingUrl(s) || seen[s]) return;
-      seen[s] = true;
-      urls.push(s);
-    }
-    add(w && w.cover);
-    (w && w.stills ? w.stills : []).forEach(add);
-    return urls;
+  function workFileStem(code) {
+    const stem = (code && parseCodeParts(code) ? formatDisplayCode(code) : code) || 'work';
+    return String(stem).replace(/[^A-Za-z0-9._-]+/g, '_') || 'work';
   }
 
   function workDownloadFilename(code, url, index, coverUrl) {
-    const stem = (code && parseCodeParts(code) ? formatDisplayCode(code) : code) || 'work';
-    const safe = String(stem).replace(/[^A-Za-z0-9._-]+/g, '_') || 'work';
-    if (index === 0 && coverUrl && url === coverUrl) return safe + '-cover.jpg';
-    const n = coverUrl && index > 0 ? index : index + 1;
+    const safe = workFileStem(code);
+    const u = String(url || '').trim();
+    const c = String(coverUrl || '').trim();
+    // Name by URL, not slot: the jacket must stay *-cover.jpg even if it is not index 0.
+    if (c && u === c) return safe + '-cover.jpg';
+    const n = index > 0 ? index : index + 1;
     return safe + '-jp-' + String(n).padStart(2, '0') + '.jpg';
+  }
+
+  /**
+   * Cover is always its own JPEG (*-cover.jpg). Stills are *-jp-01.jpg…
+   * Same URL as the jacket is not turned into a still (keep the cover name).
+   * Different URLs (pl jacket vs jp sample) are both kept.
+   */
+  function workDownloadItems(w) {
+    const code = w && w.code;
+    const cover = String((w && w.cover) || '').trim();
+    const items = [];
+    const seen = {};
+    if (cover && !isNowPrintingUrl(cover)) {
+      items.push({
+        role: 'cover',
+        url: cover,
+        filename: workDownloadFilename(code, cover, 0, cover),
+      });
+      seen[cover] = true;
+    }
+    let stillN = 0;
+    const stills = w && w.stills ? w.stills : [];
+    for (let i = 0; i < stills.length; i++) {
+      const s = String(stills[i] || '').trim();
+      if (!s || isNowPrintingUrl(s) || seen[s]) continue;
+      seen[s] = true;
+      stillN += 1;
+      items.push({
+        role: 'still',
+        url: s,
+        filename: workDownloadFilename(code, s, stillN, cover),
+      });
+    }
+    return items;
+  }
+
+  function workDownloadUrls(w) {
+    return workDownloadItems(w).map(function (it) {
+      return it.url;
+    });
   }
 
   function cdnProxyUrl(url) {
     return '/api/cdn-file?url=' + encodeURIComponent(url);
   }
 
-  function jpegFileFromBlob(blob, filename) {
+  function jpegFileFromBytes(buf, filename) {
     const fileName = filename || 'image.jpg';
-    const parts = blob ? [blob] : [];
+    const parts = buf ? [buf] : [];
     try {
       return new File(parts, fileName, { type: 'image/jpeg' });
     } catch (_) {
-      return new Blob(parts, { type: 'image/jpeg' });
+      try {
+        return new Blob(parts, { type: 'image/jpeg' });
+      } catch (__) {
+        return null;
+      }
     }
+  }
+
+  function jpegFileFromBlob(blob, filename) {
+    return jpegFileFromBytes(blob, filename);
   }
 
   function shareSheetPayload(files) {
@@ -1253,50 +1294,117 @@
     return name === 'AbortError' || /abort|cancel/i.test(msg);
   }
 
-  async function fetchWorkImageBlob(url) {
+  async function fetchWorkImageBuffer(url) {
     const res = await fetch(cdnProxyUrl(url));
     if (!res.ok) throw new Error('cdn');
     const buf = await res.arrayBuffer();
     if (!buf || !buf.byteLength) throw new Error('empty');
-    return new Blob([buf], { type: 'image/jpeg' });
+    return buf;
+  }
+
+  async function fetchWorkImageBufferTries(url, tries) {
+    const n = Math.max(1, tries || 1);
+    let lastErr = null;
+    for (let i = 0; i < n; i++) {
+      try {
+        return await fetchWorkImageBuffer(url);
+      } catch (err) {
+        lastErr = err;
+      }
+    }
+    throw lastErr || new Error('cdn');
+  }
+
+  function prefetchProgressToast(okCount, total, failed) {
+    let msg = '準備中（' + okCount + '/' + total + '）';
+    if (failed) msg += ' · 失敗 ' + failed;
+    showToast(msg, { persist: true });
   }
 
   async function prefetchWorkImageFiles(w, onProgress) {
-    const urls = workDownloadUrls(w);
-    const total = urls.length;
+    const items = workDownloadItems(w);
+    const total = items.length;
     const slots = new Array(total);
+    let ok = 0;
+    let failed = 0;
     let done = 0;
+
+    function report() {
+      if (onProgress) onProgress(ok, total, { ok: ok, failed: failed, done: done, total: total });
+    }
+    report();
+
+    async function fillSlot(i, tries) {
+      const buf = await fetchWorkImageBufferTries(items[i].url, tries);
+      const file = jpegFileFromBytes(buf, items[i].filename);
+      if (!file) throw new Error('file');
+      slots[i] = file;
+    }
+
+    const coverIdx = items.findIndex(function (it) {
+      return it.role === 'cover';
+    });
+    // Jacket first (own retry) so a flaky CDN slot cannot silently drop it.
+    if (coverIdx >= 0) {
+      try {
+        await fillSlot(coverIdx, 2);
+        ok += 1;
+      } catch (_) {
+        slots[coverIdx] = null;
+        failed += 1;
+      }
+      done += 1;
+      report();
+    }
+
+    const stillIdxs = [];
+    for (let i = 0; i < items.length; i++) {
+      if (i !== coverIdx) stillIdxs.push(i);
+    }
     let cursor = 0;
-    const workers = Math.min(3, total) || 0;
-    if (onProgress) onProgress(0, total);
+    const workers = Math.min(3, stillIdxs.length) || 0;
 
     async function worker() {
-      while (cursor < total) {
-        const i = cursor++;
-        const fname = workDownloadFilename(w.code, urls[i], i, w.cover);
+      while (cursor < stillIdxs.length) {
+        const i = stillIdxs[cursor++];
         try {
-          const blob = await fetchWorkImageBlob(urls[i]);
-          slots[i] = jpegFileFromBlob(blob, fname);
+          await fillSlot(i, 1);
+          ok += 1;
         } catch (_) {
           slots[i] = null;
+          failed += 1;
         }
         done += 1;
-        if (onProgress) onProgress(done, total);
+        report();
       }
     }
 
     const jobs = [];
     for (let n = 0; n < workers; n++) jobs.push(worker());
     await Promise.all(jobs);
-    const files = [];
-    for (let i = 0; i < slots.length; i++) {
-      if (slots[i]) files.push(slots[i]);
+
+    const stillFiles = [];
+    let coverFile = null;
+    for (let i = 0; i < items.length; i++) {
+      if (!slots[i]) continue;
+      if (items[i].role === 'cover') coverFile = slots[i];
+      else stillFiles.push(slots[i]);
     }
-    return files;
+    // Cover last in the share list: iOS has been seen dropping the first file
+    // of a multi-file share (jacket was index 0 → Photos got only the 10 stills).
+    const files = coverFile ? stillFiles.concat([coverFile]) : stillFiles.slice();
+    return {
+      files: files,
+      total: total,
+      ok: ok,
+      failed: failed,
+      coverExpected: coverIdx >= 0,
+      coverFailed: coverIdx >= 0 && !coverFile,
+    };
   }
 
-  function armTapToShare(files) {
-    showToast('準備完成 · 點一下儲存到相簿', {
+  function armTapToShare(files, readyMsg) {
+    showToast(readyMsg || '準備完成 · 點一下儲存到相簿', {
       persist: true,
       onClick: function () {
         if (typeof navigator.share !== 'function') {
@@ -1311,7 +1419,7 @@
     });
   }
 
-  async function offerSaveImageFiles(files) {
+  async function offerSaveImageFiles(files, readyMsg) {
     if (!files || !files.length) {
       showToast('沒有可下載的圖片');
       return { ok: false, reason: 'empty' };
@@ -1337,15 +1445,15 @@
 
     // Prefetch consumes the original tap; one follow-up tap opens one share sheet
     // for the whole set (iOS: 儲存影像). Never fire N <a download> clicks.
-    armTapToShare(files);
+    armTapToShare(files, readyMsg);
     return { ok: true, reason: 'tap' };
   }
 
   let downloadBusy = false;
 
   async function downloadWorkMedia(w) {
-    const urls = workDownloadUrls(w);
-    if (!urls.length) {
+    const items = workDownloadItems(w);
+    if (!items.length) {
       showToast('沒有可下載的圖片');
       return { ok: false, reason: 'empty' };
     }
@@ -1354,17 +1462,24 @@
       return { ok: false, reason: 'busy' };
     }
     downloadBusy = true;
-    const total = urls.length;
+    const total = items.length;
     try {
-      showToast('準備中（0/' + total + '）', { persist: true });
-      const files = await prefetchWorkImageFiles(w, function (done, tot) {
-        showToast('準備中（' + done + '/' + tot + '）', { persist: true });
+      prefetchProgressToast(0, total, 0);
+      const result = await prefetchWorkImageFiles(w, function (okCount, tot, meta) {
+        prefetchProgressToast(okCount, tot, meta && meta.failed);
       });
-      if (!files.length) {
+      if (result.coverExpected && result.coverFailed) {
+        showToast('封面下載失敗');
+        return { ok: false, reason: 'cover' };
+      }
+      if (!result.files.length) {
         showToast('下載失敗');
         return { ok: false, reason: 'fetch' };
       }
-      return await offerSaveImageFiles(files);
+      const readyMsg = result.failed
+        ? '準備完成（' + result.files.length + '/' + result.total + '）· 點一下儲存到相簿'
+        : null;
+      return await offerSaveImageFiles(result.files, readyMsg);
     } catch (_) {
       showToast('下載失敗');
       return { ok: false, reason: 'error' };
@@ -2443,6 +2558,7 @@
       workNeedsTitleZh,
       workDownloadFilename,
       workDownloadUrls,
+      workDownloadItems,
       shareSheetPayload,
       canShareImageFiles,
       jpegFileFromBlob,

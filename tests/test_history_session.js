@@ -431,6 +431,29 @@ function related(n, line) {
   assert.strictEqual(payload.files, fakeFiles);
   assert.strictEqual(payload.text, undefined);
   assert.strictEqual(payload.url, undefined);
+
+  // Cover is always its own file; same still URL does not replace *-cover.jpg
+  const dup = H.workDownloadItems({ cover: cover, stills: [cover, still], code: 'AAA-001' });
+  assert.strictEqual(dup.length, 2);
+  assert.strictEqual(dup[0].role, 'cover');
+  assert.strictEqual(dup[0].filename, 'AAA-001-cover.jpg');
+  assert.strictEqual(dup[1].role, 'still');
+  assert.strictEqual(dup[1].url, still);
+  assert.strictEqual(dup[1].filename, 'AAA-001-jp-01.jpg');
+
+  // Jacket pl vs sample jp stay both (HAWA-367 pattern: 1 cover + 10 stills)
+  const hawaCover = 'https://pics.dmm.co.jp/digital/video/1hawa00367/1hawa00367pl.jpg';
+  const hawaStills = Array.from({ length: 10 }, (_, i) =>
+    'https://pics.dmm.co.jp/digital/video/1hawa00367/1hawa00367jp-' + (i + 1) + '.jpg'
+  );
+  const hawa = H.workDownloadItems({ code: 'HAWA-367', cover: hawaCover, stills: hawaStills });
+  assert.strictEqual(hawa.length, 11);
+  assert.strictEqual(hawa[0].role, 'cover');
+  assert.strictEqual(hawa[0].url, hawaCover);
+  assert.strictEqual(hawa[0].filename, 'HAWA-367-cover.jpg');
+  assert.strictEqual(hawa[1].filename, 'HAWA-367-jp-01.jpg');
+  assert.strictEqual(hawa[10].filename, 'HAWA-367-jp-10.jpg');
+  assert.ok(hawa.every((it) => it.url !== hawaCover || it.role === 'cover'));
 }
 
 (async function () {
@@ -480,6 +503,9 @@ function related(n, line) {
       assert.ok(!name.endsWith('.zip'), name);
       assert.strictEqual(f.type, 'image/jpeg');
     });
+    const names = shareCalls[0].files.map((f) => String(f.name || ''));
+    assert.ok(names.indexOf('AAA-001-cover.jpg') !== -1, 'cover jpeg must be in the share set: ' + names.join(','));
+    assert.ok(names.indexOf('AAA-001-jp-01.jpg') !== -1, names.join(','));
     assert.strictEqual(anchorClicks, 0, 'must not fire sequential <a download> clicks');
     assert.ok(fetched.length >= 2);
     fetched.forEach((u) => {
@@ -516,6 +542,126 @@ function related(n, line) {
     assert.strictEqual(shareCalls.length, 1);
     assert.strictEqual(shareCalls[0].files.length, 2);
     assert.strictEqual(anchorClicks, 0);
+  }
+
+  function namesOf(files) {
+    return (files || []).map((f) => String(f.name || ''));
+  }
+
+  // Cover fetch fails once, then succeeds on the same /api/cdn-file retry
+  {
+    const fetched = [];
+    const shareCalls = [];
+    let coverHits = 0;
+    context.fetch = async (url) => {
+      const u = String(url);
+      fetched.push(u);
+      if (u.indexOf('aaa00001pl.jpg') !== -1) {
+        coverHits += 1;
+        if (coverHits === 1) {
+          return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+        }
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(result.reason, 'shared');
+    assert.strictEqual(coverHits, 2, 'cover retries once via /api/cdn-file');
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 2);
+    assert.ok(namesOf(shareCalls[0].files).indexOf('AAA-001-cover.jpg') !== -1);
+    fetched.forEach((u) => assert.ok(u.indexOf('/api/cdn-file?') !== -1, u));
+  }
+
+  // Cover never arrives: do not share stills as if 11/11 succeeded
+  {
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (u.indexOf('aaa00001pl.jpg') !== -1) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.ok, false);
+    assert.strictEqual(result.reason, 'cover');
+    assert.strictEqual(shareCalls.length, 0, 'must not open share without the jacket');
+    assert.ok(
+      String(getEl('lfp-toast').textContent).indexOf('封面下載失敗') !== -1,
+      getEl('lfp-toast').textContent
+    );
+  }
+
+  // HAWA-367: 1 jacket + 10 jp stills all go into one share, cover named *-cover.jpg
+  {
+    const hawaCover = 'https://pics.dmm.co.jp/digital/video/1hawa00367/1hawa00367pl.jpg';
+    const hawaStills = Array.from({ length: 10 }, (_, i) =>
+      'https://pics.dmm.co.jp/digital/video/1hawa00367/1hawa00367jp-' + (i + 1) + '.jpg'
+    );
+    const hawaWork = { code: 'HAWA-367', cover: hawaCover, stills: hawaStills };
+    const shareCalls = [];
+    const toasts = [];
+    context.fetch = async (url) => {
+      toasts.push(String(getEl('lfp-toast').textContent));
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(hawaWork);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 11);
+    const names = namesOf(shareCalls[0].files);
+    assert.ok(names.indexOf('HAWA-367-cover.jpg') !== -1, names.join(','));
+    assert.strictEqual(names.filter((n) => /-jp-\d+\.jpg$/.test(n)).length, 10);
+    assert.ok(
+      toasts.some((t) => /準備中（\d+\/11）/.test(t)),
+      'progress denominator is 11: ' + toasts.join(' | ')
+    );
+  }
+
+  // One still fails: share the rest (including cover); toast shows failed count
+  {
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (u.indexOf('aaa00001jp-1.jpg') !== -1) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(work);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    assert.strictEqual(shareCalls[0].files.length, 1, 'cover still shared if a still fails');
+    assert.ok(
+      namesOf(shareCalls[0].files).some((n) => String(n) === 'AAA-001-cover.jpg'),
+      'cover jpeg remains: ' + namesOf(shareCalls[0].files).join(',')
+    );
   }
 
   // No Web Share API: toast Safari limitation, still no zip / no N downloads
