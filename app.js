@@ -104,9 +104,12 @@
     if (!code || !parseCodeParts(code)) return null;
     const list = loadHistory();
     for (const rec of list) {
-      if (!rec || !rec.code) continue;
-      if (!codesMatch(rec.code, code)) continue;
-      const cover = rec.cover && String(rec.cover).trim();
+      if (!rec) continue;
+      const works = historySessionWorks(rec);
+      const hit = works.find((w) => w && w.code && codesMatch(w.code, code)) ||
+        (rec.code && codesMatch(rec.code, code) ? rec : null);
+      if (!hit) continue;
+      const cover = (hit.cover || rec.cover) && String(hit.cover || rec.cover).trim();
       if (cover && !isNowPrintingUrl(cover)) {
         return rec;
       }
@@ -126,44 +129,239 @@
       cover: r.cover || '',
       stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
       why: r.why || '',
-      line: r.line || '',
+      line: relatedLineFromRaw(r),
     }));
+  }
+
+  function relatedLineFromRaw(r) {
+    const why = String((r && r.why) || '');
+    let rl = (r && r.line) || '';
+    if (rl === 'title') rl = 'theme';
+    if (rl === 'theme' || rl === 'keyword' || rl === 'actress') return rl;
+    if (rl === 'multi' || rl === 'candidate' || rl === 'main') return rl;
+    if (/候選|candidate/i.test(why)) return 'candidate';
+    if (/多圖/i.test(why)) return 'multi';
+    if (/演員|女優|actress/i.test(why)) return 'actress';
+    if (/關鍵字|keyword/i.test(why)) return 'keyword';
+    if (/主題|theme|片名相近/i.test(why)) return 'theme';
+    return rl || 'theme';
+  }
+
+  /** Theme/keyword/actress siblings only — never main, multi-shot, or title candidates. */
+  function isRelatedBucketItem(r) {
+    if (!r) return false;
+    const line = String(r.line || '');
+    const why = String(r.why || '');
+    if (line === 'theme' || line === 'keyword' || line === 'actress' || line === 'title') return true;
+    if (line === 'main' || line === 'multi' || line === 'candidate') return false;
+    if (/候選|candidate/i.test(why) || /多圖/i.test(why)) return false;
+    if (/主題|theme|片名相近/i.test(why)) return true;
+    if (/女優|actress|演員/i.test(why)) return true;
+    if (/關鍵字|keyword/i.test(why)) return true;
+    return false;
+  }
+
+  function pickRelatedSource(src, allowFallback, fb) {
+    src = src || {};
+    if (Array.isArray(src.related_by_title) && src.related_by_title.length) {
+      return src.related_by_title;
+    }
+    if (Array.isArray(src.related) && src.related.length) {
+      const only = src.related.filter(isRelatedBucketItem);
+      if (only.length) return only;
+    }
+    if (allowFallback && fb && fb !== src) {
+      if (Array.isArray(fb.related_by_title) && fb.related_by_title.length) {
+        return fb.related_by_title;
+      }
+      if (Array.isArray(fb.related) && fb.related.length) {
+        const only = fb.related.filter(isRelatedBucketItem);
+        if (only.length) return only;
+      }
+    }
+    return [];
   }
 
   function relatedNeedsTitleZh(related) {
     return (related || []).some((r) => r && r.code && !String(r.title_zh || r.titleZh || '').trim());
   }
 
-  function mergeTitleZhIntoRelated(existing, incoming) {
-    const zhBy = new Map();
-    for (const r of incoming || []) {
-      if (!r || !r.code) continue;
-      const zh = String(r.title_zh || r.titleZh || '').trim();
-      if (!zh) continue;
-      zhBy.set(String(r.code), zh);
-      if (parseCodeParts(String(r.code))) zhBy.set(formatDisplayCode(String(r.code)), zh);
-    }
-    return (existing || []).map((r) => {
-      if (!r || String(r.title_zh || r.titleZh || '').trim()) return r;
-      const key = r.code && parseCodeParts(String(r.code)) ? formatDisplayCode(String(r.code)) : String(r.code || '');
-      const zh = zhBy.get(key) || zhBy.get(String(r.code || ''));
-      return zh ? Object.assign({}, r, { title_zh: zh }) : r;
+  function relatedBucketsNeedFill(related) {
+    const counts = { theme: 0, keyword: 0, actress: 0 };
+    (related || []).forEach((r) => {
+      const ln = relatedLineFromRaw(r);
+      if (counts[ln] != null) counts[ln] += 1;
     });
+    return counts.theme < 5 || counts.keyword < 5 || counts.actress < 3;
+  }
+
+  function mergeStillsKeepExisting(prev, incoming) {
+    const out = [];
+    const seen = {};
+    (Array.isArray(prev) ? prev : []).concat(Array.isArray(incoming) ? incoming : []).forEach((u) => {
+      const s = String(u || '').trim();
+      if (!s || /now_printing/i.test(s) || seen[s]) return;
+      seen[s] = true;
+      out.push(s);
+    });
+    return out.slice(0, 20);
+  }
+
+  function capRelatedBuckets(items) {
+    const buckets = { theme: [], keyword: [], actress: [] };
+    const caps = { theme: 5, keyword: 5, actress: 3 };
+    const seen = {};
+    (items || []).forEach((r) => {
+      if (!r || !r.code) return;
+      const key = parseCodeParts(String(r.code)) ? formatDisplayCode(String(r.code)) : String(r.code);
+      if (seen[key]) return;
+      const line = relatedLineFromRaw(r);
+      if (!buckets[line] || buckets[line].length >= caps[line]) return;
+      seen[key] = true;
+      buckets[line].push(Object.assign({}, r, { line: line }));
+    });
+    return buckets.theme.concat(buckets.keyword, buckets.actress);
+  }
+
+  function mergeRelatedIncremental(existing, incoming) {
+    const byKey = {};
+    const order = [];
+    function keyOf(r) {
+      return r && r.code && parseCodeParts(String(r.code))
+        ? formatDisplayCode(String(r.code))
+        : String((r && r.code) || '');
+    }
+    slimRelatedForHistory(existing).concat(slimRelatedForHistory(incoming)).forEach((r) => {
+      const k = keyOf(r);
+      if (!k) return;
+      if (!byKey[k]) {
+        byKey[k] = Object.assign({}, r);
+        order.push(k);
+        return;
+      }
+      const cur = byKey[k];
+      ['title', 'title_zh', 'cover', 'why', 'line', 'actress'].forEach((f) => {
+        if (!cur[f] && r[f]) cur[f] = r[f];
+      });
+      cur.stills = mergeStillsKeepExisting(cur.stills, r.stills);
+    });
+    return capRelatedBuckets(order.map((k) => byKey[k]));
+  }
+
+  function mergeTitleZhIntoRelated(existing, incoming) {
+    return mergeRelatedIncremental(existing, incoming);
   }
 
   function backfillHistoryTitleZh(list, donor) {
     if (!donor || !Array.isArray(list)) return list;
-    const donorRelated = donor.related_by_title || donor.related || [];
-    const donorZh = String(donor.title_zh || donor.titleZh || '').trim();
+    const donorWorks = Array.isArray(donor.works) && donor.works.length
+      ? donor.works
+      : Array.isArray(donor.results) && donor.results.length
+        ? donor.results
+        : [donor];
     return list.map((rec) => {
-      if (!rec || !rec.code || !donor.code || !codesMatch(rec.code, donor.code)) return rec;
-      const next = Object.assign({}, rec);
-      if (!String(next.title_zh || '').trim() && donorZh) next.title_zh = donorZh;
-      if (Array.isArray(next.related) && next.related.length && donorRelated.length) {
-        next.related = mergeTitleZhIntoRelated(next.related, donorRelated);
-      }
-      return next;
+      if (!rec) return rec;
+      const works = historySessionWorks(rec);
+      let changed = false;
+      const nextWorks = works.map((w) => {
+        const match = donorWorks.find((d) => d && w && w.code && d.code && codesMatch(w.code, d.code));
+        if (!match) return w;
+        changed = true;
+        const nw = Object.assign({}, w);
+        const donorZh = String(match.title_zh || match.titleZh || '').trim();
+        if (!String(nw.title_zh || '').trim() && donorZh) nw.title_zh = donorZh;
+        const donorStills = Array.isArray(match.stills) ? match.stills : [];
+        if (donorStills.length) nw.stills = mergeStillsKeepExisting(nw.stills, donorStills);
+        const donorRelated = Array.isArray(match.related_by_title) && match.related_by_title.length
+          ? match.related_by_title
+          : (match.related || []).filter(isRelatedBucketItem);
+        if (donorRelated.length) {
+          nw.related = nw.related && nw.related.length
+            ? mergeRelatedIncremental(nw.related, donorRelated)
+            : slimRelatedForHistory(donorRelated);
+        }
+        if (match.cover && !nw.cover) nw.cover = match.cover;
+        return nw;
+      });
+      if (!changed) return rec;
+      const first = nextWorks[0] || rec;
+      return Object.assign({}, rec, {
+        works: nextWorks,
+        title_zh: rec.title_zh || first.title_zh || '',
+        related: first.related || rec.related,
+        stills: first.stills || rec.stills,
+        cover: rec.cover || first.cover,
+      });
     });
+  }
+
+  function historySessionWorks(rec) {
+    if (!rec) return [];
+    if (Array.isArray(rec.works) && rec.works.length) return rec.works;
+    return [
+      {
+        code: rec.code,
+        title: rec.title,
+        title_zh: rec.title_zh,
+        cover: rec.cover,
+        stills: rec.stills,
+        actress: rec.actress,
+        related: rec.related || [],
+        line: 'main',
+      },
+    ];
+  }
+
+  function slimWorkForHistory(item, fallback, line) {
+    const src = item || {};
+    const fb = fallback || {};
+    const lineOut = line || src.line || 'main';
+    const codeRaw = src.code || fb.code || '';
+    const code = codeRaw && parseCodeParts(String(codeRaw))
+      ? formatDisplayCode(String(codeRaw))
+      : String(codeRaw || '');
+    const relatedSrc = pickRelatedSource(src, lineOut === 'main', fb);
+    return {
+      code: code,
+      title: src.title || fb.title || '',
+      title_zh: src.title_zh || src.titleZh || fb.title_zh || '',
+      cover: src.cover || fb.cover || '',
+      stills: Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
+      actress: src.actress || fb.actress || '',
+      line: lineOut,
+      related: slimRelatedForHistory(relatedSrc),
+    };
+  }
+
+  function sessionWorksFromIdentify(data) {
+    if (!data) return [];
+    const hasResults = Array.isArray(data.results) && data.results.length;
+    const rows = hasResults ? data.results : [data];
+    const works = [];
+    const seen = {};
+    function pushWork(item, line) {
+      if (!item || isRelatedBucketItem(item)) return;
+      const work = slimWorkForHistory(item, data, line);
+      if (!work.code && !work.title) return;
+      const key = work.code ? String(work.code).toUpperCase() : ('t:' + work.title);
+      if (seen[key]) return;
+      seen[key] = true;
+      works.push(work);
+    }
+    rows.forEach((item, i) => {
+      const line = i === 0
+        ? 'main'
+        : (item && item.line === 'candidate' ? 'candidate' : ((item && item.line) || 'multi'));
+      pushWork(item, line);
+    });
+    // Title-search alternatives belong on the vertical axis of this session
+    if (!hasResults) {
+      const apiCands = Array.isArray(data.candidates) ? data.candidates : [];
+      if (apiCands.length >= 2) {
+        apiCands.forEach((c) => pushWork(c, 'candidate'));
+      }
+    }
+    return works;
   }
 
   function coverUrl(cid) {
@@ -178,7 +376,7 @@
   }
 
 
-  /** 日本語タイトル（中文片名）— omit empty parentheses when no Chinese title */
+  /** 日本語（中文）on main AND related, including offline-cache / history replay. */
   function formatDisplayTitle(titleJa, titleZh) {
     const ja = (titleJa || '').trim();
     const zh = (titleZh || '').trim();
@@ -218,18 +416,14 @@
     if (!stills.length && cid) {
       stills = stillUrls(cid, 10);
     }
-    const relatedByTitle = Array.isArray(raw.related_by_title)
-      ? raw.related_by_title.map((r) => {
-          const why = String((r && r.why) || '');
-          let rl = (r && r.line) || '';
-          if (!rl) {
-            if (/演員|女優|actress/i.test(why)) rl = 'actress';
-            else if (/關鍵字|keyword/i.test(why)) rl = 'keyword';
-            else rl = 'theme';
-          }
-          return workFromApi(r, rl);
-        })
-      : [];
+    const lineOut = line || raw.line || 'main';
+    let relatedByTitle = [];
+    if (lineOut !== 'theme' && lineOut !== 'keyword' && lineOut !== 'actress') {
+      const relRaw = Array.isArray(raw.related_by_title) && raw.related_by_title.length
+        ? raw.related_by_title
+        : (Array.isArray(raw.related) ? raw.related.filter(isRelatedBucketItem) : []);
+      relatedByTitle = relRaw.map((r) => workFromApi(r, relatedLineFromRaw(r)));
+    }
     return {
       code,
       title: raw.title ? String(raw.title) : '',
@@ -237,7 +431,7 @@
       actress: raw.actress ? String(raw.actress) : '',
       studio: raw.studio ? String(raw.studio) : '',
       cid,
-      line: line || raw.line || 'main',
+      line: lineOut,
       why: raw.why ? String(raw.why) : '',
       cover,
       stills,
@@ -514,92 +708,45 @@
   function galleryFromIdentify(data) {
     const seenCodes = new Set();
 
-    function mapRelated(r) {
-      const why = String(r.why || '');
-      let line = r.line || 'related';
-      if (!r.line) {
-        if (/候選|candidate/i.test(why)) line = 'candidate';
-        else if (/主題|theme|片名相近/i.test(why)) line = 'theme';
-        else if (/女優|actress|演員/i.test(why)) line = 'actress';
-        else if (/關鍵字|keyword/i.test(why)) line = 'keyword';
-        else if (/多圖/i.test(why)) line = 'multi';
-      }
-      return workFromApi(r, line);
-    }
-
-    // Prefer explicit results[] from multi-identify
+    // Prefer explicit results[] from multi-identify (vertical = this query's mains only)
     if (Array.isArray(data.results) && data.results.length) {
-      const items = data.results.map((r, i) => workFromApi(r, i === 0 ? 'main' : 'multi'));
-      items.forEach((w, i) => {
+      const items = data.results.map((r, i) =>
+        workFromApi(r, i === 0 ? 'main' : (r.line || 'multi'))
+      );
+      items.forEach((w) => {
         if (w.code && !w.titleOnly) seenCodes.add(String(w.code).toUpperCase());
-        // Ensure related_by_title from this result row (not only first / top-level)
-        if ((!w.relatedByTitle || !w.relatedByTitle.length) && data.results[i] && Array.isArray(data.results[i].related_by_title)) {
-          w.relatedByTitle = data.results[i].related_by_title.map((r) => {
-            const why = String((r && r.why) || '');
-            let rl = (r && r.line) || '';
-            if (!rl) {
-              if (/演員|女優|actress/i.test(why)) rl = 'actress';
-              else if (/關鍵字|keyword/i.test(why)) rl = 'keyword';
-              else rl = 'theme';
-            }
-            return workFromApi(r, rl);
-          });
-        }
       });
-      // Also merge non-multi related from first payload (theme/actress/candidates)
-      const relatedRaw = Array.isArray(data.related) ? data.related.slice() : [];
-      const extras = relatedRaw
-        .filter((r) => String(r.line || '') !== 'multi' && !/多圖/.test(String(r.why || '')))
-        .map(mapRelated)
-        .filter((w) => {
-          if (w.titleOnly || !w.code) return true;
-          const key = String(w.code).toUpperCase();
-          if (seenCodes.has(key)) return false;
-          seenCodes.add(key);
-          return true;
-        });
+      // Related stays nested on each main — never extra vertical rows
+      if (items[0] && (!items[0].relatedByTitle || !items[0].relatedByTitle.length)
+          && Array.isArray(data.related_by_title) && data.related_by_title.length) {
+        items[0].relatedByTitle = data.related_by_title.map((r) =>
+          workFromApi(r, relatedLineFromRaw(r))
+        );
+      } else if (items[0] && (!items[0].relatedByTitle || !items[0].relatedByTitle.length)
+          && Array.isArray(data.related) && data.related.length) {
+        const nested = data.related.filter(isRelatedBucketItem);
+        if (nested.length) {
+          items[0].relatedByTitle = nested.map((r) => workFromApi(r, relatedLineFromRaw(r)));
+        }
+      }
       let notice = data.related_note || data.message || null;
-      return { items: items.concat(extras), notice: notice || null, source: 'api' };
+      return { items: items, notice: notice || null, source: 'api' };
     }
 
     const main = workFromApi(data, 'main');
     if (main.code && !main.titleOnly) seenCodes.add(String(main.code).toUpperCase());
 
+    const items = [main];
+    // Title-search alternative 番號: extra vertical works for this query (not related)
     const apiCands = Array.isArray(data.candidates) ? data.candidates : [];
-    const relatedRaw = Array.isArray(data.related) ? data.related.slice() : [];
     if (apiCands.length >= 2) {
-      const relatedCodes = new Set(
-        relatedRaw
-          .map((r) => (r && r.code ? String(r.code).toUpperCase() : ''))
-          .filter(Boolean)
-      );
-      for (const c of apiCands) {
-        const key = c && c.code ? String(c.code).toUpperCase() : '';
-        if (!key || relatedCodes.has(key) || seenCodes.has(key)) continue;
-        relatedRaw.push({ ...c, why: c.why || '片名候選', line: 'candidate' });
-        relatedCodes.add(key);
-      }
-    }
-    const extras = relatedRaw.map(mapRelated).filter((w) => {
-      if (w.titleOnly || !w.code) return true;
-      const key = String(w.code).toUpperCase();
-      if (seenCodes.has(key)) return false;
-      seenCodes.add(key);
-      return true;
-    });
-
-    let items;
-    if (main.titleOnly && extras.length) {
-      items = extras;
-    } else {
-      items = [main, ...extras];
-    }
-
-    // Ensure main carries related_by_title from top-level if missing
-    if (items[0] && (!items[0].relatedByTitle || !items[0].relatedByTitle.length)) {
-      if (Array.isArray(data.related_by_title) && data.related_by_title.length) {
-        items[0].relatedByTitle = data.related_by_title.map((r) => workFromApi(r, 'theme'));
-      }
+      apiCands.forEach((c) => {
+        if (!c || !c.code) return;
+        const key = String(c.code).toUpperCase();
+        if (seenCodes.has(key)) return;
+        seenCodes.add(key);
+        items.push(workFromApi(c, 'candidate'));
+      });
     }
 
     let notice = data.related_note || data.message || null;
@@ -613,7 +760,7 @@
         notice = notice ? banner + ' — ' + notice : banner;
       }
     }
-    if (main.titleOnly && !extras.length) {
+    if (main.titleOnly && items.length < 2) {
       notice = (notice ? notice + ' ' : '') + '尚無封面；請手動輸入正確番號。';
     }
     return {
@@ -1045,6 +1192,12 @@
           ...r,
           userShots: (r.userShots || []).slice(0, 1),
           stills: (r.stills || []).slice(0, 6),
+          related: (r.related || []).slice(0, 8),
+          works: (r.works || []).map((w) => ({
+            ...w,
+            stills: (w.stills || []).slice(0, 6),
+            related: (w.related || []).slice(0, 8),
+          })),
         }));
         localStorage.setItem(HISTORY_KEY, JSON.stringify(slim));
       } catch (_) {}
@@ -1107,43 +1260,30 @@
 
   async function appendHistoryFromIdentify(data, userFiles) {
     if (!data || !data.ok) return;
-    const mainCode = data.code && parseCodeParts(String(data.code)) ? formatDisplayCode(String(data.code)) : String(data.code || '');
-    if (!mainCode && !data.title) return;
+    const works = sessionWorksFromIdentify(data);
+    if (!works.length) return;
 
     const userShots = await buildUserShotThumbs(userFiles || []);
-    const related = slimRelatedForHistory(data.related_by_title);
-
-    // Multi: save one record per result
-    const toSave = Array.isArray(data.results) && data.results.length
-      ? data.results
-      : [data];
+    const first = works[0];
+    const rec = {
+      id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      ts: Date.now(),
+      kind: 'session',
+      code: first.code,
+      title: first.title,
+      title_zh: first.title_zh || '',
+      cover: first.cover || '',
+      stills: first.stills || [],
+      actress: first.actress || '',
+      userShots: userShots,
+      related: first.related || [],
+      works: works,
+    };
 
     let list = loadHistory();
-    for (const item of toSave) {
-      const code = item.code && parseCodeParts(String(item.code))
-        ? formatDisplayCode(String(item.code))
-        : String(item.code || mainCode || '');
-      const rec = {
-        id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-        ts: Date.now(),
-        code: code,
-        title: item.title || data.title || '',
-        title_zh: item.title_zh || data.title_zh || '',
-        cover: item.cover || data.cover || '',
-        stills: Array.isArray(item.stills) ? item.stills.slice(0, 12) : (data.stills || []).slice(0, 12),
-        userShots: userShots,
-        related: item.related_by_title
-          ? slimRelatedForHistory(item.related_by_title)
-          : related,
-        actress: item.actress || data.actress || '',
-      };
-      list.unshift(rec);
-    }
-    // Patch older same-code records so related is not stuck JP-only after a live hit with Chinese
+    list.unshift(rec);
+    list = backfillHistoryTitleZh(list, rec);
     list = backfillHistoryTitleZh(list, data);
-    for (const item of toSave) {
-      list = backfillHistoryTitleZh(list, item);
-    }
     if (list.length > HISTORY_MAX) list = list.slice(0, HISTORY_MAX);
     saveHistory(list);
   }
@@ -1193,6 +1333,9 @@
         '<div class="history-meta">' +
         '<p class="history-code">' +
         escapeHtml(rec.code || '—') +
+        (historySessionWorks(rec).length > 1
+          ? ' <span class="badge">' + historySessionWorks(rec).length + ' 部</span>'
+          : '') +
         '</p>' +
         '<p class="history-title">' +
         escapeHtml(formatDisplayTitle(rec.title, rec.title_zh)) +
@@ -1219,13 +1362,76 @@
     });
   }
 
+  function identifyPayloadFromHistory(rec) {
+    const works = historySessionWorks(rec);
+    const first = works[0] || rec || {};
+    return {
+      ok: true,
+      code: first.code || rec.code,
+      title: first.title || rec.title || '',
+      title_zh: first.title_zh || rec.title_zh || '',
+      actress: first.actress || rec.actress || '',
+      cover: first.cover || rec.cover || '',
+      stills: Array.isArray(first.stills) ? first.stills : (rec.stills || []),
+      related_by_title: first.related || rec.related || [],
+      from_offline_cache: true,
+      // Always nested: vertical = session works, horizontal = each work's related
+      results: works.map((w, i) => ({
+        ok: true,
+        code: w.code,
+        title: w.title,
+        title_zh: w.title_zh,
+        actress: w.actress,
+        cover: w.cover,
+        stills: w.stills || [],
+        related_by_title: w.related || [],
+        line: i === 0 ? 'main' : (w.line || 'multi'),
+      })),
+    };
+  }
+
+  async function fillWorkRelatedGaps(work, recId, workIndex) {
+    const related = work.related || [];
+    const need =
+      !!work.title &&
+      ((!related || !related.length) || relatedNeedsTitleZh(related) || relatedBucketsNeedFill(related));
+    if (!need) return work;
+    try {
+      const qs =
+        '/api/related-by-title?title=' +
+        encodeURIComponent(work.title) +
+        '&code=' +
+        encodeURIComponent(work.code || '') +
+        (work.actress ? '&actress=' + encodeURIComponent(work.actress) : '');
+      const res = await fetch(qs);
+      const data = await res.json();
+      if (data && data.ok && Array.isArray(data.related_by_title) && data.related_by_title.length) {
+        const incoming = data.related_by_title;
+        const merged = related && related.length
+          ? mergeRelatedIncremental(related, incoming)
+          : slimRelatedForHistory(incoming);
+        work = Object.assign({}, work, { related: merged });
+        const list = loadHistory();
+        const idx = list.findIndex((x) => x.id === recId);
+        if (idx >= 0) {
+          const works = historySessionWorks(list[idx]);
+          if (works[workIndex]) works[workIndex] = Object.assign({}, works[workIndex], { related: merged });
+          list[idx].works = works;
+          if (workIndex === 0) list[idx].related = merged;
+          if (data.title_zh && !list[idx].title_zh) list[idx].title_zh = data.title_zh;
+          saveHistory(list);
+        }
+      }
+    } catch (_) {}
+    return work;
+  }
+
   async function openHistoryDetail(id) {
     const rec = loadHistory().find((x) => x.id === id);
     if (!rec) return;
     viewingHistoryId = id;
     historyDetailEl.innerHTML = '';
 
-    // User shots
     if (rec.userShots && rec.userShots.length) {
       const head = document.createElement('div');
       head.className = 'user-shots-head';
@@ -1243,56 +1449,15 @@
       historyDetailEl.appendChild(scroll);
     }
 
-    const w = workFromApi(
-      {
-        code: rec.code,
-        title: rec.title,
-        title_zh: rec.title_zh || '',
-        cover: rec.cover,
-        stills: rec.stills,
-        actress: rec.actress,
-        related_by_title: rec.related || [],
-      },
-      'main'
-    );
-    // Empty related, or related missing title_zh: fill from server (API already attaches Chinese)
-    const needRelatedFetch =
-      !!rec.title &&
-      ((!rec.related || !rec.related.length) || relatedNeedsTitleZh(rec.related));
-    if (needRelatedFetch) {
-      try {
-        const qs =
-          '/api/related-by-title?title=' +
-          encodeURIComponent(rec.title) +
-          '&code=' +
-          encodeURIComponent(rec.code || '') +
-          (rec.actress ? '&actress=' + encodeURIComponent(rec.actress) : '');
-        const res = await fetch(qs);
-        const data = await res.json();
-        if (data && data.ok && Array.isArray(data.related_by_title) && data.related_by_title.length) {
-          const incoming = data.related_by_title;
-          if (!rec.related || !rec.related.length) {
-            w.relatedByTitle = incoming.map((r) => workFromApi(r, 'theme'));
-          } else {
-            const merged = mergeTitleZhIntoRelated(rec.related, incoming);
-            w.relatedByTitle = merged.map((r) => workFromApi(r, r.line || 'theme'));
-          }
-          const list = loadHistory();
-          const idx = list.findIndex((x) => x.id === id);
-          if (idx >= 0) {
-            if (!list[idx].related || !list[idx].related.length) {
-              list[idx].related = slimRelatedForHistory(incoming);
-            } else {
-              list[idx].related = slimRelatedForHistory(
-                mergeTitleZhIntoRelated(list[idx].related, incoming)
-              );
-            }
-            saveHistory(list);
-          }
-        }
-      } catch (_) {}
+    let works = historySessionWorks(rec);
+    for (let i = 0; i < works.length; i++) {
+      works[i] = await fillWorkRelatedGaps(works[i], id, i);
     }
-    historyDetailEl.appendChild(buildWorkCarousel(w));
+    const payload = identifyPayloadFromHistory(Object.assign({}, rec, { works: works }));
+    const result = galleryFromIdentify(payload);
+    (result.items || []).forEach((w) => {
+      historyDetailEl.appendChild(buildWorkCarousel(w));
+    });
     showScreen('history-detail');
     hideUserShots();
     hideProgress();
@@ -1334,20 +1499,10 @@
     let historyPreviewShown = false;
     if (code && !imgs.length && !title) {
       const hist = findHistoryByCode(code);
-      if (hist && (hist.title || hist.cover)) {
+      if (hist && (hist.title || hist.cover || (hist.works && hist.works.length))) {
         try {
-          const previewData = {
-            ok: true,
-            code: hist.code,
-            title: hist.title || '',
-            title_zh: hist.title_zh || '',
-            actress: hist.actress || '',
-            cover: hist.cover || '',
-            stills: Array.isArray(hist.stills) ? hist.stills : [],
-            related_by_title: Array.isArray(hist.related) ? hist.related : [],
-            message: '瀏覽紀錄快取（等候伺服器確認）',
-            from_offline_cache: true,
-          };
+          const previewData = identifyPayloadFromHistory(hist);
+          previewData.message = '瀏覽紀錄快取（等候伺服器確認）';
           const result = galleryFromIdentify(previewData);
           renderGallery(result);
           setStatus('瀏覽紀錄快取 · 伺服器查詢中…', 'busy');
@@ -1776,5 +1931,12 @@
     window.__lfpAddFiles = addFilesToPending;
     window.__lfpStartPending = startPendingIdentify;
     window.__lfpGetPendingCount = () => pendingFiles.length;
+    window.__lfpHistory = {
+      sessionWorksFromIdentify,
+      identifyPayloadFromHistory,
+      galleryFromIdentify,
+      historySessionWorks,
+      isRelatedBucketItem,
+    };
   } catch (_) {}
 })();
