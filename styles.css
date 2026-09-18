@@ -839,11 +839,22 @@ label.btn {
   font-size: 1rem;
   cursor: pointer;
 }
-.history-detail .user-shots-scroll {
-  margin-bottom: 12px;
+.history-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
-.history-detail .card {
-  margin-bottom: 14px;
+.history-detail .user-shots-scroll {
+  margin-bottom: 0;
+}
+.history-detail .work-carousel-block {
+  margin-bottom: 0;
+}
+.history-detail .work-carousel-track {
+  overflow-x: auto;
+}
+.history-detail .work-carousel-slide .card {
+  margin-bottom: 0;
 }
 
 
