@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent
 DEMO_PATH = ROOT / "data" / "demo-package.json"
 
 DMM_PICS = "https://pics.dmm.co.jp/digital/video"
-CDN_MEDIA_HOSTS = {"pics.dmm.co.jp"}
+CDN_MEDIA_HOSTS = {"pics.dmm.co.jp", "pics.dmm.com"}
 PREFIX_ONE_LABELS = {
     "nhdtc", "nhdtb", "nhdta", "nhdts", "nhdt",
     # SOD-style digital CIDs need leading "1" (curl-verified: without → now_printing)
@@ -591,7 +591,8 @@ TITLE_CODE_MATCH_MIN = 0.45
 
 def is_now_printing_url(url: str | None) -> bool:
     """True if URL is DMM's placeholder / missing-cover image."""
-    return "now_printing" in (url or "").lower()
+    s = (url or "").lower()
+    return "now_printing" in s or "/noimage/" in s
 
 
 def usable_cover_url(url: object) -> bool:
@@ -1178,30 +1179,167 @@ def _restore_helper_defaults() -> None:
 _restore_helper_defaults()
 
 
+_CDN_UA_IOS = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 "
+    "Mobile/15E148 Safari/604.1"
+)
+
+
+def _cdn_header_variants() -> list[dict[str, str]]:
+    accept = "image/jpeg,image/webp,image/avif,image/*,*/*;q=0.8"
+    return [
+        {
+            "User-Agent": UA,
+            "Referer": "https://www.dmm.co.jp/",
+            "Accept": accept,
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.5",
+        },
+        {
+            "User-Agent": UA,
+            "Referer": "https://www.dmm.co.jp/digital/videoa/-/detail/",
+            "Accept": accept,
+            "Accept-Language": "ja,en;q=0.6",
+        },
+        {
+            "User-Agent": _CDN_UA_IOS,
+            "Referer": "https://www.dmm.co.jp/",
+            "Accept": "image/*",
+        },
+    ]
+
+
+def _looks_like_jpeg(blob: bytes | None) -> bool:
+    return bool(blob) and len(blob) >= 800 and blob[:2] == b"\xff\xd8"
+
+
+def dmm_cover_variant_urls(url: str) -> list[str]:
+    """Same-work DMM jacket variants only (pl ↔ ps, digital ↔ mono/movie).
+
+    Never invent jp/js sample stills as a cover. Stills pass through unchanged.
+    """
+    primary = (url or "").strip()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def add(u: str) -> None:
+        s = (u or "").strip()
+        if not s or s in seen:
+            return
+        seen.add(s)
+        out.append(s)
+
+    add(primary)
+    if not primary:
+        return out
+
+    def _swap(u: str, src: str, dst: str) -> str:
+        m = re.search(rf"{src}\.jpg(\?.*)?$", u, flags=re.I)
+        if not m:
+            return ""
+        return re.sub(rf"{src}\.jpg(?=\?|$)", f"{dst}.jpg", u, count=1, flags=re.I)
+
+    add(_swap(primary, "pl", "ps"))
+    add(_swap(primary, "ps", "pl"))
+
+    pics = "https://pics.dmm.co.jp"
+    m = re.match(
+        r"^https?://pics\.dmm\.(?:co\.jp|com)/digital/video/([^/?#]+)/[^/?#]+?(pl|ps)\.jpg(\?.*)?$",
+        primary,
+        flags=re.I,
+    )
+    if m:
+        cid, q = m.group(1), m.group(3) or ""
+        add(f"{pics}/mono/movie/adult/{cid}/{cid}pl.jpg{q}")
+        add(f"{pics}/mono/movie/adult/{cid}/{cid}ps.jpg{q}")
+    m = re.match(
+        r"^https?://pics\.dmm\.(?:co\.jp|com)/mono/movie/adult/([^/?#]+)/[^/?#]+?(pl|ps)\.jpg(\?.*)?$",
+        primary,
+        flags=re.I,
+    )
+    if m:
+        cid, q = m.group(1), m.group(3) or ""
+        add(f"{DMM_PICS}/{cid}/{cid}pl.jpg{q}")
+        add(f"{DMM_PICS}/{cid}/{cid}ps.jpg{q}")
+    # Same digital jackets on pics.dmm.com (Railway sometimes prefers one host)
+    for u in list(out):
+        if "pics.dmm.co.jp/digital/" in u:
+            add(u.replace("pics.dmm.co.jp", "pics.dmm.com", 1))
+        elif "pics.dmm.com/digital/" in u:
+            add(u.replace("pics.dmm.com", "pics.dmm.co.jp", 1))
+    return out
+
+
 def download_cover_bytes(url: str, timeout: float | None = None) -> bytes | None:
-    """Fetch candidate cover image bytes (short timeout). Prefer DMM CDN."""
+    """Fetch candidate cover/still bytes. Prefer DMM CDN; reject placeholders."""
     if timeout is None:
         timeout = float(COVER_DOWNLOAD_TIMEOUT)
     u = (url or "").strip()
     if not u.startswith("http"):
         return None
-    try:
-        r = requests.get(
-            u,
-            timeout=(2, timeout),
-            headers={"User-Agent": UA, "Referer": "https://www.dmm.co.jp/"},
-            verify=False,
-        )
-        if r.status_code >= 400 or not r.content or len(r.content) < 800:
-            return None
-        if is_now_printing_url(str(r.url or u)):
-            return None
-        ctype = (r.headers.get("Content-Type") or "").lower()
-        if "html" in ctype:
-            return None
-        return r.content
-    except Exception:
+    if is_now_printing_url(u):
         return None
+    connect_t = 2.5
+    read_t = max(1.5, float(timeout))
+    headers_list = _cdn_header_variants()
+    cid_m = re.search(r"/digital/video/([^/?#]+)/", u, flags=re.I)
+    if cid_m:
+        headers_list = list(headers_list) + [
+            {
+                "User-Agent": UA,
+                "Referer": (
+                    "https://www.dmm.co.jp/digital/videoa/-/detail/=/cid="
+                    + cid_m.group(1)
+                    + "/"
+                ),
+                "Accept": "image/jpeg,image/webp,image/*,*/*;q=0.8",
+                "Accept-Language": "ja-JP,ja;q=0.9",
+            }
+        ]
+    for headers in headers_list:
+        try:
+            r = requests.get(
+                u,
+                timeout=(connect_t, read_t),
+                headers=headers,
+                verify=False,
+                allow_redirects=True,
+            )
+            if r.status_code >= 400 or not r.content or len(r.content) < 800:
+                if r.status_code in (403, 429):
+                    continue
+                return None
+            if is_now_printing_url(str(r.url or u)):
+                return None
+            ctype = (r.headers.get("Content-Type") or "").lower()
+            if "html" in ctype:
+                continue
+            if not _looks_like_jpeg(r.content):
+                continue
+            return r.content
+        except Exception:
+            continue
+    return None
+
+
+def fetch_cdn_file_bytes(url: str, timeout: float | None = None) -> bytes | None:
+    """Same-origin proxy fetch: requested URL, then jacket pl/ps / mono fallbacks."""
+    urls = dmm_cover_variant_urls(url)
+    if not urls:
+        return None
+    primary_t = 8.0 if timeout is None else float(timeout)
+    blob = download_cover_bytes(urls[0], timeout=primary_t)
+    if blob:
+        return blob
+    # One longer retry on the exact URL (Railway → DMM can stall on pl.jpg)
+    blob = download_cover_bytes(urls[0], timeout=max(10.0, primary_t))
+    if blob:
+        return blob
+    for alt in urls[1:]:
+        blob = download_cover_bytes(alt, timeout=min(8.0, max(5.0, primary_t)))
+        if blob:
+            return blob
+    return None
 
 
 
@@ -4250,7 +4388,6 @@ _WEAK_THEME_TOKENS = frozenset(
         "顔射",
         "NTR",
         "SEX",
-        "OL",
         "CA",
         "VR",
         "油",
@@ -4264,7 +4401,6 @@ _WEAK_THEME_TOKENS = frozenset(
         "開發",
         "下着",
         "会社",
-        "オフィス",
     }
 )
 
@@ -4322,7 +4458,55 @@ _THEME_KEYWORD_LEXICON = (
     "羞恥",
     "指マン",
     "美尻",
+    # Short high-signal look tokens (2–4 chars). Keep out of _WEAK_THEME_TOKENS
+    # so leftover {4,6} scraps are not the only "distinctive" keywords.
+    "眼鏡っ娘",
+    "メガネっ娘",
+    "眼鏡",
+    "メガネ",
+    "地味",
+    "美人",
+    "辦公室",
+    "办公室",
 )
+
+# Short setting / identity nouns (valid even at 2 chars). Not 地位 — 地味.
+_SHORT_THEME_NOUNS = frozenset(
+    {
+        "眼鏡",
+        "メガネ",
+        "地味",
+        "美人",
+        "電車",
+        "OL",
+        "オフィス",
+        "辦公室",
+        "办公室",
+        "満員",
+        "滿員",
+        "温泉",
+        "秘書",
+        "女医",
+        "痴女",
+        "義妹",
+        "巨乳",
+        "美乳",
+        "爆乳",
+        "通勤",
+        "ナース",
+    }
+)
+
+# Search/hit aliases so 眼鏡 titles match メガネ / 眼鏡っ娘 catalog rows.
+_THEME_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
+    "眼鏡": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
+    "メガネ": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
+    "眼鏡っ娘": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
+    "メガネっ娘": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
+    "オフィス": ("オフィス", "辦公室", "办公室"),
+    "辦公室": ("オフィス", "辦公室", "办公室"),
+    "办公室": ("オフィス", "辦公室", "办公室"),
+}
 
 
 def _title_sibling_phrases(title: str) -> list[str]:
@@ -4375,6 +4559,10 @@ def _title_sibling_phrases(title: str) -> list[str]:
         ("乳首", "開発"),
         ("乳首", "イキ"),
         ("巨乳", "OL"),
+        ("地味", "眼鏡"),
+        ("地味", "メガネ"),
+        ("美人", "OL"),
+        ("眼鏡", "OL"),
         ("声我慢", "SEX"),
         ("逆", "NTR"),
         ("夜行", "バス"),
@@ -4418,6 +4606,9 @@ def _title_sibling_phrases(title: str) -> list[str]:
         ("夜行", "バス"),
         ("逆", "NTR"),
         ("巨乳", "OL"),
+        ("地味", "眼鏡"),
+        ("地味", "メガネ"),
+        ("美人", "OL"),
         ("乳首", "開発"),
     ):
         if a in t and b in t:
@@ -4443,10 +4634,35 @@ def _title_sibling_phrases(title: str) -> list[str]:
     return merged[:16]
 
 
-def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
-    """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/OL …).
+def _theme_keyword_aliases(tok: str) -> tuple[str, ...]:
+    t = (tok or "").strip()
+    if not t:
+        return ()
+    return _THEME_KEYWORD_ALIASES.get(t) or _THEME_KEYWORD_ALIASES.get(t.casefold()) or (t,)
 
-    Prefer lexicon + Latin tokens; avoid junk 2–3 char scraps that pad unrelated hits.
+
+def _is_weak_theme_token(tok: str) -> bool:
+    t = (tok or "").strip()
+    if not t:
+        return True
+    if t in _SHORT_THEME_NOUNS or t.upper() in _SHORT_THEME_NOUNS:
+        return False
+    return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
+
+
+def _keyword_min_hits(keywords: list[str] | None) -> int:
+    """≥3 extracted keywords → need ≥2 hits; 1–2 keywords may match alone."""
+    n = len([k for k in (keywords or []) if k])
+    if n >= 3:
+        return 2
+    return 1 if n else 0
+
+
+def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
+    """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
+
+    Prefer lexicon + Latin tokens; keep high-signal 2-char look tokens
+    (眼鏡/地味/美人). Avoid junk leftover scraps that pad unrelated hits.
     """
     raw = (title or "").strip()
     if not raw:
@@ -4460,6 +4676,7 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     t_norm = t
     found: list[str] = []
     seen: set[str] = set()
+    alias_seen: set[str] = set()
 
     def _add(tok: str) -> None:
         tok = (tok or "").strip()
@@ -4468,7 +4685,13 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
         key = tok.casefold()
         if key in seen:
             return
+        for al in _theme_keyword_aliases(tok):
+            if al.casefold() in alias_seen:
+                return
         seen.add(key)
+        alias_seen.add(key)
+        for al in _theme_keyword_aliases(tok):
+            alias_seen.add(al.casefold())
         found.append(tok)
 
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
@@ -4479,14 +4702,23 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     for m in re.finditer(r"[A-Za-z]{2,6}", t):
         _add(m.group(0).upper())
 
-    # Only keep longer leftover compounds (4+), not 2–3 char noise
-    for m in re.finditer(r"[\u4e00-\u9fff\u3040-\u30ff]{4,6}", t_norm):
-        chunk = m.group(0)
-        if re.fullmatch(r"[\u3040-\u309f]+", chunk):
-            continue
-        if len(found) >= 10:
-            break
-        _add(chunk)
+    # Known 2-char theme nouns left in the title after longer lexicon hits
+    compact = re.sub(r"\s+", "", t_norm)
+    for noun in sorted(_SHORT_THEME_NOUNS, key=len, reverse=True):
+        if noun and noun in compact:
+            _add(noun)
+
+    distinctive_lex = [k for k in found if not _is_weak_theme_token(k)]
+    # Leftover {4,6} only when lexicon/latin produced no distinctive token.
+    # JUFE-271 leftovers (は隠し切れな / が性欲を抑え) do not match other 地味眼鏡 works.
+    if not distinctive_lex:
+        for m in re.finditer(r"[\u4e00-\u9fff\u3040-\u30ff]{4,6}", t_norm):
+            chunk = m.group(0)
+            if re.fullmatch(r"[\u3040-\u309f]+", chunk):
+                continue
+            if len(found) >= 10:
+                break
+            _add(chunk)
 
     return found[:10]
 
@@ -4497,7 +4729,9 @@ def _keyword_hit_count(candidate_title: str, keywords: list[str]) -> int:
         return 0
     n = 0
     for kw in keywords:
-        if kw and kw.casefold() in text:
+        if not kw:
+            continue
+        if any(al and al.casefold() in text for al in _theme_keyword_aliases(kw)):
             n += 1
     return n
 
@@ -4567,7 +4801,8 @@ def _find_related_by_keywords(
 ) -> list[dict]:
     """Up to max_n works matching title theme keywords; more hits rank higher.
 
-    Tight: compound queries first; require ≥2 keyword hits; no single-hit junk pad.
+    If the title yields ≥3 keywords, require ≥2 hits (no single weak pad).
+    If it yields only 1–2 keywords, those may define the bucket (≤5, no invent).
     """
     import time as _time
 
@@ -4576,7 +4811,8 @@ def _find_related_by_keywords(
     keywords = _extract_title_theme_keywords(title, actress=actress)
     if len(keywords) < 1:
         return []
-    distinctive = [k for k in keywords if k.upper() not in _WEAK_THEME_TOKENS and k not in _WEAK_THEME_TOKENS]
+    distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
+    min_hits = _keyword_min_hits(keywords)
     t0 = _time.monotonic()
     budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
     exclude = ""
@@ -4615,16 +4851,31 @@ def _find_related_by_keywords(
         ("乳首", "イキ"),
         ("巨乳", "OL"),
         ("美乳", "OL"),
+        ("地味", "眼鏡"),
+        ("地味", "メガネ"),
+        ("眼鏡", "OL"),
+        ("メガネ", "OL"),
+        ("美人", "OL"),
         ("声我慢", "SEX"),
     ):
         if any(k.casefold() == a.casefold() for k in keywords) and any(
             k.casefold() == b.casefold() for k in keywords
         ):
             _add_q(a + b)
-    # Strong singles last — skip ultra-common alone
-    for kw in ordered[:4]:
-        if kw not in _WEAK_THEME_TOKENS and kw.upper() not in _WEAK_THEME_TOKENS:
+    # Glasses + plain look: catalog often uses メガネ even when the title has 眼鏡
+    if any(not _is_weak_theme_token(k) and k in _THEME_KEYWORD_ALIASES for k in keywords):
+        if any(k == "地味" for k in keywords):
+            _add_q("地味眼鏡")
+            _add_q("地味メガネ")
+    # Strong singles last. With only 1–2 keywords, query those nouns even if
+    # they used to be treated as weak (OL / オフィス). With ≥3, skip action weaks.
+    singles = list(keywords) if len(keywords) <= 2 else ordered[:4]
+    for kw in singles:
+        if len(keywords) <= 2 or not _is_weak_theme_token(kw):
             _add_q(kw)
+            for alias in _theme_keyword_aliases(kw):
+                if alias != kw and (len(keywords) <= 2 or not _is_weak_theme_token(alias)):
+                    _add_q(alias)
     queries = queries[:8]
 
     ranked: dict[str, tuple[float, dict]] = {}
@@ -4653,7 +4904,7 @@ def _find_related_by_keywords(
             if code in seen:
                 continue
             hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
-            if hits < 2:
+            if hits < min_hits:
                 continue
             d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
             sc = float(hits) * 10.0 + float(d_hits) * 3.0 + float(c.get("score") or 0)
@@ -4665,11 +4916,11 @@ def _find_related_by_keywords(
     out: list[dict] = []
     for sc, c in ordered_rows:
         hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
-        if hits < 2:
+        if hits < min_hits:
             continue
-        # Drop weak multi-hits that only share common tokens
+        # Drop weak-only overlap when the title had several keywords
         d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
-        if d_hits < 1 and hits < 3:
+        if d_hits < 1 and len(keywords) >= 3:
             continue
         why = f"關鍵字×{hits}"
         item = enrich_title_candidate(c, why=why)
@@ -6347,9 +6598,7 @@ def cdn_file():
     url = (request.args.get("url") or "").strip()
     if not allowed_media_url(url):
         return jsonify({"ok": False, "message": "不支援的圖片網址"}), 400
-    blob = download_cover_bytes(url, timeout=8.0)
-    if not blob:
-        blob = download_cover_bytes(url, timeout=12.0)
+    blob = fetch_cdn_file_bytes(url, timeout=8.0)
     if not blob:
         return jsonify({"ok": False, "message": "下載失敗"}), 404
     fname = (url.rsplit("/", 1)[-1] or "image.jpg").split("?")[0]

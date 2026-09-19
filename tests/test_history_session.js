@@ -727,6 +727,10 @@ function related(n, line) {
       urls.every((u) => !/j[ps]-\d+\.jpg/i.test(u)),
       'must not invent jp/js stills as cover: ' + urls.join(',')
     );
+    assert.ok(
+      urls.some((u) => u.indexOf('pics.dmm.com/digital/video/jufe00271/') !== -1),
+      'also tries pics.dmm.com digital jacket: ' + urls.join(',')
+    );
     const ready = H.shareReadyMessage({
       coverExpected: true,
       coverFailed: true,
@@ -734,7 +738,7 @@ function related(n, line) {
       failed: 1,
       total: 3,
     });
-    assert.ok(/封面失敗/.test(ready), ready);
+    assert.ok(/封面無法下載/.test(ready), ready);
     assert.ok(/劇照 2 張/.test(ready), ready);
     assert.ok(/失敗 1/.test(ready), ready);
     assert.ok(/點一下儲存/.test(ready), ready);
@@ -804,12 +808,10 @@ function related(n, line) {
       fetched.some((u) => u.indexOf('aaa00001ps.jpg') !== -1),
       'cover fail tries ps via /api/cdn-file: ' + fetched.join(' | ')
     );
+    // Stills run in parallel, so in-flight toasts may still be 1/2 before the
+    // jacket variants finish. Ready copy (next test) names 封面無法下載.
     assert.ok(
-      toasts.some((t) => /封面失敗/.test(t)),
-      'progress mentions cover fail: ' + toasts.join(' | ')
-    );
-    assert.ok(
-      toasts.every((t) => !/準備完成/.test(t) || /封面失敗/.test(t)),
+      toasts.every((t) => !/準備完成/.test(t) || /封面無法下載/.test(t)),
       'must not toast bare 準備完成: ' + toasts.join(' | ')
     );
   }
@@ -834,7 +836,7 @@ function related(n, line) {
     assert.strictEqual(result.reason, 'tap');
     assert.strictEqual(shareCalls.length, 0);
     const toast = String(getEl('lfp-toast').textContent);
-    assert.ok(/封面失敗/.test(toast), toast);
+    assert.ok(/封面無法下載/.test(toast), toast);
     assert.ok(/劇照 1 張/.test(toast), toast);
     assert.ok(/失敗/.test(toast), toast);
     assert.ok(/點一下儲存/.test(toast), toast);
@@ -859,7 +861,7 @@ function related(n, line) {
     const result = await H.downloadWorkMedia(work);
     assert.strictEqual(result.ok, false);
     assert.strictEqual(shareCalls.length, 0);
-    assert.ok(/失敗/.test(String(getEl('lfp-toast').textContent)));
+    assert.ok(/封面無法下載|失敗/.test(String(getEl('lfp-toast').textContent)));
   }
 
   // JUFE-271: primary pl fails, same-cid ps jacket succeeds as *-cover.jpg (last in list)
@@ -987,7 +989,8 @@ function related(n, line) {
     assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
   }
 
-  // Displayed DMM <img> canvas export → CODE-cover.jpg when /api/cdn-file jackets 404
+  // Cross-origin DMM <img> must NOT be treated as a cover (tainted canvas on iOS).
+  // Stills still share — cover-fail must not abort the batch (PR #9).
   {
     const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
     const jufeWork = {
@@ -1019,12 +1022,98 @@ function related(n, line) {
       decode: async () => {},
     };
     const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
+    assert.strictEqual(result.ok, true, 'stills still share when DMM canvas is tainted');
+    assert.strictEqual(shareCalls.length, 1);
+    const names = namesOf(shareCalls[0].files);
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') === -1, 'must not export tainted DMM canvas: ' + names.join(','));
+    assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
+    const toast = String(getEl('lfp-toast').textContent);
+    assert.ok(/封面無法下載/.test(toast) || result.reason === 'shared', toast);
+  }
+
+  // Same-origin /api/cdn-file <img> can be exported (not a DMM tainted canvas)
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const proxySrc =
+      '/api/cdn-file?url=' + encodeURIComponent(jufeCover);
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (u.indexOf(proxySrc) !== -1 || (u.indexOf('/api/cdn-file') !== -1 && u.indexOf('jufe00271pl.jpg') !== -1 && !isJacketUrl(u.replace(/^.*url=/, '')))) {
+        const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+        return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer, blob: async () => blob };
+      }
+      if (isJacketUrl(u) && u.indexOf('jufe00271jp-') === -1) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const coverImg = {
+      currentSrc: proxySrc,
+      src: proxySrc,
+      alt: 'JUFE-271 封面',
+      naturalWidth: 800,
+      naturalHeight: 538,
+      classList: { contains: () => false },
+    };
+    const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
     assert.strictEqual(result.ok, true);
     assert.strictEqual(shareCalls.length, 1);
     const names = namesOf(shareCalls[0].files);
-    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, 'canvas/decode export: ' + names.join(','));
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, 'same-origin proxy img: ' + names.join(','));
     assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
-    assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
+  }
+
+  // Stills start while the jacket is still in-flight (must not stay 0/11 until cover ends)
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const events = [];
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      const jacket = isJacketUrl(u);
+      events.push('start:' + (jacket ? 'jacket' : 'still'));
+      if (jacket) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        events.push('end:jacket');
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      events.push('end:still');
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(jufeWork);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    assert.ok(namesOf(shareCalls[0].files).indexOf('JUFE-271-jp-01.jpg') !== -1);
+    const stillStart = events.indexOf('start:still');
+    const jacketEnd = events.indexOf('end:jacket');
+    assert.ok(stillStart !== -1 && jacketEnd !== -1, events.join(' | '));
+    assert.ok(
+      stillStart < jacketEnd,
+      'stills must prefetch before cover variants finish: ' + events.join(' | ')
+    );
   }
 
   // HAWA-367: 1 jacket + 10 jp stills all go into one share, cover named *-cover.jpg
@@ -1102,6 +1191,86 @@ function related(n, line) {
       assert.ok(u.indexOf('/api/cdn-file?') !== -1, u);
       assert.ok(u.indexOf('work-zip') === -1, u);
     });
+  }
+
+  // Manual fix: only incomplete cards (no cover and/or no title)
+  {
+    assert.ok(H.workNeedsManualFix({ titleOnly: true, code: '片名搜尋', title: '', cover: '' }));
+    assert.ok(H.workNeedsManualFix({ code: 'AAA-001', title: '', cover: '' }));
+    assert.ok(
+      H.workNeedsManualFix({
+        code: 'AAA-001',
+        title: '',
+        cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+      }),
+      'cover without a name still needs a title fix'
+    );
+    assert.ok(
+      H.workNeedsManualFix({ code: 'AAA-001', title: '地味な眼鏡', cover: '' }),
+      'named work without cover needs a cover fix'
+    );
+    assert.ok(
+      !H.workNeedsManualFix({
+        code: 'AAA-001',
+        title: '地味な眼鏡',
+        cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+      }),
+      'complete cards stay uncluttered'
+    );
+    assert.ok(
+      H.workHasUsableCover({ cover: 'data:image/jpeg;base64,xx', titleOnly: true })
+    );
+  }
+
+  {
+    const merged = H.mergeManualFixIntoWork(
+      { code: '片名搜尋', title: '', titleOnly: true, line: 'main', stills: [] },
+      {
+        ok: true,
+        code: 'JUFE-271',
+        title: '地味な眼鏡では隠し切れない美人OL',
+        cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+        stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+      }
+    );
+    assert.strictEqual(merged.code, 'JUFE-271');
+    assert.ok(!merged.titleOnly);
+    assert.ok(merged.cover.indexOf('jufe00271pl') !== -1);
+    assert.ok(merged.title.indexOf('眼鏡') !== -1);
+    const local = H.mergeManualFixIntoWork(
+      { code: 'BBB-001', title: '有名無圖', cover: '', stills: [] },
+      { ok: false },
+      'data:image/jpeg;base64,cover'
+    );
+    assert.strictEqual(local.cover, 'data:image/jpeg;base64,cover');
+    assert.strictEqual(local.title, '有名無圖');
+  }
+
+  {
+    H.saveHistory([
+      {
+        id: 'h-fix',
+        code: '片名搜尋',
+        title: '',
+        cover: '',
+        works: [{ code: '片名搜尋', title: '', cover: '', related: [] }],
+      },
+    ]);
+    const next = {
+      code: 'JUFE-271',
+      title: '地味な眼鏡',
+      titleZh: '土味眼鏡',
+      cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+      stills: [],
+      line: 'main',
+    };
+    H.persistManualWorkFix({ code: '片名搜尋' }, next, { historyId: 'h-fix', workIndex: 0 });
+    const rec = H.loadHistory().find((x) => x.id === 'h-fix');
+    assert.ok(rec);
+    assert.strictEqual(rec.code, 'JUFE-271');
+    assert.strictEqual(rec.works[0].code, 'JUFE-271');
+    assert.strictEqual(rec.works[0].title, '地味な眼鏡');
+    assert.ok(String(rec.works[0].cover).indexOf('jufe00271pl') !== -1);
   }
 
   console.log('test_history_session.js: ok');

@@ -611,6 +611,78 @@ label.btn {
   color: var(--text);
   font-size: 0.95rem;
 }
+
+/* Manual fix: only on cards missing cover and/or title */
+.manual-fix {
+  padding: 0 14px 12px;
+  touch-action: manipulation;
+}
+.manual-fix-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 36px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: #222230;
+  color: var(--accent2);
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.manual-fix-toggle:active { transform: scale(0.97); }
+.manual-fix-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 10px 10px 8px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #16161e;
+}
+.manual-fix-form.hidden { display: none; }
+.manual-fix-label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.manual-fix-label input {
+  min-height: 42px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  color: var(--text);
+  font-size: 0.95rem;
+  -webkit-appearance: none;
+  appearance: none;
+}
+.manual-fix-label input:focus {
+  outline: 2px solid var(--accent);
+  border-color: transparent;
+}
+.manual-fix-code { text-transform: uppercase; letter-spacing: 0.04em; }
+.manual-fix-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.manual-fix-row .btn { width: auto; flex: 1; min-height: 40px; font-size: 0.88rem; }
+.manual-fix-file-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .progress-panel.is-complete:not(.hidden) {
   border-color: #2f4a38;
 }
