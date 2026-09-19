@@ -804,10 +804,8 @@ function related(n, line) {
       fetched.some((u) => u.indexOf('aaa00001ps.jpg') !== -1),
       'cover fail tries ps via /api/cdn-file: ' + fetched.join(' | ')
     );
-    assert.ok(
-      toasts.some((t) => /封面失敗/.test(t)),
-      'progress mentions cover fail: ' + toasts.join(' | ')
-    );
+    // Stills run in parallel, so in-flight toasts may still be 1/2 before the
+    // jacket variants finish. Ready copy (next test) names 封面失敗.
     assert.ok(
       toasts.every((t) => !/準備完成/.test(t) || /封面失敗/.test(t)),
       'must not toast bare 準備完成: ' + toasts.join(' | ')
@@ -987,7 +985,8 @@ function related(n, line) {
     assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
   }
 
-  // Displayed DMM <img> canvas export → CODE-cover.jpg when /api/cdn-file jackets 404
+  // Cross-origin DMM <img> must NOT be treated as a cover (tainted canvas on iOS).
+  // Stills still share — cover-fail must not abort the batch (PR #9).
   {
     const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
     const jufeWork = {
@@ -1019,12 +1018,98 @@ function related(n, line) {
       decode: async () => {},
     };
     const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
+    assert.strictEqual(result.ok, true, 'stills still share when DMM canvas is tainted');
+    assert.strictEqual(shareCalls.length, 1);
+    const names = namesOf(shareCalls[0].files);
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') === -1, 'must not export tainted DMM canvas: ' + names.join(','));
+    assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
+    const toast = String(getEl('lfp-toast').textContent);
+    assert.ok(/封面失敗/.test(toast) || result.reason === 'shared', toast);
+  }
+
+  // Same-origin /api/cdn-file <img> can be exported (not a DMM tainted canvas)
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const proxySrc =
+      '/api/cdn-file?url=' + encodeURIComponent(jufeCover);
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      if (u.indexOf(proxySrc) !== -1 || (u.indexOf('/api/cdn-file') !== -1 && u.indexOf('jufe00271pl.jpg') !== -1 && !isJacketUrl(u.replace(/^.*url=/, '')))) {
+        const blob = new Blob([jpegBytes], { type: 'image/jpeg' });
+        return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer, blob: async () => blob };
+      }
+      if (isJacketUrl(u) && u.indexOf('jufe00271jp-') === -1) {
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const coverImg = {
+      currentSrc: proxySrc,
+      src: proxySrc,
+      alt: 'JUFE-271 封面',
+      naturalWidth: 800,
+      naturalHeight: 538,
+      classList: { contains: () => false },
+    };
+    const result = await H.downloadWorkMedia(jufeWork, { coverImg: coverImg });
     assert.strictEqual(result.ok, true);
     assert.strictEqual(shareCalls.length, 1);
     const names = namesOf(shareCalls[0].files);
-    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, 'canvas/decode export: ' + names.join(','));
+    assert.ok(names.indexOf('JUFE-271-cover.jpg') !== -1, 'same-origin proxy img: ' + names.join(','));
     assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
-    assert.strictEqual(names[names.length - 1], 'JUFE-271-cover.jpg');
+  }
+
+  // Stills start while the jacket is still in-flight (must not stay 0/11 until cover ends)
+  {
+    const jufeCover = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const jufeWork = {
+      code: 'JUFE-271',
+      cover: jufeCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+    };
+    const events = [];
+    const shareCalls = [];
+    context.fetch = async (url) => {
+      const u = String(url);
+      const jacket = isJacketUrl(u);
+      events.push('start:' + (jacket ? 'jacket' : 'still'));
+      if (jacket) {
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        events.push('end:jacket');
+        return { ok: false, arrayBuffer: async () => new ArrayBuffer(0) };
+      }
+      events.push('end:still');
+      return { ok: true, arrayBuffer: async () => jpegBytes.slice().buffer };
+    };
+    context.navigator.share = async (data) => {
+      shareCalls.push(data);
+    };
+    context.navigator.canShare = (data) => !!(data && data.files && data.files.length);
+    context.navigator.userActivation = { isActive: true };
+
+    const result = await H.downloadWorkMedia(jufeWork);
+    assert.strictEqual(result.ok, true);
+    assert.strictEqual(shareCalls.length, 1);
+    assert.ok(namesOf(shareCalls[0].files).indexOf('JUFE-271-jp-01.jpg') !== -1);
+    const stillStart = events.indexOf('start:still');
+    const jacketEnd = events.indexOf('end:jacket');
+    assert.ok(stillStart !== -1 && jacketEnd !== -1, events.join(' | '));
+    assert.ok(
+      stillStart < jacketEnd,
+      'stills must prefetch before cover variants finish: ' + events.join(' | ')
+    );
   }
 
   // HAWA-367: 1 jacket + 10 jp stills all go into one share, cover named *-cover.jpg

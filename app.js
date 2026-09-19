@@ -120,7 +120,8 @@
   }
 
   function isNowPrintingUrl(url) {
-    return /now_printing/i.test(String(url || ''));
+    const s = String(url || '');
+    return /now_printing/i.test(s) || /\/noimage\//i.test(s);
   }
 
   function slimRelatedForHistory(items) {
@@ -948,7 +949,8 @@
     // Display: the browser loads pics.dmm.co.jp directly (no CORS).
     // Share/download: fetch('/api/cdn-file') on the Railway server.
     // JUFE-271 can paint here while the proxy is blocked — do not require
-    // the proxy for on-screen cover, and warm a same-origin blob in parallel.
+    // the proxy for on-screen cover. When the proxy lands, swap src to a
+    // same-origin blob URL so share does not need a tainted canvas.
     coverImg.referrerPolicy = 'no-referrer';
     coverImg.src = url;
     coverImg.addEventListener('error', () => onImgError(coverImg));
@@ -1425,6 +1427,27 @@
     return (k && warmedCoverByUrl[k]) || null;
   }
 
+  function isCrossOriginDmmSrc(src) {
+    return /^https?:\/\/pics\.dmm\.(co\.jp|com)\//i.test(String(src || '').trim());
+  }
+
+  function applyWarmedCoverToImg(img, url, blob) {
+    rememberWarmedCover(url, blob);
+    if (!img || !blob || !blob.size) return;
+    img._lfpCoverBlob = blob;
+    img._lfpCoverRemote = String(url || '').trim() || img._lfpCoverRemote || '';
+    try {
+      if (img._lfpCoverBlobUrl) {
+        URL.revokeObjectURL(img._lfpCoverBlobUrl);
+      }
+    } catch (_) {}
+    try {
+      const obj = URL.createObjectURL(blob);
+      img._lfpCoverBlobUrl = obj;
+      img.src = obj;
+    } catch (_) {}
+  }
+
   /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file. */
   function warmCoverFromProxy(img, url) {
     const u = String(url || '').trim();
@@ -1439,8 +1462,7 @@
           blob = null;
         }
         if (!blob || !blob.size) return;
-        rememberWarmedCover(u, blob);
-        if (img) img._lfpCoverBlob = blob;
+        applyWarmedCoverToImg(img, u, blob);
       })
       .catch(function () {});
   }
@@ -1515,15 +1537,18 @@
   }
 
   /**
-   * When the jacket is already on the card, export that bitmap as JPEG.
-   * Display used a no-CORS DMM <img>; canvas/currentSrc can still work for
-   * blob:/same-origin/CORS-clean images, and for a warmed /api/cdn-file blob.
+   * Jacket bytes already on the card — only same-origin / warmed proxy bytes.
+   * A no-CORS DMM <img> taints canvas on iOS Safari (drawImage / createImageBitmap
+   * / toBlob throw). Never treat that path as a cover fallback.
    */
   async function captureDisplayedCoverBlob(w, opts) {
     const img = findDisplayedCoverImg(w, opts);
     const cover = String((w && w.cover) || '').trim();
     if (img && img._lfpCoverBlob && img._lfpCoverBlob.size) return img._lfpCoverBlob;
-    const warmed = warmedCoverBlob(cover) || (img && warmedCoverBlob(img.currentSrc || img.src));
+    const warmed =
+      warmedCoverBlob(cover) ||
+      (img && warmedCoverBlob(img._lfpCoverRemote)) ||
+      (img && warmedCoverBlob(img.currentSrc || img.src));
     if (warmed && warmed.size) return warmed;
     if (!img) return null;
     if (typeof img.decode === 'function') {
@@ -1532,6 +1557,9 @@
       } catch (_) {}
     }
     const src = String(img.currentSrc || img.src || '');
+    if (isCrossOriginDmmSrc(src)) {
+      return null;
+    }
     if (/^(blob:|data:)/i.test(src) || (src && src.indexOf('/api/cdn-file') !== -1)) {
       try {
         const blob = await blobFromSrc(src);
@@ -1550,14 +1578,14 @@
       const blob = await canvasExportDrawn(img);
       if (blob && blob.size) return blob;
     } catch (_) {}
-    if (src && /^https?:/i.test(src)) {
+    if (src && /^https?:/i.test(src) && src.indexOf('/api/cdn-file') !== -1) {
       try {
         const clone = await loadCorsCoverImage(src);
         const blob = await canvasExportDrawn(clone);
         if (blob && blob.size) return blob;
       } catch (_) {}
     }
-    if (src) {
+    if (src && !isCrossOriginDmmSrc(src)) {
       try {
         const blob = await blobFromSrc(src);
         if (blob && blob.size) return blob;
@@ -1566,12 +1594,26 @@
     return null;
   }
 
+  async function bufferFromCoverBlob(blob) {
+    if (!blob) return null;
+    if (typeof blob.arrayBuffer === 'function') {
+      const buf = await blob.arrayBuffer();
+      if (buf && buf.byteLength) return buf;
+    }
+    return blob;
+  }
+
   /**
-   * Jacket bytes: /api/cdn-file first (retries + pl/ps / mono variants), then
-   * the bitmap already shown on the card. Display ≠ download: <img> talks to
-   * DMM; this function talks to the Railway proxy unless the fallback hits.
+   * Jacket bytes: warmed same-origin blob first (display upgrade), then
+   * /api/cdn-file (retries + pl/ps / mono; server also tries variants),
+   * then blob:/cdn-file <img> src. Never draw a cross-origin DMM <img>.
    */
   async function fetchCoverImageBuffer(item, w, opts) {
+    try {
+      const local = await captureDisplayedCoverBlob(w, opts);
+      const buf = await bufferFromCoverBlob(local);
+      if (buf) return buf;
+    } catch (_) {}
     const urls = dmmCoverVariantUrls(item && item.url);
     let lastErr = null;
     for (let i = 0; i < urls.length; i++) {
@@ -1584,13 +1626,8 @@
     }
     try {
       const blob = await captureDisplayedCoverBlob(w, opts);
-      if (blob) {
-        if (typeof blob.arrayBuffer === 'function') {
-          const buf = await blob.arrayBuffer();
-          if (buf && buf.byteLength) return buf;
-        }
-        return blob;
-      }
+      const buf = await bufferFromCoverBlob(blob);
+      if (buf) return buf;
     } catch (_) {}
     throw lastErr || new Error('cover');
   }
@@ -1658,22 +1695,8 @@
       slots[i] = file;
     }
 
-    // Jacket first: retry /api/cdn-file, then pl/ps / mono jacket variants,
-    // then the bitmap already on the card. A failed cover must not skip stills.
-    if (coverIdx >= 0) {
-      try {
-        const buf = await fetchCoverImageBuffer(items[coverIdx], w, opts);
-        await fillSlot(coverIdx, 1, buf);
-        ok += 1;
-      } catch (_) {
-        slots[coverIdx] = null;
-        failed += 1;
-      }
-      coverAttempted = true;
-      done += 1;
-      report();
-    }
-
+    // Cover and stills in parallel: a slow/failing jacket (pl.jpg + variants)
+    // must not keep the toast at 0/11 before stills enter the batch.
     const stillIdxs = [];
     for (let i = 0; i < items.length; i++) {
       if (i !== coverIdx) stillIdxs.push(i);
@@ -1696,7 +1719,22 @@
       }
     }
 
-    const jobs = [];
+    const coverJob = (async function () {
+      if (coverIdx < 0) return;
+      try {
+        const buf = await fetchCoverImageBuffer(items[coverIdx], w, opts);
+        await fillSlot(coverIdx, 1, buf);
+        ok += 1;
+      } catch (_) {
+        slots[coverIdx] = null;
+        failed += 1;
+      }
+      coverAttempted = true;
+      done += 1;
+      report();
+    })();
+
+    const jobs = [coverJob];
     for (let n = 0; n < workers; n++) jobs.push(worker());
     await Promise.all(jobs);
 
