@@ -23,6 +23,11 @@ class TestAllowedMediaUrl(unittest.TestCase):
                 "https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg"
             )
         )
+        self.assertTrue(
+            S.allowed_media_url(
+                "https://pics.dmm.com/digital/video/jufe00271/jufe00271pl.jpg"
+            )
+        )
 
     def test_rejects_other_hosts_and_now_printing(self):
         self.assertFalse(S.allowed_media_url("https://evil.example/x.jpg"))
@@ -67,6 +72,10 @@ class TestDownloadCoverBytes(unittest.TestCase):
         self.assertEqual(urls[0], self.JUFE_PL)
         self.assertIn(self.JUFE_PS, urls)
         self.assertTrue(any("/mono/movie/adult/jufe00271/" in u for u in urls))
+        self.assertTrue(
+            any("pics.dmm.com/digital/video/jufe00271/" in u for u in urls),
+            urls,
+        )
         self.assertFalse(any("jp-" in u or "js-" in u for u in urls))
 
     def test_rejects_noimage_placeholder(self):

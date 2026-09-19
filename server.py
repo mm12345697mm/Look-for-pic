@@ -30,7 +30,7 @@ ROOT = Path(__file__).resolve().parent
 DEMO_PATH = ROOT / "data" / "demo-package.json"
 
 DMM_PICS = "https://pics.dmm.co.jp/digital/video"
-CDN_MEDIA_HOSTS = {"pics.dmm.co.jp"}
+CDN_MEDIA_HOSTS = {"pics.dmm.co.jp", "pics.dmm.com"}
 PREFIX_ONE_LABELS = {
     "nhdtc", "nhdtb", "nhdta", "nhdts", "nhdt",
     # SOD-style digital CIDs need leading "1" (curl-verified: without → now_printing)
@@ -1244,7 +1244,7 @@ def dmm_cover_variant_urls(url: str) -> list[str]:
 
     pics = "https://pics.dmm.co.jp"
     m = re.match(
-        r"^https?://pics\.dmm\.co\.jp/digital/video/([^/?#]+)/[^/?#]+?(pl|ps)\.jpg(\?.*)?$",
+        r"^https?://pics\.dmm\.(?:co\.jp|com)/digital/video/([^/?#]+)/[^/?#]+?(pl|ps)\.jpg(\?.*)?$",
         primary,
         flags=re.I,
     )
@@ -1253,7 +1253,7 @@ def dmm_cover_variant_urls(url: str) -> list[str]:
         add(f"{pics}/mono/movie/adult/{cid}/{cid}pl.jpg{q}")
         add(f"{pics}/mono/movie/adult/{cid}/{cid}ps.jpg{q}")
     m = re.match(
-        r"^https?://pics\.dmm\.co\.jp/mono/movie/adult/([^/?#]+)/[^/?#]+?(pl|ps)\.jpg(\?.*)?$",
+        r"^https?://pics\.dmm\.(?:co\.jp|com)/mono/movie/adult/([^/?#]+)/[^/?#]+?(pl|ps)\.jpg(\?.*)?$",
         primary,
         flags=re.I,
     )
@@ -1261,6 +1261,12 @@ def dmm_cover_variant_urls(url: str) -> list[str]:
         cid, q = m.group(1), m.group(3) or ""
         add(f"{DMM_PICS}/{cid}/{cid}pl.jpg{q}")
         add(f"{DMM_PICS}/{cid}/{cid}ps.jpg{q}")
+    # Same digital jackets on pics.dmm.com (Railway sometimes prefers one host)
+    for u in list(out):
+        if "pics.dmm.co.jp/digital/" in u:
+            add(u.replace("pics.dmm.co.jp", "pics.dmm.com", 1))
+        elif "pics.dmm.com/digital/" in u:
+            add(u.replace("pics.dmm.com", "pics.dmm.co.jp", 1))
     return out
 
 
@@ -1275,7 +1281,22 @@ def download_cover_bytes(url: str, timeout: float | None = None) -> bytes | None
         return None
     connect_t = 2.5
     read_t = max(1.5, float(timeout))
-    for headers in _cdn_header_variants()[:2]:
+    headers_list = _cdn_header_variants()
+    cid_m = re.search(r"/digital/video/([^/?#]+)/", u, flags=re.I)
+    if cid_m:
+        headers_list = list(headers_list) + [
+            {
+                "User-Agent": UA,
+                "Referer": (
+                    "https://www.dmm.co.jp/digital/videoa/-/detail/=/cid="
+                    + cid_m.group(1)
+                    + "/"
+                ),
+                "Accept": "image/jpeg,image/webp,image/*,*/*;q=0.8",
+                "Accept-Language": "ja-JP,ja;q=0.9",
+            }
+        ]
+    for headers in headers_list:
         try:
             r = requests.get(
                 u,
@@ -4367,7 +4388,6 @@ _WEAK_THEME_TOKENS = frozenset(
         "顔射",
         "NTR",
         "SEX",
-        "OL",
         "CA",
         "VR",
         "油",
@@ -4381,7 +4401,6 @@ _WEAK_THEME_TOKENS = frozenset(
         "開發",
         "下着",
         "会社",
-        "オフィス",
     }
 )
 
@@ -4447,6 +4466,35 @@ _THEME_KEYWORD_LEXICON = (
     "メガネ",
     "地味",
     "美人",
+    "辦公室",
+    "办公室",
+)
+
+# Short setting / identity nouns (valid even at 2 chars). Not 地位 — 地味.
+_SHORT_THEME_NOUNS = frozenset(
+    {
+        "眼鏡",
+        "メガネ",
+        "地味",
+        "美人",
+        "電車",
+        "OL",
+        "オフィス",
+        "辦公室",
+        "办公室",
+        "満員",
+        "滿員",
+        "温泉",
+        "秘書",
+        "女医",
+        "痴女",
+        "義妹",
+        "巨乳",
+        "美乳",
+        "爆乳",
+        "通勤",
+        "ナース",
+    }
 )
 
 # Search/hit aliases so 眼鏡 titles match メガネ / 眼鏡っ娘 catalog rows.
@@ -4455,6 +4503,9 @@ _THEME_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
     "メガネ": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
     "眼鏡っ娘": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
     "メガネっ娘": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
+    "オフィス": ("オフィス", "辦公室", "办公室"),
+    "辦公室": ("オフィス", "辦公室", "办公室"),
+    "办公室": ("オフィス", "辦公室", "办公室"),
 }
 
 
@@ -4594,7 +4645,17 @@ def _is_weak_theme_token(tok: str) -> bool:
     t = (tok or "").strip()
     if not t:
         return True
+    if t in _SHORT_THEME_NOUNS or t.upper() in _SHORT_THEME_NOUNS:
+        return False
     return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
+
+
+def _keyword_min_hits(keywords: list[str] | None) -> int:
+    """≥3 extracted keywords → need ≥2 hits; 1–2 keywords may match alone."""
+    n = len([k for k in (keywords or []) if k])
+    if n >= 3:
+        return 2
+    return 1 if n else 0
 
 
 def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
@@ -4640,6 +4701,12 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     for m in re.finditer(r"[A-Za-z]{2,6}", t):
         _add(m.group(0).upper())
+
+    # Known 2-char theme nouns left in the title after longer lexicon hits
+    compact = re.sub(r"\s+", "", t_norm)
+    for noun in sorted(_SHORT_THEME_NOUNS, key=len, reverse=True):
+        if noun and noun in compact:
+            _add(noun)
 
     distinctive_lex = [k for k in found if not _is_weak_theme_token(k)]
     # Leftover {4,6} only when lexicon/latin produced no distinctive token.
@@ -4734,7 +4801,8 @@ def _find_related_by_keywords(
 ) -> list[dict]:
     """Up to max_n works matching title theme keywords; more hits rank higher.
 
-    Tight: compound queries first; require ≥2 keyword hits; no single-hit junk pad.
+    If the title yields ≥3 keywords, require ≥2 hits (no single weak pad).
+    If it yields only 1–2 keywords, those may define the bucket (≤5, no invent).
     """
     import time as _time
 
@@ -4744,6 +4812,7 @@ def _find_related_by_keywords(
     if len(keywords) < 1:
         return []
     distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
+    min_hits = _keyword_min_hits(keywords)
     t0 = _time.monotonic()
     budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
     exclude = ""
@@ -4798,12 +4867,14 @@ def _find_related_by_keywords(
         if any(k == "地味" for k in keywords):
             _add_q("地味眼鏡")
             _add_q("地味メガネ")
-    # Strong singles last — skip ultra-common alone; include aliases
-    for kw in ordered[:4]:
-        if not _is_weak_theme_token(kw):
+    # Strong singles last. With only 1–2 keywords, query those nouns even if
+    # they used to be treated as weak (OL / オフィス). With ≥3, skip action weaks.
+    singles = list(keywords) if len(keywords) <= 2 else ordered[:4]
+    for kw in singles:
+        if len(keywords) <= 2 or not _is_weak_theme_token(kw):
             _add_q(kw)
             for alias in _theme_keyword_aliases(kw):
-                if alias != kw and not _is_weak_theme_token(alias):
+                if alias != kw and (len(keywords) <= 2 or not _is_weak_theme_token(alias)):
                     _add_q(alias)
     queries = queries[:8]
 
@@ -4833,7 +4904,7 @@ def _find_related_by_keywords(
             if code in seen:
                 continue
             hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
-            if hits < 2:
+            if hits < min_hits:
                 continue
             d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
             sc = float(hits) * 10.0 + float(d_hits) * 3.0 + float(c.get("score") or 0)
@@ -4845,11 +4916,11 @@ def _find_related_by_keywords(
     out: list[dict] = []
     for sc, c in ordered_rows:
         hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
-        if hits < 2:
+        if hits < min_hits:
             continue
-        # Drop weak multi-hits that only share common tokens
+        # Drop weak-only overlap when the title had several keywords
         d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
-        if d_hits < 1 and hits < 3:
+        if d_hits < 1 and len(keywords) >= 3:
             continue
         why = f"關鍵字×{hits}"
         item = enrich_title_candidate(c, why=why)

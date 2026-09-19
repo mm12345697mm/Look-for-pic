@@ -1293,7 +1293,7 @@
 
     const pics = 'https://pics.dmm.co.jp';
     let m = primary.match(
-      /^https?:\/\/pics\.dmm\.co\.jp\/digital\/video\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
+      /^https?:\/\/pics\.dmm\.(?:co\.jp|com)\/digital\/video\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
     );
     if (m) {
       const cid = m[1];
@@ -1302,13 +1302,21 @@
       add(pics + '/mono/movie/adult/' + cid + '/' + cid + 'ps.jpg' + q);
     }
     m = primary.match(
-      /^https?:\/\/pics\.dmm\.co\.jp\/mono\/movie\/adult\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
+      /^https?:\/\/pics\.dmm\.(?:co\.jp|com)\/mono\/movie\/adult\/([^/?#]+)\/[^/?#]+?(pl|ps)\.jpg(\?.*)?$/i
     );
     if (m) {
       const cid = m[1];
       const q = m[3] || '';
       add(DMM_PICS + '/' + cid + '/' + cid + 'pl.jpg' + q);
       add(DMM_PICS + '/' + cid + '/' + cid + 'ps.jpg' + q);
+    }
+    for (let i = 0; i < out.length; i++) {
+      const u = out[i];
+      if (u.indexOf('pics.dmm.co.jp/digital/') !== -1) {
+        add(u.replace('pics.dmm.co.jp', 'pics.dmm.com'));
+      } else if (u.indexOf('pics.dmm.com/digital/') !== -1) {
+        add(u.replace('pics.dmm.com', 'pics.dmm.co.jp'));
+      }
     }
     return out;
   }
@@ -1452,19 +1460,24 @@
   function warmCoverFromProxy(img, url) {
     const u = String(url || '').trim();
     if (!u || isNowPrintingUrl(u)) return;
-    fetchWorkImageBuffer(u)
-      .then(function (buf) {
-        if (!buf) return;
-        let blob = null;
+    const urls = dmmCoverVariantUrls(u);
+    (async function () {
+      for (let i = 0; i < urls.length; i++) {
         try {
-          blob = new Blob([buf], { type: 'image/jpeg' });
-        } catch (_) {
-          blob = null;
-        }
-        if (!blob || !blob.size) return;
-        applyWarmedCoverToImg(img, u, blob);
-      })
-      .catch(function () {});
+          const buf = await fetchWorkImageBuffer(urls[i]);
+          if (!buf) continue;
+          let blob = null;
+          try {
+            blob = new Blob([buf], { type: 'image/jpeg' });
+          } catch (_) {
+            blob = null;
+          }
+          if (!blob || !blob.size) continue;
+          applyWarmedCoverToImg(img, u, blob);
+          return;
+        } catch (_) {}
+      }
+    })();
   }
 
   function blobFromCanvas(canvas) {
@@ -1635,7 +1648,7 @@
   function prefetchProgressToast(okCount, total, failed, meta) {
     let msg = '準備中（' + okCount + '/' + total + '）';
     if (meta && meta.coverFailed) {
-      msg += ' · 封面失敗';
+      msg += ' · 封面無法下載';
       if (failed > 1) msg += ' · 失敗 ' + failed;
     } else if (failed) {
       msg += ' · 失敗 ' + failed;
@@ -1646,7 +1659,7 @@
   function shareReadyMessage(result) {
     if (result && result.coverExpected && result.coverFailed) {
       const n = (result.files && result.files.length) || 0;
-      let msg = '封面失敗，已準備劇照 ' + n + ' 張';
+      let msg = '封面無法下載，已準備劇照 ' + n + ' 張';
       if (result.failed) msg += ' · 失敗 ' + result.failed;
       msg += ' · 點一下儲存';
       return msg;
@@ -1829,7 +1842,7 @@
       );
       if (!result.files.length) {
         showToast(
-          result.coverExpected && result.coverFailed ? '封面失敗，沒有可儲存的圖片' : '下載失敗'
+          result.coverExpected && result.coverFailed ? '封面無法下載，沒有可儲存的圖片' : '下載失敗'
         );
         return { ok: false, reason: result.coverFailed ? 'cover' : 'fetch' };
       }

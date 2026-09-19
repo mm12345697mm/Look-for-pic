@@ -727,6 +727,10 @@ function related(n, line) {
       urls.every((u) => !/j[ps]-\d+\.jpg/i.test(u)),
       'must not invent jp/js stills as cover: ' + urls.join(',')
     );
+    assert.ok(
+      urls.some((u) => u.indexOf('pics.dmm.com/digital/video/jufe00271/') !== -1),
+      'also tries pics.dmm.com digital jacket: ' + urls.join(',')
+    );
     const ready = H.shareReadyMessage({
       coverExpected: true,
       coverFailed: true,
@@ -734,7 +738,7 @@ function related(n, line) {
       failed: 1,
       total: 3,
     });
-    assert.ok(/封面失敗/.test(ready), ready);
+    assert.ok(/封面無法下載/.test(ready), ready);
     assert.ok(/劇照 2 張/.test(ready), ready);
     assert.ok(/失敗 1/.test(ready), ready);
     assert.ok(/點一下儲存/.test(ready), ready);
@@ -805,9 +809,9 @@ function related(n, line) {
       'cover fail tries ps via /api/cdn-file: ' + fetched.join(' | ')
     );
     // Stills run in parallel, so in-flight toasts may still be 1/2 before the
-    // jacket variants finish. Ready copy (next test) names 封面失敗.
+    // jacket variants finish. Ready copy (next test) names 封面無法下載.
     assert.ok(
-      toasts.every((t) => !/準備完成/.test(t) || /封面失敗/.test(t)),
+      toasts.every((t) => !/準備完成/.test(t) || /封面無法下載/.test(t)),
       'must not toast bare 準備完成: ' + toasts.join(' | ')
     );
   }
@@ -832,7 +836,7 @@ function related(n, line) {
     assert.strictEqual(result.reason, 'tap');
     assert.strictEqual(shareCalls.length, 0);
     const toast = String(getEl('lfp-toast').textContent);
-    assert.ok(/封面失敗/.test(toast), toast);
+    assert.ok(/封面無法下載/.test(toast), toast);
     assert.ok(/劇照 1 張/.test(toast), toast);
     assert.ok(/失敗/.test(toast), toast);
     assert.ok(/點一下儲存/.test(toast), toast);
@@ -857,7 +861,7 @@ function related(n, line) {
     const result = await H.downloadWorkMedia(work);
     assert.strictEqual(result.ok, false);
     assert.strictEqual(shareCalls.length, 0);
-    assert.ok(/失敗/.test(String(getEl('lfp-toast').textContent)));
+    assert.ok(/封面無法下載|失敗/.test(String(getEl('lfp-toast').textContent)));
   }
 
   // JUFE-271: primary pl fails, same-cid ps jacket succeeds as *-cover.jpg (last in list)
@@ -1024,7 +1028,7 @@ function related(n, line) {
     assert.ok(names.indexOf('JUFE-271-cover.jpg') === -1, 'must not export tainted DMM canvas: ' + names.join(','));
     assert.ok(names.indexOf('JUFE-271-jp-01.jpg') !== -1, names.join(','));
     const toast = String(getEl('lfp-toast').textContent);
-    assert.ok(/封面失敗/.test(toast) || result.reason === 'shared', toast);
+    assert.ok(/封面無法下載/.test(toast) || result.reason === 'shared', toast);
   }
 
   // Same-origin /api/cdn-file <img> can be exported (not a DMM tainted canvas)

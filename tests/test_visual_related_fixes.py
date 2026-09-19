@@ -135,10 +135,24 @@ class TestRelatedCaps(unittest.TestCase):
         self.assertIn("家庭教師", S._THEME_KEYWORD_LEXICON)
 
     def test_jufe271_short_theme_tokens_are_distinctive(self):
-        for tok in ("眼鏡", "メガネ", "眼鏡っ娘", "地味", "美人"):
+        for tok in (
+            "眼鏡",
+            "メガネ",
+            "眼鏡っ娘",
+            "地味",
+            "美人",
+            "電車",
+            "オフィス",
+            "辦公室",
+            "OL",
+        ):
             self.assertIn(tok, S._THEME_KEYWORD_LEXICON, tok)
+            self.assertFalse(S._is_weak_theme_token(tok), tok)
             self.assertNotIn(tok, S._WEAK_THEME_TOKENS, tok)
-            self.assertNotIn(tok.upper(), S._WEAK_THEME_TOKENS, tok)
+        self.assertNotIn("地位", S._THEME_KEYWORD_LEXICON)
+        self.assertEqual(S._keyword_min_hits(["眼鏡", "地味", "美人", "OL"]), 2)
+        self.assertEqual(S._keyword_min_hits(["眼鏡", "地味"]), 1)
+        self.assertEqual(S._keyword_min_hits(["眼鏡"]), 1)
 
     def test_jufe271_title_extracts_look_tokens_not_leftover_scraps(self):
         title = "地味な眼鏡では隠し切れない美人OLが性欲を抑えきれず完全生撮り"
@@ -150,10 +164,18 @@ class TestRelatedCaps(unittest.TestCase):
         distinctive = [k for k in kws if not S._is_weak_theme_token(k)]
         self.assertIn("眼鏡", distinctive)
         self.assertIn("地味", distinctive)
-        self.assertNotIn("OL", distinctive)
+        self.assertIn("OL", distinctive)
+        self.assertGreaterEqual(len(kws), 3)
+        self.assertEqual(S._keyword_min_hits(kws), 2)
         self.assertGreaterEqual(S._keyword_hit_count("地味なメガネのOLが会社で", kws), 2)
         self.assertGreaterEqual(S._keyword_hit_count("眼鏡っ娘の美人OL", kws), 2)
         self.assertLess(S._keyword_hit_count("ただのOLです", kws), 2)
+
+    def test_office_train_nouns_extract(self):
+        kws = S._extract_title_theme_keywords("満員電車のオフィスで美人OL")
+        for tok in ("電車", "オフィス", "美人", "OL", "満員"):
+            self.assertIn(tok, kws, kws)
+        self.assertIn("辦公室", S._extract_title_theme_keywords("辦公室的美人"))
 
     def test_sibling_phrases_include_quoted_hook(self):
         title = "「今日も息子の家庭教師とセックスしています。」2人きりになったら10秒で挿入"
@@ -225,6 +247,40 @@ class TestJufe271KeywordBucket(unittest.TestCase):
             any("眼鏡" in q or "メガネ" in q or "地味" in q for q in queries),
             blob,
         )
+
+    def test_two_keyword_title_allows_single_noun_hits_without_pad(self):
+        title = "地味な眼鏡では隠し切れない"
+
+        def fake_avbase(q, actress=None):
+            return [
+                {"code": "BBB-001", "title": "眼鏡っ娘の放課後", "actress": "A", "score": 0.6},
+                {"code": "BBB-002", "title": "地味な日常", "actress": "B", "score": 0.5},
+                {"code": "BBB-003", "title": "ただの中出し", "actress": "C", "score": 0.9},
+            ]
+
+        def fake_enrich(c, why="片名候選"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        kws = S._extract_title_theme_keywords(title)
+        self.assertLessEqual(len(kws), 2, kws)
+        self.assertIn("眼鏡", kws)
+        self.assertIn("地味", kws)
+        self.assertEqual(S._keyword_min_hits(kws), 1)
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=fake_avbase), mock.patch.object(
+            S, "fetch_jav321_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "fetch_javlibrary_title_results", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+            rows = S._find_related_by_keywords(title, max_n=5, budget_sec=20.0)
+        codes = [r["code"] for r in rows]
+        self.assertIn("BBB-001", codes)
+        self.assertIn("BBB-002", codes)
+        self.assertNotIn("BBB-003", codes)
+        self.assertLessEqual(len(rows), 5)
 
     def test_keyword_bucket_does_not_pad_past_cap(self):
         def fake_avbase(q, actress=None):
