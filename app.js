@@ -59,6 +59,8 @@
   /** Object URLs / dataURLs for sticky comparison (cleared on 重新開始) */
   let lastUserShotUrls = [];
   let viewingHistoryId = null;
+  /** Last painted gallery mains (so 手動修正 can patch in place). */
+  let lastGalleryItems = [];
 
   // --- Normalize ---
   function normalizeCode(raw) {
@@ -210,6 +212,60 @@
     const code = String(w.code || '').trim();
     if (!code || code === '片名搜尋' || !parseCodeParts(code)) return false;
     return !String(w.title_zh || w.titleZh || '').trim();
+  }
+
+  function isLocalCoverUrl(url) {
+    return /^(data:|blob:)/i.test(String(url || '').trim());
+  }
+
+  function workHasUsableCover(w) {
+    const url = String((w && w.cover) || '').trim();
+    if (!url || isNowPrintingUrl(url)) return false;
+    if (w && w.titleOnly && !isLocalCoverUrl(url)) return false;
+    return true;
+  }
+
+  function workHasUsableTitle(w) {
+    const t = formatDisplayTitle(w && w.title, w && (w.titleZh || w.title_zh));
+    return !!(t && t !== '（無標題）');
+  }
+
+  /** Missing cover and/or name — user can fix without the bot. */
+  function workNeedsManualFix(w) {
+    if (!w) return false;
+    return !workHasUsableCover(w) || !workHasUsableTitle(w);
+  }
+
+  function mergeManualFixIntoWork(oldW, data, localCoverUrl) {
+    const usable =
+      data &&
+      typeof data === 'object' &&
+      (parseCodeParts(String(data.code || '')) ||
+        String(data.title || '').trim() ||
+        String(data.cover || data.cover_url || '').trim());
+    const incoming = usable ? workFromApi(data, (oldW && oldW.line) || 'main') : null;
+    const next = Object.assign({}, oldW || {});
+    if (incoming) {
+      if (incoming.code && (!incoming.titleOnly || parseCodeParts(incoming.code))) {
+        next.code = incoming.code;
+      }
+      if (incoming.title) next.title = incoming.title;
+      if (incoming.titleZh) next.titleZh = incoming.titleZh;
+      if (incoming.actress) next.actress = incoming.actress;
+      if (incoming.studio) next.studio = incoming.studio;
+      if (incoming.cid) next.cid = incoming.cid;
+      if (incoming.cover) next.cover = incoming.cover;
+      if (incoming.stills && incoming.stills.length) next.stills = incoming.stills;
+      if (incoming.relatedByTitle && incoming.relatedByTitle.length) {
+        next.relatedByTitle = incoming.relatedByTitle;
+      }
+    }
+    if ((!next.cover || isNowPrintingUrl(next.cover)) && localCoverUrl) {
+      next.cover = localCoverUrl;
+    }
+    if (parseCodeParts(next.code) && next.code !== '片名搜尋') next.titleOnly = false;
+    else if (isLocalCoverUrl(next.cover)) next.titleOnly = !!next.titleOnly;
+    return next;
   }
 
   function workNeedsStillsFill(w) {
@@ -928,11 +984,17 @@
       ph.innerHTML = '<strong>暫無封面</strong><span>請確認番號或改以番號搜尋</span>';
       wrap.appendChild(ph);
     }
+    const card = wrap && wrap.closest ? wrap.closest('.card') : wrap && wrap.parentElement;
+    const w = wrap && wrap._lfpWork;
+    if (card && w && !card.querySelector('.manual-fix')) {
+      card.appendChild(buildManualFixPanel(Object.assign({}, w, { cover: '' }), card));
+    }
   }
 
   function appendCover(coverWrap, w) {
+    coverWrap._lfpWork = w;
     const url = (w.cover || '').trim();
-    if (!url || w.titleOnly) {
+    if (!url || (w.titleOnly && !isLocalCoverUrl(url))) {
       coverWrap.classList.add('is-empty');
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
@@ -1044,8 +1106,239 @@
     card.appendChild(meta);
     card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
+    if (workNeedsManualFix(w)) {
+      card.appendChild(buildManualFixPanel(w, card));
+    }
     appendStillsScroll(card, w, '劇照（橫滑）');
     return card;
+  }
+
+  let manualFixFileCb = null;
+
+  function pickManualFixFile() {
+    const input = $('file-manual-fix');
+    if (!input) return Promise.resolve(null);
+    return new Promise((resolve) => {
+      manualFixFileCb = resolve;
+      try {
+        input.click();
+      } catch (_) {
+        manualFixFileCb = null;
+        resolve(null);
+      }
+    });
+  }
+
+  function patchGallerySessionWork(oldW, nextW) {
+    lastGalleryItems = (lastGalleryItems || []).map((item) => {
+      if (!item) return item;
+      if (
+        item === oldW ||
+        (oldW &&
+          item.code &&
+          oldW.code &&
+          codesMatch(item.code, oldW.code) &&
+          (item.line || 'main') === (oldW.line || 'main'))
+      ) {
+        return nextW;
+      }
+      if (Array.isArray(item.relatedByTitle)) {
+        let changed = false;
+        const rel = item.relatedByTitle.map((r) => {
+          if (
+            r === oldW ||
+            (oldW && r && oldW.code && r.code && codesMatch(oldW.code, r.code))
+          ) {
+            changed = true;
+            return nextW;
+          }
+          return r;
+        });
+        if (changed) return Object.assign({}, item, { relatedByTitle: rel });
+      }
+      return item;
+    });
+  }
+
+  function replaceWorkOnScreen(card, oldW, nextW) {
+    patchGallerySessionWork(oldW, nextW);
+    if (viewingHistoryId) {
+      const rec = loadHistory().find((x) => x.id === viewingHistoryId);
+      if (rec) {
+        paintHistoryDetail(rec);
+        return;
+      }
+    }
+    if (!card || !card.parentElement) return;
+    const slide = card.parentElement;
+    const block =
+      card.closest && typeof card.closest === 'function'
+        ? card.closest('.work-carousel-block')
+        : null;
+    const firstSlide = block && block.querySelector && block.querySelector('.work-carousel-slide');
+    const isMain = !!(block && firstSlide && (firstSlide === slide || firstSlide.contains(card)));
+    if (block && isMain && block.parentElement) {
+      block.replaceWith(buildWorkCarousel(nextW));
+      return;
+    }
+    const badge = lineLabel(nextW.line);
+    const nextCard = buildWorkCard(nextW, { slide: !!slide && slide.classList && slide.classList.contains('work-carousel-slide'), badgeLabel: badge });
+    card.replaceWith(nextCard);
+  }
+
+  async function applyManualWorkFix(oldW, fields, card) {
+    const codeRaw = String((fields && fields.code) || '').trim();
+    const titleRaw = String((fields && fields.title) || '').trim();
+    const file = fields && fields.file;
+    const code = parseCodeParts(codeRaw) ? formatDisplayCode(codeRaw) : '';
+    const titleLooksCode = !code && AV_CODE_INPUT_RE.test(titleRaw);
+    const sendCode = code || (titleLooksCode ? formatDisplayCode(titleRaw) : '');
+    const sendTitle = titleLooksCode ? '' : titleRaw;
+    if (!sendCode && !sendTitle && !file) {
+      showToast('請輸入番號／片名或上傳圖片');
+      return { ok: false, reason: 'empty' };
+    }
+
+    let localCover = '';
+    if (file) {
+      try {
+        localCover =
+          (await downscaleFileToDataUrl(file, 280 * 1024, 720)) ||
+          (await smallFileDataUrl(file, 280 * 1024)) ||
+          '';
+      } catch (_) {
+        localCover = '';
+      }
+    }
+
+    let data = null;
+    if (sendCode || sendTitle || file) {
+      try {
+        const res = await apiIdentify({
+          images: file ? [file] : [],
+          code: sendCode || '',
+          title: sendTitle || '',
+        });
+        data = res && res.data;
+      } catch (err) {
+        data = null;
+        if (!file) {
+          showToast((err && err.message) || '修正失敗');
+          return { ok: false, reason: 'fetch' };
+        }
+      }
+    }
+
+    const identified =
+      data &&
+      data.ok &&
+      (parseCodeParts(String(data.code || '')) ||
+        (data.title && String(data.title).trim()) ||
+        (Array.isArray(data.results) && data.results.length));
+    if (!identified && !localCover) {
+      showToast((data && data.message) || '找不到作品，請再試番號或上傳封面');
+      return { ok: false, reason: 'miss' };
+    }
+
+    const source = identified
+      ? Array.isArray(data.results) && data.results[0]
+        ? data.results[0]
+        : data
+      : null;
+    const nextW = mergeManualFixIntoWork(oldW, source, localCover);
+    persistManualWorkFix(oldW, nextW, {});
+    replaceWorkOnScreen(card, oldW, nextW);
+    showToast(workNeedsManualFix(nextW) ? '已套用，仍可再補資料' : '已更新');
+    return { ok: true, work: nextW };
+  }
+
+  function buildManualFixPanel(w, card) {
+    const box = document.createElement('div');
+    box.className = 'manual-fix';
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'manual-fix-toggle';
+    toggle.textContent = '手動修正';
+    toggle.setAttribute('aria-expanded', 'false');
+    const form = document.createElement('div');
+    form.className = 'manual-fix-form hidden';
+    form.innerHTML =
+      '<label class="manual-fix-label">番號' +
+      '<input class="manual-fix-code" type="text" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="例：JUFE-271" /></label>' +
+      '<label class="manual-fix-label">片名' +
+      '<input class="manual-fix-title" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="日文或中文片名" /></label>' +
+      '<div class="manual-fix-row">' +
+      '<button type="button" class="btn btn-secondary btn-sm manual-fix-upload">上傳圖片</button>' +
+      '<span class="manual-fix-file-name" hidden></span>' +
+      '</div>' +
+      '<div class="manual-fix-row">' +
+      '<button type="button" class="btn btn-sm manual-fix-apply">套用</button>' +
+      '<button type="button" class="btn btn-ghost btn-sm manual-fix-cancel">取消</button>' +
+      '</div>';
+    const codeEl = form.querySelector('.manual-fix-code');
+    const titleEl = form.querySelector('.manual-fix-title');
+    const nameEl = form.querySelector('.manual-fix-file-name');
+    const uploadBtn = form.querySelector('.manual-fix-upload');
+    const applyBtn = form.querySelector('.manual-fix-apply');
+    const cancelBtn = form.querySelector('.manual-fix-cancel');
+    if (codeEl && w && w.code && parseCodeParts(w.code)) codeEl.value = formatDisplayCode(w.code);
+    if (titleEl && w && w.title) titleEl.value = w.title;
+    let picked = null;
+
+    function setOpen(on) {
+      form.classList.toggle('hidden', !on);
+      toggle.setAttribute('aria-expanded', on ? 'true' : 'false');
+      toggle.hidden = !!on;
+    }
+    bindWorkAction(toggle, () => setOpen(true));
+    if (cancelBtn) {
+      bindWorkAction(cancelBtn, () => {
+        picked = null;
+        if (nameEl) {
+          nameEl.hidden = true;
+          nameEl.textContent = '';
+        }
+        setOpen(false);
+      });
+    }
+    if (uploadBtn) {
+      bindWorkAction(uploadBtn, () => {
+        pickManualFixFile().then((file) => {
+          if (!file) return;
+          picked = file;
+          if (nameEl) {
+            nameEl.hidden = false;
+            nameEl.textContent = file.name || '已選圖片';
+          }
+        });
+      });
+    }
+    if (applyBtn) {
+      bindWorkAction(applyBtn, () => {
+        if (applyBtn.disabled) return;
+        applyBtn.disabled = true;
+        applyBtn.textContent = '套用中…';
+        applyManualWorkFix(
+          w,
+          {
+            code: codeEl ? codeEl.value : '',
+            title: titleEl ? titleEl.value : '',
+            file: picked,
+          },
+          card
+        ).finally(() => {
+          applyBtn.disabled = false;
+          applyBtn.textContent = '套用';
+        });
+      });
+    }
+    [form, toggle].forEach((el) => {
+      el.addEventListener('pointerdown', stopCarouselBubble);
+      el.addEventListener('touchstart', stopCarouselBubble, { passive: true });
+    });
+    box.appendChild(toggle);
+    box.appendChild(form);
+    return box;
   }
 
   const ICON_COPY =
@@ -1958,6 +2251,7 @@
       galleryNotice.textContent = '';
     }
 
+    lastGalleryItems = items || [];
     // Vertical: each screenshot/main hit. Horizontal: main ↔️ related works.
     for (const w of items) {
       galleryCards.appendChild(buildWorkCarousel(w));
@@ -2438,6 +2732,82 @@
     if (workIndex === 0 && patch.related) list[idx].related = patch.related;
     if (patch.title_zh && !list[idx].title_zh) list[idx].title_zh = patch.title_zh;
     saveHistory(list);
+  }
+
+  function persistManualWorkFix(oldW, nextW, opts) {
+    opts = opts || {};
+    const patch = {
+      code: nextW.code,
+      title: nextW.title,
+      title_zh: nextW.titleZh || nextW.title_zh || '',
+      cover: nextW.cover || '',
+      stills: nextW.stills || [],
+      actress: nextW.actress || '',
+      cid: nextW.cid || '',
+    };
+    if (Array.isArray(nextW.relatedByTitle) && nextW.relatedByTitle.length) {
+      patch.related = slimRelatedForHistory(nextW.relatedByTitle);
+    } else if (Array.isArray(nextW.related) && nextW.related.length) {
+      patch.related = slimRelatedForHistory(nextW.related);
+    }
+    const recId = opts.historyId || viewingHistoryId;
+    function stampRecord(rec, workIdx) {
+      if (!rec) return;
+      persistHistoryWork(rec.id, workIdx, patch);
+      if (workIdx === 0) {
+        const list = loadHistory();
+        const i = list.findIndex((x) => x.id === rec.id);
+        if (i < 0) return;
+        list[i] = Object.assign({}, list[i], {
+          code: patch.code || list[i].code,
+          title: patch.title || list[i].title,
+          title_zh: patch.title_zh || list[i].title_zh,
+          cover: patch.cover || list[i].cover,
+          stills: patch.stills && patch.stills.length ? patch.stills : list[i].stills,
+        });
+        saveHistory(list);
+      }
+    }
+    if (recId) {
+      const rec = loadHistory().find((x) => x.id === recId);
+      if (rec) {
+        const works = historySessionWorks(rec);
+        let idx = typeof opts.workIndex === 'number' ? opts.workIndex : -1;
+        if (idx < 0 && oldW && oldW.code) {
+          idx = works.findIndex((w) => w && w.code && codesMatch(w.code, oldW.code));
+        }
+        if (idx < 0) idx = 0;
+        stampRecord(rec, idx);
+        return recId;
+      }
+    }
+    const list = loadHistory();
+    for (let i = 0; i < list.length; i++) {
+      const works = historySessionWorks(list[i]);
+      const idx = works.findIndex((w) => oldW && oldW.code && w && w.code && codesMatch(w.code, oldW.code));
+      if (idx >= 0) {
+        stampRecord(list[i], idx);
+        return list[i].id;
+      }
+    }
+    const rec = {
+      id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      ts: Date.now(),
+      kind: 'session',
+      ok: true,
+      code: nextW.code,
+      title: nextW.title,
+      title_zh: patch.title_zh,
+      cover: patch.cover,
+      stills: patch.stills,
+      actress: patch.actress,
+      related: patch.related || [],
+      works: [Object.assign({ line: nextW.line || 'main' }, patch)],
+    };
+    const nextList = loadHistory();
+    nextList.unshift(rec);
+    saveHistory(nextList.slice(0, HISTORY_MAX));
+    return rec.id;
   }
 
   async function fillWorkRelatedGaps(work, recId, workIndex) {
@@ -2931,6 +3301,16 @@
       }
     });
   }
+  const fileManualFix = $('file-manual-fix');
+  if (fileManualFix) {
+    fileManualFix.addEventListener('change', () => {
+      const file = (fileManualFix.files && fileManualFix.files[0]) || null;
+      fileManualFix.value = '';
+      const cb = manualFixFileCb;
+      manualFixFileCb = null;
+      if (typeof cb === 'function') cb(file);
+    });
+  }
 
   if ($('btn-demo')) {
     $('btn-demo').addEventListener('click', () => {
@@ -3061,6 +3441,12 @@
       relatedNeedsTitleZh,
       relatedBucketsNeedFill,
       workNeedsTitleZh,
+      workNeedsManualFix,
+      workHasUsableCover,
+      workHasUsableTitle,
+      mergeManualFixIntoWork,
+      persistManualWorkFix,
+      applyManualWorkFix,
       workDownloadFilename,
       workDownloadUrls,
       workDownloadItems,

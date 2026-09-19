@@ -1193,6 +1193,86 @@ function related(n, line) {
     });
   }
 
+  // Manual fix: only incomplete cards (no cover and/or no title)
+  {
+    assert.ok(H.workNeedsManualFix({ titleOnly: true, code: '片名搜尋', title: '', cover: '' }));
+    assert.ok(H.workNeedsManualFix({ code: 'AAA-001', title: '', cover: '' }));
+    assert.ok(
+      H.workNeedsManualFix({
+        code: 'AAA-001',
+        title: '',
+        cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+      }),
+      'cover without a name still needs a title fix'
+    );
+    assert.ok(
+      H.workNeedsManualFix({ code: 'AAA-001', title: '地味な眼鏡', cover: '' }),
+      'named work without cover needs a cover fix'
+    );
+    assert.ok(
+      !H.workNeedsManualFix({
+        code: 'AAA-001',
+        title: '地味な眼鏡',
+        cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+      }),
+      'complete cards stay uncluttered'
+    );
+    assert.ok(
+      H.workHasUsableCover({ cover: 'data:image/jpeg;base64,xx', titleOnly: true })
+    );
+  }
+
+  {
+    const merged = H.mergeManualFixIntoWork(
+      { code: '片名搜尋', title: '', titleOnly: true, line: 'main', stills: [] },
+      {
+        ok: true,
+        code: 'JUFE-271',
+        title: '地味な眼鏡では隠し切れない美人OL',
+        cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+        stills: ['https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg'],
+      }
+    );
+    assert.strictEqual(merged.code, 'JUFE-271');
+    assert.ok(!merged.titleOnly);
+    assert.ok(merged.cover.indexOf('jufe00271pl') !== -1);
+    assert.ok(merged.title.indexOf('眼鏡') !== -1);
+    const local = H.mergeManualFixIntoWork(
+      { code: 'BBB-001', title: '有名無圖', cover: '', stills: [] },
+      { ok: false },
+      'data:image/jpeg;base64,cover'
+    );
+    assert.strictEqual(local.cover, 'data:image/jpeg;base64,cover');
+    assert.strictEqual(local.title, '有名無圖');
+  }
+
+  {
+    H.saveHistory([
+      {
+        id: 'h-fix',
+        code: '片名搜尋',
+        title: '',
+        cover: '',
+        works: [{ code: '片名搜尋', title: '', cover: '', related: [] }],
+      },
+    ]);
+    const next = {
+      code: 'JUFE-271',
+      title: '地味な眼鏡',
+      titleZh: '土味眼鏡',
+      cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+      stills: [],
+      line: 'main',
+    };
+    H.persistManualWorkFix({ code: '片名搜尋' }, next, { historyId: 'h-fix', workIndex: 0 });
+    const rec = H.loadHistory().find((x) => x.id === 'h-fix');
+    assert.ok(rec);
+    assert.strictEqual(rec.code, 'JUFE-271');
+    assert.strictEqual(rec.works[0].code, 'JUFE-271');
+    assert.strictEqual(rec.works[0].title, '地味な眼鏡');
+    assert.ok(String(rec.works[0].cover).indexOf('jufe00271pl') !== -1);
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);
