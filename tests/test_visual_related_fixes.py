@@ -309,6 +309,167 @@ class TestJufe271KeywordBucket(unittest.TestCase):
         self.assertEqual(len(rows), 5)
 
 
+class TestKeywordResearch(unittest.TestCase):
+    TITLE = "地味な眼鏡では隠し切れない美人OLが性欲を抑えきれず完全生撮り"
+
+    def test_selected_min_hits_and_original_rule_unchanged(self):
+        self.assertEqual(S._selected_keyword_min_hits(["眼鏡", "地味", "OL"]), 2)
+        self.assertEqual(S._selected_keyword_min_hits(["眼鏡", "地味"]), 2)
+        self.assertEqual(S._selected_keyword_min_hits(["眼鏡"]), 1)
+        self.assertEqual(S._selected_keyword_min_hits([]), 0)
+        # Title bucket still allows a single hit when the title only yielded two nouns.
+        self.assertEqual(S._keyword_min_hits(["眼鏡", "地味"]), 1)
+        self.assertEqual(S._keyword_min_hits(["眼鏡", "地味", "美人", "OL"]), 2)
+
+    def test_stamp_exposes_keywords_without_reguessing(self):
+        payload = S._stamp_theme_keywords(
+            {"title": self.TITLE, "actress": "楪カレン", "ok": True}
+        )
+        for tok in ("地味", "眼鏡", "美人", "OL"):
+            self.assertIn(tok, payload["theme_keywords"], payload["theme_keywords"])
+        self.assertTrue(payload["keyword_queries"])
+        kept = S._stamp_theme_keywords(
+            {
+                "title": self.TITLE,
+                "theme_keywords": ["眼鏡", "地味"],
+                "keyword_queries": ["地味眼鏡"],
+            }
+        )
+        self.assertEqual(kept["theme_keywords"], ["眼鏡", "地味"])
+        self.assertEqual(kept["keyword_queries"], ["地味眼鏡"])
+
+    def test_selected_only_queries_skip_unselected_nouns(self):
+        qs = S._keyword_search_queries(self.TITLE, ["眼鏡"], selected_only=True)
+        self.assertTrue(any("眼鏡" in q or "メガネ" in q for q in qs), qs)
+        self.assertFalse(any("地味" in q for q in qs), qs)
+
+    def _rows(self):
+        return [
+            {"code": "PRED-001", "title": "地味な眼鏡の会社員", "actress": "A", "score": 0.8},
+            {"code": "PRED-002", "title": "メガネっ娘の地味な毎日", "actress": "B", "score": 0.7},
+            {"code": "PRED-003", "title": "眼鏡っ娘の放課後", "actress": "C", "score": 0.9},
+            {"code": "PRED-004", "title": "ただの中出し", "actress": "D", "score": 1.0},
+            {"code": "JUFE-271", "title": "地味な眼鏡の美人", "actress": "E", "score": 1.0},
+        ]
+
+    def _run(self, keywords, **kwargs):
+        def fake_enrich(c, why="片名候選"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        with mock.patch.object(S, "fetch_avbase_title_results", return_value=self._rows()), mock.patch.object(
+            S, "fetch_jav321_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "fetch_javlibrary_title_results", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+            return S._find_related_by_keywords(
+                self.TITLE,
+                exclude_code="JUFE-271",
+                max_n=5,
+                budget_sec=20.0,
+                keywords=keywords,
+                **kwargs,
+            )
+
+    def test_two_selected_keywords_require_multi_hit_no_pad(self):
+        rows = self._run(["眼鏡", "地味"])
+        codes = [r["code"] for r in rows]
+        self.assertIn("PRED-001", codes)
+        self.assertIn("PRED-002", codes)
+        self.assertNotIn("PRED-003", codes, "single 眼鏡 hit must not fill a 2-keyword re-search")
+        self.assertNotIn("PRED-004", codes)
+        self.assertNotIn("JUFE-271", codes)
+        self.assertLessEqual(len(rows), 5)
+        self.assertTrue(all(r.get("line") == "keyword" for r in rows))
+        self.assertTrue(all(int(r.get("keyword_hits") or 0) >= 2 for r in rows))
+
+    def test_one_selected_keyword_may_fill_without_junk(self):
+        rows = self._run(["眼鏡"])
+        codes = [r["code"] for r in rows]
+        self.assertIn("PRED-003", codes)
+        self.assertIn("PRED-001", codes)
+        self.assertNotIn("PRED-004", codes)
+        self.assertNotIn("JUFE-271", codes)
+        self.assertLessEqual(len(rows), 5)
+
+    def test_research_caps_at_five(self):
+        many = [
+            {"code": f"AAA-{i:03d}", "title": "地味な眼鏡の美人", "actress": "A", "score": 0.4}
+            for i in range(1, 12)
+        ]
+
+        def fake_enrich(c, why="片名候選"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        with mock.patch.object(S, "fetch_avbase_title_results", return_value=many), mock.patch.object(
+            S, "fetch_jav321_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "fetch_javlibrary_title_results", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+            rows = S._find_related_by_keywords(
+                self.TITLE,
+                keywords=["眼鏡", "地味"],
+                max_n=5,
+                budget_sec=20.0,
+            )
+        self.assertEqual(len(rows), 5)
+
+    def test_api_payload_and_empty_selection(self):
+        captured = {}
+
+        def fake_find(title, **kwargs):
+            captured["title"] = title
+            captured.update(kwargs)
+            return [
+                {
+                    "code": "PRED-001",
+                    "title": "地味な眼鏡の会社員",
+                    "title_zh": "土味眼鏡",
+                    "line": "keyword",
+                    "why": "關鍵字×2",
+                    "stills": [],
+                }
+            ]
+
+        with mock.patch.object(S, "_find_related_by_keywords", side_effect=fake_find), mock.patch.object(
+            S, "attach_chinese_titles", side_effect=lambda payload, **kwargs: payload
+        ):
+            client = S.app.test_client()
+            res = client.post(
+                "/api/related-by-keywords",
+                json={
+                    "title": self.TITLE,
+                    "code": "JUFE-271",
+                    "actress": "楪カレン",
+                    "keywords": ["眼鏡", "地味"],
+                },
+            )
+            empty = client.post(
+                "/api/related-by-keywords",
+                json={"title": self.TITLE, "keywords": []},
+            )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data.get("ok"))
+        self.assertEqual(data.get("keywords"), ["眼鏡", "地味"])
+        self.assertEqual(data.get("min_hits"), 2)
+        self.assertEqual(captured.get("keywords"), ["眼鏡", "地味"])
+        self.assertEqual(captured.get("min_hits"), 2)
+        self.assertEqual(len(data.get("related") or []), 1)
+        self.assertEqual(data["related"][0]["code"], "PRED-001")
+        self.assertIn("眼鏡", data.get("theme_keywords") or [])
+        self.assertTrue(data.get("keyword_queries"))
+        self.assertEqual(empty.status_code, 200)
+        self.assertEqual(empty.get_json().get("related"), [])
+        self.assertEqual(empty.get_json().get("min_hits"), 0)
+        self.assertIn("OL", empty.get_json().get("theme_keywords") or [])
+
+
 class TestActressQueryKeep(unittest.TestCase):
     def test_is_actress_query_detection_via_score_path(self):
         # Unit-level: compact JP name without particles looks like actress query
