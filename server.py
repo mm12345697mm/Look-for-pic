@@ -3229,6 +3229,7 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     if not isinstance(payload, dict):
         return payload
     if not _payload_needs_enrichment(payload):
+        _stamp_theme_keywords(payload)
         return payload
     payload.setdefault(
         "related_by_title",
@@ -3276,6 +3277,7 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     # Attempt markers for this request only — next open still checks gaps.
     payload["cache_backfilled"] = True
     payload["chinese_titles_attached"] = True
+    _stamp_theme_keywords(payload)
     try:
         if _payload_enrichment_fingerprint(payload) != before:
             offline_cache_put(payload, image_hash=image_hash)
@@ -3327,6 +3329,8 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "related_by_title": _slim_related_for_cache(
             payload.get("related_by_title") or payload.get("related")
         ),
+        "theme_keywords": list((_stamp_theme_keywords(payload).get("theme_keywords")) or []),
+        "keyword_queries": list(payload.get("keyword_queries") or []),
         "message": payload.get("message") or "",
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
@@ -3447,6 +3451,7 @@ def offline_cache_get(
                 out.setdefault("related", [])
                 out.setdefault("stills", out.get("stills") or [])
                 out.setdefault("related_by_title", out.get("related_by_title") or [])
+                _stamp_theme_keywords(out)
                 return out
         except Exception:
             return None
@@ -3482,7 +3487,15 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                 # merge: keep richer title/cover if new is thinner; never wipe stills/cover
                 prev = entries.get(entry_id)
                 if isinstance(prev, dict):
-                    for field in ("title", "title_zh", "actress", "studio", "cid"):
+                    for field in (
+                        "title",
+                        "title_zh",
+                        "actress",
+                        "studio",
+                        "cid",
+                        "theme_keywords",
+                        "keyword_queries",
+                    ):
                         if not value.get(field) and prev.get(field):
                             value[field] = prev[field]
                     if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
@@ -4658,6 +4671,41 @@ def _keyword_min_hits(keywords: list[str] | None) -> int:
     return 1 if n else 0
 
 
+def _selected_keyword_min_hits(keywords: list[str] | None) -> int:
+    """Interactive re-search over the chips the user turned on.
+
+    ≥2 selected → require multiple hits among that set (AND / multi-hit, same
+    idea as the ≥3-keyword bucket rule). Exactly 1 selected → that keyword may
+    fill the row. Never pad with non-matches.
+    """
+    n = len([k for k in (keywords or []) if str(k or "").strip()])
+    if n >= 2:
+        return 2
+    return 1 if n else 0
+
+
+def _normalize_keyword_list(raw, *, limit: int = 10) -> list[str]:
+    """Stable unique keyword tokens for API payloads and re-search chips."""
+    out: list[str] = []
+    seen: set[str] = set()
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，、・/|]+", raw)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    for item in raw:
+        tok = str(item or "").strip()
+        if len(tok) < 2 or len(tok) > 24:
+            continue
+        key = tok.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tok)
+        if len(out) >= limit:
+            break
+    return out
+
+
 def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
     """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
 
@@ -4790,38 +4838,18 @@ def _is_title_theme_match(
     return False, sim
 
 
-def _find_related_by_keywords(
+def _keyword_search_queries(
     title: str,
+    keywords: list[str],
     *,
-    exclude_code: str | None = None,
-    actress: str | None = None,
-    max_n: int = 5,
-    budget_sec: float = 6.0,
-    already: set[str] | None = None,
-) -> list[dict]:
-    """Up to max_n works matching title theme keywords; more hits rank higher.
+    selected_only: bool = False,
+) -> list[str]:
+    """Catalog queries for a keyword bucket.
 
-    If the title yields ≥3 keywords, require ≥2 hits (no single weak pad).
-    If it yields only 1–2 keywords, those may define the bucket (≤5, no invent).
+    selected_only: interactive re-search — query the chosen tokens and their
+    compounds/aliases, not unrelated sibling phrases from the full title.
     """
-    import time as _time
-
-    if max_n <= 0:
-        return []
-    keywords = _extract_title_theme_keywords(title, actress=actress)
-    if len(keywords) < 1:
-        return []
-    distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
-    min_hits = _keyword_min_hits(keywords)
-    t0 = _time.monotonic()
-    budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
-    exclude = ""
-    if exclude_code and parse_code_parts(str(exclude_code)):
-        exclude = format_display_code(str(exclude_code))
-    seen: set[str] = set(already or ())
-    if exclude:
-        seen.add(exclude)
-
+    title = title or ""
     queries: list[str] = []
 
     def _add_q(q: str) -> None:
@@ -4829,13 +4857,15 @@ def _find_related_by_keywords(
         if len(q) >= 2 and q not in queries:
             queries.append(q)
 
-    # Prefer sibling phrases / compounds over bare weak tokens
-    for p in _title_sibling_phrases(title)[:6]:
-        if p not in _WEAK_THEME_TOKENS and len(p) >= 4:
-            _add_q(p)
+    distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
+    if not selected_only:
+        # Prefer sibling phrases / compounds over bare weak tokens
+        for p in _title_sibling_phrases(title)[:6]:
+            if p not in _WEAK_THEME_TOKENS and len(p) >= 4:
+                _add_q(p)
 
     ordered = sorted(
-        distinctive or keywords,
+        keywords if selected_only else (distinctive or keywords),
         key=lambda k: (title.find(k) if k and k in title else 10_000, -len(k)),
     )
     for i in range(len(ordered) - 1):
@@ -4869,14 +4899,97 @@ def _find_related_by_keywords(
             _add_q("地味メガネ")
     # Strong singles last. With only 1–2 keywords, query those nouns even if
     # they used to be treated as weak (OL / オフィス). With ≥3, skip action weaks.
-    singles = list(keywords) if len(keywords) <= 2 else ordered[:4]
+    # Explicit re-search queries every selected token (the user asked for it).
+    if selected_only:
+        singles = list(keywords)
+    else:
+        singles = list(keywords) if len(keywords) <= 2 else ordered[:4]
     for kw in singles:
-        if len(keywords) <= 2 or not _is_weak_theme_token(kw):
+        if selected_only or len(keywords) <= 2 or not _is_weak_theme_token(kw):
             _add_q(kw)
             for alias in _theme_keyword_aliases(kw):
-                if alias != kw and (len(keywords) <= 2 or not _is_weak_theme_token(alias)):
+                if alias != kw and (
+                    selected_only or len(keywords) <= 2 or not _is_weak_theme_token(alias)
+                ):
                     _add_q(alias)
-    queries = queries[:8]
+    return queries[:10 if selected_only else 8]
+
+
+def _stamp_theme_keywords(payload: dict) -> dict:
+    """Attach theme_keywords + keyword_queries on a work so the UI does not re-guess.
+
+    Keeps a non-empty list already on the payload. Fills from the title otherwise.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    title = str(payload.get("title") or "")
+    actress = str(payload.get("actress") or "").strip() or None
+    existing = payload.get("theme_keywords")
+    if isinstance(existing, list) and existing:
+        kws = _normalize_keyword_list(existing)
+    else:
+        kws = _extract_title_theme_keywords(title, actress=actress)
+    existing_q = payload.get("keyword_queries")
+    if isinstance(existing_q, list) and existing_q:
+        queries = _normalize_keyword_list(existing_q, limit=8)
+    else:
+        queries = _keyword_search_queries(title, kws, selected_only=False)
+    payload["theme_keywords"] = kws
+    payload["keyword_queries"] = queries
+    return payload
+
+
+def _find_related_by_keywords(
+    title: str,
+    *,
+    exclude_code: str | None = None,
+    actress: str | None = None,
+    max_n: int = 5,
+    budget_sec: float = 6.0,
+    already: set[str] | None = None,
+    keywords: list[str] | None = None,
+    min_hits: int | None = None,
+) -> list[dict]:
+    """Up to max_n works matching title theme keywords; more hits rank higher.
+
+    Default (keywords is None): extract from the title.
+    If the title yields ≥3 keywords, require ≥2 hits (no single weak pad).
+    If it yields only 1–2 keywords, those may define the bucket (≤5, no invent).
+
+    Explicit keywords (interactive re-search): match only that set.
+    ≥2 selected → require ≥2 hits among them (multi-hit / AND-style).
+    Exactly 1 selected → that keyword may fill the row (≤5, no junk pad).
+    """
+    import time as _time
+
+    if max_n <= 0:
+        return []
+    explicit = keywords is not None
+    if explicit:
+        keywords = _normalize_keyword_list(keywords)
+    else:
+        keywords = _extract_title_theme_keywords(title, actress=actress)
+    if len(keywords) < 1:
+        return []
+    if explicit:
+        # User-picked tokens all count, including ones the title bucket treats as weak.
+        distinctive = list(keywords)
+        if min_hits is None:
+            min_hits = _selected_keyword_min_hits(keywords)
+    else:
+        distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
+        if min_hits is None:
+            min_hits = _keyword_min_hits(keywords)
+    t0 = _time.monotonic()
+    budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
+    exclude = ""
+    if exclude_code and parse_code_parts(str(exclude_code)):
+        exclude = format_display_code(str(exclude_code))
+    seen: set[str] = set(already or ())
+    if exclude:
+        seen.add(exclude)
+
+    queries = _keyword_search_queries(title, keywords, selected_only=explicit)
 
     ranked: dict[str, tuple[float, dict]] = {}
     for q in queries:
@@ -4918,9 +5031,11 @@ def _find_related_by_keywords(
         hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
         if hits < min_hits:
             continue
-        # Drop weak-only overlap when the title had several keywords
+        # Drop weak-only overlap when the title had several keywords.
+        # Explicit re-search counts every selected token, so this only applies
+        # to the original title bucket.
         d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
-        if d_hits < 1 and len(keywords) >= 3:
+        if not explicit and d_hits < 1 and len(keywords) >= 3:
             continue
         why = f"關鍵字×{hits}"
         item = enrich_title_candidate(c, why=why)
@@ -5362,6 +5477,7 @@ def attach_related_by_title(
     except Exception:
         pass
 
+    _stamp_theme_keywords(result)
     if not per_item:
         return result
     # Also attach on each results[] entry if present (single-image path)
@@ -5383,6 +5499,7 @@ def attach_related_by_title(
                 )
             except Exception:
                 pass
+            _stamp_theme_keywords(item)
             continue
         it_title = item.get("title") or title
         it_code = item.get("code")
@@ -5403,6 +5520,7 @@ def attach_related_by_title(
             )
         except Exception:
             item["related_by_title"] = []
+        _stamp_theme_keywords(item)
     return result
 
 
@@ -5885,6 +6003,8 @@ def run_multi_identify_pipeline(
     # Top-level related mirrors first work (compat); gallery uses each results[].related_by_title
     if results and isinstance(results[0], dict):
         payload["related_by_title"] = list(results[0].get("related_by_title") or [])
+        payload["theme_keywords"] = list(results[0].get("theme_keywords") or [])
+        payload["keyword_queries"] = list(results[0].get("keyword_queries") or [])
     else:
         payload["related_by_title"] = []
     payload["results"] = results
@@ -6679,6 +6799,7 @@ def related_by_title_api():
             )
         except Exception:
             pass
+        _stamp_theme_keywords(wrap)
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
     return jsonify({
@@ -6687,6 +6808,66 @@ def related_by_title_api():
         "title": title,
         "title_zh": wrap.get("title_zh"),
         "exclude": code,
+        "theme_keywords": wrap.get("theme_keywords") or [],
+        "keyword_queries": wrap.get("keyword_queries") or [],
+    })
+
+
+@app.route("/api/related-by-keywords", methods=["POST"])
+def related_by_keywords_api():
+    """Re-search the keyword bucket using only the chips the user selected.
+
+    ≥2 keywords → keep works that hit multiple selected keywords (cap 5).
+    1 keyword → that keyword may fill the row (cap 5). No junk pad.
+    Does not change the main related carousel.
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    title = str(body.get("title") or "").strip()
+    code = str(body.get("code") or body.get("exclude") or "").strip()
+    actress = str(body.get("actress") or "").strip() or None
+    keywords = _normalize_keyword_list(body.get("keywords"))
+    min_hits = _selected_keyword_min_hits(keywords)
+    stamped = _stamp_theme_keywords({"title": title, "actress": actress})
+    if not keywords:
+        return jsonify({
+            "ok": True,
+            "keywords": [],
+            "min_hits": 0,
+            "related": [],
+            "theme_keywords": stamped.get("theme_keywords") or [],
+            "keyword_queries": stamped.get("keyword_queries") or [],
+        })
+    try:
+        items = _find_related_by_keywords(
+            title,
+            exclude_code=code or None,
+            actress=actress,
+            max_n=RELATED_KEYWORD_CAP,
+            budget_sec=6.0,
+            keywords=keywords,
+            min_hits=min_hits,
+        )
+    except Exception as e:
+        return jsonify({"ok": False, "related": [], "keywords": keywords, "message": str(e)}), 500
+    wrap: dict = {"ok": True, "title": title, "related_by_title": items}
+    try:
+        attach_chinese_titles(
+            wrap,
+            related_network=True,
+            related_budget_sec=3.0,
+        )
+    except Exception:
+        pass
+    related = list(wrap.get("related_by_title") or [])[:RELATED_KEYWORD_CAP]
+    return jsonify({
+        "ok": True,
+        "keywords": keywords,
+        "min_hits": min_hits,
+        "related": related,
+        "theme_keywords": stamped.get("theme_keywords") or [],
+        "keyword_queries": _keyword_search_queries(title, keywords, selected_only=True),
     })
 
 

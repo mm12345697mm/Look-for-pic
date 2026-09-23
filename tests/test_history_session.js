@@ -592,11 +592,173 @@ function related(n, line) {
   assert.ok(hawa.every((it) => it.url !== hawaCover || it.role === 'cover'));
 }
 
+function walkNodes(node, acc) {
+  acc = acc || [];
+  if (!node) return acc;
+  acc.push(node);
+  (node.children || []).forEach((child) => walkNodes(child, acc));
+  return acc;
+}
+
+// Keyword chips on a card that already has a 關鍵字 related section
+{
+  assert.strictEqual(
+    H.formatKeywordListLabel('關鍵字相關', ['眼鏡', '地味', 'OL']),
+    '關鍵字相關（眼鏡・地味・OL）'
+  );
+  assert.strictEqual(
+    H.formatKeywordListLabel('關鍵字再搜', ['眼鏡', '地味']),
+    '關鍵字再搜（眼鏡・地味）'
+  );
+  const data = {
+    ok: true,
+    code: 'JUFE-271',
+    title: '地味な眼鏡',
+    theme_keywords: ['眼鏡', '地味', 'OL'],
+    keyword_queries: ['地味眼鏡', '眼鏡'],
+    related_by_title: related(1, 'keyword'),
+  };
+  const works = H.sessionWorksFromIdentify(data);
+  assert.strictEqual(works[0].theme_keywords.join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(works[0].keyword_queries.join('・'), '地味眼鏡・眼鏡');
+  const payload = H.identifyPayloadFromHistory({ id: 'kw', works: works, code: 'JUFE-271' });
+  assert.strictEqual(payload.theme_keywords.join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(payload.results[0].theme_keywords.join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(payload.results[0].keyword_queries.join('・'), '地味眼鏡・眼鏡');
+
+  H.paintHistoryDetail({
+    id: 'kw-paint',
+    works: [
+      {
+        code: 'JUFE-271',
+        title: '地味な眼鏡では隠し切れない美人OL',
+        cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+        stills: [],
+        theme_keywords: ['眼鏡', '地味', 'OL'],
+        keyword_queries: ['地味眼鏡'],
+        related: related(1, 'keyword'),
+        line: 'main',
+      },
+    ],
+  });
+  const nodes = walkNodes(getEl('history-detail'));
+  const labels = nodes
+    .filter((n) => n.className === 'kw-related-label')
+    .map((n) => n.textContent);
+  assert.ok(labels.indexOf('關鍵字相關（眼鏡・地味・OL）') !== -1, labels.join('|'));
+  const chips = nodes.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
+  assert.strictEqual(chips.map((c) => c.textContent).join('・'), '眼鏡・地味・OL');
+  const hint = nodes.find((n) => n.className === 'work-carousel-hint');
+  assert.ok(
+    hint && hint.textContent.indexOf('關鍵字相關（眼鏡・地味・OL）') !== -1,
+    hint && hint.textContent
+  );
+  const search = nodes.find((n) => String(n.className || '').indexOf('kw-search') !== -1);
+  assert.ok(search && search.textContent === '搜尋');
+  assert.ok(nodes.some((n) => String(n.className || '').indexOf('kw-research-block') !== -1));
+
+  H.paintHistoryDetail({
+    id: 'theme-only',
+    works: [
+      {
+        code: 'AAA-001',
+        title: '主題だけ',
+        cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+        related: related(1, 'theme'),
+        line: 'main',
+      },
+    ],
+  });
+  const themeNodes = walkNodes(getEl('history-detail'));
+  assert.ok(!themeNodes.some((n) => n.getAttribute && n.getAttribute('data-kw')));
+  assert.ok(!themeNodes.some((n) => String(n.className || '').indexOf('kw-related-panel') !== -1));
+  assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'theme'), theme_keywords: [] }));
+  assert.ok(H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: [] }));
+  assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['眼鏡'] }));
+}
+
 (async function () {
   const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
   const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
   const work = { code: 'AAA-001', cover: cover, stills: [still] };
   const jpegBytes = new Uint8Array([0xff, 0xd8, 0xff, 0xd9]);
+
+  // Selecting chips then 搜尋 re-searches only those keywords into a bottom row
+  {
+    const calls = [];
+    const prevFetch = context.fetch;
+    context.fetch = async (url, opts) => {
+      calls.push({ url: String(url), body: opts && opts.body });
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          keywords: ['眼鏡', '地味'],
+          min_hits: 2,
+          related: [
+            {
+              code: 'PRED-001',
+              title: '地味な眼鏡の会社員',
+              title_zh: '土味眼鏡公司',
+              line: 'keyword',
+              why: '關鍵字×2',
+              cover: 'https://pics.dmm.co.jp/digital/video/pred00001/pred00001pl.jpg',
+              cid: 'pred00001',
+              stills: [],
+            },
+            {
+              code: 'JUFE-271',
+              title: 'same as main',
+              line: 'keyword',
+              why: '關鍵字×2',
+              cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+            },
+          ],
+        }),
+      };
+    };
+    H.paintHistoryDetail({
+      id: 'kw-search',
+      works: [
+        {
+          code: 'JUFE-271',
+          title: '地味な眼鏡では隠し切れない美人OL',
+          cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+          stills: [],
+          theme_keywords: ['眼鏡', '地味', 'OL'],
+          related: related(1, 'keyword'),
+          line: 'main',
+        },
+      ],
+    });
+    const nodes = walkNodes(getEl('history-detail'));
+    const chips = nodes.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
+    chips[0].click();
+    chips[1].click();
+    assert.strictEqual(chips[0].getAttribute('aria-pressed'), 'true');
+    assert.strictEqual(chips[1].getAttribute('aria-pressed'), 'true');
+    assert.ok(chips[0].classList.contains('is-on'));
+    const search = nodes.find((n) => String(n.className || '').indexOf('kw-search') !== -1);
+    search.click();
+    await new Promise((r) => setTimeout(r, 30));
+    const posted = calls.find((c) => c.url.indexOf('/api/related-by-keywords') !== -1);
+    assert.ok(posted, calls.map((c) => c.url).join(' | '));
+    const body = JSON.parse(posted.body);
+    assert.strictEqual(body.keywords.join('・'), '眼鏡・地味');
+    assert.strictEqual(body.code, 'JUFE-271');
+    const after = walkNodes(getEl('history-detail'));
+    const researchLabel = after
+      .filter((n) => n.className === 'kw-related-label')
+      .map((n) => n.textContent)
+      .find((t) => t.indexOf('關鍵字再搜') === 0);
+    assert.strictEqual(researchLabel, '關鍵字再搜（眼鏡・地味）');
+    const slides = after.filter((n) => n.className === 'kw-research-slide');
+    assert.strictEqual(slides.length, 1, 'source work is not repeated in the re-search row');
+    const slideHtml = walkNodes(slides[0]).map((n) => n._html || n.textContent || '').join('\n');
+    assert.ok(slideHtml.indexOf('PRED-001') !== -1, slideHtml.slice(0, 240));
+    assert.ok(slideHtml.indexOf('土味眼鏡公司') !== -1, 'Chinese title stays on the re-search card');
+    context.fetch = prevFetch;
+  }
 
   // appendHistoryFromIdentify stores a thumb per uploaded file
   {

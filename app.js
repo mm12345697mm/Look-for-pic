@@ -192,6 +192,13 @@
     return (related || []).some((r) => r && r.code && !String(r.title_zh || r.titleZh || '').trim());
   }
 
+  function workNeedsThemeKeywords(work) {
+    const related = (work && work.related) || [];
+    const hasKw = related.some((r) => relatedLineFromRaw(r) === 'keyword');
+    if (!hasKw) return false;
+    return !normalizeKeywordList(work.theme_keywords || work.themeKeywords).length;
+  }
+
   function relatedBucketsNeedFill(related, opts) {
     opts = opts || {};
     const counts = { theme: 0, keyword: 0, actress: 0 };
@@ -431,6 +438,8 @@
       actress: src.actress || fb.actress || '',
       line: lineOut,
       related: slimRelatedForHistory(relatedSrc),
+      theme_keywords: normalizeKeywordList(src.theme_keywords || src.themeKeywords),
+      keyword_queries: normalizeKeywordList(src.keyword_queries || src.keywordQueries),
     };
   }
 
@@ -474,6 +483,41 @@
     const out = [];
     for (let i = 1; i <= n; i++) out.push(`${DMM_PICS}/${cid}/${cid}jp-${i}.jpg`);
     return out;
+  }
+
+  /** Unique chip labels from an API list. Does not invent keywords from a title. */
+  function normalizeKeywordList(raw) {
+    const out = [];
+    const seen = {};
+    const items = Array.isArray(raw)
+      ? raw
+      : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
+    items.forEach((item) => {
+      const s = String(item || '').trim();
+      if (s.length < 2 || s.length > 24 || seen[s]) return;
+      seen[s] = true;
+      out.push(s);
+    });
+    return out.slice(0, 10);
+  }
+
+  function formatKeywordListLabel(prefix, keywords) {
+    const kws = normalizeKeywordList(keywords);
+    if (!kws.length) return prefix;
+    return prefix + '（' + kws.join('・') + '）';
+  }
+
+  function copyKeywordFields(work, src) {
+    if (!work || !src) return work;
+    if (!work.themeKeywords || !work.themeKeywords.length) {
+      const kws = normalizeKeywordList(src.theme_keywords || src.themeKeywords);
+      if (kws.length) work.themeKeywords = kws;
+    }
+    if (!work.keywordQueries || !work.keywordQueries.length) {
+      const qs = normalizeKeywordList(src.keyword_queries || src.keywordQueries);
+      if (qs.length) work.keywordQueries = qs;
+    }
+    return work;
   }
 
 
@@ -555,6 +599,8 @@
       stills,
       titleOnly,
       relatedByTitle,
+      themeKeywords: normalizeKeywordList(raw.theme_keywords || raw.themeKeywords),
+      keywordQueries: normalizeKeywordList(raw.keyword_queries || raw.keywordQueries),
     };
   }
 
@@ -847,6 +893,10 @@
           items[0].relatedByTitle = nested.map((r) => workFromApi(r, relatedLineFromRaw(r)));
         }
       }
+      items.forEach((w, i) => {
+        copyKeywordFields(w, (data.results && data.results[i]) || null);
+        if (i === 0) copyKeywordFields(w, data);
+      });
       let notice = data.related_note || data.message || null;
       return { items: items, notice: notice || null, source: 'api' };
     }
@@ -1047,7 +1097,7 @@
     parent.appendChild(stills);
   }
 
-  function relatedHeadingForList(relatedList) {
+  function relatedHeadingForList(relatedList, keywords) {
     const hasActress = (relatedList || []).some((rw) => {
       const why = String((rw && rw.why) || '');
       const line = String((rw && rw.line) || '');
@@ -1065,7 +1115,10 @@
     });
     const parts = [];
     if (hasTitle) parts.push('片名');
-    if (hasKeyword) parts.push('關鍵字');
+    if (hasKeyword) {
+      const kws = normalizeKeywordList(keywords);
+      parts.push(kws.length ? formatKeywordListLabel('關鍵字相關', kws) : '關鍵字');
+    }
     if (hasActress) parts.push('同演員');
     if (!parts.length) return '相關作品';
     return parts.join('／');
@@ -2167,10 +2220,13 @@
     const hint = document.createElement('div');
     hint.className = 'work-carousel-hint';
     const total = 1 + related.length;
+    const themeKeywords = normalizeKeywordList(
+      mainWork.themeKeywords || mainWork.theme_keywords
+    );
     if (related.length) {
       hint.textContent =
         '左右滑 · 主作品 ↔️ 相關（' +
-        relatedHeadingForList(related) +
+        relatedHeadingForList(related, themeKeywords) +
         '）· ' +
         total +
         ' 張';
@@ -2225,7 +2281,205 @@
     // Track first, then hint/pager as snug footer under stills (no stretch gap)
     block.appendChild(track);
     block.appendChild(head);
+    mountKeywordResearch(block, mainWork, related, themeKeywords);
     return block;
+  }
+
+  /**
+   * Keyword chips + a separate bottom row.
+   * Shown only when this card already has a 關鍵字 related section.
+   * Re-search uses only the selected chips (server enforces multi-hit / cap 5).
+   */
+  function mountKeywordResearch(block, mainWork, related, themeKeywords) {
+    const hasKeyword = (related || []).some((rw) => {
+      const why = String((rw && rw.why) || '');
+      const line = String((rw && rw.line) || '');
+      return line === 'keyword' || why.includes('關鍵字');
+    });
+    if (!hasKeyword) return;
+
+    const keywords = normalizeKeywordList(themeKeywords);
+    const panel = document.createElement('div');
+    panel.className = 'kw-related-panel';
+    const label = document.createElement('div');
+    label.className = 'kw-related-label';
+    label.textContent = keywords.length
+      ? formatKeywordListLabel('關鍵字相關', keywords)
+      : '關鍵字相關';
+    panel.appendChild(label);
+
+    const research = document.createElement('div');
+    research.className = 'kw-research-block';
+    research.hidden = true;
+    const researchLabel = document.createElement('div');
+    researchLabel.className = 'kw-related-label';
+    const researchTrack = document.createElement('div');
+    researchTrack.className = 'kw-research-track';
+    researchTrack.setAttribute('aria-label', '關鍵字再搜');
+    research.appendChild(researchLabel);
+    research.appendChild(researchTrack);
+
+    const selected = {};
+    let timer = 0;
+    let seq = 0;
+
+    function pickedList() {
+      return keywords.filter((k) => selected[k]);
+    }
+
+    function showResearch(picked, state) {
+      state = state || {};
+      const headText = formatKeywordListLabel('關鍵字再搜', picked);
+      research.hidden = false;
+      if (state.loading) {
+        researchLabel.textContent = headText + ' · 搜尋中…';
+        researchTrack.innerHTML = '';
+        researchTrack.hidden = true;
+        return;
+      }
+      researchTrack.hidden = false;
+      researchTrack.innerHTML = '';
+      const items = state.items || [];
+      if (state.error) {
+        researchLabel.textContent = headText + ' · 再搜失敗';
+        return;
+      }
+      if (!items.length) {
+        researchLabel.textContent = headText + ' · 沒有符合的作品';
+        return;
+      }
+      researchLabel.textContent = headText;
+      items.slice(0, 5).forEach((raw) => {
+        const w = workFromApi(raw, 'keyword');
+        const slide = document.createElement('div');
+        slide.className = 'kw-research-slide';
+        slide.appendChild(buildWorkCard(w, { slide: true, badgeLabel: '關鍵字' }));
+        researchTrack.appendChild(slide);
+      });
+    }
+
+    function clearResearch() {
+      seq += 1;
+      research.hidden = true;
+      researchLabel.textContent = '';
+      researchTrack.innerHTML = '';
+      researchTrack.hidden = false;
+    }
+
+    async function runSearch() {
+      const picked = pickedList();
+      const my = ++seq;
+      if (!picked.length) {
+        research.hidden = true;
+        researchLabel.textContent = '';
+        researchTrack.innerHTML = '';
+        return;
+      }
+      showResearch(picked, { loading: true, items: [] });
+      try {
+        const res = await fetch('/api/related-by-keywords', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: (mainWork && mainWork.title) || '',
+            code: (mainWork && mainWork.code) || '',
+            actress: (mainWork && mainWork.actress) || '',
+            keywords: picked,
+          }),
+        });
+        let data = null;
+        try {
+          data = await res.json();
+        } catch (_) {
+          data = null;
+        }
+        if (my !== seq) return;
+        if (!res.ok || !data || data.ok === false) {
+          showResearch(picked, { error: true, items: [] });
+          return;
+        }
+        const rawItems = data.related || data.related_by_title || [];
+        const items = (Array.isArray(rawItems) ? rawItems : []).filter((r) => {
+          if (!r || !r.code) return false;
+          if (mainWork && mainWork.code && codesMatch(String(r.code), String(mainWork.code))) return false;
+          return true;
+        });
+        if (my !== seq) return;
+        showResearch(picked, { items: items.slice(0, 5) });
+      } catch (_) {
+        if (my !== seq) return;
+        showResearch(picked, { error: true, items: [] });
+      }
+    }
+
+    function scheduleSearch() {
+      if (timer) clearTimeout(timer);
+      // Drop a response that was started for the previous chip set.
+      seq += 1;
+      const token = seq;
+      if (!pickedList().length) {
+        research.hidden = true;
+        researchLabel.textContent = '';
+        researchTrack.innerHTML = '';
+        researchTrack.hidden = false;
+        return;
+      }
+      timer = setTimeout(() => {
+        timer = 0;
+        if (token !== seq) return;
+        runSearch();
+      }, 320);
+    }
+
+    if (keywords.length) {
+      const row = document.createElement('div');
+      row.className = 'kw-chip-row';
+      row.setAttribute('role', 'group');
+      row.setAttribute('aria-label', '關鍵字再搜');
+      keywords.forEach((kw) => {
+        const chip = document.createElement('button');
+        chip.type = 'button';
+        chip.className = 'kw-chip';
+        chip.textContent = kw;
+        chip.setAttribute('data-kw', kw);
+        chip.setAttribute('aria-pressed', 'false');
+        chip.title = kw;
+        bindWorkAction(chip, () => {
+          const on = !selected[kw];
+          if (on) selected[kw] = true;
+          else delete selected[kw];
+          chip.classList.toggle('is-on', !!selected[kw]);
+          chip.setAttribute('aria-pressed', selected[kw] ? 'true' : 'false');
+          scheduleSearch();
+        });
+        row.appendChild(chip);
+      });
+      const searchBtn = document.createElement('button');
+      searchBtn.type = 'button';
+      searchBtn.className = 'kw-chip kw-search';
+      searchBtn.textContent = '搜尋';
+      bindWorkAction(searchBtn, () => {
+        if (timer) {
+          clearTimeout(timer);
+          timer = 0;
+        }
+        if (!pickedList().length) {
+          showToast('請先選關鍵字');
+          clearResearch();
+          return;
+        }
+        runSearch();
+      });
+      row.appendChild(searchBtn);
+      panel.appendChild(row);
+    }
+
+    [panel, research].forEach((el) => {
+      el.addEventListener('pointerdown', stopCarouselBubble);
+      el.addEventListener('touchstart', stopCarouselBubble, { passive: true });
+    });
+    block.appendChild(panel);
+    block.appendChild(research);
   }
 
   // Back-compat alias (history detail may still call this name)
@@ -2705,6 +2959,8 @@
       cover: first.cover || rec.cover || '',
       stills: Array.isArray(first.stills) ? first.stills : (rec.stills || []),
       related_by_title: first.related || rec.related || [],
+      theme_keywords: normalizeKeywordList(first.theme_keywords || first.themeKeywords),
+      keyword_queries: normalizeKeywordList(first.keyword_queries || first.keywordQueries),
       from_offline_cache: true,
       // Always nested: vertical = session works, horizontal = each work's related
       results: works.map((w, i) => ({
@@ -2717,6 +2973,8 @@
         cover: w.cover,
         stills: w.stills || [],
         related_by_title: w.related || [],
+        theme_keywords: normalizeKeywordList(w.theme_keywords || w.themeKeywords),
+        keyword_queries: normalizeKeywordList(w.keyword_queries || w.keywordQueries),
         line: i === 0 ? 'main' : (w.line || 'multi'),
       })),
     };
@@ -2822,7 +3080,8 @@
     const need =
       relatedNeedsTitleZh(related) ||
       relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
-      workNeedsTitleZh(work);
+      workNeedsTitleZh(work) ||
+      workNeedsThemeKeywords(work);
     if (!need) return work;
     try {
       const res = await fetch('/api/related-by-title', {
@@ -2846,6 +3105,10 @@
         if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
           patch.title_zh = incomingZh;
         }
+        const incomingKw = normalizeKeywordList(data.theme_keywords);
+        if (incomingKw.length) patch.theme_keywords = incomingKw;
+        const incomingQ = normalizeKeywordList(data.keyword_queries);
+        if (incomingQ.length) patch.keyword_queries = incomingQ;
         work = backfillWorkTreeLocal(Object.assign({}, work, patch));
         patch.stills = work.stills;
         patch.related = work.related;
@@ -2918,7 +3181,9 @@
         if (
           next !== works[i] ||
           JSON.stringify(next && next.related) !== JSON.stringify(works[i] && works[i].related) ||
-          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '')
+          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '') ||
+          JSON.stringify((next && next.theme_keywords) || []) !==
+            JSON.stringify((works[i] && works[i].theme_keywords) || [])
         ) {
           changed = true;
         }
@@ -3429,6 +3694,9 @@
       isRelatedBucketItem,
       formatDisplayTitle,
       formatCodeTitleClipboard,
+      formatKeywordListLabel,
+      normalizeKeywordList,
+      workNeedsThemeKeywords,
       historyRecordIsOpenable,
       renderHistoryList,
       openHistoryDetail,
