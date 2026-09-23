@@ -790,7 +790,11 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
 
 
 class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
-    """DANDYA-style titles: kinship chips, 教育 compounds, no VOL/OL false hits."""
+    """DANDYA-style titles: kinship chips, 教育 compounds, edition marks stripped.
+
+    OL stays a lexicon occupation chip. It is absent on the DANDY title only
+    because that title never says OL; VOL.2 must not invent it.
+    """
 
     DANDYA = (
         "「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! "
@@ -804,8 +808,12 @@ class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
             ["家庭教師", "肉欲教育", "息子の家庭教師", "息子", "ママ"],
             kws,
         )
+        # This title has VOL.2 and no occupation OL, so neither is a chip.
         for absent in ("VOL", "OL", "Vol", "教育", "肉欲", "まま"):
             self.assertNotIn(absent, kws, kws)
+        self.assertIn("OL", S._THEME_KEYWORD_LEXICON)
+        self.assertIn("OL", S._SHORT_THEME_NOUNS)
+        self.assertFalse(S._is_weak_theme_token("OL"))
         self.assertTrue(S._is_weak_theme_token("息子"))
         self.assertTrue(S._is_weak_theme_token("ママ"))
         self.assertFalse(S._is_weak_theme_token("家庭教師"))
@@ -848,6 +856,30 @@ class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
         self.assertEqual(S._keyword_hit_count("COOLな毎日", ["OL"]), 0)
         self.assertGreaterEqual(S._keyword_hit_count("美人OL", ["OL"]), 1)
         self.assertGreaterEqual(S._keyword_hit_count("巨乳OL", ["OL"]), 1)
+        # Numbered Japanese volume/episode counters are junk, not chips.
+        # A real OL next to one of them still surfaces.
+        for title in (
+            "美人OL第2巻",
+            "美人OL第２巻",
+            "美人OL第十二巻",
+            "美人OL第2話",
+            "美人OL第2回",
+            "美人OL EP.2",
+            "美人OL Vol",
+        ):
+            kws = S._extract_title_theme_keywords(title)
+            self.assertIn("OL", kws, (title, kws))
+            self.assertIn("美人", kws, (title, kws))
+            for tok in kws:
+                self.assertNotIn("巻", tok, (title, kws))
+                self.assertNotIn("話", tok, (title, kws))
+                self.assertNotIn("回", tok, (title, kws))
+                self.assertFalse(tok.upper() in {"VOL", "EP", "EPISODE", "VOLUME"}, (title, kws))
+        bare = S._extract_title_theme_keywords("ただの日常第十二巻")
+        self.assertNotIn("第十二巻", bare, bare)
+        self.assertNotIn("第十二", bare, bare)
+        self.assertEqual(S._extract_title_theme_keywords("第2巻"), [])
+        self.assertEqual(S._extract_title_theme_keywords("VOL.2"), [])
 
     def test_education_suffix_on_other_titles(self):
         # Known lexicon head + 教育 leads, same rank rule as ノーブラ誘惑.

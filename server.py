@@ -4525,8 +4525,15 @@ _ROLE_THEME_NOUNS = frozenset(
         "秘書",
     }
 )
-# Edition marks. VOL.2 / Vol.2 / vol.2 / VOL2 / VOLUME 2 are not theme chips.
-_EDITION_LATIN = frozenset({"vol", "volume"})
+# Edition / episode marks. Not theme chips. OL is not in this set: it stays an
+# occupation keyword. These tokens are junk even without a number (VOL, EP);
+# VOL.2 / 第2巻 / 第十二話 are the numbered forms.
+_EDITION_LATIN = frozenset({"vol", "volume", "ep", "episode"})
+_EDITION_MARKER_RE = re.compile(
+    r"(?i)(?<![A-Za-z])(?:vol(?:ume)?|ep(?:isode)?)(?![A-Za-z])"
+    r"(?:\s*[\.．]?\s*[0-9０-９]+)?"
+    r"|第\s*[0-9０-９一二三四五六七八九十百千〇零]+\s*[巻話章集回]"
+)
 _RELATION_NOUN_SET = frozenset(_RELATION_NOUNS)
 _KINSHIP_ROLE_SET = frozenset(n for n in _RELATION_NOUNS if n not in _PRONOUN_NOUNS)
 
@@ -4663,11 +4670,24 @@ def _keyword_index(text: str, kw: str) -> int:
 
 
 def _is_edition_marker_span(text: str, start: int, end: int) -> bool:
-    """True when this Latin span is VOL.2 / Vol.2 / vol.2 / VOL2 / VOLUME 2."""
+    """True when this Latin span is VOL / Vol / EP, numbered or not.
+
+    OL is never an edition mark. Numbered forms (VOL.2) are removed up front by
+    _strip_edition_markers; this guards the Latin pass if a bare token remains.
+    """
     tok = (text or "")[start:end].casefold()
-    if tok not in _EDITION_LATIN:
-        return False
-    return re.match(r"[\.．]?\s*[0-9０-９]", (text or "")[end:]) is not None
+    return tok in _EDITION_LATIN
+
+
+def _strip_edition_markers(text: str) -> str:
+    """Drop episode/volume junk before keyword extraction.
+
+    Removes VOL / Vol / VOL.2 / VOLUME 2 / EP.2 and 第N巻-style counters
+    (第2巻, 第２話, 第十二巻, 第2回). Does not touch a real occupation token OL.
+    """
+    if not text:
+        return ""
+    return _EDITION_MARKER_RE.sub(" ", text)
 
 
 def _title_sibling_phrases(title: str) -> list[str]:
@@ -5075,15 +5095,17 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
     and both parts. Those stay on the chip list, but rank after theme nouns so
     息子 / ママ / 彼女 / 妹 do not lead automatic search. Bare 誘惑 / 教育 are
-    not chips unless glued to a noun. Edition marks (VOL.2 / Vol.2 / vol.2)
-    are not chips, and short Latin lexicon tokens do not match inside a longer
-    Latin token (OL is not the tail of VOL). Leftover {4,6} scraps run only
-    when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
+    not chips unless glued to a noun. Edition / episode junk (VOL, Vol, VOL.2,
+    EP.2, 第2巻, 第十二話) is stripped before matching, so it cannot become a
+    chip or a leftover scrap. OL stays in the lexicon: it is an occupation
+    chip when the title actually contains that token, and it does not match
+    inside VOL. Leftover {4,6} scraps run only when nothing distinctive was
+    found (JUFE-271 は隠し切れな must not pad).
     """
     raw = (title or "").strip()
     if not raw:
         return []
-    t = raw
+    t = _strip_edition_markers(raw)
     if actress:
         for piece in re.split(r"[\s　・/|]+", str(actress)):
             piece = piece.strip()
