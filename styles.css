@@ -334,6 +334,35 @@ label.btn {
   padding: 2px 8px;
   border-radius: 6px;
 }
+.card-badge-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+.card-badge-row .card-line {
+  margin-top: 0;
+}
+.card-hit-keywords {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.card-hit-kw {
+  display: inline-flex;
+  align-items: center;
+  min-height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: #222230;
+  color: var(--accent2);
+  font-size: 0.68rem;
+  font-weight: 650;
+  line-height: 1.2;
+}
 
 /* Cover: NEVER crop — object-fit contain */
 .cover-wrap {

@@ -2997,6 +2997,8 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "cid": it.get("cid"),
                 "line": it.get("line"),
                 "why": it.get("why"),
+                "keyword_hits": it.get("keyword_hits"),
+                "matched_keywords": list(it.get("matched_keywords") or it.get("hit_keywords") or []),
                 "stills": list(it.get("stills") or [])[:10] if isinstance(it.get("stills"), list) else [],
             }
         )
@@ -3011,18 +3013,44 @@ def _related_cache_item_key(it: dict | None) -> str | None:
     return _offline_cache_entry_id(str(it.get("code"))) or str(it.get("code"))
 
 
+def _why_is_actress_bucket(why: str) -> bool:
+    text = why or ""
+    return "同女優" in text or "同演員" in text
+
+
+def _why_is_theme_bucket(why: str) -> bool:
+    """Real title/series labels. A passing mention of 主題 (主題線) is not one."""
+    text = why or ""
+    return "片名" in text or "同系列" in text or "主題相近" in text or text.startswith("主題")
+
+
 def _related_line_of(x: dict | None) -> str:
+    """Bucket for display order: 片名 > 關鍵字 > 同女優.
+
+    Explicit `line` wins. A 同女優 note that only says 主題 in passing
+    (主題線に近い) stays in the actress bucket so it cannot sit between
+    title and keyword. Dedup keeps the earlier bucket when a work qualifies
+    for more than one.
+    """
     if not isinstance(x, dict):
         return "theme"
     ln = str(x.get("line") or "")
+    if ln == "title":
+        ln = "theme"
     why = str(x.get("why") or "")
-    if ln in {"theme", "title"} or "片名" in why or "主題" in why:
-        return "theme"
-    if ln == "keyword" or "關鍵字" in why:
+    if ln == "keyword" or (ln not in {"theme", "keyword", "actress"} and "關鍵字" in why):
         return "keyword"
-    if ln == "actress" or "演員" in why or "女優" in why:
+    if ln == "theme":
+        if _why_is_actress_bucket(why) and not _why_is_theme_bucket(why):
+            return "actress"
+        return "theme"
+    if ln == "actress" or _why_is_actress_bucket(why):
         return "actress"
-    return ln or "theme"
+    if _why_is_theme_bucket(why) or "主題" in why or "片名" in why:
+        return "theme"
+    if "演員" in why or "女優" in why:
+        return "actress"
+    return "theme"
 
 
 def _related_bucket_counts(items) -> tuple[int, int, int]:
@@ -3101,7 +3129,17 @@ def _merge_related_for_cache(prev_items, new_items) -> list:
             continue
         merged = dict(by_key[k])
         incoming = dict(it)
-        for field in ("title", "title_zh", "actress", "cover", "cid", "line", "why"):
+        for field in (
+            "title",
+            "title_zh",
+            "actress",
+            "cover",
+            "cid",
+            "line",
+            "why",
+            "keyword_hits",
+            "matched_keywords",
+        ):
             if not merged.get(field) and incoming.get(field):
                 merged[field] = incoming[field]
         if incoming.get("stills"):
@@ -4771,17 +4809,26 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     return found[:10]
 
 
-def _keyword_hit_count(candidate_title: str, keywords: list[str]) -> int:
+def _matched_theme_keywords(candidate_title: str, keywords: list[str] | None) -> list[str]:
+    """Source keywords that actually hit this related title (aliases count).
+
+    Returns the source tokens, not a guessed extra list. Empty when nothing hits.
+    """
     text = (candidate_title or "").casefold()
     if not text or not keywords:
-        return 0
-    n = 0
+        return []
+    hit: list[str] = []
     for kw in keywords:
-        if not kw:
+        tok = str(kw or "").strip()
+        if not tok:
             continue
-        if any(al and al.casefold() in text for al in _theme_keyword_aliases(kw)):
-            n += 1
-    return n
+        if any(al and al.casefold() in text for al in _theme_keyword_aliases(tok)):
+            hit.append(tok)
+    return hit
+
+
+def _keyword_hit_count(candidate_title: str, keywords: list[str]) -> int:
+    return len(_matched_theme_keywords(candidate_title, keywords))
 
 
 def _is_title_theme_match(
@@ -5042,6 +5089,9 @@ def _find_related_by_keywords(
         item["line"] = "keyword"
         item["why"] = why
         item["keyword_hits"] = hits
+        matched = _matched_theme_keywords(str(c.get("title") or ""), keywords)
+        item["matched_keywords"] = matched
+        item["hit_keywords"] = matched
         out.append(item)
         seen.add(format_display_code(str(c.get("code") or "")))
         if len(out) >= max_n:
@@ -5211,6 +5261,17 @@ def find_related_by_title(
         item = enrich_title_candidate(raw, why=why)
         item["line"] = line
         item["why"] = why
+        if line == "keyword":
+            matched = raw.get("matched_keywords") or raw.get("hit_keywords")
+            if not isinstance(matched, list) or not matched:
+                matched = _matched_theme_keywords(
+                    str(raw.get("title") or item.get("title") or ""),
+                    keywords,
+                )
+            item["matched_keywords"] = _normalize_keyword_list(matched)
+            item["hit_keywords"] = item["matched_keywords"]
+            hits = raw.get("keyword_hits")
+            item["keyword_hits"] = int(hits) if hits else len(item["matched_keywords"])
         out.append(item)
 
     # --- 1) Title / same-series (cap 5, no pad) ---
@@ -5315,7 +5376,9 @@ def find_related_by_title(
         try:
             for r in related_from_demo():
                 why = str(r.get("why") or "")
-                if "女優" in why and "主題" not in why:
+                ln = str(r.get("line") or "")
+                # Actress-bucket rows stay actress even if the note mentions 主題.
+                if ln == "actress" or _why_is_actress_bucket(why):
                     continue
                 _push(r, why=why or "主題相近", line="theme")
                 theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
@@ -5391,14 +5454,28 @@ def find_related_by_title(
         except Exception:
             pass
 
-    # Stable display order: theme → keyword → actress (caps already applied)
-    theme_items = [x for x in out if str(x.get("line")) == "theme"][:title_cap]
-    keyword_items = [x for x in out if str(x.get("line")) == "keyword"][:keyword_cap]
-    actress_items = [x for x in out if str(x.get("line")) == "actress"][:actress_cap]
+    # Stable display order: theme → keyword → actress (caps already applied).
+    # Resolve line again so a 同女優 note cannot remain inside the title block.
+    normalized: list[dict] = []
+    for x in out:
+        if not isinstance(x, dict):
+            continue
+        item = dict(x)
+        item["line"] = _related_line_of(item)
+        if item["line"] == "keyword":
+            matched = item.get("matched_keywords") or item.get("hit_keywords")
+            if not isinstance(matched, list) or not matched:
+                matched = _matched_theme_keywords(str(item.get("title") or ""), keywords)
+            item["matched_keywords"] = _normalize_keyword_list(matched)
+            item["hit_keywords"] = item["matched_keywords"]
+        normalized.append(item)
+    theme_items = [x for x in normalized if x.get("line") == "theme"][:title_cap]
+    keyword_items = [x for x in normalized if x.get("line") == "keyword"][:keyword_cap]
+    actress_items = [x for x in normalized if x.get("line") == "actress"][:actress_cap]
     other_items = [
         x
-        for x in out
-        if str(x.get("line")) not in {"theme", "keyword", "actress"}
+        for x in normalized
+        if x.get("line") not in {"theme", "keyword", "actress"}
     ]
     # Within keyword tier: more hits first
     keyword_items.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
