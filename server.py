@@ -3011,6 +3011,9 @@ RELATED_KEYWORD_CAP = 5
 # Interactive「關鍵字再搜」only. Carousel keyword bucket stays RELATED_KEYWORD_CAP.
 RELATED_KEYWORD_RESEARCH_CAP = 10
 RELATED_ACTRESS_CAP = 3
+# Floor for the keyword bucket. Title search may consume the shared deadline;
+# 關鍵字相關 still gets this slice, the same way 同女優 keeps its own budget.
+RELATED_KEYWORD_BUDGET = 5.0
 STILLS_TARGET = 10
 _OFFLINE_CACHE_MEM_LOCK = threading.Lock()
 _OFFLINE_CACHE_PATH: Path | None = None
@@ -3149,6 +3152,71 @@ def _related_line_of(x: dict | None) -> str:
     if "演員" in why or "女優" in why:
         return "actress"
     return "theme"
+
+
+def _carousel_related_items(payload: dict | None) -> list[dict]:
+    """Related cards the gallery carousel actually shows.
+
+    Prefer related_by_title. Fall back to `related` only for real
+    theme/keyword/actress rows — title-search candidates are vertical works,
+    not carousel slides, so they must not make a「僅顯示主作品」note look false.
+    """
+    if not isinstance(payload, dict):
+        return []
+    rel = payload.get("related_by_title")
+    use_curated = isinstance(rel, list) and bool(rel)
+    source = rel if use_curated else (payload.get("related") or [])
+    out: list[dict] = []
+    for x in source or []:
+        if not isinstance(x, dict) or not x.get("code"):
+            continue
+        ln = str(x.get("line") or "")
+        why = str(x.get("why") or "")
+        if ln in {"candidate", "multi", "main"}:
+            continue
+        if "候選" in why or "candidate" in why.lower():
+            continue
+        if use_curated:
+            out.append(x)
+            continue
+        if ln in {"theme", "keyword", "actress", "title"} or any(
+            s in why for s in ("關鍵字", "同女優", "同演員", "主題相近", "片名相近")
+        ):
+            out.append(x)
+    return out
+
+
+def _finalize_related_note(payload: dict | None) -> dict | None:
+    """Drop a same-actress / main-only note that the carousel contradicts.
+
+    「線上目錄未取得同女優相關；僅顯示主作品 CDN。」 is honest only when the
+    actress bucket is empty and no other related cards are showing. Visual-lock
+    and title-search banners in other clauses stay.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    note = str(payload.get("related_note") or "").strip()
+    if not note:
+        return payload
+    items = _carousel_related_items(payload)
+    has_actress = any(_related_line_of(x) == "actress" for x in items)
+    has_any = bool(items)
+    kept: list[str] = []
+    for part in re.split(r"[；;]", note):
+        p = part.strip()
+        if not p:
+            continue
+        miss = "未取得同女優" in p
+        main_only = "僅顯示主作品" in p
+        online_miss = "無法取得線上相關" in p
+        if has_actress and (miss or main_only or online_miss):
+            continue
+        if has_any and (main_only or online_miss):
+            continue
+        if p not in kept:
+            kept.append(p)
+    payload["related_note"] = "；".join(kept) or None
+    return payload
 
 
 def _related_bucket_counts(items) -> tuple[int, int, int]:
@@ -3409,6 +3477,7 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
                 offline_cache_put(payload, image_hash=image_hash)
         except Exception:
             pass
+        _finalize_related_note(payload)
         return payload
     payload.setdefault(
         "related_by_title",
@@ -3457,6 +3526,7 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     payload["cache_backfilled"] = True
     payload["chinese_titles_attached"] = True
     _recompute_theme_keywords(payload)
+    _finalize_related_note(payload)
     try:
         if _payload_enrichment_fingerprint(payload) != before:
             offline_cache_put(payload, image_hash=image_hash)
@@ -3768,6 +3838,7 @@ def identify_code(
         cached.setdefault("related_by_title", cached.get("related_by_title") or [])
         # Still fill missing title_zh (main + related); live path used to skip this
         cached = enrich_offline_cache_hit(cached)
+        _finalize_related_note(cached)
         return apply_vision_meta(cached, vision_meta)
 
     cid = code_to_cid(display)
@@ -3996,6 +4067,7 @@ def identify_code(
     except Exception:
         pass
     _recompute_theme_keywords(out)
+    _finalize_related_note(out)
     try:
         offline_cache_put(out)
     except Exception:
@@ -4965,10 +5037,114 @@ def _title_sibling_phrases(title: str) -> list[str]:
     return merged[:16]
 
 
+_DIGIT_FOLD = str.maketrans("０１２３４５６７８９", "0123456789")
+# Distinctive time + action hooks (10秒で挿入 / 10秒挿入 / 3分で絶頂).
+# The chip is the compact form; で / に are surface spellings of the same hook.
+# Not edition junk: VOL.2 / 第2巻 never match (no 秒/分/時間 + action).
+_TIME_ACTION_VERBS: tuple[str, ...] = (
+    "フェラチオ",
+    "セックス",
+    "中出し",
+    "手コキ",
+    "クンニ",
+    "挿入",
+    "絶頂",
+    "射精",
+    "顔射",
+    "イカせ",
+    "フェラ",
+    "接吻",
+    "ハメ",
+    "キス",
+    "イク",
+)
+_TIME_ACTION_VERB_RE = "|".join(re.escape(v) for v in _TIME_ACTION_VERBS)
+_TIME_ACTION_FIND_RE = re.compile(
+    rf"([0-9０-９]{{1,3}})\s*(時間|秒|分)\s*(?:で|に)?\s*({_TIME_ACTION_VERB_RE})"
+)
+_TIME_ACTION_SURFACE_RE = re.compile(
+    rf"^([0-9]+)(時間|秒|分)(?:で|に)?({_TIME_ACTION_VERB_RE})$"
+)
+
+
+def _fold_digits(text: str) -> str:
+    return (text or "").translate(_DIGIT_FOLD)
+
+
+def _canonical_time_action(num: str, unit: str, action: str) -> str:
+    return f"{_fold_digits(num)}{unit}{action}"
+
+
+def _time_action_match_forms(tok: str) -> tuple[str, ...]:
+    """Compact, で, and に spellings of one time+action chip. Empty if tok is not one."""
+    raw = re.sub(r"\s+", "", _fold_digits((tok or "").strip()))
+    m = _TIME_ACTION_SURFACE_RE.fullmatch(raw)
+    if not m:
+        return ()
+    n, unit, act = m.group(1), m.group(2), m.group(3)
+    return (f"{n}{unit}{act}", f"{n}{unit}で{act}", f"{n}{unit}に{act}")
+
+
+def _is_time_action_keyword(tok: str) -> bool:
+    """True for the compact chip (10秒挿入), not the で/に surface alone."""
+    forms = _time_action_match_forms(tok)
+    return bool(forms) and forms[0] == re.sub(r"\s+", "", _fold_digits((tok or "").strip()))
+
+
+def _extract_time_action_phrases(title: str) -> list[str]:
+    """In-title time+action hooks as compact chips (10秒で挿入 → 10秒挿入)."""
+    text = _fold_digits(title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _TIME_ACTION_FIND_RE.finditer(text):
+        start = m.start(1)
+        if start > 0 and text[start - 1].isdigit():
+            continue
+        canon = _canonical_time_action(m.group(1), m.group(2), m.group(3))
+        if canon in seen:
+            continue
+        seen.add(canon)
+        out.append(canon)
+    return out
+
+
+def _time_phrase_in_text(phrase: str, text: str) -> bool:
+    """Substring hit of any spelling. A longer number's tail (110秒) is not 10秒."""
+    folded = _fold_digits(text or "")
+    forms = _time_action_match_forms(phrase)
+    if not forms:
+        key = re.sub(r"\s+", "", _fold_digits(phrase or ""))
+        forms = (key,) if key else ()
+    for key in forms:
+        if not key:
+            continue
+        for hit in re.finditer(re.escape(key), folded):
+            if hit.start() > 0 and folded[hit.start() - 1].isdigit():
+                continue
+            return True
+    return False
+
+
+def _keyword_surface_pos(title: str, tok: str) -> int:
+    """Earliest index of tok, or of 10秒で挿入 when the chip is 10秒挿入."""
+    if not title or not tok:
+        return 10_000
+    folded = _fold_digits(title)
+    best = folded.find(_fold_digits(tok))
+    for al in _time_action_match_forms(tok):
+        i = folded.find(al)
+        if i >= 0 and (best < 0 or i < best):
+            best = i
+    return best if best >= 0 else 10_000
+
+
 def _theme_keyword_aliases(tok: str) -> tuple[str, ...]:
     t = (tok or "").strip()
     if not t:
         return ()
+    timed = _time_action_match_forms(t)
+    if timed:
+        return timed
     return _THEME_KEYWORD_ALIASES.get(t) or _THEME_KEYWORD_ALIASES.get(t.casefold()) or (t,)
 
 
@@ -5013,7 +5189,11 @@ def _keyword_token_ok(tok: str) -> bool:
 def _is_auto_theme_keyword(tok: str) -> bool:
     """Terms that lead automatic related search (not relationship chips)."""
     t = (tok or "").strip()
-    if not t or _is_relation_phrase(t) or _is_weak_theme_token(t):
+    if not t:
+        return False
+    if _is_time_action_keyword(t):
+        return True
+    if _is_relation_phrase(t) or _is_weak_theme_token(t):
         return False
     return True
 
@@ -5178,6 +5358,9 @@ def _rank_theme_keywords(
         # Relationship phrase stays selectable but behind theme nouns.
         if _is_relation_phrase(tok):
             return 4
+        # 10秒挿入-style hooks are productive theme chips, beside lexicon nouns.
+        if _is_time_action_keyword(tok):
+            return 1
         if _is_weak_theme_token(tok):
             return 5
         if tok in heads and (tok in _THEME_KEYWORD_LEXICON or tok in _SHORT_THEME_NOUNS):
@@ -5185,8 +5368,8 @@ def _rank_theme_keywords(
         return 1
 
     def _key(tok: str) -> tuple:
-        pos = compact.find(tok)
-        return (_tier(tok), pos if pos >= 0 else 10_000, -len(tok))
+        pos = _keyword_surface_pos(compact, tok)
+        return (_tier(tok), pos, -len(tok))
 
     return sorted(found, key=_key)
 
@@ -5245,12 +5428,13 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
     and both parts. Those stay on the chip list, but rank after theme nouns so
     息子 / ママ / 彼女 / 妹 do not lead automatic search. Bare 誘惑 / 教育 are
-    not chips unless glued to a noun. Edition / episode junk (VOL, Vol, VOL.2,
-    EP.2, 第2巻, 第十二話) is stripped before matching, so it cannot become a
-    chip or a leftover scrap. OL stays in the lexicon: it is an occupation
-    chip when the title actually contains that token, and it does not match
-    inside VOL. Leftover {4,6} scraps run only when nothing distinctive was
-    found (JUFE-271 は隠し切れな must not pad).
+    not chips unless glued to a noun. A time+action hook (10秒で挿入, 3分で絶頂)
+    becomes one compact chip (10秒挿入) and is searched like other theme nouns.
+    Edition / episode junk (VOL, Vol, VOL.2, EP.2, 第2巻, 第十二話) is stripped
+    before matching, so it cannot become a chip or a leftover scrap. OL stays
+    in the lexicon: it is an occupation chip when the title actually contains
+    that token, and it does not match inside VOL. Leftover {4,6} scraps run
+    only when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
     """
     raw = (title or "").strip()
     if not raw:
@@ -5290,6 +5474,8 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
         _add(phrase)
         _add(left)
         _add(right)
+    for canon in _extract_time_action_phrases(t):
+        _add(canon)
 
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
         if _keyword_index(t_norm, kw) < 0:
@@ -5336,10 +5522,13 @@ def _alias_in_title(alias: str, text: str) -> bool:
 
     妹 matches 彼女の妹 and a title that starts with 妹, not the tail of 義妹.
     ASCII aliases use the same whole-token boundary as extraction (OL ≠ VOL).
+    Time+action chips match 10秒で挿入 / 10秒に挿入 / １０秒挿入, not the tail of 110秒.
     """
     al = (alias or "").strip()
     if not al or not text:
         return False
+    if _time_action_match_forms(al):
+        return _time_phrase_in_text(al, text)
     folded = text.casefold()
     key = al.casefold()
     if len(al) == 1 and _is_relation_noun(al):
@@ -5484,7 +5673,7 @@ def _keyword_search_queries(
     ]
     ordered = sorted(
         keywords if selected_only else (distinctive or keywords),
-        key=lambda k: (title.find(k) if k and k in title else 10_000, -len(k)),
+        key=lambda k: (_keyword_surface_pos(title, k), -len(k)),
     )
 
     def _add_pairs() -> None:
@@ -6035,15 +6224,19 @@ def find_related_by_title(
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
 
     # --- 2) Keywords — independent bucket (cap 5), always try when keywords exist ---
+    # Dedicated floor: a long 片名 search used to exhaust `_left()` and skip this
+    # bucket, so code/title lookups showed 片名/同演員 with no 關鍵字相關.
     keyword_items_added = 0
-    if fill_keyword and keywords and _left() >= 1.2:
+    keyword_have = sum(1 for x in out if str(x.get("line")) == "keyword")
+    if fill_keyword and keywords and keyword_have < keyword_cap:
         try:
+            kw_budget = max(RELATED_KEYWORD_BUDGET, min(6.0, max(0.0, _left())))
             for r in _find_related_by_keywords(
                 title,
                 exclude_code=exclude or None,
                 actress=actress,
-                max_n=keyword_cap,
-                budget_sec=min(6.0, max(2.0, _left() * 0.45)),
+                max_n=keyword_cap - keyword_have,
+                budget_sec=kw_budget,
                 already=seen,
             ):
                 # Strong title-series matches found via keyword search → promote to theme
@@ -6201,6 +6394,7 @@ def attach_related_by_title(
         pass
 
     _recompute_theme_keywords(result)
+    _finalize_related_note(result)
     if not per_item:
         return result
     # Also attach on each results[] entry if present (single-image path)
@@ -6244,6 +6438,7 @@ def attach_related_by_title(
         except Exception:
             item["related_by_title"] = []
         _recompute_theme_keywords(item)
+    _finalize_related_note(result)
     return result
 
 
@@ -6889,6 +7084,7 @@ def reverify_cached_image_hit(
     out["from_offline_cache"] = True
     out["image_reverified"] = True
     _recompute_theme_keywords(out)
+    _finalize_related_note(out)
     return out
 
 
@@ -6929,6 +7125,51 @@ def _ensure_image_visual_rank(
         result["visual_meta"] = meta
         return result
     return _apply_visual_winner(result, ranked, meta, promote_candidates=True)
+
+
+def _complete_identify_result(
+    result: dict,
+    *,
+    image_bytes: bytes | None = None,
+    api_key: str | None = None,
+    extra_candidates: list | None = None,
+    skip_related: bool = False,
+    image_hash: str | None = None,
+) -> dict:
+    """Shared finish for code, title, and image identify.
+
+    Visual lock (when an image is present and not yet ranked), then the same
+    related buckets and title-keyword stamp. The actress note is reconciled
+    after the carousel exists so it cannot claim the bucket is empty.
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    if image_bytes:
+        try:
+            result = _ensure_image_visual_rank(
+                result, image_bytes, api_key, extra_candidates
+            )
+        except Exception:
+            pass
+    if result.get("from_offline_cache"):
+        try:
+            result = enrich_offline_cache_hit(result, image_hash=image_hash)
+        except Exception:
+            pass
+    elif not skip_related:
+        try:
+            result = attach_related_by_title(result, budget_sec=14.0)
+        except Exception:
+            result.setdefault("related_by_title", [])
+    else:
+        result.setdefault("related_by_title", [])
+    _recompute_theme_keywords(result)
+    _finalize_related_note(result)
+    try:
+        offline_cache_put(result, image_hash=image_hash)
+    except Exception:
+        pass
+    return result
 
 
 def run_identify_pipeline(
@@ -6982,6 +7223,16 @@ def run_identify_pipeline(
     )
 
     img_hash = image_content_hash(image_bytes) if image_bytes else None
+
+    def _finish(payload: dict, extras: list | None = None) -> dict:
+        return _complete_identify_result(
+            payload,
+            image_bytes=image_bytes,
+            api_key=api_key,
+            extra_candidates=extras,
+            skip_related=skip_related,
+            image_hash=img_hash,
+        )
     # Same screenshot may reuse catalog fields, but must re-check cover + stills
     # against this upload. A previous 僅排序未鎖定 must not be replayed as-is.
     if img_hash and not code and not user_title:
@@ -7251,28 +7502,32 @@ def run_identify_pipeline(
                             (extra_msg + " " if extra_msg else "")
                             + (vmeta.get("note") or "已對照原圖依人物／衣服／姿勢核對")
                         )
-                payload = multi_candidate_payload(
-                    query_title=vtitle,
-                    hit=hit2,
-                    ocr_preview=ocr_preview,
-                    vision_used=vision_used,
-                    extra_msg=extra_msg,
+                payload = _finish(
+                    multi_candidate_payload(
+                        query_title=vtitle,
+                        hit=hit2,
+                        ocr_preview=ocr_preview,
+                        vision_used=vision_used,
+                        extra_msg=extra_msg,
+                    )
                 )
                 _progress(on_progress, "search", "done", f"片名候選 {len(coded)} 筆", 4 / 6)
                 _progress(on_progress, "cover", "done", "已依番號帶入 CDN 封面", 5 / 6)
                 _progress(on_progress, "done", "done", "完成", 1.0)
                 return payload, 200
-            early_payload = title_only_payload(
-                title=vtitle,
-                actress=vactress,
-                studio=vstudio,
-                cover=None,  # no fake / broken cover
-                ocr_preview=ocr_preview,
-                vision_used=vision_used,
-                message=(
-                    (extra_msg + " " if extra_msg else "")
-                    + f"以片名搜尋：「{vtitle}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
-                ),
+            early_payload = _finish(
+                title_only_payload(
+                    title=vtitle,
+                    actress=vactress,
+                    studio=vstudio,
+                    cover=None,  # no fake / broken cover
+                    ocr_preview=ocr_preview,
+                    vision_used=vision_used,
+                    message=(
+                        (extra_msg + " " if extra_msg else "")
+                        + f"以片名搜尋：「{vtitle}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
+                    ),
+                )
             )
             _progress(on_progress, "search", "done", "片名搜尋未解析番號（部分結果）", 4 / 6)
             _progress(on_progress, "cover", "skipped", "無番號可抓封面", 5 / 6)
@@ -7282,14 +7537,16 @@ def run_identify_pipeline(
     if image_bytes is not None and not code and not early_payload:
         vtitle = (vision_meta or {}).get("title") if vision_meta else None
         if is_usable_title(vtitle):
-            early_payload = title_only_payload(
-                title=str(vtitle).strip(),
-                actress=(vision_meta or {}).get("actress"),
-                studio=(vision_meta or {}).get("studio"),
-                ocr_preview=ocr_preview,
-                vision_used=vision_used,
-                message=(extra_msg + " " if extra_msg else "")
-                + f"以片名搜尋：「{str(vtitle).strip()}」。未解析出番號。",
+            early_payload = _finish(
+                title_only_payload(
+                    title=str(vtitle).strip(),
+                    actress=(vision_meta or {}).get("actress"),
+                    studio=(vision_meta or {}).get("studio"),
+                    ocr_preview=ocr_preview,
+                    vision_used=vision_used,
+                    message=(extra_msg + " " if extra_msg else "")
+                    + f"以片名搜尋：「{str(vtitle).strip()}」。未解析出番號。",
+                )
             )
             _progress(on_progress, "parse", "done", "僅有片名", 3 / 6)
             _progress(on_progress, "search", "skipped", "無法解析番號", 4 / 6)
@@ -7364,28 +7621,32 @@ def run_identify_pipeline(
                             (extra_msg + " " if extra_msg else "")
                             + (vmeta.get("note") or "已對照原圖依人物／衣服／姿勢核對")
                         )
-                payload = multi_candidate_payload(
-                    query_title=user_title,
-                    hit=hit2,
-                    ocr_preview=ocr_preview,
-                    vision_used=False,
-                    extra_msg=extra_msg,
+                payload = _finish(
+                    multi_candidate_payload(
+                        query_title=user_title,
+                        hit=hit2,
+                        ocr_preview=ocr_preview,
+                        vision_used=False,
+                        extra_msg=extra_msg,
+                    )
                 )
                 _progress(on_progress, "search", "done", f"片名候選 {len(coded)} 筆", 4 / 6)
                 _progress(on_progress, "cover", "done", "已依番號帶入 CDN 封面", 5 / 6)
                 _progress(on_progress, "done", "done", "完成", 1.0)
                 return payload, 200
-            payload = title_only_payload(
-                title=str(hit.get("title") or user_title).strip(),
-                actress=hit.get("actress"),
-                studio=hit.get("studio"),
-                cover=None,
-                ocr_preview=ocr_preview,
-                vision_used=False,
-                message=(
-                    (extra_msg + " " if extra_msg else "")
-                    + f"以片名搜尋：「{user_title}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
-                ),
+            payload = _finish(
+                title_only_payload(
+                    title=str(hit.get("title") or user_title).strip(),
+                    actress=hit.get("actress"),
+                    studio=hit.get("studio"),
+                    cover=None,
+                    ocr_preview=ocr_preview,
+                    vision_used=False,
+                    message=(
+                        (extra_msg + " " if extra_msg else "")
+                        + f"以片名搜尋：「{user_title}」。未解析出番號；可手動輸入番號以補齊封面／劇照。"
+                    ),
+                )
             )
             _progress(on_progress, "search", "done", "片名搜尋未解析番號", 4 / 6)
             _progress(on_progress, "cover", "skipped", "無封面", 5 / 6)
@@ -7461,49 +7722,22 @@ def run_identify_pipeline(
             result, title_search_hit, query_title=title_search_query
         )
 
-    # Image path that resolved a code without the title-search visual pass
-    # (verified 番號) still has to compare cover + stills against the user image.
-    if image_bytes and result.get("ok"):
-        try:
-            extras = None
-            if title_search_hit:
-                extras = title_search_hit.get("candidates")
-            result = _ensure_image_visual_rank(
-                result, image_bytes, api_key, extras
-            )
-        except Exception:
-            pass
-
-    # Step 6: done
+    # Step 6: visual lock (image), related buckets, keyword stamp, honest note.
     ok = bool(result.get("ok"))
     status = 200 if ok else 400
     if ok:
+        extras = (title_search_hit or {}).get("candidates") if title_search_hit else None
+        result = _finish(result, extras)
         n_extra = len(result.get("candidates") or [])
         detail = "完成，進入畫廊"
         if n_extra >= 2:
             detail = f"完成，列出 {n_extra} 個番號候選"
-        # related_by_title — skip full re-search when served from offline cache;
-        # incremental backfill fills title_zh + remaining 5/5/3 related slots.
         if result.get("from_offline_cache"):
-            result.setdefault("related_by_title", result.get("related_by_title") or [])
-            # Always gap-check: flags from an earlier pass in this request
-            # must not freeze incomplete title_zh / 5/5/3 / stills.
-            result = enrich_offline_cache_hit(result, image_hash=img_hash)
             detail = "完成（離線快取）"
         elif not skip_related:
-            try:
-                result = attach_related_by_title(result, budget_sec=14.0)
-                n_rel = len(result.get("related_by_title") or [])
-                if n_rel:
-                    detail = f"{detail}；片名相關 {n_rel}"
-            except Exception:
-                result.setdefault("related_by_title", [])
-        else:
-            result.setdefault("related_by_title", [])
-        try:
-            offline_cache_put(result, image_hash=img_hash)
-        except Exception:
-            pass
+            n_rel = len(result.get("related_by_title") or [])
+            if n_rel:
+                detail = f"{detail}；片名相關 {n_rel}"
         _progress(on_progress, "done", "done", detail, 1.0)
     else:
         result.setdefault("related_by_title", [])
