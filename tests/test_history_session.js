@@ -681,6 +681,49 @@ function walkNodes(node, acc) {
   const themeNodes = walkNodes(getEl('history-detail'));
   assert.ok(!themeNodes.some((n) => n.getAttribute && n.getAttribute('data-kw')));
   assert.ok(!themeNodes.some((n) => String(n.className || '').indexOf('kw-related-panel') !== -1));
+  // Same-actress miss note must not contradict a carousel that already has 同演員.
+  {
+    const dishonest = '線上目錄未取得同女優相關；僅顯示主作品 CDN。';
+    const withActress = H.galleryFromIdentify({
+      ok: true,
+      code: 'DANDYA-001',
+      title: '息子の家庭教師',
+      message: '來源：avbase',
+      related_note: dishonest,
+      related_by_title: [
+        { code: 'MDBK-434', title: '別作品', line: 'actress', why: '同演員', cover: 'https://example.com/a.jpg' },
+        { code: 'KW-001', title: '家庭教師が10秒で挿入', line: 'keyword', why: '關鍵字×2', matched_keywords: ['家庭教師', '10秒挿入'] },
+      ],
+      theme_keywords: ['家庭教師', '10秒挿入', '肉欲教育', '息子の家庭教師', '息子', 'ママ'],
+    });
+    assert.ok(!String(withActress.notice || '').includes('未取得同女優'), withActress.notice);
+    assert.ok(!String(withActress.notice || '').includes('僅顯示主作品'), withActress.notice);
+    assert.strictEqual(withActress.notice, '來源：avbase');
+
+    const themeOnly = H.galleryFromIdentify({
+      ok: true,
+      code: 'DANDYA-001',
+      title: '息子の家庭教師',
+      related_note: dishonest + '；視覺鎖定',
+      related_by_title: [
+        { code: 'AAA-001', title: '系列', line: 'theme', why: '片名相近' },
+      ],
+    });
+    assert.ok(String(themeOnly.notice || '').includes('未取得同女優'), themeOnly.notice);
+    assert.ok(!String(themeOnly.notice || '').includes('僅顯示主作品'), themeOnly.notice);
+    assert.ok(String(themeOnly.notice || '').includes('視覺鎖定'), themeOnly.notice);
+
+    const empty = H.galleryFromIdentify({
+      ok: true,
+      code: 'DANDYA-001',
+      title: '息子の家庭教師',
+      related_note: dishonest,
+      related_by_title: [],
+    });
+    assert.ok(String(empty.notice || '').includes('未取得同女優'), empty.notice);
+    assert.ok(String(empty.notice || '').includes('僅顯示主作品'), empty.notice);
+  }
+
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'theme'), theme_keywords: [] }));
   assert.ok(H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: [] }));
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['眼鏡'] }));

@@ -903,6 +903,52 @@
     return { status: res.status, data };
   }
 
+  /**
+   * The same-actress miss note is only honest when that bucket is empty.
+   * 「僅顯示主作品」cannot sit on a carousel that already has related cards.
+   * Other clauses (視覺鎖定, 片名找到 N 個番號) stay.
+   */
+  function honestRelatedNotice(notice, items) {
+    const text = String(notice || '').trim();
+    if (!text) return null;
+    const related = [];
+    (items || []).forEach((w) => {
+      const rel = (w && (w.relatedByTitle || w.related_by_title)) || [];
+      rel.forEach((r) => related.push(r));
+    });
+    const hasActress = related.some((r) => relatedLineFromRaw(r) === 'actress');
+    const hasAny = related.length > 0;
+    if (!hasActress && !hasAny) return text;
+    const kept = [];
+    text.split(/[；;]/).forEach((part) => {
+      let p = String(part || '').trim();
+      if (!p) return;
+      // Strip inside the clause so a title banner glued with 「—」 survives.
+      if (hasActress) {
+        p = p.replace(/線上目錄未取得同女優相關/g, '');
+        p = p.replace(/無法取得線上相關/g, '');
+      }
+      if (hasActress || hasAny) {
+        p = p.replace(/僅顯示主作品(?:\s*CDN)?/g, '');
+      }
+      if (hasAny && !hasActress) {
+        p = p.replace(/無法取得線上相關/g, '');
+      }
+      p = p.replace(/^[—\-\s。．.]+|[—\-\s。．.]+$/g, '').replace(/\s{2,}/g, ' ').trim();
+      if (!p || kept.indexOf(p) !== -1) return;
+      kept.push(p);
+    });
+    return kept.join('；') || null;
+  }
+
+  function noticeForGallery(data, items, notice) {
+    const cleaned = honestRelatedNotice(notice, items);
+    if (cleaned) return cleaned;
+    const msg = data && data.message ? String(data.message) : '';
+    if (msg && msg !== String(notice || '')) return honestRelatedNotice(msg, items);
+    return null;
+  }
+
   function galleryFromIdentify(data) {
     const seenCodes = new Set();
 
@@ -932,7 +978,7 @@
         if (i === 0) copyKeywordFields(w, data);
       });
       let notice = data.related_note || data.message || null;
-      return { items: items, notice: notice || null, source: 'api' };
+      return { items: items, notice: noticeForGallery(data, items, notice), source: 'api' };
     }
 
     const main = workFromApi(data, 'main');
@@ -967,7 +1013,7 @@
     }
     return {
       items,
-      notice: notice || null,
+      notice: noticeForGallery(data, items, notice),
       source: 'api',
     };
   }
