@@ -470,6 +470,110 @@ class TestKeywordResearch(unittest.TestCase):
         self.assertIn("OL", empty.get_json().get("theme_keywords") or [])
 
 
+class TestRelatedBucketOrder(unittest.TestCase):
+    def test_actress_note_mentioning_theme_stays_after_keywords(self):
+        items = [
+            {"code": "SNIS-978", "line": "theme", "why": "同系列"},
+            {
+                "code": "MIDA-584",
+                "line": "theme",
+                "why": "同女優／同レーベル；義妹挑発アピールで主題線に近い",
+            },
+            {
+                "code": "VENX-380",
+                "line": "keyword",
+                "why": "關鍵字×2",
+                "keyword_hits": 2,
+                "title": "ノーブラ巨乳叔母",
+                "matched_keywords": ["巨乳"],
+            },
+            {"code": "MIDA-652", "line": "actress", "why": "同女優／同レーベル"},
+        ]
+        ordered = S._cap_related_buckets(items)
+        lines = [x["line"] for x in ordered]
+        self.assertEqual(lines, ["theme", "keyword", "actress", "actress"])
+        codes = [x["code"] for x in ordered]
+        self.assertLess(codes.index("SNIS-978"), codes.index("VENX-380"))
+        self.assertLess(codes.index("VENX-380"), codes.index("MIDA-584"))
+        self.assertEqual(ordered[2]["line"], "actress")
+        self.assertEqual(S._related_line_of(items[1]), "actress")
+        self.assertEqual(S._related_line_of(items[0]), "theme")
+        self.assertEqual(S._related_line_of(items[2]), "keyword")
+
+    def test_matched_keywords_are_real_hits_only(self):
+        title = "地味なメガネのOLが会社で"
+        matched = S._matched_theme_keywords(title, ["眼鏡", "地味", "美人", "OL"])
+        self.assertEqual(matched, ["眼鏡", "地味", "OL"])
+        self.assertNotIn("美人", matched)
+
+    def test_mida616_keyword_block_is_not_split_by_actress(self):
+        def fake_enrich(c, why="片名候選"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        kw_rows = [
+            {
+                "code": "VENX-380",
+                "title": "巨乳だけど系列は違う作品",
+                "line": "keyword",
+                "why": "關鍵字×2",
+                "keyword_hits": 2,
+                "matched_keywords": ["巨乳"],
+            },
+            {
+                "code": "ZZZA-1241",
+                "title": "別の巨乳作品パート2",
+                "line": "keyword",
+                "why": "關鍵字×1",
+                "keyword_hits": 1,
+                "matched_keywords": ["巨乳"],
+            },
+        ]
+        demo_rows = [
+            {"code": "SNIS-978", "title": "系列A", "line": "theme", "why": "同系列"},
+            {"code": "SSNI-432", "title": "系列B", "line": "theme", "why": "同系列"},
+            {
+                "code": "MIDA-584",
+                "title": "義妹",
+                "line": "actress",
+                "why": "同女優／同レーベル；義妹挑発アピールで主題線に近い",
+            },
+            {"code": "MIDA-652", "title": "痴女", "line": "actress", "why": "同女優／同レーベル"},
+        ]
+
+        with mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ), mock.patch.object(S, "fetch_jav321_title_results", return_value=[]), mock.patch.object(
+            S, "fetch_javlibrary_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "related_from_demo", return_value=demo_rows, create=True
+        ), mock.patch.object(
+            S, "_find_related_by_keywords", return_value=kw_rows
+        ), mock.patch.object(
+            S, "_find_related_by_actress", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+            rows = S.find_related_by_title(
+                "彼女の妹のノーブラ誘惑に負け巨乳ナマ乳沼に溺れたサイテーなボク",
+                exclude_code="MIDA-616",
+                actress="福田ゆあ",
+                budget_sec=30,
+            )
+        lines = [r.get("line") for r in rows]
+        compact = "".join({"theme": "T", "keyword": "K", "actress": "A"}.get(ln, "?") for ln in lines)
+        self.assertRegex(compact, r"^T*K*A*$", compact)
+        codes = [r["code"] for r in rows]
+        self.assertIn("SNIS-978", codes)
+        self.assertIn("VENX-380", codes)
+        self.assertIn("MIDA-584", codes)
+        self.assertEqual(next(r["line"] for r in rows if r["code"] == "MIDA-584"), "actress")
+        self.assertLess(codes.index("SNIS-978"), codes.index("VENX-380"))
+        self.assertLess(codes.index("VENX-380"), codes.index("MIDA-584"))
+        venx = next(r for r in rows if r["code"] == "VENX-380")
+        self.assertIn("巨乳", venx.get("matched_keywords") or [])
+
+
 class TestActressQueryKeep(unittest.TestCase):
     def test_is_actress_query_detection_via_score_path(self):
         # Unit-level: compact JP name without particles looks like actress query

@@ -677,6 +677,63 @@ function walkNodes(node, acc) {
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['眼鏡'] }));
 }
 
+// Hit keywords sit beside the 關鍵字 badge; actress notes do not split the keyword block
+{
+  const cover = 'https://pics.dmm.co.jp/digital/video/snis00978/snis00978pl.jpg';
+  H.paintHistoryDetail({
+    id: 'order-paint',
+    works: [
+      {
+        code: 'MIDA-616',
+        title: '彼女の妹のノーブラ誘惑',
+        cover: 'https://pics.dmm.co.jp/digital/video/mida00616/mida00616pl.jpg',
+        line: 'main',
+        theme_keywords: ['巨乳', 'ノーブラ'],
+        related: [
+          { code: 'SNIS-978', title: '系列', line: 'theme', why: '同系列', cover: cover },
+          {
+            code: 'MIDA-584',
+            title: '義妹',
+            line: 'theme',
+            why: '同女優／同レーベル；義妹挑発アピールで主題線に近い',
+            cover: cover,
+          },
+          {
+            code: 'VENX-380',
+            title: 'ノーブラ巨乳叔母',
+            line: 'keyword',
+            why: '關鍵字×2',
+            matched_keywords: ['巨乳', 'ノーブラ'],
+            cover: cover,
+          },
+          {
+            code: 'ZZZA-1241',
+            title: '別作品',
+            line: 'keyword',
+            why: '關鍵字×1',
+            cover: cover,
+          },
+          { code: 'MIDA-652', title: '痴女', line: 'actress', why: '同女優', cover: cover },
+        ],
+      },
+    ],
+  });
+  const slides = walkNodes(getEl('history-detail')).filter((n) => n.className === 'work-carousel-slide');
+  const badges = slides.slice(1).map((slide) => {
+    const html = walkNodes(slide).map((n) => n._html || '').join('\n');
+    if (html.indexOf('同演員') !== -1) return '同演員';
+    if (html.indexOf('關鍵字') !== -1) return '關鍵字';
+    if (html.indexOf('片名相近') !== -1) return '片名相近';
+    return html.slice(0, 80);
+  });
+  assert.deepStrictEqual(badges, ['片名相近', '關鍵字', '關鍵字', '同演員', '同演員']);
+  const venx = walkNodes(slides[2]).map((n) => n._html || '').join('\n');
+  assert.ok(venx.indexOf('card-hit-kw') !== -1, venx.slice(0, 300));
+  assert.ok(venx.indexOf('巨乳') !== -1 && venx.indexOf('ノーブラ') !== -1);
+  const bare = walkNodes(slides[3]).map((n) => n._html || '').join('\n');
+  assert.ok(bare.indexOf('card-hit-kw') === -1, 'do not invent hit keywords');
+}
+
 (async function () {
   const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
   const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';

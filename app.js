@@ -136,20 +136,37 @@
       stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
       why: r.why || '',
       line: relatedLineFromRaw(r),
+      keyword_hits: r.keyword_hits || r.keywordHits || 0,
+      matched_keywords: normalizeKeywordList(
+        r.matched_keywords || r.matchedKeywords || r.hit_keywords || r.hitKeywords
+      ),
     }));
+  }
+
+  function whyIsActressBucket(why) {
+    return /同女優|同演員/.test(String(why || ''));
+  }
+
+  function whyIsThemeBucket(why) {
+    const text = String(why || '');
+    return /片名|同系列|主題相近/.test(text) || text.indexOf('主題') === 0;
   }
 
   function relatedLineFromRaw(r) {
     const why = String((r && r.why) || '');
     let rl = (r && r.line) || '';
     if (rl === 'title') rl = 'theme';
-    if (rl === 'theme' || rl === 'keyword' || rl === 'actress') return rl;
+    // Explicit bucket wins. A 同女優 note that only mentions 主題 in passing
+    // stays actress so it cannot sit between 片名 and 關鍵字.
+    if (rl === 'keyword') return 'keyword';
+    if (rl === 'theme' && whyIsActressBucket(why) && !whyIsThemeBucket(why)) return 'actress';
+    if (rl === 'theme' || rl === 'actress') return rl;
     if (rl === 'multi' || rl === 'candidate' || rl === 'main') return rl;
     if (/候選|candidate/i.test(why)) return 'candidate';
     if (/多圖/i.test(why)) return 'multi';
-    if (/演員|女優|actress/i.test(why)) return 'actress';
+    if (whyIsThemeBucket(why)) return 'theme';
     if (/關鍵字|keyword/i.test(why)) return 'keyword';
-    if (/主題|theme|片名相近/i.test(why)) return 'theme';
+    if (whyIsActressBucket(why) || /演員|女優|actress/i.test(why)) return 'actress';
     return rl || 'theme';
   }
 
@@ -346,9 +363,12 @@
         return;
       }
       const cur = byKey[k];
-      ['title', 'title_zh', 'cover', 'why', 'line', 'actress', 'cid'].forEach((f) => {
+      ['title', 'title_zh', 'cover', 'why', 'line', 'actress', 'cid', 'keyword_hits'].forEach((f) => {
         if (!cur[f] && r[f]) cur[f] = r[f];
       });
+      if ((!cur.matched_keywords || !cur.matched_keywords.length) && r.matched_keywords && r.matched_keywords.length) {
+        cur.matched_keywords = r.matched_keywords;
+      }
       cur.stills = mergeStillsKeepExisting(cur.stills, r.stills);
     });
     return capRelatedBuckets(order.map((k) => byKey[k]));
@@ -601,6 +621,9 @@
       relatedByTitle,
       themeKeywords: normalizeKeywordList(raw.theme_keywords || raw.themeKeywords),
       keywordQueries: normalizeKeywordList(raw.keyword_queries || raw.keywordQueries),
+      matchedKeywords: normalizeKeywordList(
+        raw.matched_keywords || raw.matchedKeywords || raw.hit_keywords || raw.hitKeywords
+      ),
     };
   }
 
@@ -1134,6 +1157,17 @@
     meta.className = 'card-meta';
     const lineClass = w.line === 'multi' ? ' card-line line-multi' : ' card-line';
     const badge = opts.badgeLabel || lineLabel(w.line);
+    const hitKeywords =
+      badge === '關鍵字'
+        ? normalizeKeywordList(w.matchedKeywords || w.matched_keywords || w.hitKeywords || w.hit_keywords)
+        : [];
+    const hitHtml = hitKeywords.length
+      ? '<span class="card-hit-keywords">' +
+        hitKeywords
+          .map((kw) => '<span class="card-hit-kw">' + escapeHtml(kw) + '</span>')
+          .join('') +
+        '</span>'
+      : '';
     meta.innerHTML =
       '<p class="card-code">' +
       escapeHtml(w.code) +
@@ -1146,10 +1180,13 @@
         : w.studio
           ? '<p class="card-actress">' + escapeHtml(w.studio) + '</p>'
           : '') +
+      '<span class="card-badge-row">' +
       '<span class="' +
       lineClass.trim() +
       '">' +
       escapeHtml(badge) +
+      '</span>' +
+      hitHtml +
       '</span>';
 
     const coverWrap = document.createElement('div');
@@ -2209,9 +2246,9 @@
    * Multiple mains stack vertically in the gallery.
    */
   function buildWorkCarousel(mainWork) {
-    const related = Array.isArray(mainWork.relatedByTitle)
-      ? mainWork.relatedByTitle.slice(0, 13)
-      : [];
+    const related = capRelatedBuckets(
+      Array.isArray(mainWork.relatedByTitle) ? mainWork.relatedByTitle : []
+    );
     const block = document.createElement('section');
     block.className = 'work-carousel-block';
 
@@ -2254,12 +2291,11 @@
     related.forEach((rw, i) => {
       const slide = document.createElement('div');
       slide.className = 'work-carousel-slide';
-      const why = String((rw && rw.why) || '');
-      const line = String((rw && rw.line) || '');
+      const line = relatedLineFromRaw(rw);
       let badge = '相關 ' + (i + 1);
-      if (line === 'actress' || why.includes('演員') || why.includes('女優')) badge = '同演員';
-      else if (line === 'keyword' || why.includes('關鍵字')) badge = '關鍵字';
-      else if (line === 'theme' || why.includes('片名')) badge = '片名相近';
+      if (line === 'actress') badge = '同演員';
+      else if (line === 'keyword') badge = '關鍵字';
+      else if (line === 'theme') badge = '片名相近';
       slide.appendChild(buildWorkCard(rw, { slide: true, badgeLabel: badge }));
       track.appendChild(slide);
       slides.push(slide);
