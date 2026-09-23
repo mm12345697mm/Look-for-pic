@@ -2912,6 +2912,8 @@ HISTORY_RELATED_TITLE_ZH_BUDGET = 8.0
 # Related maxima (caps, not quotas — never pad with junk).
 RELATED_THEME_CAP = 5
 RELATED_KEYWORD_CAP = 5
+# Interactive「關鍵字再搜」only. Carousel keyword bucket stays RELATED_KEYWORD_CAP.
+RELATED_KEYWORD_RESEARCH_CAP = 10
 RELATED_ACTRESS_CAP = 3
 STILLS_TARGET = 10
 _OFFLINE_CACHE_MEM_LOCK = threading.Lock()
@@ -5005,7 +5007,7 @@ def _find_related_by_keywords(
 
     Explicit keywords (interactive re-search): match only that set.
     ≥2 selected → require ≥2 hits among them (multi-hit / AND-style).
-    Exactly 1 selected → that keyword may fill the row (≤5, no junk pad).
+    Exactly 1 selected → that keyword may fill the row (up to max_n, no junk pad).
     """
     import time as _time
 
@@ -6894,9 +6896,9 @@ def related_by_title_api():
 def related_by_keywords_api():
     """Re-search the keyword bucket using only the chips the user selected.
 
-    ≥2 keywords → keep works that hit multiple selected keywords (cap 5).
-    1 keyword → that keyword may fill the row (cap 5). No junk pad.
-    Does not change the main related carousel.
+    ≥2 keywords → keep works that hit multiple selected keywords (cap 10).
+    1 keyword → that keyword may fill the row (cap 10). No junk pad.
+    Does not change the main related carousel (keyword bucket stays at 5).
     """
     body = request.get_json(silent=True) or {}
     if not isinstance(body, dict):
@@ -6921,7 +6923,7 @@ def related_by_keywords_api():
             title,
             exclude_code=code or None,
             actress=actress,
-            max_n=RELATED_KEYWORD_CAP,
+            max_n=RELATED_KEYWORD_RESEARCH_CAP,
             budget_sec=6.0,
             keywords=keywords,
             min_hits=min_hits,
@@ -6937,7 +6939,7 @@ def related_by_keywords_api():
         )
     except Exception:
         pass
-    related = list(wrap.get("related_by_title") or [])[:RELATED_KEYWORD_CAP]
+    related = list(wrap.get("related_by_title") or [])[:RELATED_KEYWORD_RESEARCH_CAP]
     return jsonify({
         "ok": True,
         "keywords": keywords,

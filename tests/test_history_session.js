@@ -817,6 +817,52 @@ function walkNodes(node, acc) {
     context.fetch = prevFetch;
   }
 
+  // Re-search row shows real matches up to 10 and does not pad
+  {
+    async function paintResearch(n) {
+      const calls = [];
+      context.fetch = async (url, opts) => {
+        calls.push({ url: String(url), body: opts && opts.body });
+        return {
+          ok: true,
+          json: async () => ({
+            ok: true,
+            related: Array.from({ length: n }, (_, i) => ({
+              code: 'PRED-' + String(i + 1).padStart(3, '0'),
+              title: '地味な眼鏡 ' + (i + 1),
+              line: 'keyword',
+              why: '關鍵字×2',
+              stills: [],
+            })),
+          }),
+        };
+      };
+      H.paintHistoryDetail({
+        id: 'kw-cap-' + n,
+        works: [
+          {
+            code: 'JUFE-271',
+            title: '地味な眼鏡では隠し切れない美人OL',
+            cover: 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg',
+            stills: [],
+            theme_keywords: ['眼鏡', '地味'],
+            related: related(1, 'keyword'),
+            line: 'main',
+          },
+        ],
+      });
+      const nodes = walkNodes(getEl('history-detail'));
+      const search = nodes.find((node) => String(node.className || '').indexOf('kw-search') !== -1);
+      nodes.filter((node) => node.getAttribute && node.getAttribute('data-kw')).forEach((chip) => chip.click());
+      search.click();
+      await new Promise((r) => setTimeout(r, 30));
+      const slides = walkNodes(getEl('history-detail')).filter((node) => node.className === 'kw-research-slide');
+      return slides.length;
+    }
+    assert.strictEqual(await paintResearch(12), 10, 're-search row caps at 10');
+    assert.strictEqual(await paintResearch(3), 3, 're-search row does not pad to 10');
+  }
+
   // appendHistoryFromIdentify stores a thumb per uploaded file
   {
     canvasThumbN = 0;
