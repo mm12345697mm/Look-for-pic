@@ -789,6 +789,170 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
         )
 
 
+class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
+    """DANDYA-style titles: kinship chips, 教育 compounds, edition marks stripped.
+
+    OL stays a lexicon occupation chip. It is absent on the DANDY title only
+    because that title never says OL; VOL.2 must not invent it.
+    """
+
+    DANDYA = (
+        "「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! "
+        "息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2"
+    )
+
+    def test_dandya001_chips_and_auto_lead(self):
+        kws = S._extract_title_theme_keywords(self.DANDYA, actress="大浦真奈美")
+        self.assertEqual(
+            kws,
+            ["家庭教師", "肉欲教育", "息子の家庭教師", "息子", "ママ"],
+            kws,
+        )
+        # This title has VOL.2 and no occupation OL, so neither is a chip.
+        for absent in ("VOL", "OL", "Vol", "教育", "肉欲", "まま"):
+            self.assertNotIn(absent, kws, kws)
+        self.assertIn("OL", S._THEME_KEYWORD_LEXICON)
+        self.assertIn("OL", S._SHORT_THEME_NOUNS)
+        self.assertFalse(S._is_weak_theme_token("OL"))
+        self.assertTrue(S._is_weak_theme_token("息子"))
+        self.assertTrue(S._is_weak_theme_token("ママ"))
+        self.assertFalse(S._is_weak_theme_token("家庭教師"))
+        self.assertFalse(S._is_auto_theme_keyword("息子"))
+        self.assertFalse(S._is_auto_theme_keyword("ママ"))
+        self.assertFalse(S._is_auto_theme_keyword("息子の家庭教師"))
+        self.assertTrue(S._is_auto_theme_keyword("家庭教師"))
+        self.assertTrue(S._is_auto_theme_keyword("肉欲教育"))
+        qs = S._keyword_search_queries(self.DANDYA, kws)
+        self.assertTrue(qs, qs)
+        self.assertEqual(qs[0], "家庭教師", qs)
+        self.assertIn("肉欲教育", qs)
+        self.assertGreater(qs.index("肉欲教育"), 0)
+        for absent in ("息子", "ママ", "息子の家庭教師", "VOL", "OL"):
+            self.assertNotIn(absent, qs, qs)
+        selected = S._keyword_search_queries(self.DANDYA, ["息子", "ママ"], selected_only=True)
+        self.assertIn("息子", selected)
+        self.assertIn("ママ", selected)
+        self.assertLessEqual(len(selected), 10)
+
+    def test_edition_marker_and_latin_boundary(self):
+        for title in (
+            "美人OLの物語VOL.2",
+            "美人OLの物語Vol.2",
+            "美人OLの物語vol.2",
+            "美人OLの物語VOL2",
+            "美人OLの物語VOLUME 2",
+        ):
+            kws = S._extract_title_theme_keywords(title)
+            self.assertIn("OL", kws, (title, kws))
+            self.assertIn("美人", kws, (title, kws))
+            self.assertNotIn("VOL", kws, (title, kws))
+            self.assertNotIn("VOLUME", kws, (title, kws))
+        for title in ("シリーズ新作VOL.2", "GOLD VOL.2", "COOL Vol.2"):
+            kws = S._extract_title_theme_keywords(title)
+            self.assertNotIn("OL", kws, (title, kws))
+            self.assertNotIn("VOL", kws, (title, kws))
+        self.assertIn("OL", S._extract_title_theme_keywords("美人OL"))
+        self.assertEqual(S._keyword_hit_count("新作VOL.2", ["OL"]), 0)
+        self.assertEqual(S._keyword_hit_count("COOLな毎日", ["OL"]), 0)
+        self.assertGreaterEqual(S._keyword_hit_count("美人OL", ["OL"]), 1)
+        self.assertGreaterEqual(S._keyword_hit_count("巨乳OL", ["OL"]), 1)
+        # Numbered Japanese volume/episode counters are junk, not chips.
+        # A real OL next to one of them still surfaces.
+        for title in (
+            "美人OL第2巻",
+            "美人OL第２巻",
+            "美人OL第十二巻",
+            "美人OL第2話",
+            "美人OL第2回",
+            "美人OL EP.2",
+            "美人OL Vol",
+        ):
+            kws = S._extract_title_theme_keywords(title)
+            self.assertIn("OL", kws, (title, kws))
+            self.assertIn("美人", kws, (title, kws))
+            for tok in kws:
+                self.assertNotIn("巻", tok, (title, kws))
+                self.assertNotIn("話", tok, (title, kws))
+                self.assertNotIn("回", tok, (title, kws))
+                self.assertFalse(tok.upper() in {"VOL", "EP", "EPISODE", "VOLUME"}, (title, kws))
+        bare = S._extract_title_theme_keywords("ただの日常第十二巻")
+        self.assertNotIn("第十二巻", bare, bare)
+        self.assertNotIn("第十二", bare, bare)
+        self.assertEqual(S._extract_title_theme_keywords("第2巻"), [])
+        self.assertEqual(S._extract_title_theme_keywords("VOL.2"), [])
+
+    def test_education_suffix_on_other_titles(self):
+        # Known lexicon head + 教育 leads, same rank rule as ノーブラ誘惑.
+        kws = S._extract_title_theme_keywords("巨乳女教師の羞恥教育")
+        self.assertIn("羞恥教育", kws, kws)
+        self.assertIn("巨乳", kws)
+        self.assertIn("女教師", kws)
+        self.assertIn("羞恥", kws)
+        self.assertNotIn("教育", kws)
+        self.assertEqual(kws[0], "羞恥教育", kws)
+        qs = S._keyword_search_queries("巨乳女教師の羞恥教育", kws)
+        self.assertEqual(qs[0], "羞恥教育", qs)
+
+        # Unknown 2-kanji head still forms a compound, but does not outrank theme nouns.
+        title = "オフィスで性欲教育される秘書"
+        kws2 = S._extract_title_theme_keywords(title)
+        self.assertIn("性欲教育", kws2, kws2)
+        self.assertIn("オフィス", kws2)
+        self.assertIn("秘書", kws2)
+        self.assertNotIn("教育", kws2)
+        self.assertNotIn("性欲", kws2)
+        self.assertEqual(kws2[0], "オフィス", kws2)
+        self.assertLess(kws2.index("オフィス"), kws2.index("性欲教育"))
+        self.assertLess(kws2.index("秘書"), kws2.index("性欲教育"))
+
+        # Particle blocks the glue, same as ノーブラの誘惑. Bare leading 教育 is not a chip.
+        parted = S._extract_title_theme_keywords("肉欲の教育ママ")
+        self.assertNotIn("肉欲教育", parted, parted)
+        self.assertIn("ママ", parted)
+        self.assertNotIn("教育", parted)
+        bare = S._extract_title_theme_keywords("教育ママ")
+        self.assertEqual(bare, ["ママ"], bare)
+
+    def test_kinship_occupation_exposes_parts_without_leading(self):
+        kws = S._extract_title_theme_keywords("妹の家庭教師")
+        self.assertEqual(kws[0], "家庭教師", kws)
+        for rel in ("妹の家庭教師", "妹"):
+            self.assertIn(rel, kws, kws)
+            self.assertGreater(kws.index(rel), kws.index("家庭教師"))
+        qs = S._keyword_search_queries("妹の家庭教師", kws)
+        self.assertEqual(qs[0], "家庭教師", qs)
+        self.assertNotIn("妹", qs)
+
+        secret = S._extract_title_theme_keywords("彼女の秘書")
+        self.assertEqual(secret[0], "秘書", secret)
+        self.assertIn("彼女の秘書", secret)
+        self.assertIn("彼女", secret)
+        self.assertGreater(secret.index("彼女"), secret.index("秘書"))
+
+        # Clothing / body / pronouns stay out of the occupation pattern.
+        nobra = S._extract_title_theme_keywords("妹のノーブラ")
+        self.assertIn("ノーブラ", nobra)
+        self.assertNotIn("妹のノーブラ", nobra)
+        self.assertNotIn("妹", nobra)
+        boku = S._extract_title_theme_keywords("ボクの女医と巨乳")
+        self.assertIn("女医", boku)
+        self.assertIn("巨乳", boku)
+        self.assertNotIn("ボク", boku)
+        self.assertNotIn("ボクの女医", boku)
+
+        full = S._keyword_overlap(
+            "息子の家庭教師と肉欲教育",
+            ["家庭教師", "肉欲教育", "息子の家庭教師", "息子", "ママ"],
+        )
+        half = S._keyword_overlap(
+            "息子と家庭教師",
+            ["家庭教師", "肉欲教育", "息子の家庭教師", "息子", "ママ"],
+        )
+        self.assertIn("息子の家庭教師", full[2])
+        self.assertNotIn("息子の家庭教師", half[2])
+        self.assertGreater(full[1], half[1])
+
+
 class TestActressQueryKeep(unittest.TestCase):
     def test_is_actress_query_detection_via_score_path(self):
         # Unit-level: compact JP name without particles looks like actress query

@@ -4436,11 +4436,14 @@ def _title_related_keyword_queries(title: str) -> list[str]:
 
 
 # Relationship / pronoun fluff and bare action tokens.
-# They may sit in the lexicon (彼女) but must not outrank theme nouns, and must
-# not be primary keyword-search drivers when a stronger term exists.
+# They may sit in the lexicon (彼女, 息子, ママ) but must not outrank theme nouns,
+# and must not be primary keyword-search drivers when a stronger term exists.
 # Bare 誘惑 is not a theme noun; it is kept only inside a compound (ノーブラ誘惑).
 # 彼女 / 妹 stay weak for automatic search priority, but a title pattern like
 # 彼女の妹 still exposes 彼女, 妹, and 彼女の妹 as selectable chips.
+# 息子 / ママ are the same class: selectable kinship-role chips, weak for auto.
+# Hiragana まま is not a chip (it means "still" / "as is"). Pronouns (ボク / 私)
+# stay chips only inside kinshipのkinship, not as bare leftovers.
 # 義妹 stays a short theme noun (see _SHORT_THEME_NOUNS).
 _WEAK_THEME_TOKENS = frozenset(
     {
@@ -4455,6 +4458,8 @@ _WEAK_THEME_TOKENS = frozenset(
         "彼氏",
         "お姉さん",
         "人妻",
+        "息子",
+        "ママ",
         "妹",
         "姉",
         "兄",
@@ -4480,18 +4485,23 @@ _WEAK_THEME_TOKENS = frozenset(
     }
 )
 
-# Productive title suffixes. Noun + suffix is one theme (ノーブラ誘惑, 巨乳沼)
-# when the noun is actually in the title. Bare 誘惑 / 沼 are not chips.
-_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼")
+# Productive title suffixes. Noun + suffix is one theme when the noun is glued
+# on (ノーブラ誘惑, 巨乳沼, 肉欲教育, 羞恥教育). Bare 誘惑 / 沼 / 教育 are not chips.
+# The noun window is the same 2–8 kanji/katakana run as 誘惑 / 沼 (性教育 is one
+# kanji short of that window, so it is not minted from a single 性).
+_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼", "教育")
 
 # Kinship / pronoun nouns that form selectable XのY chips (彼女の妹).
 # One-character members are chips only as part of such a phrase, not as leftovers.
+# 息子 / ママ are also lexicon chips (see below) so a bare occurrence still shows.
 _RELATION_NOUNS: tuple[str, ...] = (
     "お姉さん",
     "あなた",
     "彼女",
     "彼氏",
     "義妹",
+    "息子",
+    "ママ",
     "ボク",
     "妹",
     "姉",
@@ -4502,7 +4512,30 @@ _RELATION_NOUNS: tuple[str, ...] = (
     "俺",
     "君",
 )
+# Pronouns are not the left side of kinshipのoccupation (ボクの巨乳 stays unsplit).
+_PRONOUN_NOUNS = frozenset({"あなた", "ボク", "私", "僕", "俺", "君"})
+# Occupations / roles on the right of 息子の家庭教師. Not body or clothing
+# nouns, so 妹のノーブラ and ボクの巨乳 do not become phrases.
+_ROLE_THEME_NOUNS = frozenset(
+    {
+        "家庭教師",
+        "女教師",
+        "ナース",
+        "女医",
+        "秘書",
+    }
+)
+# Edition / episode marks. Not theme chips. OL is not in this set: it stays an
+# occupation keyword. These tokens are junk even without a number (VOL, EP);
+# VOL.2 / 第2巻 / 第十二話 are the numbered forms.
+_EDITION_LATIN = frozenset({"vol", "volume", "ep", "episode"})
+_EDITION_MARKER_RE = re.compile(
+    r"(?i)(?<![A-Za-z])(?:vol(?:ume)?|ep(?:isode)?)(?![A-Za-z])"
+    r"(?:\s*[\.．]?\s*[0-9０-９]+)?"
+    r"|第\s*[0-9０-９一二三四五六七八九十百千〇零]+\s*[巻話章集回]"
+)
 _RELATION_NOUN_SET = frozenset(_RELATION_NOUNS)
+_KINSHIP_ROLE_SET = frozenset(n for n in _RELATION_NOUNS if n not in _PRONOUN_NOUNS)
 
 
 _THEME_KEYWORD_LEXICON = (
@@ -4534,6 +4567,8 @@ _THEME_KEYWORD_LEXICON = (
     "寝取",
     "義妹",
     "彼女",
+    "息子",
+    "ママ",
     "お姉さん",
     "ナース",
     "女医",
@@ -4609,6 +4644,52 @@ _THEME_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+def _keyword_index(text: str, kw: str) -> int:
+    """Index of kw in text, or -1.
+
+    ASCII lexicon tokens (OL, NTR, SEX) must be a whole Latin/digit token.
+    OL matches 美人OL and 巨乳OL, not the middle of VOL / GOLD / COOL.
+    CJK keywords stay ordinary substrings (逆NTR, 家庭教師).
+    """
+    if not text or not kw:
+        return -1
+    if re.fullmatch(r"[A-Za-z0-9]+", kw):
+        m = re.search(
+            rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])",
+            text,
+            flags=re.IGNORECASE,
+        )
+        return m.start() if m else -1
+    # Mixed tokens such as 逆NTR stay case-insensitive substrings. casefold
+    # does not change length for these, so the index still points into text.
+    folded = text.casefold()
+    key = kw.casefold()
+    if len(folded) == len(text) and len(key) == len(kw):
+        return folded.find(key)
+    return text.find(kw)
+
+
+def _is_edition_marker_span(text: str, start: int, end: int) -> bool:
+    """True when this Latin span is VOL / Vol / EP, numbered or not.
+
+    OL is never an edition mark. Numbered forms (VOL.2) are removed up front by
+    _strip_edition_markers; this guards the Latin pass if a bare token remains.
+    """
+    tok = (text or "")[start:end].casefold()
+    return tok in _EDITION_LATIN
+
+
+def _strip_edition_markers(text: str) -> str:
+    """Drop episode/volume junk before keyword extraction.
+
+    Removes VOL / Vol / VOL.2 / VOLUME 2 / EP.2 and 第N巻-style counters
+    (第2巻, 第２話, 第十二巻, 第2回). Does not touch a real occupation token OL.
+    """
+    if not text:
+        return ""
+    return _EDITION_MARKER_RE.sub(" ", text)
+
+
 def _title_sibling_phrases(title: str) -> list[str]:
     """Distinctive title phrases for 片名相近 / same-series catalog search."""
     raw = normalize_ocr_title(title) or (title or "").strip()
@@ -4645,7 +4726,7 @@ def _title_sibling_phrases(title: str) -> list[str]:
 
     # Lexicon compounds + small context windows
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
-        i = t.find(kw)
+        i = _keyword_index(t, kw)
         if i < 0:
             continue
         _add(kw)
@@ -4667,8 +4748,8 @@ def _title_sibling_phrases(title: str) -> list[str]:
         ("逆", "NTR"),
         ("夜行", "バス"),
     ):
-        if a in t and b in t:
-            ia, ib = t.find(a), t.find(b)
+        ia, ib = _keyword_index(t, a), _keyword_index(t, b)
+        if ia >= 0 and ib >= 0:
             if 0 <= ia < ib <= ia + 12:
                 _add(t[ia : ib + len(b)])
             _add(a + b)
@@ -4711,11 +4792,11 @@ def _title_sibling_phrases(title: str) -> list[str]:
         ("美人", "OL"),
         ("乳首", "開発"),
     ):
-        if a in t and b in t:
+        ia, ib = _keyword_index(t, a), _keyword_index(t, b)
+        if ia >= 0 and ib >= 0:
             comp = a + b
             if 4 <= len(comp) <= 10 and comp in t and comp not in must:
                 must.append(comp)
-            ia, ib = t.find(a), t.find(b)
             if 0 <= ia < ib <= ia + 10:
                 span = t[ia : ib + len(b)]
                 if 4 <= len(span) <= 12 and span not in must:
@@ -4755,12 +4836,18 @@ def _is_relation_noun(tok: str) -> bool:
 
 
 def _is_relation_phrase(tok: str) -> bool:
-    """彼女の妹 — both sides are relationship nouns, particle kept."""
+    """Selectable XのY that must not lead automatic search.
+
+    彼女の妹 — both sides are relationship nouns.
+    息子の家庭教師 — kinship noun + occupation. Bare 息子 stays weak.
+    """
     t = (tok or "").strip()
     if t.count("の") != 1:
         return False
     left, right = t.split("の", 1)
-    return _is_relation_noun(left) and _is_relation_noun(right)
+    if _is_relation_noun(left) and _is_relation_noun(right):
+        return True
+    return left in _KINSHIP_ROLE_SET and right in _ROLE_THEME_NOUNS
 
 
 def _keyword_token_ok(tok: str) -> bool:
@@ -4784,40 +4871,56 @@ def _is_auto_theme_keyword(tok: str) -> bool:
 def _extract_relation_compounds(title: str) -> list[tuple[str, str, str]]:
     """In-title relationship phrases as (phrase, left, right).
 
-    彼女の妹 yields the full chip plus both parts. 妹のノーブラ does not:
-    the right side is a theme noun, not a relationship noun.
+    彼女の妹 yields the full chip plus both parts.
+    息子の家庭教師 does too: kinship on the left, occupation on the right.
+    妹のノーブラ does not (clothing is not an occupation). ボクの巨乳 does not
+    (pronouns are not a kinship-role left side, and 巨乳 is not an occupation).
     """
     t = re.sub(r"\s+", "", title or "")
     if "の" not in t:
         return []
-    nouns = sorted(_RELATION_NOUN_SET, key=len, reverse=True)
+    rel_nouns = sorted(_RELATION_NOUN_SET, key=len, reverse=True)
+    kin_nouns = sorted(_KINSHIP_ROLE_SET, key=len, reverse=True)
+    roles = sorted(_ROLE_THEME_NOUNS, key=len, reverse=True)
     out: list[tuple[str, str, str]] = []
     seen: set[str] = set()
+
+    def _before(end: int, nouns: list[str]) -> str:
+        for noun in nouns:
+            if end >= len(noun) and t.endswith(noun, 0, end):
+                return noun
+        return ""
+
+    def _after(start: int, nouns: list[str]) -> str:
+        for noun in nouns:
+            if t.startswith(noun, start):
+                return noun
+        return ""
+
+    def _emit(left: str, right: str) -> None:
+        phrase = f"{left}の{right}"
+        if phrase in seen:
+            return
+        seen.add(phrase)
+        out.append((phrase, left, right))
+
     start = 0
     while True:
         i = t.find("の", start)
         if i < 0:
             break
         start = i + 1
-        left = ""
-        for noun in nouns:
-            if i >= len(noun) and t.endswith(noun, 0, i):
-                left = noun
-                break
-        if not left:
-            continue
-        right = ""
-        for noun in nouns:
-            if t.startswith(noun, i + 1):
-                right = noun
-                break
-        if not right:
-            continue
-        phrase = f"{left}の{right}"
-        if phrase in seen:
-            continue
-        seen.add(phrase)
-        out.append((phrase, left, right))
+        left_rel = _before(i, rel_nouns)
+        if left_rel:
+            right_rel = _after(i + 1, rel_nouns)
+            if right_rel:
+                _emit(left_rel, right_rel)
+                continue
+        left_kin = _before(i, kin_nouns)
+        if left_kin:
+            right_role = _after(i + 1, roles)
+            if right_role:
+                _emit(left_kin, right_role)
     return out
 
 
@@ -4838,11 +4941,12 @@ def _compound_noun_heads() -> list[str]:
 def _extract_title_compounds(title: str) -> list[tuple[str, str]]:
     """In-title compounds as (compound, noun_half).
 
-    Prefer a known theme noun glued to 誘惑/沼 (ノーブラ誘惑, 巨乳沼).
-    Otherwise keep a short kanji/katakana noun glued to the same suffix
-    (ナマ乳沼) without minting that noun as its own chip.
+    Prefer a known theme noun glued to 誘惑/沼/教育 (ノーブラ誘惑, 巨乳沼,
+    羞恥教育). Otherwise keep a short kanji/katakana noun glued to the same
+    suffix (ナマ乳沼, 肉欲教育) without minting that noun as its own chip.
     Weak heads (彼女) do not form a compound. A particle between the noun
-    and the suffix (ノーブラの誘惑) does not either.
+    and the suffix (ノーブラの誘惑, 肉欲の教育) does not either. Bare 教育
+    is not a chip.
     """
     t = re.sub(r"\s+", "", title or "")
     if len(t) < 3:
@@ -4983,20 +5087,25 @@ def _normalize_keyword_list(raw, *, limit: int = 10) -> list[str]:
 def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
     """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
 
-    Prefer lexicon + Latin tokens and in-title compounds (ノーブラ誘惑, 巨乳沼).
-    Keep the distinctive noun half of a lexicon compound (ノーブラ), and keep
-    high-signal 2-char look tokens (眼鏡/地味/美人).
+    Prefer lexicon + Latin tokens and in-title compounds (ノーブラ誘惑, 巨乳沼,
+    肉欲教育). Keep the distinctive noun half of a lexicon compound (ノーブラ),
+    and keep high-signal 2-char look tokens (眼鏡/地味/美人).
 
     Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
-    彼女の妹. Those stay on the chip list, but rank after theme nouns so they
-    do not lead automatic search. Bare 誘惑 is not a chip unless it is glued
-    to a noun (ノーブラ誘惑). Leftover {4,6} scraps run only when nothing
-    distinctive was found (JUFE-271 は隠し切れな must not pad).
+    彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
+    and both parts. Those stay on the chip list, but rank after theme nouns so
+    息子 / ママ / 彼女 / 妹 do not lead automatic search. Bare 誘惑 / 教育 are
+    not chips unless glued to a noun. Edition / episode junk (VOL, Vol, VOL.2,
+    EP.2, 第2巻, 第十二話) is stripped before matching, so it cannot become a
+    chip or a leftover scrap. OL stays in the lexicon: it is an occupation
+    chip when the title actually contains that token, and it does not match
+    inside VOL. Leftover {4,6} scraps run only when nothing distinctive was
+    found (JUFE-271 は隠し切れな must not pad).
     """
     raw = (title or "").strip()
     if not raw:
         return []
-    t = raw
+    t = _strip_edition_markers(raw)
     if actress:
         for piece in re.split(r"[\s　・/|]+", str(actress)):
             piece = piece.strip()
@@ -5033,17 +5142,29 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
         _add(right)
 
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
-        if kw.casefold() in t_norm.casefold():
-            _add(kw)
+        if _keyword_index(t_norm, kw) < 0:
+            continue
+        _add(kw)
+        if re.fullmatch(r"[A-Za-z0-9]+", kw):
+            t_norm = re.sub(
+                rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])",
+                " ",
+                t_norm,
+                flags=re.IGNORECASE,
+            )
+        else:
             t_norm = re.sub(re.escape(kw), " ", t_norm, flags=re.IGNORECASE)
 
     for m in re.finditer(r"[A-Za-z]{2,6}", t):
+        if _is_edition_marker_span(t, m.start(), m.end()):
+            continue
         _add(m.group(0).upper())
 
-    # Known 2-char theme nouns left in the title after longer lexicon hits
+    # Known 2-char theme nouns left in the title after longer lexicon hits.
+    # Same Latin boundary as the lexicon pass (OL must not fall out of VOL).
     compact = re.sub(r"\s+", "", t_norm)
     for noun in sorted(_SHORT_THEME_NOUNS, key=len, reverse=True):
-        if noun and noun in compact:
+        if noun and _keyword_index(compact, noun) >= 0:
             _add(noun)
 
     distinctive_lex = [k for k in found if not _is_weak_theme_token(k)]
@@ -5064,6 +5185,7 @@ def _alias_in_title(alias: str, text: str) -> bool:
     """Substring hit. One-character relation nouns need a particle/edge boundary.
 
     妹 matches 彼女の妹 and a title that starts with 妹, not the tail of 義妹.
+    ASCII aliases use the same whole-token boundary as extraction (OL ≠ VOL).
     """
     al = (alias or "").strip()
     if not al or not text:
@@ -5078,7 +5200,7 @@ def _alias_in_title(alias: str, text: str) -> bool:
             )
             is not None
         )
-    return key in folded
+    return _keyword_index(text, al) >= 0
 
 
 def _matched_theme_keywords(candidate_title: str, keywords: list[str] | None) -> list[str]:
