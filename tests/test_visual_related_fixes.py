@@ -625,6 +625,98 @@ class TestRelatedBucketOrder(unittest.TestCase):
         self.assertIn("巨乳", venx.get("matched_keywords") or [])
 
 
+class TestDistinctiveThemeKeywords(unittest.TestCase):
+    """Compound phrases lead; relationship/action fluff does not outrank them."""
+
+    MIDA = "彼女の妹のノーブラ誘惑に負け巨乳ナマ乳沼に溺れたサイテーなボク"
+
+    def test_mida616_prefers_compound_then_kyonyu(self):
+        kws = S._extract_title_theme_keywords(self.MIDA, actress="福田ゆあ")
+        self.assertGreaterEqual(len(kws), 2, kws)
+        self.assertEqual(kws[0], "ノーブラ誘惑", kws)
+        self.assertEqual(kws[1], "巨乳", kws)
+        # Noun half of the compound stays, but does not outrank 巨乳.
+        self.assertIn("ノーブラ", kws)
+        self.assertGreater(kws.index("ノーブラ"), kws.index("巨乳"))
+        self.assertLess(kws.index("ノーブラ誘惑"), kws.index("ノーブラ"))
+        if "彼女" in kws:
+            self.assertGreater(kws.index("彼女"), kws.index("巨乳"))
+            self.assertGreater(kws.index("彼女"), kws.index("ノーブラ誘惑"))
+        # 妹 is one character and a relationship word; bare 誘惑/負け/ボク are action or pronoun.
+        for absent in ("妹", "誘惑", "負け", "ボク", "私"):
+            self.assertNotIn(absent, kws, kws)
+        # noun+沼 in this title is kept, behind the circled theme nouns.
+        self.assertIn("ナマ乳沼", kws)
+        self.assertGreater(kws.index("ナマ乳沼"), kws.index("巨乳"))
+
+    def test_mida616_queries_led_by_distinctive_terms(self):
+        kws = S._extract_title_theme_keywords(self.MIDA)
+        qs = S._keyword_search_queries(self.MIDA, kws)
+        self.assertTrue(qs, qs)
+        self.assertLessEqual(len(qs), 8)
+        self.assertEqual(qs[0], "ノーブラ誘惑", qs)
+        self.assertIn("巨乳", qs[:4])
+        self.assertNotIn("彼女", qs)
+        self.assertNotIn("妹", qs)
+        self.assertNotIn("誘惑", qs)
+        self.assertTrue(all(not S._is_weak_theme_token(q) for q in qs[:2]), qs)
+
+    def test_particle_blocks_false_compound(self):
+        kws = S._extract_title_theme_keywords("ノーブラの誘惑に負けた巨乳")
+        self.assertIn("ノーブラ", kws)
+        self.assertIn("巨乳", kws)
+        self.assertNotIn("ノーブラ誘惑", kws)
+        self.assertNotIn("誘惑", kws)
+        self.assertLess(kws.index("ノーブラ"), kws.index("彼女") if "彼女" in kws else 99)
+
+    def test_kyonyu_swamp_keeps_noun_half(self):
+        title = "巨乳沼にハマった眼鏡OL"
+        kws = S._extract_title_theme_keywords(title)
+        self.assertEqual(kws[0], "巨乳沼", kws)
+        self.assertIn("巨乳", kws)
+        self.assertIn("眼鏡", kws)
+        self.assertIn("OL", kws)
+        self.assertLess(kws.index("巨乳沼"), kws.index("巨乳"))
+        self.assertNotIn("沼", kws)
+        qs = S._keyword_search_queries(title, kws)
+        self.assertEqual(qs[0], "巨乳沼", qs)
+        self.assertLessEqual(len(qs), 8)
+        self.assertTrue(any(q == "メガネ" or "眼鏡" in q for q in qs), qs)
+
+    def test_megane_alias_and_jufe_scraps_unchanged(self):
+        title = "地味な眼鏡では隠し切れない美人OLが性欲を抑えきれず完全生撮り"
+        kws = S._extract_title_theme_keywords(title, actress="楪カレン")
+        for tok in ("地味", "眼鏡", "美人", "OL"):
+            self.assertIn(tok, kws, kws)
+        for scrap in ("は隠し切れな", "が性欲を抑え", "きれず完全生"):
+            self.assertNotIn(scrap, kws, kws)
+        self.assertEqual(kws[0], "地味", kws)
+        qs = S._keyword_search_queries(title, kws)
+        self.assertIn("地味", qs)
+        self.assertTrue(any("眼鏡" in q or "メガネ" in q for q in qs), qs)
+        self.assertLessEqual(len(qs), 8)
+        selected = S._keyword_search_queries(title, ["眼鏡"], selected_only=True)
+        self.assertLessEqual(len(selected), 10)
+        self.assertTrue(any("眼鏡" in q or "メガネ" in q for q in selected), selected)
+        self.assertFalse(any("地味" in q for q in selected), selected)
+
+    def test_weak_relation_does_not_outrank_theme_noun(self):
+        kws = S._extract_title_theme_keywords("彼女の妹とボクの巨乳電車")
+        self.assertIn("巨乳", kws)
+        self.assertIn("電車", kws)
+        self.assertNotIn("妹", kws)
+        self.assertNotIn("ボク", kws)
+        if "彼女" in kws:
+            self.assertGreater(kws.index("彼女"), kws.index("巨乳"))
+            self.assertGreater(kws.index("彼女"), kws.index("電車"))
+        self.assertTrue(S._is_weak_theme_token("彼女"))
+        self.assertTrue(S._is_weak_theme_token("誘惑"))
+        self.assertTrue(S._is_weak_theme_token("妹"))
+        self.assertFalse(S._is_weak_theme_token("ノーブラ"))
+        self.assertFalse(S._is_weak_theme_token("巨乳"))
+        self.assertFalse(S._is_weak_theme_token("義妹"))
+
+
 class TestActressQueryKeep(unittest.TestCase):
     def test_is_actress_query_detection_via_score_path(self):
         # Unit-level: compact JP name without particles looks like actress query

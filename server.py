@@ -4435,6 +4435,12 @@ def _title_related_keyword_queries(title: str) -> list[str]:
     return _title_sibling_phrases(title)[:8]
 
 
+# Relationship / pronoun fluff and bare action tokens.
+# They may sit in the lexicon (彼女) but must not outrank theme nouns, and must
+# not be primary keyword-search drivers when a stronger term exists.
+# 妹 is one character: the length≥2 rule drops it before this set matters.
+# Bare 誘惑 is not a theme noun; it is kept only inside a compound (ノーブラ誘惑).
+# 義妹 stays a short theme noun (see _SHORT_THEME_NOUNS), unlike bare 妹.
 _WEAK_THEME_TOKENS = frozenset(
     {
         "中出し",
@@ -4445,8 +4451,24 @@ _WEAK_THEME_TOKENS = frozenset(
         "VR",
         "油",
         "彼女",
+        "彼氏",
         "お姉さん",
         "人妻",
+        "妹",
+        "姉",
+        "兄",
+        "弟",
+        "私",
+        "僕",
+        "ボク",
+        "俺",
+        "君",
+        "あなた",
+        "誘惑",
+        "負け",
+        "負ける",
+        "負けた",
+        "負けちゃう",
         "拘束",
         "監禁",
         "調教",
@@ -4456,6 +4478,10 @@ _WEAK_THEME_TOKENS = frozenset(
         "会社",
     }
 )
+
+# Productive title suffixes. Noun + suffix is one theme (ノーブラ誘惑, 巨乳沼)
+# when the noun is actually in the title. Bare 誘惑 / 沼 are not chips.
+_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼")
 
 
 _THEME_KEYWORD_LEXICON = (
@@ -4703,6 +4729,119 @@ def _is_weak_theme_token(tok: str) -> bool:
     return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
 
 
+def _compound_noun_heads() -> list[str]:
+    """Non-weak lexicon nouns that may head noun+誘惑 / noun+沼, longest first."""
+    seen: set[str] = set()
+    heads: list[str] = []
+    for raw in list(_THEME_KEYWORD_LEXICON) + list(_SHORT_THEME_NOUNS):
+        noun = (raw or "").strip()
+        if len(noun) < 2 or noun in seen or _is_weak_theme_token(noun):
+            continue
+        seen.add(noun)
+        heads.append(noun)
+    heads.sort(key=len, reverse=True)
+    return heads
+
+
+def _extract_title_compounds(title: str) -> list[tuple[str, str]]:
+    """In-title compounds as (compound, noun_half).
+
+    Prefer a known theme noun glued to 誘惑/沼 (ノーブラ誘惑, 巨乳沼).
+    Otherwise keep a short kanji/katakana noun glued to the same suffix
+    (ナマ乳沼) without minting that noun as its own chip.
+    Weak heads (彼女) do not form a compound. A particle between the noun
+    and the suffix (ノーブラの誘惑) does not either.
+    """
+    t = re.sub(r"\s+", "", title or "")
+    if len(t) < 3:
+        return []
+    heads = _compound_noun_heads()
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+
+    def _push(noun: str, suf: str) -> None:
+        noun = (noun or "").strip()
+        if len(noun) < 2 or _is_weak_theme_token(noun) or noun in _COMPOUND_SUFFIXES:
+            return
+        compound = noun + suf
+        if compound in seen or compound not in t:
+            return
+        if not (3 <= len(compound) <= 18):
+            return
+        seen.add(compound)
+        out.append((compound, noun))
+
+    for suf in _COMPOUND_SUFFIXES:
+        start = 0
+        while True:
+            i = t.find(suf, start)
+            if i < 0:
+                break
+            start = i + max(len(suf), 1)
+            if i <= 0:
+                continue
+            head = t[:i]
+            noun = ""
+            for h in heads:
+                if head.endswith(h):
+                    noun = h
+                    break
+            if noun:
+                _push(noun, suf)
+                continue
+            m = re.search(r"([\u30a0-\u30ff\u4e00-\u9fff]{2,8})$", head)
+            if not m:
+                continue
+            span = m.group(1)
+            generic = ""
+            for h in heads:
+                idx = span.rfind(h)
+                if idx >= 0 and idx + len(h) < len(span):
+                    rest = span[idx + len(h) :]
+                    if 2 <= len(rest) <= 6 and not _is_weak_theme_token(rest):
+                        generic = rest
+                        break
+            if not generic:
+                generic = span[-6:] if len(span) > 6 else span
+            _push(generic, suf)
+    return out
+
+
+def _rank_theme_keywords(
+    found: list[str],
+    title: str,
+    compounds: list[tuple[str, str]],
+) -> list[str]:
+    """Compounds of known theme nouns, then other strong nouns, then weak fluff.
+
+    The noun half of a kept compound stays (ノーブラ under ノーブラ誘惑) but
+    ranks after strong nouns that are not already covered by that compound,
+    so 巨乳 is not pushed behind a duplicate of the same head.
+    """
+    compact = re.sub(r"\s+", "", title or "")
+    compound_head = {comp: noun for comp, noun in compounds}
+    heads = {noun for noun in compound_head.values() if noun}
+
+    def _tier(tok: str) -> int:
+        head = compound_head.get(tok)
+        if head and not _is_weak_theme_token(tok):
+            known = (not _is_weak_theme_token(head)) and (
+                head in _THEME_KEYWORD_LEXICON or head in _SHORT_THEME_NOUNS
+            )
+            return 0 if known else 3
+        if _is_weak_theme_token(tok):
+            return 4
+        if tok in heads and (tok in _THEME_KEYWORD_LEXICON or tok in _SHORT_THEME_NOUNS):
+            return 2
+        return 1
+
+    def _key(tok: str) -> tuple:
+        pos = compact.find(tok)
+        return (_tier(tok), pos if pos >= 0 else 10_000, -len(tok))
+
+    return sorted(found, key=_key)
+
+
 def _keyword_min_hits(keywords: list[str] | None) -> int:
     """≥3 extracted keywords → need ≥2 hits; 1–2 keywords may match alone."""
     n = len([k for k in (keywords or []) if k])
@@ -4749,8 +4888,15 @@ def _normalize_keyword_list(raw, *, limit: int = 10) -> list[str]:
 def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
     """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
 
-    Prefer lexicon + Latin tokens; keep high-signal 2-char look tokens
-    (眼鏡/地味/美人). Avoid junk leftover scraps that pad unrelated hits.
+    Prefer lexicon + Latin tokens and in-title compounds (ノーブラ誘惑, 巨乳沼).
+    Keep the distinctive noun half of a lexicon compound (ノーブラ), and keep
+    high-signal 2-char look tokens (眼鏡/地味/美人). Rank weak relationship
+    and bare-action tokens (彼女, 誘惑, 負け, ボク) after strong theme nouns.
+
+    妹 is not a chip: it is a one-character relationship word, not a theme noun
+    (義妹 is the lexicon form). Bare 誘惑 is not a chip either: it is action
+    fluff unless it is glued to a noun in the title. Leftover {4,6} scraps run
+    only when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
     """
     raw = (title or "").strip()
     if not raw:
@@ -4765,6 +4911,7 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     found: list[str] = []
     seen: set[str] = set()
     alias_seen: set[str] = set()
+    compounds = _extract_title_compounds(t)
 
     def _add(tok: str) -> None:
         tok = (tok or "").strip()
@@ -4782,6 +4929,9 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
             alias_seen.add(al.casefold())
         found.append(tok)
 
+    for comp, _noun in compounds:
+        _add(comp)
+
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
         if kw.casefold() in t_norm.casefold():
             _add(kw)
@@ -4797,8 +4947,7 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
             _add(noun)
 
     distinctive_lex = [k for k in found if not _is_weak_theme_token(k)]
-    # Leftover {4,6} only when lexicon/latin produced no distinctive token.
-    # JUFE-271 leftovers (は隠し切れな / が性欲を抑え) do not match other 地味眼鏡 works.
+    # Leftover {4,6} only when lexicon/latin/compounds produced no distinctive token.
     if not distinctive_lex:
         for m in re.finditer(r"[\u4e00-\u9fff\u3040-\u30ff]{4,6}", t_norm):
             chunk = m.group(0)
@@ -4808,7 +4957,7 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
                 break
             _add(chunk)
 
-    return found[:10]
+    return _rank_theme_keywords(found, t, compounds)[:10]
 
 
 def _matched_theme_keywords(candidate_title: str, keywords: list[str] | None) -> list[str]:
@@ -4897,6 +5046,11 @@ def _keyword_search_queries(
 
     selected_only: interactive re-search — query the chosen tokens and their
     compounds/aliases, not unrelated sibling phrases from the full title.
+    Cap 10 (關鍵字再搜).
+
+    Default bucket: distinctive compounds and theme nouns lead (cap 8). Weak
+    relationship/action tokens are queried only when the title has no stronger
+    term, or when there are just 1–2 keywords total. They must not lead.
     """
     title = title or ""
     queries: list[str] = []
@@ -4906,62 +5060,87 @@ def _keyword_search_queries(
         if len(q) >= 2 and q not in queries:
             queries.append(q)
 
-    distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
-    if not selected_only:
-        # Prefer sibling phrases / compounds over bare weak tokens
-        for p in _title_sibling_phrases(title)[:6]:
-            if p not in _WEAK_THEME_TOKENS and len(p) >= 4:
-                _add_q(p)
-
+    distinctive = [k for k in keywords if k and not _is_weak_theme_token(k)]
     ordered = sorted(
         keywords if selected_only else (distinctive or keywords),
         key=lambda k: (title.find(k) if k and k in title else 10_000, -len(k)),
     )
-    for i in range(len(ordered) - 1):
-        a, b = ordered[i], ordered[i + 1]
-        if a and b and a.casefold() != b.casefold():
+
+    def _add_pairs() -> None:
+        for i in range(len(ordered) - 1):
+            a, b = ordered[i], ordered[i + 1]
+            if not a or not b or a.casefold() == b.casefold():
+                continue
+            # ノーブラ is already inside ノーブラ誘惑; don't invent a doubled query.
+            if a in b or b in a:
+                continue
             _add_q(a + b)
-    for a, b in (
-        ("満員", "電車"),
-        ("滿員", "電車"),
-        ("媚薬", "オイル"),
-        ("媚藥", "オイル"),
-        ("乳首", "開発"),
-        ("乳首", "イキ"),
-        ("巨乳", "OL"),
-        ("美乳", "OL"),
-        ("地味", "眼鏡"),
-        ("地味", "メガネ"),
-        ("眼鏡", "OL"),
-        ("メガネ", "OL"),
-        ("美人", "OL"),
-        ("声我慢", "SEX"),
-    ):
-        if any(k.casefold() == a.casefold() for k in keywords) and any(
-            k.casefold() == b.casefold() for k in keywords
+        for a, b in (
+            ("満員", "電車"),
+            ("滿員", "電車"),
+            ("媚薬", "オイル"),
+            ("媚藥", "オイル"),
+            ("乳首", "開発"),
+            ("乳首", "イキ"),
+            ("巨乳", "OL"),
+            ("美乳", "OL"),
+            ("地味", "眼鏡"),
+            ("地味", "メガネ"),
+            ("眼鏡", "OL"),
+            ("メガネ", "OL"),
+            ("美人", "OL"),
+            ("声我慢", "SEX"),
         ):
-            _add_q(a + b)
-    # Glasses + plain look: catalog often uses メガネ even when the title has 眼鏡
-    if any(not _is_weak_theme_token(k) and k in _THEME_KEYWORD_ALIASES for k in keywords):
-        if any(k == "地味" for k in keywords):
-            _add_q("地味眼鏡")
-            _add_q("地味メガネ")
-    # Strong singles last. With only 1–2 keywords, query those nouns even if
-    # they used to be treated as weak (OL / オフィス). With ≥3, skip action weaks.
-    # Explicit re-search queries every selected token (the user asked for it).
-    if selected_only:
-        singles = list(keywords)
-    else:
-        singles = list(keywords) if len(keywords) <= 2 else ordered[:4]
-    for kw in singles:
-        if selected_only or len(keywords) <= 2 or not _is_weak_theme_token(kw):
+            if any(k.casefold() == a.casefold() for k in keywords) and any(
+                k.casefold() == b.casefold() for k in keywords
+            ):
+                _add_q(a + b)
+        # Glasses + plain look: catalog often uses メガネ even when the title has 眼鏡
+        if any(not _is_weak_theme_token(k) and k in _THEME_KEYWORD_ALIASES for k in keywords):
+            if any(k == "地味" for k in keywords):
+                _add_q("地味眼鏡")
+                _add_q("地味メガネ")
+
+    def _add_singles(singles: list[str], *, include_weak: bool) -> None:
+        for kw in singles:
+            if not include_weak and _is_weak_theme_token(kw):
+                continue
             _add_q(kw)
             for alias in _theme_keyword_aliases(kw):
-                if alias != kw and (
-                    selected_only or len(keywords) <= 2 or not _is_weak_theme_token(alias)
-                ):
+                if alias != kw and (include_weak or not _is_weak_theme_token(alias)):
                     _add_q(alias)
-    return queries[:10 if selected_only else 8]
+
+    if selected_only:
+        # Explicit re-search queries every selected token (the user asked for it).
+        _add_pairs()
+        _add_singles(list(keywords), include_weak=True)
+        return queries[:10]
+
+    # Distinctive compounds / nouns first, in chip rank order.
+    if distinctive:
+        _add_singles(distinctive, include_weak=False)
+    _add_pairs()
+    if distinctive:
+        for p in _title_sibling_phrases(title):
+            if len(queries) >= 8:
+                break
+            if not p or p in _WEAK_THEME_TOKENS or len(p) < 4:
+                continue
+            if any(p.startswith(k) for k in distinctive):
+                _add_q(p)
+    else:
+        # No theme noun: series scraps, then the weak tokens themselves.
+        for p in _title_sibling_phrases(title)[:6]:
+            if p not in _WEAK_THEME_TOKENS and len(p) >= 4:
+                _add_q(p)
+        _add_singles(list(keywords), include_weak=True)
+    # 1–2 keywords may still query a weak token, but only after stronger ones.
+    if distinctive and len(keywords) <= 2:
+        _add_singles(
+            [k for k in keywords if _is_weak_theme_token(k)],
+            include_weak=True,
+        )
+    return queries[:8]
 
 
 def _stamp_theme_keywords(payload: dict) -> dict:
