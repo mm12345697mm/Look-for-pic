@@ -2,9 +2,12 @@
 """Light unit tests for visual same_work enforcement and related caps."""
 from __future__ import annotations
 
+import json
 import os
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
@@ -951,6 +954,425 @@ class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
         self.assertIn("息子の家庭教師", full[2])
         self.assertNotIn("息子の家庭教師", half[2])
         self.assertGreater(full[1], half[1])
+
+
+class TestDandyCodeLookupAndVisualLock(unittest.TestCase):
+    """Code-only DANDY lookup must restamp chips and fill 同女優.
+
+    Image identify must keep a cover/still lock, and say when sort-only is
+    the real outcome.
+    """
+
+    DANDY_TITLE = (
+        "「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! "
+        "息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2"
+    )
+    EXPECTED_KEYWORDS = ["家庭教師", "肉欲教育", "息子の家庭教師", "息子", "ママ"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._prev_cache = S._OFFLINE_CACHE_PATH
+        S._OFFLINE_CACHE_PATH = Path(self.tmp.name) / "offline-cache.json"
+
+    def tearDown(self):
+        S._OFFLINE_CACHE_PATH = self._prev_cache
+        self.tmp.cleanup()
+
+    def _write_stale_cache(self, code: str) -> None:
+        entry_id = S._offline_cache_entry_id(code)
+        display = S.format_display_code(code)
+        data = {
+            "version": 1,
+            "by_key": {f"code:{display}": entry_id},
+            "entries": {
+                entry_id: {
+                    "ok": True,
+                    "code": display,
+                    "title": self.DANDY_TITLE,
+                    "title_zh": "中文主標",
+                    "actress": "",
+                    "studio": "DANDY",
+                    "cover": "https://example.com/c.jpg",
+                    "stills": ["https://example.com/s.jpg"],
+                    "related_by_title": [
+                        {
+                            "code": "DANDY-100",
+                            "title": self.DANDY_TITLE,
+                            "title_zh": "中文相關",
+                            "line": "theme",
+                            "why": "片名相近",
+                            "cover": "https://example.com/r.jpg",
+                        }
+                    ],
+                    "theme_keywords": ["家庭教師", "OL", "VOL"],
+                    "keyword_queries": ["家庭教師", "OL"],
+                    "message": "舊快取",
+                    "touched_at": 1,
+                }
+            },
+        }
+        S._OFFLINE_CACHE_PATH.write_text(
+            json.dumps(data, ensure_ascii=False), encoding="utf-8"
+        )
+
+    def _catalog(self, code: str) -> dict:
+        return {
+            "code": S.format_display_code(code),
+            "title": self.DANDY_TITLE,
+            "actress": "竹内夏希",
+            "studio": "DANDY",
+            "source": "avbase",
+            "cid": "1dandy00893",
+            "cover": "https://example.com/c.jpg",
+        }
+
+    def _siblings(self):
+        return [
+            {"code": "DANDY-710", "title": "別作品A", "actress": "竹内夏希", "score": 0.4},
+            {"code": "DANDY-711", "title": "別作品B", "actress": "竹内夏希", "score": 0.3},
+            {"code": "DANDY-712", "title": "別作品C", "actress": "竹内夏希", "score": 0.2},
+            {"code": "JUNK-009", "title": "無関係な作品", "actress": "別人", "score": 0.99},
+        ]
+
+    def _enrich_copy(self, c, why="片名候選"):
+        item = dict(c)
+        item["why"] = why
+        item.setdefault("stills", [])
+        item.setdefault("cover", "https://example.com/x.jpg")
+        return item
+
+    def test_recompute_replaces_stale_chips(self):
+        payload = S._recompute_theme_keywords(
+            {
+                "title": self.DANDY_TITLE,
+                "actress": "竹内夏希",
+                "theme_keywords": ["家庭教師", "OL", "VOL"],
+                "keyword_queries": ["OL"],
+            }
+        )
+        self.assertEqual(payload["theme_keywords"], self.EXPECTED_KEYWORDS)
+        for absent in ("OL", "VOL", "Vol", "教育"):
+            self.assertNotIn(absent, payload["theme_keywords"])
+
+    def test_actress_bucket_drops_non_matches_and_caps_at_three(self):
+        def fake_avbase(q, actress=None):
+            return self._siblings()
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=fake_avbase), mock.patch.object(
+            S, "enrich_title_candidate", side_effect=self._enrich_copy
+        ):
+            rows = S._find_related_by_actress(
+                "竹内夏希",
+                exclude_code="DANDY-893",
+                max_n=3,
+                budget_sec=5,
+            )
+        codes = [r["code"] for r in rows]
+        self.assertEqual(codes, ["DANDY-710", "DANDY-711", "DANDY-712"])
+        self.assertNotIn("JUNK-009", codes)
+        self.assertTrue(all(r.get("line") == "actress" for r in rows))
+        self.assertLessEqual(len(rows), 3)
+
+    def test_actress_search_runs_after_title_budget_is_spent(self):
+        called = {}
+
+        def fake_actress(name, **kwargs):
+            called["name"] = name
+            return [self._enrich_copy(self._siblings()[0], why="同演員")]
+
+        with mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ), mock.patch.object(S, "_find_related_by_keywords", return_value=[]), mock.patch.object(
+            S, "_find_related_by_actress", side_effect=fake_actress
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich_copy):
+            out = S.find_related_by_title(
+                self.DANDY_TITLE,
+                exclude_code="DANDY-893",
+                actress="竹内夏希",
+                budget_sec=0.01,
+            )
+        self.assertEqual(called.get("name"), "竹内夏希")
+        self.assertTrue(any(r.get("line") == "actress" for r in out))
+        self.assertLessEqual(sum(1 for r in out if r.get("line") == "actress"), 3)
+
+    def test_code_cache_restamps_keywords_and_fills_actress(self):
+        for code in ("DANDY-893", "DANDYA-001"):
+            self._write_stale_cache(code)
+
+            def fake_actress(name, **kwargs):
+                self.assertEqual(name, "竹内夏希")
+                return [dict(row) for row in self._siblings() if row["actress"] == "竹内夏希"]
+
+            with mock.patch.object(
+                S, "fetch_avbase_by_code", return_value=self._catalog(code)
+            ), mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+                S, "fetch_avbase_title_results", return_value=[]
+            ), mock.patch.object(S, "_find_related_by_keywords", return_value=[]), mock.patch.object(
+                S, "_find_related_by_actress", side_effect=fake_actress
+            ), mock.patch.object(
+                S, "enrich_title_candidate", side_effect=self._enrich_copy
+            ), mock.patch.object(S, "resolve_chinese_title", return_value=None):
+                out = S.identify_code(code)
+            self.assertEqual(out.get("actress"), "竹内夏希", code)
+            self.assertEqual(out.get("theme_keywords"), self.EXPECTED_KEYWORDS, code)
+            rel = out.get("related_by_title") or []
+            actress_rows = [r for r in rel if r.get("line") == "actress"]
+            self.assertGreaterEqual(len(actress_rows), 1, rel)
+            self.assertLessEqual(len(actress_rows), 3)
+            codes = [r.get("code") for r in rel]
+            self.assertNotIn("JUNK-009", codes)
+            self.assertIn("DANDY-100", codes)
+            self.assertLessEqual(len(rel), 13)
+
+    def test_attach_refills_actress_when_related_already_exists(self):
+        payload = {
+            "ok": True,
+            "code": "DANDY-893",
+            "title": self.DANDY_TITLE,
+            "title_zh": "中文主標",
+            "actress": "竹内夏希",
+            "cover": "https://example.com/c.jpg",
+            "theme_keywords": ["家庭教師"],
+            "keyword_queries": ["家庭教師"],
+            "related_by_title": [
+                {
+                    "code": "DANDY-100",
+                    "title": self.DANDY_TITLE,
+                    "title_zh": "中文相關",
+                    "line": "theme",
+                    "why": "片名相近",
+                    "cover": "https://example.com/r.jpg",
+                }
+            ],
+        }
+
+        def fake_actress(name, **kwargs):
+            return [dict(row) for row in self._siblings() if row["actress"] == "竹内夏希"]
+
+        with mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ), mock.patch.object(S, "_find_related_by_keywords", return_value=[]), mock.patch.object(
+            S, "_find_related_by_actress", side_effect=fake_actress
+        ), mock.patch.object(
+            S, "enrich_title_candidate", side_effect=self._enrich_copy
+        ), mock.patch.object(
+            S, "attach_chinese_titles", side_effect=lambda payload, **kwargs: payload
+        ):
+            out = S.attach_related_by_title(payload, budget_sec=2, per_item=False)
+        self.assertEqual(out.get("theme_keywords"), self.EXPECTED_KEYWORDS)
+        actress_rows = [r for r in out.get("related_by_title") or [] if r.get("line") == "actress"]
+        self.assertEqual(len(actress_rows), 3)
+        self.assertIn("DANDY-100", [r.get("code") for r in out["related_by_title"]])
+
+    def _lock_vm(self):
+        return {
+            "same_work": True,
+            "confidence": 0.93,
+            "reason": "same crop",
+            "match_person": True,
+            "match_face": True,
+            "match_accessories": True,
+            "match_clothes": True,
+            "match_pose": True,
+        }
+
+    def _reject_vm(self):
+        return {
+            "same_work": False,
+            "confidence": 0.22,
+            "reason": "clothes differ",
+            "match_person": True,
+            "match_face": False,
+            "match_accessories": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+
+    def _rank(self, candidates, responses):
+        calls = {"n": 0}
+
+        def fake_dl(url, timeout=None):
+            u = str(url)
+            if "cover" in u:
+                return b"cover"
+            if "still-1" in u:
+                return b"s1"
+            if "still-2" in u:
+                return b"s2"
+            return None
+
+        def fake_gemini(user, covers, key, timeout=10.0, labels=None):
+            idx = calls["n"]
+            calls["n"] += 1
+            row = responses[min(idx, len(responses) - 1)]
+            if isinstance(row, list):
+                self.assertEqual(len(row), len(covers))
+                return row
+            return [row]
+
+        with mock.patch.object(S, "download_cover_bytes", side_effect=fake_dl), mock.patch.object(
+            S, "gemini_rank_covers_batch", side_effect=fake_gemini
+        ):
+            return S.rank_candidates_by_visual(
+                b"user-image",
+                candidates,
+                api_key="test-key",
+                budget_s=5,
+            )
+
+    def test_cover_lock_survives_one_disagreeing_still(self):
+        cand = {
+            "code": "DANDY-893",
+            "title": self.DANDY_TITLE,
+            "score": 0.8,
+            "cover": "https://example.com/cover.jpg",
+            "stills": ["https://example.com/still-1.jpg"],
+        }
+        ranked, meta = self._rank([cand], [self._lock_vm(), self._reject_vm()])
+        self.assertTrue(meta.get("visual_ranked"))
+        self.assertTrue(meta.get("note_stills"))
+        self.assertIn("視覺鎖定", meta.get("note") or "")
+        self.assertNotIn("已否決封面誤判", meta.get("note") or "")
+        self.assertNotIn("僅排序未鎖定", meta.get("note") or "")
+        self.assertTrue((ranked[0].get("visual") or {}).get("same_work"))
+        self.assertTrue((ranked[0].get("visual") or {}).get("match_clothes"))
+
+    def test_two_rejecting_stills_revoke_and_document_sort_only(self):
+        cand = {
+            "code": "DANDY-893",
+            "title": self.DANDY_TITLE,
+            "score": 0.8,
+            "cover": "https://example.com/cover.jpg",
+            "stills": [
+                "https://example.com/still-1.jpg",
+                "https://example.com/still-2.jpg",
+            ],
+        }
+        ranked, meta = self._rank(
+            [cand],
+            [self._lock_vm(), [self._reject_vm(), self._reject_vm()]],
+        )
+        note = meta.get("note") or ""
+        self.assertIn("僅排序未鎖定", note)
+        self.assertIn("已否決封面誤判", note)
+        self.assertIn("無法視覺鎖定", note)
+        self.assertNotIn("；視覺鎖定；", note)
+        self.assertTrue(meta.get("stills_revoked"))
+        self.assertFalse((ranked[0].get("visual") or {}).get("same_work"))
+
+    def test_still_lock_when_cover_does_not(self):
+        cand = {
+            "code": "DANDY-893",
+            "title": self.DANDY_TITLE,
+            "score": 0.4,
+            "cover": "https://example.com/cover.jpg",
+            "stills": ["https://example.com/still-1.jpg"],
+        }
+        ranked, meta = self._rank([cand], [self._reject_vm(), self._lock_vm()])
+        self.assertIn("視覺鎖定", meta.get("note") or "")
+        self.assertTrue((ranked[0].get("visual") or {}).get("same_work"))
+        self.assertTrue((ranked[0].get("visual") or {}).get("match_clothes"))
+
+    def test_lock_outranks_higher_title_score(self):
+        cands = [
+            {
+                "code": "AAA-001",
+                "title": "全然違うタイトルですよ",
+                "score": 0.99,
+                "cover": "https://example.com/cover-a.jpg",
+            },
+            {
+                "code": "AAA-002",
+                "title": "もう一つの作品タイトル",
+                "score": 0.12,
+                "cover": "https://example.com/cover-b.jpg",
+            },
+        ]
+        ranked, meta = self._rank(cands, [[self._reject_vm(), self._lock_vm()]])
+        self.assertEqual(ranked[0]["code"], "AAA-002")
+        self.assertIn("視覺鎖定", meta.get("note") or "")
+        self.assertIn("AAA-002", meta.get("note") or "")
+
+    def test_image_rescan_rechecks_instead_of_replaying_cache(self):
+        img = b"user-image-bytes-dandy"
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "DANDY-893",
+                "title": self.DANDY_TITLE,
+                "title_zh": "中文主標",
+                "actress": "竹内夏希",
+                "cover": "https://example.com/c.jpg",
+                "stills": ["https://example.com/s.jpg"],
+                "message": "舊的僅排序未鎖定",
+            },
+            image_hash=S.image_content_hash(img),
+        )
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            self.assertEqual(user, img)
+            self.assertTrue(any(c.get("code") == "DANDY-893" for c in cands))
+            best = dict(cands[0])
+            best["visual"] = self._lock_vm()
+            best["visual_score"] = 0.9
+            note = (
+                "已對照使用者原圖比對 2 張封面＋劇照"
+                "（主選 DANDY-893；視覺鎖定；依人物／衣服／表情／飾品／姿勢）"
+            )
+            return [best], {
+                "visual_ranked": True,
+                "note": note,
+                "note_stills": True,
+                "compared": 2,
+                "visual_lock": True,
+            }
+
+        with mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank), mock.patch.object(
+            S, "get_gemini_api_key", return_value="test-key"
+        ), mock.patch.object(S, "find_related_by_title", return_value=[]), mock.patch.object(
+            S, "resolve_chinese_title", return_value=None
+        ), mock.patch.object(S, "fetch_avbase_by_code", return_value=None):
+            result, status = S.run_identify_pipeline(image_bytes=img)
+        self.assertEqual(status, 200)
+        self.assertTrue(result.get("image_reverified"))
+        self.assertIn("視覺鎖定", result.get("message") or "")
+        self.assertEqual(result.get("theme_keywords"), self.EXPECTED_KEYWORDS)
+
+    def test_single_unlocked_cache_does_not_skip_a_fresh_search(self):
+        img = b"user-image-bytes-unlocked"
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "DANDY-893",
+                "title": self.DANDY_TITLE,
+                "title_zh": "中文主標",
+                "actress": "竹内夏希",
+                "cover": "https://example.com/c.jpg",
+                "message": "僅排序未鎖定",
+            },
+            image_hash=S.image_content_hash(img),
+        )
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            item = dict(cands[0])
+            item["visual"] = self._reject_vm()
+            return [item], {
+                "visual_ranked": True,
+                "note": "僅排序未鎖定（封面與劇照皆未同時符合同一作品與衣服）",
+                "note_stills": True,
+                "compared": 2,
+            }
+
+        with mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank), mock.patch.object(
+            S, "get_gemini_api_key", return_value="test-key"
+        ), mock.patch.object(S, "find_related_by_title", return_value=[]), mock.patch.object(
+            S, "resolve_chinese_title", return_value=None
+        ), mock.patch.object(S, "fetch_avbase_by_code", return_value=None), mock.patch.object(
+            S, "call_gemini_vision", return_value={"title": None, "code": None}
+        ), mock.patch.object(S, "ocr_image_bytes", return_value=""):
+            result, status = S.run_identify_pipeline(image_bytes=img)
+        self.assertFalse(result.get("image_reverified"))
+        self.assertNotEqual(result.get("code"), "DANDY-893")
 
 
 class TestActressQueryKeep(unittest.TestCase):

@@ -2059,6 +2059,147 @@ def same_series_collision_indices(candidates: list[dict]) -> list[int]:
     return list(range(min(len(coded), VISUAL_COMPARE_MAX)))
 
 
+def _visual_is_lock(vm: dict | None) -> bool:
+    """Lock-quality verdict: same work and the same clothes as the user image."""
+    if not isinstance(vm, dict):
+        return False
+    return bool(vm.get("same_work") and vm.get("match_clothes"))
+
+
+def _still_explicit_reject(vm: dict | None) -> bool:
+    """A still that disagrees on person or clothes. Missing flags are not a reject."""
+    if not isinstance(vm, dict):
+        return False
+    if vm.get("match_clothes") is False or vm.get("match_person") is False:
+        return True
+    return False
+
+
+def _collect_still_urls(item: dict, *, limit: int = 3) -> list[str]:
+    """Up to `limit` still URLs. Prefer ones already on the candidate, then CDN."""
+    urls: list[str] = []
+    seen: set[str] = set()
+    raw = item.get("stills") if isinstance(item.get("stills"), list) else []
+    for u in raw:
+        s = str(u or "").strip()
+        if not s or is_now_printing_url(s) or s in seen:
+            continue
+        seen.add(s)
+        urls.append(s)
+        if len(urls) >= limit:
+            return urls
+    cid = str(item.get("cid") or "").strip()
+    if not cid:
+        code = format_display_code(str(item.get("code") or ""))
+        cid = code_to_cid(code) if code and parse_code_parts(code) else ""
+    if cid and len(urls) < limit:
+        try:
+            for u in still_urls(str(cid), limit):
+                if u in seen or is_now_printing_url(u):
+                    continue
+                seen.add(u)
+                urls.append(u)
+                if len(urls) >= limit:
+                    break
+        except Exception:
+            pass
+    return urls[:limit]
+
+
+def _reconcile_cover_with_stills(
+    prev_sc: float,
+    prev_item: dict,
+    still_pairs: list[tuple[float, dict]],
+) -> tuple[float, dict, str]:
+    """Merge a cover verdict with still comparisons against the user image.
+
+    One disagreeing still must not revoke a cover lock: stills from the same
+    work often use another outfit. Revoke only after at least two stills
+    explicitly reject person or clothes and none of them lock. Any still that
+    agrees on same_work + clothes becomes the lock.
+    """
+    prev_vm = prev_item.get("visual") or {}
+    cover_lock = _visual_is_lock(prev_vm)
+    locks = [
+        (sc, it)
+        for sc, it in still_pairs
+        if _visual_is_lock((it or {}).get("visual") or {})
+    ]
+    if locks:
+        locks.sort(
+            key=lambda pair: float(((pair[1].get("visual") or {}).get("confidence")) or 0),
+            reverse=True,
+        )
+        sc, it = locks[0]
+        return max(float(sc), float(prev_sc) + 0.01), it, "still_lock"
+    rejects = [
+        it
+        for _sc, it in still_pairs
+        if _still_explicit_reject((it or {}).get("visual") or {})
+    ]
+    if cover_lock and len(still_pairs) >= 2 and len(rejects) >= 2:
+        revoked = dict(prev_item)
+        rvm = dict(prev_vm)
+        rvm["same_work"] = False
+        if any((it.get("visual") or {}).get("match_clothes") is False for it in rejects):
+            rvm["match_clothes"] = False
+        if any((it.get("visual") or {}).get("match_person") is False for it in rejects):
+            rvm["match_person"] = False
+        rvm["confidence"] = min(float(rvm.get("confidence") or 0), 0.34)
+        reasons = [
+            str((it.get("visual") or {}).get("reason") or "").strip()
+            for it in rejects
+            if str((it.get("visual") or {}).get("reason") or "").strip()
+        ]
+        reason_bit = reasons[0] if reasons else "stills mismatch"
+        rvm["reason"] = (str(rvm.get("reason") or "") + f"｜劇照核對否決：{reason_bit}")[:240]
+        rvm = enforce_visual_same_work(rvm)
+        revoked["visual"] = {
+            "same_work": rvm.get("same_work"),
+            "confidence": rvm.get("confidence"),
+            "reason": rvm.get("reason"),
+            "match_person": rvm.get("match_person"),
+            "match_face": rvm.get("match_face"),
+            "match_accessories": rvm.get("match_accessories"),
+            "match_clothes": rvm.get("match_clothes"),
+            "match_pose": rvm.get("match_pose"),
+        }
+        revoked["visual_score"] = visual_match_score(rvm)
+        ts = float(revoked.get("title_score") or revoked.get("score") or 0)
+        revoked["score"] = round(float(revoked["visual_score"]) * 0.92 + ts * 0.08, 4)
+        return float(revoked["score"]), revoked, "revoked"
+    if cover_lock:
+        return float(prev_sc), prev_item, "cover_lock"
+    if still_pairs:
+        best_sc, best_it = max(still_pairs, key=lambda pair: float(pair[0]))
+        if float(best_sc) > float(prev_sc) + 0.05:
+            return float(best_sc), best_it, "rank"
+    return float(prev_sc), prev_item, "rank"
+
+
+def _format_visual_rank_note(meta: dict, best_code: str, best_vm: dict | None) -> str:
+    """User-facing compare note. Sort-only states why a lock was not possible."""
+    ncmp = int(meta.get("compared") or 0)
+    still_bit = "＋劇照" if meta.get("note_stills") else ""
+    vm = best_vm or {}
+    if _visual_is_lock(vm):
+        lock_bit = "視覺鎖定"
+        revoke_bit = ""
+    elif meta.get("stills_revoked"):
+        lock_bit = "僅排序未鎖定（多張劇照與封面衣服／人物不一致，無法視覺鎖定）"
+        revoke_bit = "；已否決封面誤判"
+    elif meta.get("note_stills"):
+        lock_bit = "僅排序未鎖定（封面與劇照皆未同時符合同一作品與衣服）"
+        revoke_bit = ""
+    else:
+        lock_bit = "僅排序未鎖定（沒有足以視覺鎖定的封面或劇照）"
+        revoke_bit = ""
+    return (
+        f"已對照使用者原圖比對 {ncmp} 張封面{still_bit}"
+        f"（主選 {best_code}；{lock_bit}；依人物／衣服／表情／飾品／姿勢{revoke_bit}）"
+    )
+
+
 def rank_candidates_by_visual(
     user_image_bytes: bytes,
     candidates: list[dict],
@@ -2344,123 +2485,88 @@ def rank_candidates_by_visual(
 
     ranked_pairs.sort(key=lambda x: x[0], reverse=True)
 
-    # Always cross-check top candidates against stills vs the *original user image*.
-    # User shots are often still crops (rear/side); cover-only same_work false-positives
-    # on series siblings must be revoked when stills disagree on clothes/person.
-    remain = budget_s - (time.monotonic() - t0)
-    if ranked_pairs and remain >= 6.5:
-        still_pairs: list[tuple[dict, bytes]] = []
-        n_still = min(4, len(ranked_pairs)) if len(ranked_pairs) >= 2 else 1
-        for _sc, it in ranked_pairs[:n_still]:
-            cid = str(it.get("cid") or "") or None
-            if not cid:
-                code = format_display_code(str(it.get("code") or ""))
-                cid = code_to_cid(code) if code else None
-            urls = []
-            if cid:
-                try:
-                    urls = still_urls(cid, 3)
-                except Exception:
-                    urls = []
-            blob = None
+    # Always cross-check top candidates against stills vs the original user image.
+    # Cover-only same_work can be a series-sibling false positive, but one still
+    # from the same work often wears a different outfit. Download several stills
+    # and revoke a cover lock only when at least two of them reject person or
+    # clothes and none agree. A still that locks (same_work + clothes) wins.
+    # This pass is not gated on leftover cover budget — a second image search
+    # must re-check stills even when the cover compare already ran long.
+    if ranked_pairs:
+        n_still_codes = min(4, len(ranked_pairs)) if len(ranked_pairs) >= 2 else 1
+        flat_pairs: list[tuple[dict, bytes]] = []
+        for _sc, it in ranked_pairs[:n_still_codes]:
+            urls = _collect_still_urls(it, limit=3)
+            got = 0
             for u in urls:
-                blob = download_cover_bytes(u)
-                if blob:
+                if got >= 3:
                     break
-            if blob:
-                still_pairs.append((dict(it), blob))
-        if len(still_pairs) >= 1:
-            meta["mode"] = (meta.get("mode") or "batch") + "+stills"
-            timeout = max(7.0, min(16.0, remain - 0.5))
-            # Batch path needs 2+; for a single top candidate, duplicate-call via batch of 1
-            # by pairing with a tiny second download if needed — else pairwise attach.
-            vms = None
-            if len(still_pairs) >= 2:
-                vms = _run_batch(still_pairs, timeout)
-            elif len(still_pairs) == 1:
-                # Single still vs user: reuse batch API with one cover list via private path
-                only_item, only_blob = still_pairs[0]
-                vms_one = gemini_rank_covers_batch(
-                    user_image_bytes,
-                    [only_blob],
-                    key,
-                    timeout=timeout,
-                    labels=[str(only_item.get("code") or "")],
-                )
-                vms = vms_one if vms_one else None
-            if vms and len(vms) == len(still_pairs):
-                meta["compared"] += len(still_pairs)
+                try:
+                    blob = download_cover_bytes(u)
+                except Exception:
+                    blob = None
+                if not blob:
+                    continue
+                flat_pairs.append((dict(it), blob))
+                got += 1
+        if flat_pairs:
+            still_timeout = 12.0
+            vms_all: list[dict | None] = []
+            for start in range(0, len(flat_pairs), 4):
+                chunk = flat_pairs[start : start + 4]
+                vms = None
+                if len(chunk) >= 2:
+                    vms = _run_batch(chunk, still_timeout)
+                else:
+                    only_item, only_blob = chunk[0]
+                    vms = gemini_rank_covers_batch(
+                        user_image_bytes,
+                        [only_blob],
+                        key,
+                        timeout=still_timeout,
+                        labels=[str(only_item.get("code") or "")],
+                    )
+                if not vms or len(vms) != len(chunk):
+                    vms_all.extend([None] * len(chunk))
+                else:
+                    vms_all.extend(vms)
+            scored_stills = [vm for vm in vms_all if isinstance(vm, dict)]
+            if scored_stills:
+                meta["mode"] = (meta.get("mode") or "batch") + "+stills"
                 meta["note_stills"] = True
+                meta["compared"] += len(scored_stills)
                 by_code: dict[str, tuple[float, dict]] = {
                     format_display_code(str(it.get("code") or "")): (sc, it)
                     for sc, it in ranked_pairs
                 }
-                for (item, _b), vm in zip(still_pairs, vms):
+                grouped: dict[str, list[tuple[float, dict]]] = {}
+                for (item, _b), vm in zip(flat_pairs, vms_all):
+                    if not isinstance(vm, dict):
+                        continue
                     sc, attached = _attach(item, vm)
                     code_k = format_display_code(str(attached.get("code") or ""))
+                    grouped.setdefault(code_k, []).append((sc, attached))
+                for code_k, still_list in grouped.items():
                     prev = by_code.get(code_k)
-                    still_vm = attached.get("visual") or {}
-                    still_ok = bool(
-                        still_vm.get("same_work")
-                        and still_vm.get("match_person")
-                        and still_vm.get("match_clothes")
-                    )
                     if prev is None:
-                        by_code[code_k] = (sc, attached)
+                        by_code[code_k] = still_list[0]
                         continue
                     prev_sc, prev_it = prev
-                    prev_vm = prev_it.get("visual") or {}
-                    prev_ok = bool(
-                        prev_vm.get("same_work")
-                        and prev_vm.get("match_person")
-                        and prev_vm.get("match_clothes")
+                    new_sc, new_it, outcome = _reconcile_cover_with_stills(
+                        prev_sc, prev_it, still_list
                     )
-                    # Stills confirm → prefer stills
-                    if still_ok:
-                        by_code[code_k] = (max(sc, prev_sc + 0.01), attached)
-                        continue
-                    # Cover claimed same_work but stills reject clothes/person → revoke
-                    if prev_ok and not still_ok:
-                        revoked = dict(prev_it)
-                        rvm = dict(prev_vm)
-                        rvm["same_work"] = False
-                        if still_vm.get("match_clothes") is False:
-                            rvm["match_clothes"] = False
-                        if still_vm.get("match_person") is False:
-                            rvm["match_person"] = False
-                        if still_vm.get("match_face") is False:
-                            rvm["match_face"] = False
-                        if still_vm.get("match_pose") is False:
-                            rvm["match_pose"] = False
-                        rvm["confidence"] = min(float(rvm.get("confidence") or 0), 0.34)
-                        reason_bit = str(still_vm.get("reason") or "stills mismatch")
-                        rvm["reason"] = (
-                            str(rvm.get("reason") or "")
-                            + f"｜劇照核對否決：{reason_bit}"
-                        )[:240]
-                        rvm = enforce_visual_same_work(rvm)
-                        revoked["visual"] = {
-                            "same_work": rvm.get("same_work"),
-                            "confidence": rvm.get("confidence"),
-                            "reason": rvm.get("reason"),
-                            "match_person": rvm.get("match_person"),
-                            "match_face": rvm.get("match_face"),
-                            "match_accessories": rvm.get("match_accessories"),
-                            "match_clothes": rvm.get("match_clothes"),
-                            "match_pose": rvm.get("match_pose"),
-                        }
-                        revoked["visual_score"] = visual_match_score(rvm)
-                        ts = float(revoked.get("title_score") or revoked.get("score") or 0)
-                        revoked["score"] = round(
-                            float(revoked["visual_score"]) * 0.92 + ts * 0.08, 4
-                        )
-                        by_code[code_k] = (float(revoked["score"]), revoked)
+                    by_code[code_k] = (new_sc, new_it)
+                    if outcome == "revoked":
                         meta["stills_revoked"] = True
-                        continue
-                    # Otherwise take higher score
-                    if sc > prev_sc + 0.05:
-                        by_code[code_k] = (sc, attached)
-                ranked_pairs = sorted(by_code.values(), key=lambda x: x[0], reverse=True)
+                ranked_pairs = list(by_code.values())
+
+    def _lock_sort_key(pair: tuple[float, dict]) -> tuple:
+        sc, it = pair
+        vm = it.get("visual") or {}
+        # A lock outranks a higher title/code score that never matched clothes.
+        return (1 if _visual_is_lock(vm) else 0, float(sc))
+
+    ranked_pairs.sort(key=_lock_sort_key, reverse=True)
 
     # Append non-compared codes after visually ranked ones (still list them),
     # but demote flat title scores so UI ordering matches visual ranking.
@@ -2477,19 +2583,9 @@ def rank_candidates_by_visual(
     meta["visual_ranked"] = meta["compared"] > 0
     if meta["visual_ranked"]:
         best_code = str(ranked_list[0].get("code") or "")
-        ncmp = meta["compared"]
-        still_bit = "＋劇照" if meta.get("note_stills") else ""
-        revoke_bit = "；已否決封面誤判" if meta.get("stills_revoked") else ""
         best_vm = (ranked_list[0].get("visual") or {}) if ranked_list else {}
-        lock_bit = (
-            "視覺鎖定"
-            if best_vm.get("same_work") and best_vm.get("match_clothes")
-            else "僅排序未鎖定"
-        )
-        meta["note"] = (
-            f"已對照使用者原圖比對 {ncmp} 張封面{still_bit}"
-            f"（主選 {best_code}；{lock_bit}；依人物／衣服／表情／飾品／姿勢{revoke_bit}）"
-        )
+        meta["note"] = _format_visual_rank_note(meta, best_code, best_vm)
+        meta["visual_lock"] = _visual_is_lock(best_vm)
     return ranked_list, meta
 
 
@@ -3250,10 +3346,43 @@ def _payload_enrichment_fingerprint(payload: dict) -> tuple:
     zh = tuple(str((x or {}).get("title_zh") or "") for x in rel if isinstance(x, dict))
     return (
         str(payload.get("title_zh") or ""),
+        str(payload.get("title") or ""),
+        str(payload.get("actress") or ""),
+        tuple(str(k) for k in (payload.get("theme_keywords") or [])),
         tuple(str(u) for u in (payload.get("stills") or [])),
         keys,
         zh,
     )
+
+
+def _backfill_catalog_identity(payload: dict) -> dict:
+    """Fill a missing actress (and title) from the code catalog.
+
+    A code-only cache hit used to skip the catalog, so 同女優 never ran and
+    the payload kept whatever actress the old entry had — often nothing.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    code = str(payload.get("code") or "").strip()
+    if not code or str(code) == "TITLE-SEARCH" or not parse_code_parts(code):
+        return payload
+    need_actress = not str(payload.get("actress") or "").strip()
+    need_title = not is_usable_title(str(payload.get("title") or ""))
+    if not need_actress and not need_title:
+        return payload
+    try:
+        meta = fetch_avbase_by_code(format_display_code(code))
+    except Exception:
+        meta = None
+    if not isinstance(meta, dict):
+        return payload
+    if need_title and str(meta.get("title") or "").strip():
+        payload["title"] = str(meta.get("title")).strip()
+    if need_actress and str(meta.get("actress") or "").strip():
+        payload["actress"] = str(meta.get("actress")).strip()
+    if not str(payload.get("studio") or "").strip() and meta.get("studio"):
+        payload["studio"] = meta.get("studio")
+    return payload
 
 
 def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) -> dict:
@@ -3268,8 +3397,18 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     """
     if not isinstance(payload, dict):
         return payload
+    before_identity = _payload_enrichment_fingerprint(payload)
+    try:
+        _backfill_catalog_identity(payload)
+    except Exception:
+        pass
+    _recompute_theme_keywords(payload)
     if not _payload_needs_enrichment(payload):
-        _stamp_theme_keywords(payload)
+        try:
+            if _payload_enrichment_fingerprint(payload) != before_identity:
+                offline_cache_put(payload, image_hash=image_hash)
+        except Exception:
+            pass
         return payload
     payload.setdefault(
         "related_by_title",
@@ -3317,7 +3456,7 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     # Attempt markers for this request only — next open still checks gaps.
     payload["cache_backfilled"] = True
     payload["chinese_titles_attached"] = True
-    _stamp_theme_keywords(payload)
+    _recompute_theme_keywords(payload)
     try:
         if _payload_enrichment_fingerprint(payload) != before:
             offline_cache_put(payload, image_hash=image_hash)
@@ -3369,7 +3508,7 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "related_by_title": _slim_related_for_cache(
             payload.get("related_by_title") or payload.get("related")
         ),
-        "theme_keywords": list((_stamp_theme_keywords(payload).get("theme_keywords")) or []),
+        "theme_keywords": list((_recompute_theme_keywords(payload).get("theme_keywords")) or []),
         "keyword_queries": list(payload.get("keyword_queries") or []),
         "message": payload.get("message") or "",
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -3491,7 +3630,7 @@ def offline_cache_get(
                 out.setdefault("related", [])
                 out.setdefault("stills", out.get("stills") or [])
                 out.setdefault("related_by_title", out.get("related_by_title") or [])
-                _stamp_theme_keywords(out)
+                _recompute_theme_keywords(out)
                 return out
         except Exception:
             return None
@@ -3536,6 +3675,10 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                         "theme_keywords",
                         "keyword_queries",
                     ):
+                        if field in ("theme_keywords", "keyword_queries"):
+                            # Recomputed from the current title. Do not restore a
+                            # stale chip list (lone 家庭教師, VOL/OL junk).
+                            continue
                         if not value.get(field) and prev.get(field):
                             value[field] = prev[field]
                     if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
@@ -3661,6 +3804,7 @@ def identify_code(
             "related_note": None,
         }
         # Vision title preferred over demo/OCR when present
+        _recompute_theme_keywords(out)
         return apply_vision_meta(out, vision_meta)
 
     # Other demo hits
@@ -3681,6 +3825,7 @@ def identify_code(
             "message": "示範包內單一部作品",
             "related_note": "相關推薦目前僅 MIDA-616 路徑會自動帶入主題＋女優。",
         }
+        _recompute_theme_keywords(out)
         return apply_vision_meta(out, vision_meta)
 
     # Online lookup: demo → JAVLibrary → JavBus → DDG(fast) → Gemini text → CDN-only.
@@ -3846,6 +3991,11 @@ def identify_code(
         "message": message,
         "related_note": related_note,
     }
+    try:
+        _backfill_catalog_identity(out)
+    except Exception:
+        pass
+    _recompute_theme_keywords(out)
     try:
         offline_cache_put(out)
     except Exception:
@@ -5438,6 +5588,24 @@ def _stamp_theme_keywords(payload: dict) -> dict:
     return payload
 
 
+def _recompute_theme_keywords(payload: dict) -> dict:
+    """Replace chips from the current extractor whenever a title is present.
+
+    Cached pre-#15 lists (a lone 家庭教師, or VOL/OL junk) must not stick on
+    read. An empty title falls back to _stamp_theme_keywords.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    title = str(payload.get("title") or "").strip()
+    if not title:
+        return _stamp_theme_keywords(payload)
+    actress = str(payload.get("actress") or "").strip() or None
+    kws = _extract_title_theme_keywords(title, actress=actress)
+    payload["theme_keywords"] = kws
+    payload["keyword_queries"] = _keyword_search_queries(title, kws, selected_only=False)
+    return payload
+
+
 def _find_related_by_keywords(
     title: str,
     *,
@@ -5555,6 +5723,27 @@ def _find_related_by_keywords(
     return out[:max_n]
 
 
+def _actress_name_matches(query: str, candidate: str) -> bool:
+    """True when the catalog billing contains the queried actress name.
+
+    A shorter fragment of the query (or a different person in the same row)
+    does not count. Used so the 同女優 bucket is never padded with junk.
+    """
+    name = (query or "").strip()
+    act = (candidate or "").strip()
+    if len(name) < 2 or not act:
+        return False
+    compact = re.sub(r"[\s　・·．.]+", "", name)
+    parts = [act] + re.split(r"[\s　・·．./|、,]+", act)
+    for piece in parts:
+        pc = re.sub(r"[\s　・·．.]+", "", piece or "")
+        if not pc:
+            continue
+        if compact == pc or compact in pc:
+            return True
+    return False
+
+
 def _find_related_by_actress(
     actress: str,
     *,
@@ -5600,9 +5789,9 @@ def _find_related_by_actress(
             if code in seen:
                 continue
             act = str(c.get("actress") or "")
-            act_compact = re.sub(r"[\s　・·．.]+", "", act)
-            act_hit = 1.0 if (name in act or (compact and compact in act_compact)) else 0.35
-            sc = float(c.get("score") or 0) * 0.5 + act_hit
+            if not _actress_name_matches(name, act):
+                continue
+            sc = float(c.get("score") or 0) * 0.5 + 1.0
             ranked.append((sc, c))
             seen.add(code)
 
@@ -5876,13 +6065,14 @@ def find_related_by_title(
     keyword_n = sum(1 for x in out if str(x.get("line")) == "keyword")
 
     # --- 3) Actress — independent bucket (cap 3), always try when actress known ---
-    if fill_actress and (actress or "").strip() and _left() >= 0.8:
+    # Dedicated budget: title/keyword overruns must not skip 同女優.
+    if fill_actress and (actress or "").strip():
         try:
             for r in _find_related_by_actress(
                 actress,
                 exclude_code=exclude or None,
                 max_n=actress_cap,
-                budget_sec=min(4.0, max(1.5, _left())),
+                budget_sec=4.0,
                 already=seen,
             ):
                 _push(r, why=str(r.get("why") or "同演員"), line="actress")
@@ -6010,7 +6200,7 @@ def attach_related_by_title(
     except Exception:
         pass
 
-    _stamp_theme_keywords(result)
+    _recompute_theme_keywords(result)
     if not per_item:
         return result
     # Also attach on each results[] entry if present (single-image path)
@@ -6032,7 +6222,7 @@ def attach_related_by_title(
                 )
             except Exception:
                 pass
-            _stamp_theme_keywords(item)
+            _recompute_theme_keywords(item)
             continue
         it_title = item.get("title") or title
         it_code = item.get("code")
@@ -6053,7 +6243,7 @@ def attach_related_by_title(
             )
         except Exception:
             item["related_by_title"] = []
-        _stamp_theme_keywords(item)
+        _recompute_theme_keywords(item)
     return result
 
 
@@ -6584,6 +6774,163 @@ def _progress(cb, step: str, status: str, detail: str = "", progress: float | No
         pass
 
 
+def _payload_as_visual_candidate(payload: dict) -> dict | None:
+    if not isinstance(payload, dict):
+        return None
+    code = str(payload.get("code") or "").strip()
+    if not code or not parse_code_parts(code):
+        return None
+    stills = payload.get("stills") if isinstance(payload.get("stills"), list) else []
+    return {
+        "code": format_display_code(code),
+        "title": payload.get("title"),
+        "actress": payload.get("actress"),
+        "studio": payload.get("studio"),
+        "cid": payload.get("cid"),
+        "cover": payload.get("cover"),
+        "stills": list(stills),
+        "score": payload.get("score") or payload.get("title_score") or 0.4,
+        "source": payload.get("source"),
+    }
+
+
+def _apply_visual_winner(
+    payload: dict,
+    ranked: list[dict],
+    meta: dict,
+    *,
+    promote_candidates: bool = False,
+) -> dict:
+    """Copy the visual winner onto an identify payload and keep the compare note."""
+    out = dict(payload)
+    out["visual_meta"] = meta
+    if not ranked:
+        return out
+    best = ranked[0]
+    vm = best.get("visual") or {}
+    locked = _visual_is_lock(vm)
+    try:
+        conf = float(best.get("visual_score") or vm.get("confidence") or 0)
+    except (TypeError, ValueError):
+        conf = 0.0
+    out["visual_confident"] = bool(locked and vm.get("match_person") and conf >= 0.55)
+    for field in ("code", "title", "actress", "studio", "cover", "cid"):
+        if best.get(field):
+            out[field] = best.get(field)
+    if best.get("stills"):
+        out["stills"] = best.get("stills")
+    if promote_candidates and len(ranked) >= 2:
+        out["candidates"] = ranked
+    win = format_display_code(str(out.get("code") or ""))
+    if win and isinstance(out.get("related_by_title"), list):
+        out["related_by_title"] = [
+            item
+            for item in out["related_by_title"]
+            if not (
+                isinstance(item, dict)
+                and format_display_code(str(item.get("code") or "")) == win
+            )
+        ]
+    note = str(meta.get("note") or "").strip()
+    if note:
+        prev = str(out.get("message") or "")
+        if note not in prev:
+            out["message"] = (prev + " " + note).strip() if prev else note
+        rn = str(out.get("related_note") or "")
+        if note not in rn:
+            out["related_note"] = (rn + "；" + note).strip("；") if rn else note
+    return out
+
+
+def reverify_cached_image_hit(
+    cached: dict,
+    user_image_bytes: bytes | None,
+    api_key: str | None = None,
+) -> dict | None:
+    """Re-run cover + stills visual match for a same-image cache hit.
+
+    A locked result (or a multi-candidate sort) is returned. A single cached
+    code that does not lock returns None so identify can search siblings
+    instead of replaying 僅排序未鎖定.
+    """
+    if not user_image_bytes or not isinstance(cached, dict) or not cached.get("ok"):
+        return None
+    pool: list[dict] = []
+    main = _payload_as_visual_candidate(cached)
+    if main:
+        pool.append(main)
+    for key in ("candidates", "related_by_title", "related"):
+        for raw in cached.get(key) or []:
+            if not isinstance(raw, dict):
+                continue
+            cand = _payload_as_visual_candidate(raw)
+            if cand:
+                pool.append(cand)
+    seen: set[str] = set()
+    cands: list[dict] = []
+    for c in pool:
+        code = format_display_code(str(c.get("code") or ""))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        cands.append(c)
+    if not cands:
+        return None
+    ranked, meta = rank_candidates_by_visual(
+        user_image_bytes, cands, api_key=api_key
+    )
+    if not meta.get("visual_ranked"):
+        return None
+    best = ranked[0] if ranked else None
+    locked = _visual_is_lock((best or {}).get("visual") or {})
+    if not locked and len(cands) < 2:
+        return None
+    out = _apply_visual_winner(cached, ranked, meta, promote_candidates=False)
+    out["from_offline_cache"] = True
+    out["image_reverified"] = True
+    _recompute_theme_keywords(out)
+    return out
+
+
+def _ensure_image_visual_rank(
+    result: dict,
+    image_bytes: bytes | None,
+    api_key: str | None,
+    extra_candidates: list | None = None,
+) -> dict:
+    """Compare cover + stills when this image identify has not ranked yet."""
+    if not image_bytes or not isinstance(result, dict) or not result.get("ok"):
+        return result
+    if (result.get("visual_meta") or {}).get("visual_ranked"):
+        return result
+    pool: list[dict] = []
+    main = _payload_as_visual_candidate(result)
+    if main:
+        pool.append(main)
+    for raw in list(extra_candidates or []) + list(result.get("candidates") or []):
+        if not isinstance(raw, dict):
+            continue
+        cand = _payload_as_visual_candidate(raw)
+        if cand:
+            pool.append(cand)
+    seen: set[str] = set()
+    cands: list[dict] = []
+    for c in pool:
+        code = format_display_code(str(c.get("code") or ""))
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        cands.append(c)
+    if not cands:
+        return result
+    ranked, meta = rank_candidates_by_visual(image_bytes, cands, api_key=api_key)
+    if not meta.get("visual_ranked"):
+        result = dict(result)
+        result["visual_meta"] = meta
+        return result
+    return _apply_visual_winner(result, ranked, meta, promote_candidates=True)
+
+
 def run_identify_pipeline(
     *,
     image_bytes: bytes | None = None,
@@ -6635,27 +6982,46 @@ def run_identify_pipeline(
     )
 
     img_hash = image_content_hash(image_bytes) if image_bytes else None
-    # Same screenshot → reuse offline cache (skip vision/network)
+    # Same screenshot may reuse catalog fields, but must re-check cover + stills
+    # against this upload. A previous 僅排序未鎖定 must not be replayed as-is.
     if img_hash and not code and not user_title:
         try:
             cached_img = offline_cache_get(image_hash=img_hash)
         except Exception:
             cached_img = None
         if cached_img and cached_img.get("ok"):
-            _progress(on_progress, "vision", "skipped", "離線快取（同圖）", 2 / 6)
-            _progress(on_progress, "parse", "done", f"番號：{cached_img.get('code') or '—'}", 3 / 6)
-            _progress(on_progress, "search", "done", "離線快取", 4 / 6)
-            if cached_img.get("cover"):
-                _progress(on_progress, "cover", "done", "封面（快取）", 5 / 6)
-            else:
-                _progress(on_progress, "cover", "skipped", "無封面", 5 / 6)
             cached_img = dict(cached_img)
             cached_img["vision_used"] = False
             cached_img["search_mode"] = "code"
             cached_img.setdefault("related_by_title", cached_img.get("related_by_title") or [])
             cached_img = enrich_offline_cache_hit(cached_img, image_hash=img_hash)
-            _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
-            return cached_img, 200
+            refreshed = None
+            try:
+                refreshed = reverify_cached_image_hit(cached_img, image_bytes, api_key)
+            except Exception:
+                refreshed = None
+            if refreshed:
+                _progress(on_progress, "vision", "done", "同圖重核封面與劇照", 2 / 6)
+                _progress(on_progress, "parse", "done", f"番號：{refreshed.get('code') or '—'}", 3 / 6)
+                _progress(on_progress, "search", "done", "已對照原圖重核", 4 / 6)
+                _progress(
+                    on_progress,
+                    "cover",
+                    "done",
+                    "封面與劇照已重核",
+                    5 / 6,
+                )
+                _progress(on_progress, "done", "done", "完成（同圖視覺重核）", 1.0)
+                return refreshed, 200
+            if not (api_key or "").strip():
+                # No vision key: cannot re-check clothes/stills. Keep catalog cache.
+                _progress(on_progress, "vision", "skipped", "離線快取（同圖）", 2 / 6)
+                _progress(on_progress, "parse", "done", f"番號：{cached_img.get('code') or '—'}", 3 / 6)
+                _progress(on_progress, "search", "done", "離線快取", 4 / 6)
+                _progress(on_progress, "cover", "done" if cached_img.get("cover") else "skipped", "封面（快取）", 5 / 6)
+                _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
+                return cached_img, 200
+            # Key present but this cached row did not lock: search again.
 
     # Manual code: try offline cache before vision/network (fast path)
     if code and parse_code_parts(code):
@@ -7094,6 +7460,19 @@ def run_identify_pipeline(
         result = merge_title_candidates(
             result, title_search_hit, query_title=title_search_query
         )
+
+    # Image path that resolved a code without the title-search visual pass
+    # (verified 番號) still has to compare cover + stills against the user image.
+    if image_bytes and result.get("ok"):
+        try:
+            extras = None
+            if title_search_hit:
+                extras = title_search_hit.get("candidates")
+            result = _ensure_image_visual_rank(
+                result, image_bytes, api_key, extras
+            )
+        except Exception:
+            pass
 
     # Step 6: done
     ok = bool(result.get("ok"))
