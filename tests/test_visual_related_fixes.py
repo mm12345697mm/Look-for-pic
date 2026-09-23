@@ -639,11 +639,14 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
         self.assertIn("ノーブラ", kws)
         self.assertGreater(kws.index("ノーブラ"), kws.index("巨乳"))
         self.assertLess(kws.index("ノーブラ誘惑"), kws.index("ノーブラ"))
-        if "彼女" in kws:
-            self.assertGreater(kws.index("彼女"), kws.index("巨乳"))
-            self.assertGreater(kws.index("彼女"), kws.index("ノーブラ誘惑"))
-        # 妹 is one character and a relationship word; bare 誘惑/負け/ボク are action or pronoun.
-        for absent in ("妹", "誘惑", "負け", "ボク", "私"):
+        for rel in ("彼女の妹", "彼女", "妹"):
+            self.assertIn(rel, kws, kws)
+            self.assertGreater(kws.index(rel), kws.index("巨乳"), kws)
+            self.assertGreater(kws.index(rel), kws.index("ノーブラ誘惑"), kws)
+        self.assertLess(kws.index("彼女の妹"), kws.index("彼女"))
+        self.assertLess(kws.index("彼女"), kws.index("妹"))
+        # Bare 誘惑 is only the action half. ボク is not part of an XのY relation pair here.
+        for absent in ("誘惑", "負け", "ボク", "私"):
             self.assertNotIn(absent, kws, kws)
         # noun+沼 in this title is kept, behind the circled theme nouns.
         self.assertIn("ナマ乳沼", kws)
@@ -658,7 +661,14 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
         self.assertIn("巨乳", qs[:4])
         self.assertNotIn("彼女", qs)
         self.assertNotIn("妹", qs)
+        self.assertNotIn("彼女の妹", qs)
         self.assertNotIn("誘惑", qs)
+        selected = S._keyword_search_queries(
+            self.MIDA, ["彼女の妹", "妹"], selected_only=True
+        )
+        self.assertIn("彼女の妹", selected)
+        self.assertIn("妹", selected)
+        self.assertLessEqual(len(selected), 10)
         self.assertTrue(all(not S._is_weak_theme_token(q) for q in qs[:2]), qs)
 
     def test_particle_blocks_false_compound(self):
@@ -704,17 +714,79 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
         kws = S._extract_title_theme_keywords("彼女の妹とボクの巨乳電車")
         self.assertIn("巨乳", kws)
         self.assertIn("電車", kws)
-        self.assertNotIn("妹", kws)
+        for rel in ("彼女の妹", "彼女", "妹"):
+            self.assertIn(rel, kws, kws)
+            self.assertGreater(kws.index(rel), kws.index("巨乳"))
+            self.assertGreater(kws.index(rel), kws.index("電車"))
+        # ボクの巨乳 is not a relationship compound, so ボク is not a chip.
         self.assertNotIn("ボク", kws)
-        if "彼女" in kws:
-            self.assertGreater(kws.index("彼女"), kws.index("巨乳"))
-            self.assertGreater(kws.index("彼女"), kws.index("電車"))
+        self.assertNotIn("ボクの巨乳", kws)
         self.assertTrue(S._is_weak_theme_token("彼女"))
         self.assertTrue(S._is_weak_theme_token("誘惑"))
         self.assertTrue(S._is_weak_theme_token("妹"))
         self.assertFalse(S._is_weak_theme_token("ノーブラ"))
         self.assertFalse(S._is_weak_theme_token("巨乳"))
         self.assertFalse(S._is_weak_theme_token("義妹"))
+
+    def test_kanojo_imouto_scores_compound_above_either_half(self):
+        kws = ["ノーブラ誘惑", "巨乳", "ノーブラ", "彼女の妹", "彼女", "妹"]
+        both = S._keyword_overlap("彼女の妹のノーブラ巨乳", kws)
+        only_phrase_theme = S._keyword_overlap("彼女の妹と巨乳", kws)
+        only_kanojo = S._keyword_overlap("彼女の日常と巨乳", kws)
+        only_imouto = S._keyword_overlap("妹の部屋で巨乳", kws)
+        theme_only = S._keyword_overlap("ノーブラの巨乳", kws)
+        lone = S._keyword_overlap("彼女の日常", kws)
+        # hits, score, matched, theme_hits
+        self.assertIn("彼女の妹", both[2])
+        self.assertIn("彼女", both[2])
+        self.assertIn("妹", both[2])
+        self.assertGreater(both[0], only_kanojo[0])
+        self.assertGreater(both[1], only_kanojo[1])
+        self.assertGreater(only_phrase_theme[1], only_kanojo[1])
+        self.assertGreater(only_phrase_theme[1], only_imouto[1])
+        self.assertGreater(only_kanojo[1], 0)
+        self.assertGreater(only_imouto[1], 0)
+        self.assertGreater(theme_only[1], lone[1])
+        self.assertEqual(lone[3], 0)
+        self.assertGreater(theme_only[3], 0)
+        # 義妹 must not count as bare 妹.
+        self.assertNotIn("妹", S._matched_theme_keywords("義妹の誘惑", ["妹"]))
+
+    def test_relation_only_does_not_pad_ahead_of_theme_hits(self):
+        def fake_avbase(q, actress=None):
+            return [
+                {"code": "AAA-001", "title": "彼女の日常", "actress": "A", "score": 1.0},
+                {"code": "AAA-002", "title": "妹と過ごす夏", "actress": "B", "score": 1.0},
+                {"code": "AAA-003", "title": "彼女の妹と温泉", "actress": "C", "score": 1.0},
+                {"code": "AAA-004", "title": "ノーブラの巨乳", "actress": "D", "score": 0.2},
+                {"code": "AAA-005", "title": "彼女の妹のノーブラ巨乳", "actress": "E", "score": 0.1},
+            ]
+
+        def fake_enrich(c, why="片名候選"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=fake_avbase), mock.patch.object(
+            S, "fetch_jav321_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "fetch_javlibrary_title_results", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+            rows = S._find_related_by_keywords(self.MIDA, max_n=5, budget_sec=20.0)
+        codes = [r["code"] for r in rows]
+        self.assertEqual(codes[0], "AAA-005", codes)
+        self.assertIn("AAA-004", codes)
+        self.assertLess(codes.index("AAA-005"), codes.index("AAA-004"))
+        for skipped in ("AAA-001", "AAA-002", "AAA-003"):
+            self.assertNotIn(skipped, codes)
+        top = rows[0]
+        self.assertIn("彼女の妹", top.get("matched_keywords") or [])
+        self.assertIn("巨乳", top.get("matched_keywords") or [])
+        self.assertGreater(
+            int(top.get("keyword_hits") or 0),
+            int(next(r for r in rows if r["code"] == "AAA-004").get("keyword_hits") or 0),
+        )
 
 
 class TestActressQueryKeep(unittest.TestCase):

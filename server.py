@@ -4438,9 +4438,10 @@ def _title_related_keyword_queries(title: str) -> list[str]:
 # Relationship / pronoun fluff and bare action tokens.
 # They may sit in the lexicon (彼女) but must not outrank theme nouns, and must
 # not be primary keyword-search drivers when a stronger term exists.
-# 妹 is one character: the length≥2 rule drops it before this set matters.
 # Bare 誘惑 is not a theme noun; it is kept only inside a compound (ノーブラ誘惑).
-# 義妹 stays a short theme noun (see _SHORT_THEME_NOUNS), unlike bare 妹.
+# 彼女 / 妹 stay weak for automatic search priority, but a title pattern like
+# 彼女の妹 still exposes 彼女, 妹, and 彼女の妹 as selectable chips.
+# 義妹 stays a short theme noun (see _SHORT_THEME_NOUNS).
 _WEAK_THEME_TOKENS = frozenset(
     {
         "中出し",
@@ -4482,6 +4483,26 @@ _WEAK_THEME_TOKENS = frozenset(
 # Productive title suffixes. Noun + suffix is one theme (ノーブラ誘惑, 巨乳沼)
 # when the noun is actually in the title. Bare 誘惑 / 沼 are not chips.
 _COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼")
+
+# Kinship / pronoun nouns that form selectable XのY chips (彼女の妹).
+# One-character members are chips only as part of such a phrase, not as leftovers.
+_RELATION_NOUNS: tuple[str, ...] = (
+    "お姉さん",
+    "あなた",
+    "彼女",
+    "彼氏",
+    "義妹",
+    "ボク",
+    "妹",
+    "姉",
+    "兄",
+    "弟",
+    "私",
+    "僕",
+    "俺",
+    "君",
+)
+_RELATION_NOUN_SET = frozenset(_RELATION_NOUNS)
 
 
 _THEME_KEYWORD_LEXICON = (
@@ -4729,6 +4750,77 @@ def _is_weak_theme_token(tok: str) -> bool:
     return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
 
 
+def _is_relation_noun(tok: str) -> bool:
+    return (tok or "").strip() in _RELATION_NOUN_SET
+
+
+def _is_relation_phrase(tok: str) -> bool:
+    """彼女の妹 — both sides are relationship nouns, particle kept."""
+    t = (tok or "").strip()
+    if t.count("の") != 1:
+        return False
+    left, right = t.split("の", 1)
+    return _is_relation_noun(left) and _is_relation_noun(right)
+
+
+def _keyword_token_ok(tok: str) -> bool:
+    """Chip/query token length. 妹 is allowed; other 1-char scraps are not."""
+    t = (tok or "").strip()
+    if not t or len(t) > 24:
+        return False
+    if len(t) >= 2:
+        return True
+    return _is_relation_noun(t)
+
+
+def _is_auto_theme_keyword(tok: str) -> bool:
+    """Terms that lead automatic related search (not relationship chips)."""
+    t = (tok or "").strip()
+    if not t or _is_relation_phrase(t) or _is_weak_theme_token(t):
+        return False
+    return True
+
+
+def _extract_relation_compounds(title: str) -> list[tuple[str, str, str]]:
+    """In-title relationship phrases as (phrase, left, right).
+
+    彼女の妹 yields the full chip plus both parts. 妹のノーブラ does not:
+    the right side is a theme noun, not a relationship noun.
+    """
+    t = re.sub(r"\s+", "", title or "")
+    if "の" not in t:
+        return []
+    nouns = sorted(_RELATION_NOUN_SET, key=len, reverse=True)
+    out: list[tuple[str, str, str]] = []
+    seen: set[str] = set()
+    start = 0
+    while True:
+        i = t.find("の", start)
+        if i < 0:
+            break
+        start = i + 1
+        left = ""
+        for noun in nouns:
+            if i >= len(noun) and t.endswith(noun, 0, i):
+                left = noun
+                break
+        if not left:
+            continue
+        right = ""
+        for noun in nouns:
+            if t.startswith(noun, i + 1):
+                right = noun
+                break
+        if not right:
+            continue
+        phrase = f"{left}の{right}"
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        out.append((phrase, left, right))
+    return out
+
+
 def _compound_noun_heads() -> list[str]:
     """Non-weak lexicon nouns that may head noun+誘惑 / noun+沼, longest first."""
     seen: set[str] = set()
@@ -4824,13 +4916,16 @@ def _rank_theme_keywords(
 
     def _tier(tok: str) -> int:
         head = compound_head.get(tok)
-        if head and not _is_weak_theme_token(tok):
+        if head and not _is_weak_theme_token(tok) and not _is_relation_phrase(tok):
             known = (not _is_weak_theme_token(head)) and (
                 head in _THEME_KEYWORD_LEXICON or head in _SHORT_THEME_NOUNS
             )
             return 0 if known else 3
-        if _is_weak_theme_token(tok):
+        # Relationship phrase stays selectable but behind theme nouns.
+        if _is_relation_phrase(tok):
             return 4
+        if _is_weak_theme_token(tok):
+            return 5
         if tok in heads and (tok in _THEME_KEYWORD_LEXICON or tok in _SHORT_THEME_NOUNS):
             return 2
         return 1
@@ -4873,7 +4968,7 @@ def _normalize_keyword_list(raw, *, limit: int = 10) -> list[str]:
         return []
     for item in raw:
         tok = str(item or "").strip()
-        if len(tok) < 2 or len(tok) > 24:
+        if not _keyword_token_ok(tok):
             continue
         key = tok.casefold()
         if key in seen:
@@ -4890,13 +4985,13 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     Prefer lexicon + Latin tokens and in-title compounds (ノーブラ誘惑, 巨乳沼).
     Keep the distinctive noun half of a lexicon compound (ノーブラ), and keep
-    high-signal 2-char look tokens (眼鏡/地味/美人). Rank weak relationship
-    and bare-action tokens (彼女, 誘惑, 負け, ボク) after strong theme nouns.
+    high-signal 2-char look tokens (眼鏡/地味/美人).
 
-    妹 is not a chip: it is a one-character relationship word, not a theme noun
-    (義妹 is the lexicon form). Bare 誘惑 is not a chip either: it is action
-    fluff unless it is glued to a noun in the title. Leftover {4,6} scraps run
-    only when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
+    Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
+    彼女の妹. Those stay on the chip list, but rank after theme nouns so they
+    do not lead automatic search. Bare 誘惑 is not a chip unless it is glued
+    to a noun (ノーブラ誘惑). Leftover {4,6} scraps run only when nothing
+    distinctive was found (JUFE-271 は隠し切れな must not pad).
     """
     raw = (title or "").strip()
     if not raw:
@@ -4912,10 +5007,11 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     seen: set[str] = set()
     alias_seen: set[str] = set()
     compounds = _extract_title_compounds(t)
+    relations = _extract_relation_compounds(t)
 
     def _add(tok: str) -> None:
         tok = (tok or "").strip()
-        if len(tok) < 2:
+        if not _keyword_token_ok(tok):
             return
         key = tok.casefold()
         if key in seen:
@@ -4931,6 +5027,10 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     for comp, _noun in compounds:
         _add(comp)
+    for phrase, left, right in relations:
+        _add(phrase)
+        _add(left)
+        _add(right)
 
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
         if kw.casefold() in t_norm.casefold():
@@ -4960,12 +5060,33 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     return _rank_theme_keywords(found, t, compounds)[:10]
 
 
+def _alias_in_title(alias: str, text: str) -> bool:
+    """Substring hit. One-character relation nouns need a particle/edge boundary.
+
+    妹 matches 彼女の妹 and a title that starts with 妹, not the tail of 義妹.
+    """
+    al = (alias or "").strip()
+    if not al or not text:
+        return False
+    folded = text.casefold()
+    key = al.casefold()
+    if len(al) == 1 and _is_relation_noun(al):
+        return (
+            re.search(
+                rf"(?:^|[のをにはがともへやで、。！？・\s]){re.escape(key)}",
+                folded,
+            )
+            is not None
+        )
+    return key in folded
+
+
 def _matched_theme_keywords(candidate_title: str, keywords: list[str] | None) -> list[str]:
     """Source keywords that actually hit this related title (aliases count).
 
     Returns the source tokens, not a guessed extra list. Empty when nothing hits.
     """
-    text = (candidate_title or "").casefold()
+    text = candidate_title or ""
     if not text or not keywords:
         return []
     hit: list[str] = []
@@ -4973,9 +5094,31 @@ def _matched_theme_keywords(candidate_title: str, keywords: list[str] | None) ->
         tok = str(kw or "").strip()
         if not tok:
             continue
-        if any(al and al.casefold() in text for al in _theme_keyword_aliases(tok)):
+        if any(_alias_in_title(al, text) for al in _theme_keyword_aliases(tok)):
             hit.append(tok)
     return hit
+
+
+def _keyword_overlap(candidate_title: str, keywords: list[str]) -> tuple[int, float, list[str], int]:
+    """Hit count, rank score, matched tokens, and distinctive-theme hit count.
+
+    More matched keywords rank first. 彼女の妹 adds a strong bonus; a lone
+    彼女 or 妹 still scores, but less than the full phrase or a theme hit.
+    """
+    matched = _matched_theme_keywords(candidate_title, keywords)
+    hits = len(matched)
+    theme_hits = sum(1 for k in matched if _is_auto_theme_keyword(k))
+    compound_hits = sum(1 for k in matched if _is_relation_phrase(k))
+    part_hits = sum(
+        1 for k in matched if _is_relation_noun(k) and not _is_relation_phrase(k)
+    )
+    score = (
+        float(hits) * 10.0
+        + float(theme_hits) * 3.0
+        + float(compound_hits) * 5.0
+        + float(part_hits) * 1.0
+    )
+    return hits, score, matched, theme_hits
 
 
 def _keyword_hit_count(candidate_title: str, keywords: list[str]) -> int:
@@ -5057,10 +5200,16 @@ def _keyword_search_queries(
 
     def _add_q(q: str) -> None:
         q = (q or "").strip()
-        if len(q) >= 2 and q not in queries:
+        if _keyword_token_ok(q) and q not in queries:
             queries.append(q)
 
-    distinctive = [k for k in keywords if k and not _is_weak_theme_token(k)]
+    # Relationship chips (彼女 / 妹 / 彼女の妹) stay selectable, but automatic
+    # queries are led by theme compounds and nouns.
+    distinctive = [
+        k
+        for k in keywords
+        if k and not _is_weak_theme_token(k) and not _is_relation_phrase(k)
+    ]
     ordered = sorted(
         keywords if selected_only else (distinctive or keywords),
         key=lambda k: (title.find(k) if k and k in title else 10_000, -len(k)),
@@ -5200,14 +5349,11 @@ def _find_related_by_keywords(
     if len(keywords) < 1:
         return []
     if explicit:
-        # User-picked tokens all count, including ones the title bucket treats as weak.
-        distinctive = list(keywords)
+        # User-picked tokens all count, including relationship chips (彼女 / 妹).
         if min_hits is None:
             min_hits = _selected_keyword_min_hits(keywords)
-    else:
-        distinctive = [k for k in keywords if not _is_weak_theme_token(k)]
-        if min_hits is None:
-            min_hits = _keyword_min_hits(keywords)
+    elif min_hits is None:
+        min_hits = _keyword_min_hits(keywords)
     t0 = _time.monotonic()
     budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
     exclude = ""
@@ -5244,11 +5390,16 @@ def _find_related_by_keywords(
             code = format_display_code(code_raw)
             if code in seen:
                 continue
-            hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
+            hits, base, _matched, theme_hits = _keyword_overlap(
+                str(c.get("title") or ""), keywords
+            )
             if hits < min_hits:
                 continue
-            d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
-            sc = float(hits) * 10.0 + float(d_hits) * 3.0 + float(c.get("score") or 0)
+            if not explicit and theme_hits < 1 and any(
+                _is_auto_theme_keyword(k) for k in keywords
+            ):
+                continue
+            sc = base + float(c.get("score") or 0)
             prev = ranked.get(code)
             if prev is None or sc > prev[0]:
                 ranked[code] = (sc, c)
@@ -5256,21 +5407,23 @@ def _find_related_by_keywords(
     ordered_rows = sorted(ranked.values(), key=lambda x: x[0], reverse=True)
     out: list[dict] = []
     for sc, c in ordered_rows:
-        hits = _keyword_hit_count(str(c.get("title") or ""), keywords)
+        hits, _base, matched, theme_hits = _keyword_overlap(
+            str(c.get("title") or ""), keywords
+        )
         if hits < min_hits:
             continue
-        # Drop weak-only overlap when the title had several keywords.
-        # Explicit re-search counts every selected token, so this only applies
-        # to the original title bucket.
-        d_hits = _keyword_hit_count(str(c.get("title") or ""), distinctive or keywords)
-        if not explicit and d_hits < 1 and len(keywords) >= 3:
+        # Theme terms lead the automatic bucket. Relationship-only overlap
+        # still scores lower, but does not pad ahead of ノーブラ / 巨乳.
+        # Explicit re-search counts every selected token.
+        if not explicit and theme_hits < 1 and any(
+            _is_auto_theme_keyword(k) for k in keywords
+        ):
             continue
         why = f"關鍵字×{hits}"
         item = enrich_title_candidate(c, why=why)
         item["line"] = "keyword"
         item["why"] = why
         item["keyword_hits"] = hits
-        matched = _matched_theme_keywords(str(c.get("title") or ""), keywords)
         item["matched_keywords"] = matched
         item["hit_keywords"] = matched
         out.append(item)
