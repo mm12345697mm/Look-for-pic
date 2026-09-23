@@ -507,6 +507,15 @@
     return out;
   }
 
+  // One-character kinship chips from patterns like 彼女の妹. Other 1-char scraps stay out.
+  const RELATION_CHIP = { '妹': 1, '姉': 1, '兄': 1, '弟': 1, '私': 1, '僕': 1, '俺': 1, '君': 1 };
+
+  function keywordTokenOk(s) {
+    if (!s || s.length > 24) return false;
+    if (s.length >= 2) return true;
+    return !!RELATION_CHIP[s];
+  }
+
   /** Unique chip labels from an API list. Does not invent keywords from a title. */
   function normalizeKeywordList(raw) {
     const out = [];
@@ -516,7 +525,7 @@
       : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
     items.forEach((item) => {
       const s = String(item || '').trim();
-      if (s.length < 2 || s.length > 24 || seen[s]) return;
+      if (!keywordTokenOk(s) || seen[s]) return;
       seen[s] = true;
       out.push(s);
     });

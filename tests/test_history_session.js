@@ -600,6 +600,15 @@ function walkNodes(node, acc) {
   return acc;
 }
 
+// 彼女の妹 keeps the phrase and both halves, including the one-character 妹 chip
+{
+  assert.strictEqual(
+    H.normalizeKeywordList(['ノーブラ誘惑', '巨乳', '彼女の妹', '彼女', '妹', '誘']).join('・'),
+    'ノーブラ誘惑・巨乳・彼女の妹・彼女・妹'
+  );
+  assert.strictEqual(H.normalizeKeywordList(['あ', '中']).join('・'), '');
+}
+
 // Keyword chips on a card that already has a 關鍵字 related section
 {
   assert.strictEqual(
