@@ -19,6 +19,8 @@
   const THUMB_MAX_BYTES = 150 * 1024;
   const USER_SHOT_THUMB_MAX_SIDE = 480;
   const USER_SHOT_SESSION_MAX = 20;
+  // Bottom「關鍵字再搜」row only. Main carousel keyword bucket stays at 5.
+  const KEYWORD_RESEARCH_CAP = 10;
 
   let runId = 0;
 
@@ -2324,7 +2326,7 @@
   /**
    * Keyword chips + a separate bottom row.
    * Shown only when this card already has a 關鍵字 related section.
-   * Re-search uses only the selected chips (server enforces multi-hit / cap 5).
+   * Re-search uses only the selected chips (server enforces multi-hit / cap 10).
    */
   function mountKeywordResearch(block, mainWork, related, themeKeywords) {
     const hasKeyword = (related || []).some((rw) => {
@@ -2385,7 +2387,7 @@
         return;
       }
       researchLabel.textContent = headText;
-      items.slice(0, 5).forEach((raw) => {
+      items.slice(0, KEYWORD_RESEARCH_CAP).forEach((raw) => {
         const w = workFromApi(raw, 'keyword');
         const slide = document.createElement('div');
         slide.className = 'kw-research-slide';
@@ -2441,7 +2443,7 @@
           return true;
         });
         if (my !== seq) return;
-        showResearch(picked, { items: items.slice(0, 5) });
+        showResearch(picked, { items: items.slice(0, KEYWORD_RESEARCH_CAP) });
       } catch (_) {
         if (my !== seq) return;
         showResearch(picked, { error: true, items: [] });

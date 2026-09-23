@@ -367,7 +367,7 @@ class TestKeywordResearch(unittest.TestCase):
             return S._find_related_by_keywords(
                 self.TITLE,
                 exclude_code="JUFE-271",
-                max_n=5,
+                max_n=S.RELATED_KEYWORD_RESEARCH_CAP,
                 budget_sec=20.0,
                 keywords=keywords,
                 **kwargs,
@@ -381,7 +381,8 @@ class TestKeywordResearch(unittest.TestCase):
         self.assertNotIn("PRED-003", codes, "single 眼鏡 hit must not fill a 2-keyword re-search")
         self.assertNotIn("PRED-004", codes)
         self.assertNotIn("JUFE-271", codes)
-        self.assertLessEqual(len(rows), 5)
+        self.assertLessEqual(len(rows), S.RELATED_KEYWORD_RESEARCH_CAP)
+        self.assertLess(len(rows), S.RELATED_KEYWORD_RESEARCH_CAP, "must not pad to the cap")
         self.assertTrue(all(r.get("line") == "keyword" for r in rows))
         self.assertTrue(all(int(r.get("keyword_hits") or 0) >= 2 for r in rows))
 
@@ -392,9 +393,10 @@ class TestKeywordResearch(unittest.TestCase):
         self.assertIn("PRED-001", codes)
         self.assertNotIn("PRED-004", codes)
         self.assertNotIn("JUFE-271", codes)
-        self.assertLessEqual(len(rows), 5)
+        self.assertLessEqual(len(rows), S.RELATED_KEYWORD_RESEARCH_CAP)
+        self.assertLess(len(rows), S.RELATED_KEYWORD_RESEARCH_CAP, "must not pad to the cap")
 
-    def test_research_caps_at_five(self):
+    def test_research_caps_at_ten_and_carousel_stays_five(self):
         many = [
             {"code": f"AAA-{i:03d}", "title": "地味な眼鏡の美人", "actress": "A", "score": 0.4}
             for i in range(1, 12)
@@ -411,13 +413,24 @@ class TestKeywordResearch(unittest.TestCase):
         ), mock.patch.object(
             S, "fetch_javlibrary_title_results", return_value=[]
         ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
-            rows = S._find_related_by_keywords(
+            carousel = S._find_related_by_keywords(
                 self.TITLE,
                 keywords=["眼鏡", "地味"],
-                max_n=5,
+                max_n=S.RELATED_KEYWORD_CAP,
                 budget_sec=20.0,
             )
-        self.assertEqual(len(rows), 5)
+            research = S._find_related_by_keywords(
+                self.TITLE,
+                keywords=["眼鏡", "地味"],
+                max_n=S.RELATED_KEYWORD_RESEARCH_CAP,
+                budget_sec=20.0,
+            )
+        self.assertEqual(S.RELATED_KEYWORD_CAP, 5)
+        self.assertEqual(S.RELATED_KEYWORD_RESEARCH_CAP, 10)
+        self.assertEqual(len(carousel), 5)
+        # Fetch window is 10 candidates; return every real match up to the re-search cap.
+        self.assertEqual(len(research), 10)
+        self.assertLess(len(research), 12)
 
     def test_api_payload_and_empty_selection(self):
         captured = {}
@@ -460,6 +473,7 @@ class TestKeywordResearch(unittest.TestCase):
         self.assertEqual(data.get("min_hits"), 2)
         self.assertEqual(captured.get("keywords"), ["眼鏡", "地味"])
         self.assertEqual(captured.get("min_hits"), 2)
+        self.assertEqual(captured.get("max_n"), S.RELATED_KEYWORD_RESEARCH_CAP)
         self.assertEqual(len(data.get("related") or []), 1)
         self.assertEqual(data["related"][0]["code"], "PRED-001")
         self.assertIn("眼鏡", data.get("theme_keywords") or [])
@@ -468,6 +482,43 @@ class TestKeywordResearch(unittest.TestCase):
         self.assertEqual(empty.get_json().get("related"), [])
         self.assertEqual(empty.get_json().get("min_hits"), 0)
         self.assertIn("OL", empty.get_json().get("theme_keywords") or [])
+
+    def test_api_returns_real_matches_up_to_ten_without_padding(self):
+        many = [
+            {
+                "code": f"AAA-{i:03d}",
+                "title": "地味な眼鏡",
+                "line": "keyword",
+                "why": "關鍵字×2",
+                "stills": [],
+            }
+            for i in range(1, 13)
+        ]
+
+        def fake_find(title, **kwargs):
+            self.assertEqual(kwargs.get("max_n"), 10)
+            n = 12 if kwargs.get("keywords") == ["眼鏡", "地味"] else 3
+            return many[:n]
+
+        with mock.patch.object(S, "_find_related_by_keywords", side_effect=fake_find), mock.patch.object(
+            S, "attach_chinese_titles", side_effect=lambda payload, **kwargs: payload
+        ):
+            client = S.app.test_client()
+            full = client.post(
+                "/api/related-by-keywords",
+                json={"title": self.TITLE, "code": "JUFE-271", "keywords": ["眼鏡", "地味"]},
+            )
+            short = client.post(
+                "/api/related-by-keywords",
+                json={"title": self.TITLE, "code": "JUFE-271", "keywords": ["眼鏡"]},
+            )
+        self.assertEqual(full.status_code, 200)
+        full_rows = full.get_json().get("related") or []
+        self.assertEqual(len(full_rows), 10)
+        self.assertEqual(full_rows[0]["code"], "AAA-001")
+        self.assertEqual(full_rows[-1]["code"], "AAA-010")
+        short_rows = short.get_json().get("related") or []
+        self.assertEqual([r["code"] for r in short_rows], ["AAA-001", "AAA-002", "AAA-003"])
 
 
 class TestRelatedBucketOrder(unittest.TestCase):
