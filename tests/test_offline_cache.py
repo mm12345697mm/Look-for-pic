@@ -287,8 +287,12 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.cache_path = Path(self.tmp.name) / "offline-cache.json"
         S._OFFLINE_CACHE_PATH = self.cache_path
+        # Cache hits with no actress must not call the live catalog in these tests.
+        self._avbase = mock.patch.object(S, "fetch_avbase_by_code", return_value=None)
+        self._avbase.start()
 
     def tearDown(self):
+        self._avbase.stop()
         S._OFFLINE_CACHE_PATH = None
         self.tmp.cleanup()
 
