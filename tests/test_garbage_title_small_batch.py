@@ -1,9 +1,8 @@
 """OCR junk must not become a title or a chip, and a 2-image batch must finish.
 
 A cover read of 特別な補習 "< ey used to be searched as a title, which chipped
-the latin crumb EY and left the catalog empty. The same clock that stops a
-14-image batch was also marking the second frame of a 2-image run 尚未查完
-while a normal catalog lookup would still have fit.
+the latin crumb EY and left the catalog empty. A shared identify clock must
+not mark a later frame 尚未查完 while a normal catalog lookup would still fit.
 """
 
 from __future__ import annotations
@@ -153,10 +152,19 @@ class TestSmallBatchDoesNotFalseTimeout(unittest.TestCase):
         self.assertEqual(calls, ["SER-221", "SER-880"])
         self.assertFalse(payload.get("partial"))
 
-    def test_expired_two_image_deadline_is_still_honest(self):
+    def test_expired_deadline_does_not_skip_the_second_slot(self):
+        calls: list[str] = []
+
+        def identify(**kwargs):
+            code = str(kwargs.get("user_code") or "")
+            calls.append(code)
+            return {"ok": True, "code": code, "title": "架空題名のテスト作品です"}, 200
+
         images = self._images(2)
         with mock.patch.object(S, "get_gemini_api_key", return_value=""), mock.patch.object(
-            S, "ocr_image_bytes", side_effect=AssertionError("ocr")
+            S, "ocr_image_bytes", side_effect=["SER-221", "SER-880"]
+        ), mock.patch.object(S, "run_identify_pipeline", side_effect=identify), mock.patch.object(
+            S, "attach_related_by_title", side_effect=lambda result, **kwargs: result
         ):
             payload, status = S.run_multi_identify_pipeline(
                 images,
@@ -165,10 +173,11 @@ class TestSmallBatchDoesNotFalseTimeout(unittest.TestCase):
         self.assertEqual(status, 200)
         results = payload.get("results") or []
         self.assertEqual(len(results), 2)
-        self.assertTrue(all(r.get("timed_out") for r in results))
-        self.assertIn("重查", payload.get("message") or "")
+        self.assertEqual(calls, ["SER-221", "SER-880"])
+        self.assertFalse(any(r.get("timed_out") for r in results), payload.get("message"))
+        self.assertFalse(payload.get("partial"))
 
-    def test_small_batch_starts_visual_lock_when_a_normal_slot_remains(self):
+    def test_near_deadline_still_starts_visual_lock(self):
         front = _png()
         hit = {
             "code": "SER-001",
@@ -194,27 +203,16 @@ class TestSmallBatchDoesNotFalseTimeout(unittest.TestCase):
         def fake_rank(*args, **kwargs):
             return ranked, {"visual_ranked": True, "visual_lock": True, "compared": 2}
 
-        S._enter_batch_ctx(time.monotonic() + 20, small_batch=True)
+        S._enter_batch_ctx(time.monotonic() + 20)
         try:
             self.assertFalse(S._visual_rank_blocked(2))
+            self.assertFalse(S._visual_rank_blocked(8))
             with mock.patch.object(S, "_jacket_lock_winner", return_value=None), mock.patch.object(
                 S, "rank_candidates_by_visual", side_effect=fake_rank
             ):
                 out = S.apply_visual_rank_to_hit(dict(hit), front, api_key="k")
             self.assertFalse(out.get("lock_incomplete"))
             self.assertEqual(out.get("code"), "SER-002")
-        finally:
-            S._leave_batch_ctx()
-
-        S._enter_batch_ctx(time.monotonic() + 20, small_batch=False)
-        try:
-            self.assertTrue(S._visual_rank_blocked(2))
-            with mock.patch.object(S, "_jacket_lock_winner", return_value=None), mock.patch.object(
-                S, "rank_candidates_by_visual", side_effect=AssertionError("large batch must not start")
-            ):
-                blocked = S.apply_visual_rank_to_hit(dict(hit), front, api_key="k")
-            self.assertTrue(blocked.get("lock_incomplete"))
-            self.assertNotEqual(blocked.get("code"), "SER-002")
         finally:
             S._leave_batch_ctx()
 
@@ -233,7 +231,7 @@ class TestSmallBatchDoesNotFalseTimeout(unittest.TestCase):
             S._BATCH.jacket_incomplete = True
             return None
 
-        S._enter_batch_ctx(time.monotonic() + 80, small_batch=True)
+        S._enter_batch_ctx(time.monotonic() + 80)
         try:
             with mock.patch.object(S, "_jacket_lock_winner", side_effect=fake_lock), mock.patch.object(
                 S, "rank_candidates_by_visual", side_effect=AssertionError("cut jacket")

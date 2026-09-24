@@ -1,8 +1,7 @@
-"""Large multi-image batches must finish or degrade per slot, not die as one 500.
+"""Large multi-image batches finish every slot. A cut jacket still does not guess.
 
-The live failure was gunicorn's 180s sync worker wall during a 14-image
-identify. Jacket crop-align itself is a small CPU cost; the batch has to
-stop on its own clock and return the slots it finished.
+Jacket crop-align stays the #25 lock. A shared identify clock must not mark
+a later frame 尚未查完, and a compare that was cut off must not keep a volume.
 """
 
 from __future__ import annotations
@@ -101,69 +100,68 @@ class TestMultiBatchDeadline(unittest.TestCase):
             out.append((_png(img), f"slot-{i + 1}.png"))
         return out
 
-    def test_expired_deadline_returns_every_slot(self):
-        images = self._images(14)
-        with mock.patch.object(S, "ocr_image_bytes", side_effect=AssertionError("ocr")):
-            with mock.patch.object(S, "get_gemini_api_key", return_value=""):
-                payload, status = S.run_multi_identify_pipeline(
-                    images,
-                    deadline=time.monotonic() - 1,
-                )
-        self.assertEqual(status, 200)
-        self.assertTrue(payload.get("ok"))
-        self.assertTrue(payload.get("partial"))
-        self.assertEqual(len(payload.get("results") or []), 14)
-        self.assertTrue(all(r.get("timed_out") for r in payload["results"]))
-        self.assertIn("不是查詢不到", payload.get("message") or "")
-        self.assertNotIn("伺服器錯誤", payload.get("message") or "")
+    def test_expired_deadline_still_finishes_every_slot(self):
+        """A shared identify clock must not mark later frames 尚未查完."""
+        images = self._images(4)
+        codes = ["ABP-101", "ABP-102", "ABP-103", "ABP-104"]
 
-    def test_slow_slots_keep_finished_and_mark_the_rest(self):
-        images = self._images(8)
-
-        def slow_identify(**kwargs):
-            time.sleep(2.0)
+        def identify(**kwargs):
             return {
                 "ok": True,
-                "code": kwargs.get("user_code") or "ABP-123",
+                "code": kwargs.get("user_code"),
                 "title": "架空題名のテスト",
             }, 200
 
-        # Above the vision-start floor, but not long enough to search every slot.
-        # OCR is instant, so every frame is read; search stops at the reserve.
-        deadline = time.monotonic() + 16.0
+        events: list[dict] = []
         with mock.patch.object(S, "get_gemini_api_key", return_value=""):
-            with mock.patch.object(S, "ocr_image_bytes", return_value="ABP-123"):
-                with mock.patch.object(S, "run_identify_pipeline", side_effect=slow_identify):
+            with mock.patch.object(S, "ocr_image_bytes", side_effect=codes):
+                with mock.patch.object(S, "run_identify_pipeline", side_effect=identify):
                     with mock.patch.object(
                         S, "attach_related_by_title", side_effect=lambda result, **kwargs: result
                     ):
-                        t0 = time.perf_counter()
                         payload, status = S.run_multi_identify_pipeline(
-                            images, deadline=deadline
+                            images,
+                            deadline=time.monotonic() - 5,
+                            on_progress=events.append,
                         )
-                        elapsed = time.perf_counter() - t0
         self.assertEqual(status, 200)
         self.assertTrue(payload.get("ok"))
+        self.assertFalse(payload.get("partial"))
         results = payload.get("results") or []
-        self.assertEqual(len(results), 8)
-        done = [r for r in results if not r.get("timed_out")]
-        waiting = [r for r in results if r.get("timed_out")]
-        self.assertGreaterEqual(len(done), 1, payload.get("message"))
-        self.assertGreaterEqual(len(waiting), 1, payload.get("message"))
-        self.assertTrue(payload.get("partial"))
-        self.assertIn("不是查詢不到", payload.get("message") or "")
-        self.assertIn("重查", payload.get("message") or "")
-        for row in done:
-            self.assertEqual(row.get("code"), "ABP-123")
-            self.assertFalse(row.get("timed_out"))
-        for row in waiting:
-            self.assertNotEqual(row.get("code"), "ABP-123")
-            self.assertIn("重查", row.get("message") or "")
-        # Must return because of the deadline, not run all 8 × 2s.
-        self.assertLess(elapsed, 15.0, elapsed)
-        print(
-            f"partial batch: {len(done)} finished, {len(waiting)} 尚未查完, {elapsed:.2f}s"
-        )
+        self.assertEqual(len(results), 4)
+        self.assertEqual([r.get("code") for r in results], codes)
+        self.assertFalse(any(r.get("timed_out") for r in results), payload.get("message"))
+        self.assertNotIn("時間不夠", payload.get("message") or "")
+        phases = [e.get("phase") for e in events if e.get("phase")]
+        for phase in ("辨識中", "目錄查詢", "封面鎖定", "相關作品"):
+            self.assertIn(phase, phases, phases)
+
+    def test_four_slots_are_not_skipped_to_save_related_time(self):
+        """The old reserve stopped searching once a hit existed and <20s remained."""
+        images = self._images(4)
+        calls: list[str] = []
+
+        def identify(**kwargs):
+            code = str(kwargs.get("user_code") or "")
+            calls.append(code)
+            return {"ok": True, "code": code, "title": "架空題名のテスト"}, 200
+
+        with mock.patch.object(S, "get_gemini_api_key", return_value=""):
+            with mock.patch.object(S, "ocr_image_bytes", side_effect=["SER-221", "SER-222", "SER-223", "SER-224"]):
+                with mock.patch.object(S, "run_identify_pipeline", side_effect=identify):
+                    with mock.patch.object(
+                        S, "attach_related_by_title", side_effect=lambda result, **kwargs: result
+                    ):
+                        payload, status = S.run_multi_identify_pipeline(
+                            images,
+                            deadline=time.monotonic() + 8,
+                        )
+        self.assertEqual(status, 200)
+        self.assertEqual(calls, ["SER-221", "SER-222", "SER-223", "SER-224"])
+        results = payload.get("results") or []
+        self.assertEqual(len(results), 4)
+        self.assertFalse(any(r.get("timed_out") for r in results), payload.get("message"))
+        self.assertFalse(payload.get("partial"))
 
 
 class TestStreamKeepsProgress(unittest.TestCase):

@@ -58,23 +58,8 @@ SAME_SERIES_SCORE_GAP = 0.08
 COVER_DOWNLOAD_TIMEOUT = 3
 TEXT_TIMEOUT = 20
 VISION_TIMEOUT = 45
-# Multi-image identify must return before gunicorn's worker wall (240s).
-# 150s leaves room for one in-flight vision/catalog call, then partial slots.
-MULTI_IDENTIFY_BUDGET_S = 150.0
-# 2–3 uploads still finish vision + catalog + a visual lock. The 150s
-# partial-stop stays for a large batch that would hit the worker wall.
-MULTI_SMALL_BATCH_N = 3
-MULTI_SMALL_IDENTIFY_BUDGET_S = 210.0
-# Do not start another slot when less than this remains — flush the response.
-MULTI_SLOT_RESERVE_S = 4.0
-# Do not start a shortened vision call. Below this, the frame is retryable.
-MULTI_VISION_START_S = 15.0
-# A 2–3 image batch may start one Gemini cover batch below the 40s tournament
-# budget. A jacket compare that was cut off still must not guess a volume.
-MULTI_SMALL_VISUAL_START_S = 12.0
-# Related carousels share this wall after identify. It is not the leftover
-# of the identify clock: a finished catalog hit still gets a real attempt
-# while the worker wall (gunicorn 240s, identify ~150s) has room.
+# Related carousels share this wall after every identify slot has finished.
+# It is not taken out of identify time, and it never skips a later frame.
 MULTI_RELATED_BUDGET_S = 20.0
 # A related call below this does not fill a bucket. Stop instead of
 # splitting the shared window into empty crumbs.
@@ -6031,15 +6016,14 @@ def _jacket_front_views(cover: Image.Image, user: Image.Image) -> list[Image.Ima
 _BATCH = threading.local()
 
 
-def _enter_batch_ctx(deadline: float, *, small_batch: bool = False) -> None:
+def _enter_batch_ctx(deadline: float | None = None) -> None:
     _BATCH.active = True
     _BATCH.deadline = deadline
     _BATCH.jacket_incomplete = False
-    _BATCH.small_batch = bool(small_batch)
 
 
 def _leave_batch_ctx() -> None:
-    for name in ("active", "deadline", "jacket_incomplete", "small_batch"):
+    for name in ("active", "deadline", "jacket_incomplete"):
         if hasattr(_BATCH, name):
             delattr(_BATCH, name)
 
@@ -6057,23 +6041,14 @@ def _seconds_left(deadline: float | None) -> float:
 
 
 def _visual_rank_blocked(n_coded: int, deadline: float | None = None) -> bool:
-    """True when a multi-candidate picture lock must not start.
+    """True only when this cover compare was cut off.
 
-    A large batch keeps the full compare budget: a short tournament can copy
-    the wrong volume. A 2–3 image batch still starts one cover batch when a
-    normal slot's worth of time remains. A jacket compare that was cut off
-    never continues into a guess.
+    A shared identify clock is not a reason to skip the lock. A jacket
+    compare that stopped before every volume was scored still must not
+    guess one.
     """
-    if deadline is None:
-        deadline = _batch_deadline()
-    if not getattr(_BATCH, "active", False) and deadline is None:
-        return False
-    if getattr(_BATCH, "jacket_incomplete", False):
-        return True
-    remain = _seconds_left(deadline)
-    if getattr(_BATCH, "small_batch", False) and int(n_coded) <= 4:
-        return remain < float(MULTI_SMALL_VISUAL_START_S)
-    return remain < float(VISUAL_COMPARE_BUDGET)
+    del n_coded, deadline
+    return bool(getattr(_BATCH, "jacket_incomplete", False))
 
 
 def _visual_compare_budget_s() -> float:
@@ -6501,9 +6476,8 @@ def apply_visual_rank_to_hit(
         return out
     if deadline is None:
         deadline = _batch_deadline()
-    # A short tournament plus the unlocked promotion can copy the wrong volume.
-    # Run the full compare, or mark the slot retryable. A 2–3 image batch
-    # still starts one cover batch when a normal slot's worth of time remains.
+    # A jacket compare that was cut off must not guess a volume.
+    # A shared identify clock is not a reason to skip this lock.
     if _visual_rank_blocked(len(coded), deadline):
         if len(coded) >= 2:
             return _mark_lock_incomplete(hit, coded)
@@ -10618,10 +10592,8 @@ def _visual_lock_winner(
     coded = [c for c in candidates or [] if isinstance(c, dict) and _catalog_code_of(c)]
     if not image_bytes or not coded or not (api_key or "").strip():
         return None
-    if getattr(_BATCH, "active", False):
-        remain = _seconds_left(_batch_deadline())
-        if getattr(_BATCH, "jacket_incomplete", False) or remain < float(VISUAL_COMPARE_BUDGET):
-            return None
+    if getattr(_BATCH, "active", False) and getattr(_BATCH, "jacket_incomplete", False):
+        return None
     try:
         ranked, meta = rank_candidates_by_visual(image_bytes, coded[:8], api_key=api_key)
     except Exception:
@@ -10779,8 +10751,6 @@ def _lock_unknown_onto_sibling(
     may merge only when both frames locked the same code.
     """
     if not image_bytes or not slot.get("unidentified") or not (api_key or "").strip():
-        return slot
-    if getattr(_BATCH, "active", False) and _seconds_left(_batch_deadline()) < float(VISUAL_COMPARE_BUDGET):
         return slot
     pool: list[dict] = []
     seen: set[str] = set()
@@ -11023,21 +10993,6 @@ def _slot_needs_related(row: dict | None) -> bool:
     return bool(is_usable_title(title) and not title.startswith("（"))
 
 
-def _keep_time_for_related(results: list, deadline: float | None) -> bool:
-    """Stop new identify slots once a catalog hit exists and related needs the clock.
-
-    The first slot still searches. After that, leftover identify time on a
-    large batch is for carousels, not for another frame that would come back
-    empty. A 2–3 image batch does not do this: related already has its own
-    clock after identify, and the remaining covers still need a normal search.
-    """
-    if getattr(_BATCH, "small_batch", False):
-        return False
-    if not any(_slot_needs_related(r) for r in results):
-        return False
-    return _seconds_left(deadline) < float(MULTI_RELATED_BUDGET_S)
-
-
 def _fill_related_for_finished_slots(
     results: list[dict],
     *,
@@ -11047,12 +11002,12 @@ def _fill_related_for_finished_slots(
 ) -> int:
     """Attach related for finished catalog slots.
 
-    The identify clock is not the related clock. A batch that already used
-    the identify budget still spends MULTI_RELATED_BUDGET_S on carousels,
-    as long as that stays inside the worker wall (identify deadline + 80s,
-    gunicorn is 240s). Slots are filled in finish order. A slot starts only
-    when a useful slice remains, so the shared budget cannot become an
-    empty crumb on every slot. Timed-out slots are left alone.
+    Related starts after identify, on its own clock. Passing an identify
+    deadline only keeps that window inside the worker (deadline + 80s,
+    gunicorn is 240s). It never skips an identify slot. Slots are filled in
+    finish order. A slot starts only when a useful slice remains, so the
+    shared related window cannot become an empty crumb on every slot.
+    Timed-out slots are left alone.
     """
     if not results:
         return 0
@@ -11060,10 +11015,8 @@ def _fill_related_for_finished_slots(
     window = float(MULTI_RELATED_BUDGET_S if budget_s is None else budget_s)
     rel_end = now + max(0.0, window)
     if identify_deadline is not None:
-        # 80s past the 150s identify mark is still inside the 240s worker.
-        # A 2–3 image identify uses a later mark, so that slack is smaller.
-        slack = 20.0 if getattr(_BATCH, "small_batch", False) else 80.0
-        rel_end = min(rel_end, float(identify_deadline) + slack)
+        # 80s past a caller-supplied identify mark stays inside the 240s worker.
+        rel_end = min(rel_end, float(identify_deadline) + 80.0)
     total_rel = 0
     floor = float(MULTI_RELATED_SLOT_FLOOR_S)
     for i, row in enumerate(results):
@@ -11088,6 +11041,7 @@ def _fill_related_for_finished_slots(
                 "active",
                 f"相關作品 {i + 1}/{len(results)}…",
                 0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
+                phase="相關作品",
             )
             filled = attach_related_by_title(row, budget_sec=slot_budget, per_item=False)
             rel = list(filled.get("related_by_title") or [])
@@ -11115,8 +11069,8 @@ def run_multi_identify_pipeline(
 
     Same-work merge happens only after both frames visually lock the same code.
     A frame that failed OCR or only has a title is never dropped.
-    A large batch stops at MULTI_IDENTIFY_BUDGET_S and returns the slots it
-    finished, plus an honest 尚未查完 card for the rest.
+    Every upload finishes vision, catalog, and jacket lock. Related runs
+    after that, on its own clock. There is no shared identify wall.
     """
     if not images:
         return run_identify_pipeline(
@@ -11137,69 +11091,24 @@ def run_multi_identify_pipeline(
         return attach_related_by_title(result, budget_sec=14.0), status
 
     n = len(images)
-    small_batch = n <= MULTI_SMALL_BATCH_N
-    if deadline is None:
-        budget_s = MULTI_SMALL_IDENTIFY_BUDGET_S if small_batch else MULTI_IDENTIFY_BUDGET_S
-        deadline = time.monotonic() + float(budget_s)
-    else:
-        deadline = float(deadline)
-    _enter_batch_ctx(deadline, small_batch=small_batch)
+    # `deadline` is ignored. Identify does not stop early to save a shared clock.
+    del deadline
+    _enter_batch_ctx(None)
     try:
         api_key = get_gemini_api_key()
         _progress(on_progress, "receive", "active", f"正在接收 {n} 張圖片…", 0.02)
         _progress(on_progress, "receive", "done", f"已接收 {n} 張圖片", 1 / 7)
 
-        # Read 2–3 covers together. Sequential vision was spending the whole
-        # identify clock before the second frame's catalog search started.
-        prefetched: list | None = None
-        if api_key and small_batch and _seconds_left(deadline) >= MULTI_VISION_START_S:
-            def _prefetch_vision(i: int):
-                img_bytes, fname = images[i]
-                mime = detect_image_mime(img_bytes, fname)
-                try:
-                    return call_gemini_vision(img_bytes, mime, api_key)
-                except Exception as exc:
-                    return exc
-
-            call_gemini_vision._model_cap = 2
-            try:
-                with ThreadPoolExecutor(max_workers=n) as pool:
-                    prefetched = list(pool.map(_prefetch_vision, range(n)))
-            finally:
-                call_gemini_vision._model_cap = None
-
         vision_rows: list[dict] = []
         for i, (img_bytes, fname) in enumerate(images):
             idx = i + 1
-            prefetched_here = prefetched[i] if prefetched is not None else None
-            if prefetched_here is None and _seconds_left(deadline) < MULTI_VISION_START_S:
-                vision_rows.append(
-                    {
-                        "index": idx,
-                        "filename": fname,
-                        "code": None,
-                        "title": None,
-                        "actress": None,
-                        "studio": None,
-                        "vision_used": False,
-                        "image_bytes": img_bytes,
-                        "budget_skipped": True,
-                    }
-                )
-                _progress(
-                    on_progress,
-                    "vision",
-                    "active",
-                    f"第 {idx}/{n} 張：時間不夠，請再上傳這張重查",
-                    0.05 + 0.35 * (idx / max(n, 1)),
-                )
-                continue
             _progress(
                 on_progress,
                 "vision",
                 "active",
                 f"辨識第 {idx}/{n} 張…",
                 0.05 + 0.35 * (i / max(n, 1)),
+                phase="辨識中",
             )
             row: dict = {
                 "index": idx,
@@ -11216,12 +11125,7 @@ def run_multi_identify_pipeline(
             mime = detect_image_mime(img_bytes, fname)
             if api_key:
                 try:
-                    if prefetched_here is not None:
-                        if isinstance(prefetched_here, Exception):
-                            raise prefetched_here
-                        vm = prefetched_here
-                    else:
-                        vm = call_gemini_vision(img_bytes, mime, api_key)
+                    vm = call_gemini_vision(img_bytes, mime, api_key)
                     row["vision_used"] = True
                     if vm.get("code"):
                         row["code"] = str(vm.get("code"))
@@ -11466,32 +11370,13 @@ def run_multi_identify_pipeline(
         for ji, job in enumerate(jobs):
             if getattr(_BATCH, "active", False):
                 _BATCH.jacket_incomplete = False
-            if (
-                job.get("kind") == "timeout"
-                or _seconds_left(deadline) < MULTI_SLOT_RESERVE_S
-                or _keep_time_for_related(results, deadline)
-            ):
-                for rest in jobs[ji:]:
-                    rest_row = rest.get("row") if isinstance(rest.get("row"), dict) else None
-                    one = _time_budget_slot(rest_row)
-                    one["line"] = "main" if not results else "multi"
-                    one["ok"] = True
-                    results.append(one)
-                    _note_slot(one)
-                _progress(
-                    on_progress,
-                    "search",
-                    "active",
-                    f"時間上限，其餘 {len(jobs) - ji} 張請再上傳重查",
-                    0.8,
-                )
-                break
             _progress(
                 on_progress,
                 "search",
                 "active",
                 f"搜尋第 {ji + 1}/{len(jobs)} 張…",
                 0.55 + 0.25 * (ji / max(len(jobs), 1)),
+                phase="目錄查詢",
             )
             row = job.get("row") if isinstance(job.get("row"), dict) else None
             vm = None
@@ -11533,7 +11418,7 @@ def run_multi_identify_pipeline(
                         queries.insert(0, job["title"])
                     resolved = None
                     noisy_title = not _title_is_search_ready(str(job.get("title") or ""))
-                    if slot_image and noisy_title and _seconds_left(deadline) > 8.0:
+                    if slot_image and noisy_title:
                         try:
                             resolved = _resolve_unnumbered_cover(queries, slot_image)
                         except Exception:
@@ -11580,6 +11465,14 @@ def run_multi_identify_pipeline(
                         if not packed["candidates"] and packed.get("code"):
                             packed["candidates"] = [dict(packed)]
                         try:
+                            _progress(
+                                on_progress,
+                                "search",
+                                "active",
+                                f"封面鎖定第 {ji + 1}/{len(jobs)} 張…",
+                                0.55 + 0.25 * ((ji + 0.5) / max(len(jobs), 1)),
+                                phase="封面鎖定",
+                            )
                             packed = apply_visual_rank_to_hit(packed, slot_image, api_key=api_key)
                         except Exception:
                             packed = packed
@@ -11708,6 +11601,14 @@ def run_multi_identify_pipeline(
 
             if one.get("ok") and _catalog_code_of(one) and not one.get("timed_out"):
                 try:
+                    _progress(
+                        on_progress,
+                        "cover",
+                        "active",
+                        f"封面鎖定第 {ji + 1}/{len(jobs)} 張…",
+                        0.7 + 0.1 * ((ji + 1) / max(len(jobs), 1)),
+                        phase="封面鎖定",
+                    )
                     one = verify_work_against_image(
                         one,
                         slot_image,
@@ -11855,10 +11756,10 @@ def run_multi_identify_pipeline(
         # Related for every finished catalog hit. This clock is not the
         # leftover of the identify deadline: that leftover used to be <1.5s
         # and every carousel stayed empty, including the first success.
-        _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94)
+        _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94, phase="相關作品")
         total_rel = _fill_related_for_finished_slots(
             results,
-            identify_deadline=deadline,
+            identify_deadline=None,
             on_progress=on_progress,
         )
         # Top-level related mirrors first work (compat); gallery uses each results[].related_by_title
@@ -11891,8 +11792,19 @@ IDENTIFY_STEPS = (
 )
 
 
-def _progress(cb, step: str, status: str, detail: str = "", progress: float | None = None) -> None:
-    """Safe progress callback. status: pending|active|done|skipped|error."""
+def _progress(
+    cb,
+    step: str,
+    status: str,
+    detail: str = "",
+    progress: float | None = None,
+    phase: str | None = None,
+) -> None:
+    """Safe progress callback. status: pending|active|done|skipped|error.
+
+    `phase` is the fine step beside the active row (辨識中, 目錄查詢,
+    封面鎖定, 相關作品). It does not replace the step id.
+    """
     if not cb:
         return
     if progress is None:
@@ -11910,7 +11822,15 @@ def _progress(cb, step: str, status: str, detail: str = "", progress: float | No
         except ValueError:
             progress = 0.0
     try:
-        cb({"step": step, "status": status, "detail": detail or "", "progress": round(float(progress), 3)})
+        evt = {
+            "step": step,
+            "status": status,
+            "detail": detail or "",
+            "progress": round(float(progress), 3),
+        }
+        if phase:
+            evt["phase"] = phase
+        cb(evt)
     except Exception:
         pass
 
@@ -12081,6 +12001,7 @@ def _complete_identify_result(
     extra_candidates: list | None = None,
     skip_related: bool = False,
     image_hash: str | None = None,
+    on_progress=None,
 ) -> dict:
     """Shared finish for code, title, and image identify.
 
@@ -12092,6 +12013,7 @@ def _complete_identify_result(
         return result
     if image_bytes:
         try:
+            _progress(on_progress, "cover", "active", "封面鎖定…", 0.9, phase="封面鎖定")
             result = _ensure_image_visual_rank(
                 result, image_bytes, api_key, extra_candidates
             )
@@ -12104,6 +12026,7 @@ def _complete_identify_result(
             pass
     elif not skip_related:
         try:
+            _progress(on_progress, "done", "active", "相關作品…", 0.94, phase="相關作品")
             result = attach_related_by_title(result, budget_sec=14.0)
         except Exception:
             result.setdefault("related_by_title", [])
@@ -12183,6 +12106,7 @@ def run_identify_pipeline(
             extra_candidates=extras,
             skip_related=skip_related,
             image_hash=img_hash,
+            on_progress=on_progress,
         )
     # Same screenshot may reuse catalog fields, but must re-check cover + stills
     # against this upload. A previous 僅排序未鎖定 must not be replayed as-is.
@@ -12252,7 +12176,7 @@ def run_identify_pipeline(
     if image_bytes is not None:
         mime = detect_image_mime(image_bytes, filename)
         if api_key:
-            _progress(on_progress, "vision", "active", "Gemini 看圖辨識中…", 1 / 6)
+            _progress(on_progress, "vision", "active", "Gemini 看圖辨識中…", 1 / 6, phase="辨識中")
             try:
                 vision_meta = call_gemini_vision(image_bytes, mime, api_key)
                 vision_used = True
@@ -12554,7 +12478,7 @@ def run_identify_pipeline(
         vactress = vision_meta.get("actress")
         vstudio = vision_meta.get("studio")
         _progress(on_progress, "parse", "done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
-        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6, phase="目錄查詢")
         phrase_extras = list(text_queries or [])
         phrase_blob = "\n".join(
             str(part or "")
@@ -12621,7 +12545,14 @@ def run_identify_pipeline(
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
             already_locked = bool((hit.get("visual_meta") or {}).get("visual_lock"))
             if n_pre >= 1 and image_bytes and not already_locked:
-                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                _progress(
+                    on_progress,
+                    "cover",
+                    "active",
+                    "對照原圖核對人物／衣服／表情／飾品／姿勢…",
+                    4 / 6,
+                    phase="封面鎖定",
+                )
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
             search_mode = "title"
@@ -12649,7 +12580,14 @@ def run_identify_pipeline(
             if len(coded) >= 1:
                 hit2 = hit or {"candidates": coded, "title": vtitle}
                 if len(coded) >= 1 and image_bytes:
-                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                    _progress(
+                    on_progress,
+                    "cover",
+                    "active",
+                    "對照原圖核對人物／衣服／表情／飾品／姿勢…",
+                    4 / 6,
+                    phase="封面鎖定",
+                )
                     hit2 = apply_visual_rank_to_hit(hit2, image_bytes, api_key=api_key)
                     vmeta = hit2.get("visual_meta") or {}
                     if vmeta.get("visual_ranked"):
@@ -12753,7 +12691,7 @@ def run_identify_pipeline(
     if not code and user_title:
         search_mode = "title"
         _progress(on_progress, "parse", "done", f"使用片名：{user_title[:40]}", 3 / 6)
-        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6, phase="目錄查詢")
         hit = None
         try:
             hit = search_by_title(user_title, actress=(user_actress or "").strip() or None)
@@ -12779,7 +12717,14 @@ def run_identify_pipeline(
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
             if n_pre >= 1 and image_bytes:
-                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                _progress(
+                    on_progress,
+                    "cover",
+                    "active",
+                    "對照原圖核對人物／衣服／表情／飾品／姿勢…",
+                    4 / 6,
+                    phase="封面鎖定",
+                )
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
             title_search_hit = hit
@@ -12811,7 +12756,14 @@ def run_identify_pipeline(
             if coded:
                 hit2 = hit
                 if len(coded) >= 1 and image_bytes:
-                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                    _progress(
+                    on_progress,
+                    "cover",
+                    "active",
+                    "對照原圖核對人物／衣服／表情／飾品／姿勢…",
+                    4 / 6,
+                    phase="封面鎖定",
+                )
                     hit2 = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
                     vmeta = hit2.get("visual_meta") or {}
                     if vmeta.get("visual_ranked"):
@@ -12882,7 +12834,7 @@ def run_identify_pipeline(
     _progress(on_progress, "parse", "done", f"番號：{disp}", 3 / 6)
 
     # Step 4: search metadata
-    _progress(on_progress, "search", "active", f"搜尋作品資料（{disp}）…", 3 / 6)
+    _progress(on_progress, "search", "active", f"搜尋作品資料（{disp}）…", 3 / 6, phase="目錄查詢")
     result = identify_code(code, ocr_preview=ocr_preview, vision_meta=vision_meta)
     result["vision_used"] = vision_used
     result["search_mode"] = search_mode if search_mode in ("code", "title", "manual") else (
