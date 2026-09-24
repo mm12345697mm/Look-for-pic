@@ -9,6 +9,11 @@ Two ways this frame resolves:
 - the listing caption prints one 品番 (APGH-012 / ApGH-012)
 - no 品番, but actress 柊ゆうき plus a visual lock on that cover
 
+Full-text search (every printed line, not just the slogan) runs only when the
+shot is one complete cover AND the read has no listing row under the thumb.
+A grid, multi-row screenshot, or player overlay keeps the focused code and
+primary title. Do not drop this gate.
+
 SHJG-448 in other tests is a fictional phrase-in-title mechanic, not this work.
 """
 from __future__ import annotations
@@ -125,7 +130,10 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertIn("無碼影片", prompt)
         self.assertIn("ApGH-012", prompt)
         self.assertIn("texts", prompt)
-        self.assertIn("全部", prompt)
+        # Full dump is cover-only. Listing and UI must not pour every line in.
+        self.assertIn("shot=cover", prompt)
+        self.assertIn("listing", prompt)
+        self.assertIn("不要把整頁字", prompt)
 
     def test_code_shapes_and_chrome_are_not_titles(self):
         for raw in ("APGH-012", "ApGH-012", "APGH 012", "APGH012"):
@@ -151,6 +159,10 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertEqual(parsed.get("code"), "APGH-012")
         self.assertIn("先生が2人っきりの", parsed.get("texts") or [])
         self.assertIn("舌技が神", parsed.get("texts") or [])
+        listed = S.parse_vision_json('{"shot":"LISTING","title":"舌技が神"}')
+        self.assertEqual(listed.get("shot"), "listing")
+        unknown = S.parse_vision_json('{"shot":"poster","title":"舌技が神"}')
+        self.assertEqual(unknown.get("shot"), "")
 
     def test_listing_caption_code_beats_slogan(self):
         img = b"missav-apgh-012-card"
@@ -262,13 +274,43 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertEqual(payload.get("title"), APGH_TITLE)
         self.assertEqual(searches, [])
 
+    def test_full_text_gate_requires_cover_and_no_listing_row(self):
+        """Do not drop this gate: both a complete cover and no caption row."""
+        fragments = "舌技が神\n先生が2人っきりの\nプライベート補習"
+        self.assertTrue(S._cover_full_text_allowed({"shot": "cover"}, fragments))
+        self.assertFalse(S._cover_full_text_allowed({}, fragments))
+        self.assertFalse(S._cover_full_text_allowed({"shot": ""}, fragments))
+        self.assertFalse(S._cover_full_text_allowed({"shot": "listing"}, fragments))
+        self.assertFalse(S._cover_full_text_allowed({"shot": "ui"}, fragments))
+        caption = "APGH-012 Yuuki Hiiragi\n舌技が神"
+        self.assertTrue(S._listing_chrome_in_text(caption))
+        self.assertFalse(S._cover_full_text_allowed({"shot": "cover"}, caption))
+        self.assertFalse(
+            S._cover_full_text_allowed({"shot": "cover"}, "舌技が神\n2:25:56\n無碼影片")
+        )
+        self.assertFalse(
+            S._cover_full_text_allowed({"shot": "cover"}, "LIVE\n先生が2人っきりの")
+        )
+        self.assertTrue(
+            S._listing_chrome_in_text("APGH-012\nAPGH-015\n先生が2人っきりの")
+        )
+
     def test_cover_only_full_text_beats_the_slogan(self):
-        """No 品番 on the art. The catalog line is smaller print than 舌技が神."""
+        """No 品番 on the art. The catalog line is smaller print than 舌技が神.
+
+        shot=cover is required. Without it this same OCR must not be searched
+        as a blob (see the listing/grid cases).
+        """
         img = b"cover-art-title-fragments"
         seen: list[str] = []
 
         def vision(image_bytes, mime, api_key):
-            return {"title": "舌技が神", "actress": ACTRESS, "texts": ["舌技が神"]}
+            return {
+                "shot": "cover",
+                "title": "舌技が神",
+                "actress": ACTRESS,
+                "texts": ["舌技が神"],
+            }
 
         def ocr(image_bytes):
             return "舌技が神\n先生が2人っきりの\nプライベート補習\nオーロラ"
@@ -307,6 +349,152 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertTrue(any("先生" in q or "補習" in q for q in seen))
         self.assertNotEqual(seen[:1], ["舌技が神"])
         self.assertNotIn("Yuuki", "\n".join(seen))
+
+    def _run_recorded_search(self, vision, ocr, seen: list[str]):
+        def search(title, actress=None):
+            seen.append(re.sub(r"\s+", "", str(title or "")))
+            return None
+
+        with mock.patch.multiple(
+            S,
+            get_gemini_api_key=mock.Mock(return_value="test-key"),
+            call_gemini_vision=mock.Mock(side_effect=vision),
+            ocr_image_bytes=mock.Mock(side_effect=ocr),
+            search_by_title=mock.Mock(side_effect=search),
+            identify_code=mock.Mock(side_effect=self._identify),
+            fetch_avbase_title_results=mock.Mock(return_value=[]),
+            rank_candidates_by_visual=mock.Mock(side_effect=self._rank(None)),
+            offline_cache_get=mock.Mock(return_value=None),
+            offline_cache_put=mock.Mock(return_value=None),
+            probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_chinese_title=mock.Mock(return_value=None),
+            find_related_by_title=mock.Mock(return_value=[]),
+            attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
+        ):
+            return S.run_identify_pipeline(image_bytes=b"shot", filename="shot.jpg")
+
+    def test_listing_grid_and_ui_do_not_dump_every_line(self):
+        """Do not drop this gate. Neighbor rows stay out of search."""
+        neighbor = "別作品の家庭教師は今日も居残り"
+        ocr_text = "舌技が神\n先生が2人っきりの\n" + neighbor + "\n2:25:56\n無碼影片"
+
+        def ocr(image_bytes):
+            return ocr_text
+
+        for shot in ("listing", "ui", ""):
+            seen: list[str] = []
+
+            def vision(image_bytes, mime, api_key, shot=shot):
+                row = {
+                    "title": "舌技が神",
+                    "actress": ACTRESS,
+                    "texts": ["舌技が神", "先生が2人っきりの", neighbor],
+                }
+                if shot:
+                    row["shot"] = shot
+                return row
+
+            payload, status = self._run_recorded_search(vision, ocr, seen)
+            blob = "\n".join(seen)
+            self.assertEqual(status, 200, shot)
+            self.assertNotIn("先生", blob, shot)
+            self.assertNotIn("補習", blob, shot)
+            self.assertNotIn("家庭教師", blob, shot)
+            self.assertEqual(payload.get("code"), "TITLE-SEARCH", shot)
+
+    def test_cover_label_with_caption_row_does_not_dump_text(self):
+        """shot=cover is not enough when a missav row sits under the thumb.
+
+        The caption 品番 is still used. Neighbor title lines are not searched.
+        Do not drop this gate.
+        """
+        seen: list[str] = []
+
+        def vision(image_bytes, mime, api_key):
+            return {
+                "shot": "cover",
+                "title": "舌技が神",
+                "actress": ACTRESS,
+                "texts": ["舌技が神", "先生が2人っきりの", "別作品の家庭教師は今日も居残り"],
+            }
+
+        def ocr(image_bytes):
+            return (
+                "APGH-012 Yuuki Hiiragi\n舌技が神\n先生が2人っきりの\n"
+                "別作品の家庭教師は今日も居残り"
+            )
+
+        payload, status = self._run_recorded_search(vision, ocr, seen)
+        blob = "\n".join(seen)
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("code"), APGH_CODE)
+        self.assertEqual(payload.get("title"), APGH_TITLE)
+        self.assertNotIn("先生", blob)
+        self.assertNotIn("家庭教師", blob)
+
+    def test_multi_listing_does_not_search_neighbor_rows(self):
+        """Do not drop this gate on the multi path either."""
+        img_list = b"listing-rows"
+        img_cover = b"full-jacket"
+        neighbor = "別作品の家庭教師は今日も居残り"
+        seen: list[str] = []
+
+        def vision(image_bytes, mime, api_key):
+            if image_bytes == img_cover:
+                return {
+                    "shot": "cover",
+                    "title": "舌技が神",
+                    "actress": ACTRESS,
+                    "texts": ["舌技が神"],
+                }
+            return {
+                "shot": "listing",
+                "title": "舌技が神",
+                "actress": ACTRESS,
+                "texts": ["舌技が神", "先生が2人っきりの", neighbor],
+            }
+
+        def ocr(image_bytes):
+            if image_bytes == img_cover:
+                return "舌技が神\n先生が2人っきりの\nプライベート補習\nオーロラ"
+            return "舌技が神\n先生が2人っきりの\n" + neighbor + "\n2:25:56"
+
+        def search(title, actress=None):
+            q = re.sub(r"\s+", "", str(title or ""))
+            seen.append(q)
+            official = re.sub(r"\s+", "", APGH_TITLE)
+            if len(q) >= 6 and q in official:
+                return _work(APGH_CODE, APGH_TITLE)
+            return None
+
+        with mock.patch.multiple(
+            S,
+            get_gemini_api_key=mock.Mock(return_value="test-key"),
+            call_gemini_vision=mock.Mock(side_effect=vision),
+            ocr_image_bytes=mock.Mock(side_effect=ocr),
+            search_by_title=mock.Mock(side_effect=search),
+            identify_code=mock.Mock(side_effect=self._identify),
+            fetch_avbase_title_results=mock.Mock(return_value=[]),
+            rank_candidates_by_visual=mock.Mock(side_effect=self._rank(None)),
+            offline_cache_get=mock.Mock(return_value=None),
+            offline_cache_put=mock.Mock(return_value=None),
+            probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_chinese_title=mock.Mock(return_value=None),
+            find_related_by_title=mock.Mock(return_value=[]),
+            attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
+        ):
+            payload, status = S.run_multi_identify_pipeline(
+                [(img_list, "list.jpg"), (img_cover, "cover.jpg")]
+            )
+
+        self.assertEqual(status, 200)
+        results = payload.get("results") or []
+        self.assertEqual(len(results), 2, payload.get("related_note"))
+        self.assertEqual(results[0].get("code"), "TITLE-SEARCH")
+        self.assertEqual(results[1].get("code"), APGH_CODE)
+        blob = "\n".join(seen)
+        self.assertNotIn("家庭教師", blob)
+        self.assertTrue(any("先生" in q or "補習" in q for q in seen))
 
     def test_no_visual_lock_stays_title_only(self):
         img = b"cover-only-no-lock"

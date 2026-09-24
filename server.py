@@ -71,18 +71,21 @@ GEMINI_TEXT_MODELS = (
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
 )
-VISION_PROMPT = """你是 AV／JAV 封面與列表截圖辨識助手。圖片可能是整張封面（沒有網站列），或 missav／JAVDB 列表。
+VISION_PROMPT = """你是 AV／JAV 封面與列表截圖辨識助手。先判斷畫面是哪一種，再讀字。回傳 JSON（不要 markdown、不要程式碼圍欄、不要多餘說明）：
+{"code":"APGH-012","title":null,"actress":"...","studio":"...","shot":"cover","texts":["舌技が神","先生が2人っきりの","APGH-012"],"confidence":0.0,"notes":""}
 
-請讀取畫面上「全部」看得到的字，不要只挑最大的那句。回傳 JSON（不要 markdown、不要程式碼圍欄、不要多餘說明）：
-{"code":"APGH-012","title":"日本語タイトル","actress":"...","studio":"...","texts":["APGH-012","日本語タイトル","女優名","メーカー","角落小字"],"confidence":0.0,"notes":""}
+shot 只能是 cover、listing、ui：
+- cover：一整張封面或封套，畫面底下沒有網站標題列。
+- listing：縮圖加上方或下方的標題列、多列列表、或格子。例如縮圖下「APGH-012 Yuuki Hiiragi」。
+- ui：播放器、LIVE、時長、無碼影片這類介面，不是封面。
 
 規則：
-1. texts 列出每一段讀得到的字：番號、標題各行、女優、片商、角落印章、小字。短宣傳句也要留下。不要因為有一句很大的標語就漏掉其餘的字。
-2. 番號優先於裝飾字。APGH-012、ApGH-012、APGH 012 這類都要寫進 code，並出現在 texts。寫成「英數-數字」。封面本體上的番號與列表縮圖下方的番號同樣要讀。
-3. 短直排或宣傳句（例如「舌技」「舌技が神」）不是目錄片名。title 只填真正的作品標題那一行；沒有就 null。短標語仍放在 texts，不要拿它冒充 title。
-4. 不要把網站介面當成 title：時長（2:25:56）、無碼影片、有碼、中文字幕、LIVE、網站名。
-5. 看不清楚的欄位填 null。不要翻譯、不要發明、不要補全看不到的字。confidence 為 0.0～1.0。
-6. actress 用畫面上的人名。列表若是羅馬字（Yuuki Hiiragi）而封面有日文名，優先日文名。studio 沒有就 null。
+1. 只有 shot=cover 時，texts 才列出這張封面上的每一段字（番號、標題各行、女優、片商、角落小字、短宣傳句）。不要只留最大的那句。
+2. shot 是 listing 或 ui 時，不要把整頁字倒進去。texts 只留焦點那一張縮圖的番號與主標題，不要鄰近列、聊天室、或其他卡片的字。
+3. 番號優先於裝飾字。APGH-012、ApGH-012、APGH 012 寫進 code，並出現在 texts。寫成「英數-數字」。
+4. 短直排或宣傳句（舌技、舌技が神）不是目錄片名。title 只填真正的作品標題那一行；沒有就 null。短標語可以留在 texts。
+5. 時長（2:25:56）、無碼影片、有碼、中文字幕、LIVE、網站名不是 title。
+6. 看不清楚填 null。不要翻譯、不要發明、不要補全看不到的字。confidence 為 0.0～1.0。actress 優先日文名。studio 沒有就 null。
 7. 只輸出一行合法 JSON。
 """
 
@@ -1360,11 +1363,16 @@ def parse_vision_json(text: str) -> dict[str, Any]:
     except (TypeError, ValueError):
         confidence = None
 
+    shot = (clean_str(data.get("shot")) or "").lower()
+    if shot not in {"cover", "listing", "ui"}:
+        shot = ""
+
     return {
         "code": code,
         "title": clean_str(data.get("title")),
         "actress": clean_str(data.get("actress")),
         "studio": clean_str(data.get("studio")),
+        "shot": shot,
         "texts": texts[:24],
         "confidence": confidence,
         "notes": clean_str(data.get("notes")) or "",
@@ -7937,6 +7945,44 @@ def _compose_read_blob(*parts: Any) -> str:
     return "\n".join(lines)
 
 
+def _listing_chrome_in_text(blob: str | None) -> bool:
+    """Site row, grid, or player chrome — not text printed on one jacket.
+
+    A missav caption is a 品番 plus a latin name under the thumb
+    (APGH-012 Yuuki Hiiragi), often with a duration or 無碼影片. Two or more
+    品番 means a grid. LIVE is a player overlay. None of these are a full cover.
+    """
+    text = str(blob or "")
+    if re.search(
+        r"(無碼影片|無碼|有碼|中文字幕|missav|javdb|javlibrary|\bLIVE\b|\d{1,2}:\d{2}(?::\d{2})?)",
+        text,
+        re.I,
+    ):
+        return True
+    if re.search(
+        r"[A-Za-z]{2,10}[\s\-－–—]*\d{2,5}\s+[A-Za-z][A-Za-z.'’\- ]{1,40}",
+        text,
+    ):
+        return True
+    _sole, codes = _sole_product_code(text)
+    return len(codes) >= 2
+
+
+def _cover_full_text_allowed(vision: dict | None, blob: str | None) -> bool:
+    """Full-read search only for one complete jacket and no listing row under it.
+
+    Both must hold: vision shot is cover, and the read has no site chrome.
+    Listing, grid, and UI captures keep the focused code + primary title even
+    if the model also dumped neighboring lines into texts. Do not drop this gate.
+    """
+    shot = str((vision or {}).get("shot") or "").strip().lower()
+    if shot != "cover":
+        return False
+    if _listing_chrome_in_text(blob):
+        return False
+    return True
+
+
 def _full_text_search_queries(blob: str | None, *, actress: str | None = None) -> list[str]:
     """Distinctive lines from the whole read, slogan last is omitted when real lines exist.
 
@@ -8583,6 +8629,8 @@ def run_multi_identify_pipeline(
                     row["studio"] = str(vm.get("studio"))
                 if isinstance(vm.get("texts"), list):
                     row["vision_texts"] = [str(t).strip() for t in vm["texts"] if str(t or "").strip()]
+                if vm.get("shot"):
+                    row["shot"] = str(vm.get("shot"))
             except Exception as e:
                 row["vision_error"] = str(e)[:120]
                 try:
@@ -8651,7 +8699,13 @@ def run_multi_identify_pipeline(
                 row["ocr_code"] = sole_blob
             elif many_blob and not row.get("ocr_codes"):
                 row["ocr_codes"] = many_blob
-        row["text_queries"] = _full_text_search_queries(read_blob, actress=row.get("actress"))
+        # Full-text search only for one complete cover and no listing row under
+        # the thumb. A grid, multi-row screenshot, or player overlay keeps the
+        # focused 品番 and primary title. Do not drop this gate.
+        if _cover_full_text_allowed(row, read_blob):
+            row["text_queries"] = _full_text_search_queries(read_blob, actress=row.get("actress"))
+        else:
+            row["text_queries"] = []
         if (
             row["text_queries"]
             and not (row.get("code") and parse_code_parts(str(row.get("code") or "")))
@@ -9517,8 +9571,9 @@ def run_identify_pipeline(
             vision_meta["title"] = ocr_title
             extra_msg = (extra_msg + " " if extra_msg else "") + "看圖未讀到片名，已用 OCR 補片名。"
 
-    # Cover-only art: the biggest phrase can be a slogan while the 品番 or the
-    # real title fragment is smaller print. Search the whole read, not one line.
+    # A corner 品番 is still a focused read on any shot. Dumping every other
+    # line into search is separate, and only allowed for one complete cover
+    # with no listing row under the thumb. Do not drop this gate.
     if image_bytes is not None:
         read_blob = _compose_read_blob(
             (vision_meta or {}).get("texts") if vision_meta else None,
@@ -9535,19 +9590,22 @@ def run_identify_pipeline(
                 extra_msg = (extra_msg + " " if extra_msg else "") + "已從整段文字讀出番號。"
             elif many_blob:
                 ambiguous_codes = many_blob
-        text_queries = _full_text_search_queries(
-            read_blob,
-            actress=(vision_meta or {}).get("actress") if vision_meta else None,
-        )
-        current_title = str((vision_meta or {}).get("title") or "") if vision_meta else ""
-        if (
-            not code
-            and text_queries
-            and (not is_usable_title(current_title) or _is_decorative_overlay(current_title))
-        ):
-            vision_meta = dict(vision_meta or {})
-            vision_meta["title"] = text_queries[0]
-            extra_msg = (extra_msg + " " if extra_msg else "") + "已改搜封面上其餘文字。"
+        if _cover_full_text_allowed(vision_meta, read_blob):
+            text_queries = _full_text_search_queries(
+                read_blob,
+                actress=(vision_meta or {}).get("actress") if vision_meta else None,
+            )
+            current_title = str((vision_meta or {}).get("title") or "") if vision_meta else ""
+            if (
+                not code
+                and text_queries
+                and (not is_usable_title(current_title) or _is_decorative_overlay(current_title))
+            ):
+                vision_meta = dict(vision_meta or {})
+                vision_meta["title"] = text_queries[0]
+                extra_msg = (extra_msg + " " if extra_msg else "") + "已改搜封面上其餘文字。"
+        else:
+            text_queries = []
 
     # Step 3: parse code/title
     _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
