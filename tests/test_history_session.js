@@ -2150,6 +2150,49 @@ function walkNodes(node, acc) {
     assert.deepStrictEqual(codesOf(H.loadHistory().find((r) => r.id === 'empty-related')), []);
   }
 
+  {
+    const steps = context.document.getElementById('progress-steps');
+    steps.querySelector = function (sel) {
+      const m = /\[data-step="([^"]+)"\]/.exec(String(sel || ''));
+      if (!m) return null;
+      return (this.children || []).find((c) => c.dataset && c.dataset.step === m[1]) || null;
+    };
+    steps.querySelectorAll = function () {
+      return this.children || [];
+    };
+    H.showProgress([
+      { id: 'vision', label: '看圖辨識（Gemini）' },
+      { id: 'search', label: '搜尋作品資料' },
+      { id: 'done', label: '完成，進入畫廊' },
+    ]);
+    H.applyProgressEvent({
+      step: 'vision',
+      status: 'active',
+      phase: '辨識中',
+      detail: '辨識第 1/4 張…',
+    });
+    const vision = steps.children.find((c) => c.dataset.step === 'vision');
+    assert.ok(vision, 'vision step row');
+    assert.strictEqual(vision.dataset.phase, '辨識中');
+    assert.ok(String(vision.textContent).indexOf('辨識中') !== -1, vision.textContent);
+    assert.ok(String(vision.innerHTML).indexOf('看圖辨識') !== -1, vision.innerHTML);
+    const detail = context.document.getElementById('progress-detail');
+    assert.ok(String(detail.textContent).indexOf('辨識第 1/4') !== -1);
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      phase: '目錄查詢',
+      detail: '搜尋第 2/4 張…',
+    });
+    const search = steps.children.find((c) => c.dataset.step === 'search');
+    assert.strictEqual(search.dataset.phase, '目錄查詢');
+    assert.ok(!vision.dataset.phase, 'only the active step keeps the sub-progress');
+    H.applyProgressEvent({ step: 'done', status: 'active', phase: '相關作品', detail: '相關作品 1/4…' });
+    const done = steps.children.find((c) => c.dataset.step === 'done');
+    assert.strictEqual(done.dataset.phase, '相關作品');
+    assert.ok(!search.dataset.phase);
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);
