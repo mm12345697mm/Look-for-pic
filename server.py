@@ -65,13 +65,8 @@ MULTI_IDENTIFY_BUDGET_S = 150.0
 MULTI_SLOT_RESERVE_S = 4.0
 # Do not start a shortened vision call. Below this, the frame is retryable.
 MULTI_VISION_START_S = 15.0
-# Related carousels share this wall after identify. It is not the leftover
-# of the identify clock: a finished catalog hit still gets a real attempt
-# while the worker wall (gunicorn 240s, identify ~150s) has room.
+# Related carousels for a large batch share this wall, not 8s × N.
 MULTI_RELATED_BUDGET_S = 20.0
-# A related call below this does not fill a bucket. Stop instead of
-# splitting the shared window into empty crumbs.
-MULTI_RELATED_SLOT_FLOOR_S = 4.0
 STREAM_KEEPALIVE_S = 5.0
 # Soft deadline for online code→title attempts in identify_code
 IDENTIFY_ONLINE_BUDGET = 20
@@ -4943,7 +4938,7 @@ def _keyword_related_sort_key(item: dict | None) -> tuple:
     Relation phrases sit ahead of bare kinship when theme hits are tied at zero.
     """
     if not isinstance(item, dict):
-        return (0, 0, 0, 0)
+        return (0, 0, 0)
     hits = int(item.get("keyword_hits") or 0)
     matched = item.get("matched_keywords") or item.get("hit_keywords") or []
     if not isinstance(matched, list):
@@ -4958,9 +4953,7 @@ def _keyword_related_sort_key(item: dict | None) -> tuple:
             theme += 1
         if _is_relation_phrase(tok):
             compound += 1
-    # A real jacket outranks now_printing / empty cover. Hit count still
-    # orders rows that are equally showable.
-    return (1 if _related_has_real_cover(item) else 0, 1 if theme else 0, hits, 1 if compound else 0)
+    return (1 if theme else 0, hits, 1 if compound else 0)
 
 
 def _merge_unique_urls(primary, secondary, *, cap: int = 20) -> list[str]:
@@ -4974,48 +4967,6 @@ def _merge_unique_urls(primary, secondary, *, cap: int = 20) -> list[str]:
         out.append(s)
         if len(out) >= cap:
             break
-    return out
-
-
-def _merge_related_upgrade(seed_items, fresh_items) -> list:
-    """New ranking first, then any saved row that still has a real cover.
-
-    A short fresh search must not discard a saved jacket just because a
-    bucket is under its maximum. Rows with no usable cover are not kept
-    merely to pad that maximum. If the fresh search produced nothing, the
-    saved list is returned unchanged.
-    """
-    fresh = [x for x in (fresh_items or []) if isinstance(x, dict)]
-    seed = [x for x in (seed_items or []) if isinstance(x, dict)]
-    if not fresh:
-        return [dict(x) for x in seed]
-
-    def _key(it: dict) -> str:
-        code = str(it.get("code") or "").strip()
-        if not code:
-            return ""
-        if parse_code_parts(code):
-            return format_display_code(code)
-        return code
-
-    out: list[dict] = []
-    seen: set[str] = set()
-
-    def _push(it: dict) -> None:
-        key = _key(it)
-        if not key or key in seen:
-            return
-        seen.add(key)
-        row = dict(it)
-        row["code"] = key
-        row["line"] = _related_line_of(row)
-        out.append(row)
-
-    for it in fresh:
-        _push(it)
-    for it in seed:
-        if _related_has_real_cover(it):
-            _push(it)
     return out
 
 
@@ -5080,32 +5031,21 @@ def _payload_needs_title_zh(payload: dict) -> bool:
     return False
 
 
-def _related_codes(items) -> list[str]:
-    """Coded related rows, in stored order. Caps are maxima, not a quota."""
-    out: list[str] = []
-    for x in items or []:
-        if not isinstance(x, dict):
-            continue
-        code = str(x.get("code") or "").strip()
-        if code:
-            out.append(code)
-    return out
-
-
 def _related_needs_backfill(payload: dict) -> bool:
-    """True only when related was never saved and we can search.
-
-    A short saved list is finished. 5/5/3 are maxima, so being under the cap
-    must not start another search that changes who is in the carousel.
-    """
-    rel = payload.get("related_by_title")
-    if not isinstance(rel, list) or not rel:
-        rel = payload.get("related") if isinstance(payload.get("related"), list) else []
-    if _related_codes(rel):
-        return False
+    """True when a related bucket is under its cap and we have a way to fill it."""
+    rel = payload.get("related_by_title") or payload.get("related") or []
+    if not isinstance(rel, list):
+        rel = []
+    t, k, a = _related_bucket_counts(rel)
     title = str(payload.get("title") or "")
     actress = str(payload.get("actress") or "").strip()
-    return is_usable_title(title) or bool(actress)
+    if t < RELATED_THEME_CAP and is_usable_title(title):
+        return True
+    if k < RELATED_KEYWORD_CAP and is_usable_title(title):
+        return True
+    if a < RELATED_ACTRESS_CAP and actress:
+        return True
+    return False
 
 
 def _payload_stills_need_fill(payload: dict) -> bool:
@@ -5207,10 +5147,9 @@ def _backfill_catalog_identity(payload: dict) -> dict:
 def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) -> dict:
     """Incremental backfill for a cache/history hit, then merge-put.
 
-    Keep existing cover/stills/related. Fill missing title_zh, extra still
-    URLs under target, and related only when the saved list is empty.
-    A non-empty related list is frozen: do not search again because a
-    bucket is under its maximum, and do not drop saved rows to re-cap.
+    Keep existing cover/stills/related. Only fill gaps: missing title_zh,
+    related buckets under 5/5/3, extra still URLs if under target.
+    Skip network for buckets already at cap.
 
     cache_backfilled / chinese_titles_attached mean "attempted this request"
     only — they must not freeze an incomplete payload on later re-query.
@@ -5245,20 +5184,24 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
         pass
     try:
         if _related_needs_backfill(payload):
+            rel = [x for x in (payload.get("related_by_title") or []) if isinstance(x, dict)]
+            t, k, a = _related_bucket_counts(rel)
             filled = find_related_by_title(
                 payload.get("title"),
                 exclude_code=str(payload.get("code") or "") if payload.get("code") else None,
                 max_n=RELATED_THEME_CAP,
                 actress=payload.get("actress"),
                 budget_sec=OFFLINE_CACHE_RELATED_BUDGET,
+                seed=rel,
+                fill_theme=t < RELATED_THEME_CAP,
+                fill_keyword=k < RELATED_KEYWORD_CAP,
+                fill_actress=a < RELATED_ACTRESS_CAP,
             )
-            # One finished write. There is no saved membership to shrink.
-            payload["related_by_title"] = list(filled or [])
+            payload["related_by_title"] = _merge_related_for_cache(rel, filled)
         else:
-            rel = payload.get("related_by_title")
-            if not isinstance(rel, list) or not _related_codes(rel):
-                rel = payload.get("related") if isinstance(payload.get("related"), list) else []
-            payload["related_by_title"] = [x for x in (rel or []) if isinstance(x, dict)]
+            payload["related_by_title"] = _cap_related_buckets(
+                payload.get("related_by_title") or []
+            )
     except Exception:
         pass
     try:
@@ -8746,91 +8689,6 @@ def _preserve_related_bucket(raw: dict) -> dict:
     return item
 
 
-def _keyword_query_is_required_chip(q: str, keywords: list[str] | None) -> bool:
-    """True for a theme chip that must be queried, not a pair built from two chips.
-
-    Body-size tokens (巨乳 / 美乳 / 爆乳) and other strong chips such as 合宿
-    stay in the lineup after a compound has used the primary time window.
-    Weak kinship chips are not required.
-    """
-    tok = (q or "").strip()
-    if not tok:
-        return False
-    chips = {str(k or "").strip() for k in (keywords or []) if str(k or "").strip()}
-    if tok not in chips:
-        return False
-    if _is_body_generic_token(tok):
-        return True
-    return _is_auto_theme_keyword(tok)
-
-
-def _diversify_body_keyword_rows(
-    eligible: list[dict],
-    keywords: list[str] | None,
-    max_n: int,
-) -> list[dict]:
-    """Keep a mix of body-size pairings inside the keyword cap.
-
-    When the title contains 巨乳 / 美乳 / 爆乳 and the catalog returned rows
-    that pair that token with another theme (巨乳+媚薬漬け, 巨乳+合宿), those
-    pairings take a slot before the bucket fills with the other themes alone
-    (媚薬+合宿 and no 巨乳). 合宿 is not demoted: it is one of the partners.
-    Rows already in rank order stay in that order within each group.
-    """
-    if max_n <= 0:
-        return []
-    body = [k for k in (keywords or []) if _is_body_generic_token(k)]
-    if not body:
-        return eligible[:max_n]
-
-    def _matched(item: dict) -> list[str]:
-        raw = item.get("matched_keywords") or item.get("hit_keywords") or []
-        if not isinstance(raw, list):
-            return []
-        return [str(x).strip() for x in raw if str(x or "").strip()]
-
-    def _is_body_row(item: dict) -> bool:
-        return any(_is_body_generic_token(k) for k in _matched(item))
-
-    def _partners(item: dict) -> list[str]:
-        return [k for k in _matched(item) if not _is_body_generic_token(k)]
-
-    body_rows = [it for it in eligible if _is_body_row(it)]
-    other = [it for it in eligible if not _is_body_row(it)]
-    if not body_rows:
-        return eligible[:max_n]
-    paired = [it for it in body_rows if _partners(it)]
-    body_only = [it for it in body_rows if not _partners(it)]
-    chosen: list[dict] = []
-    seen: set[str] = set()
-
-    def _take(item: dict) -> bool:
-        code = str(item.get("code") or "")
-        if not code or code in seen:
-            return False
-        seen.add(code)
-        chosen.append(item)
-        return True
-
-    # One best row per other theme, in chip order, so 媚薬漬け and 合宿
-    # pairings both appear before a second row of either.
-    for partner in (k for k in (keywords or []) if not _is_body_generic_token(k)):
-        if len(chosen) >= max_n:
-            break
-        for item in paired:
-            if partner in _partners(item) and str(item.get("code") or "") not in seen:
-                _take(item)
-                break
-    for group in (paired, body_only, other):
-        for item in group:
-            if len(chosen) >= max_n:
-                break
-            _take(item)
-        if len(chosen) >= max_n:
-            break
-    return chosen[:max_n]
-
-
 def _find_related_by_keywords(
     title: str,
     *,
@@ -8935,11 +8793,11 @@ def _find_related_by_keywords(
                 continue
             _remember(strict, code, sc, c)
 
-    def _fetch_query(q: str, *, force: bool = False) -> list[dict]:
+    def _fetch_query(q: str) -> list[dict]:
         if not q or q in fetched:
             return []
         fetched.add(q)
-        if not force and _time.monotonic() - t0 > budget:
+        if _time.monotonic() - t0 > budget:
             return []
         rows: list[dict] = []
         for fetch in (
@@ -8947,7 +8805,7 @@ def _find_related_by_keywords(
             fetch_jav321_title_results,
             fetch_javlibrary_title_results,
         ):
-            if not force and _time.monotonic() - t0 > budget:
+            if _time.monotonic() - t0 > budget:
                 break
             try:
                 rows.extend(fetch(q, actress=None)[:10])
@@ -8958,12 +8816,9 @@ def _find_related_by_keywords(
         return rows
 
     for q in queries:
-        # Compounds may spend the primary window. Strong chips — 巨乳 and
-        # 合宿 alike — are still issued. Pair queries may stop.
-        required = (not explicit) and _keyword_query_is_required_chip(q, keywords)
-        if not required and _time.monotonic() >= min(primary_end, t0 + budget):
-            continue
-        _ingest(_fetch_query(q, force=required))
+        if _time.monotonic() >= min(primary_end, t0 + budget):
+            break
+        _ingest(_fetch_query(q))
 
     if _auto_keyword_needs_single_fallback(
         explicit=explicit,
@@ -8991,8 +8846,7 @@ def _find_related_by_keywords(
             str(c.get("title") or ""), keywords
         )
         compound = 1 if any(_is_relation_phrase(k) for k in matched) else 0
-        show = 1 if _related_has_real_cover(c) else 0
-        return (show, 1 if theme_hits else 0, compound, hits, sc)
+        return (1 if theme_hits else 0, compound, hits, sc)
 
     def _strict_rank(pair: tuple[float, dict]) -> tuple:
         sc, c = pair
@@ -9000,8 +8854,7 @@ def _find_related_by_keywords(
             str(c.get("title") or ""), keywords
         )
         cover = 1 if any(_compound_covers_auto_theme(tok, keywords) for tok in matched) else 0
-        show = 1 if _related_has_real_cover(c) else 0
-        return (show, cover, sc)
+        return (cover, sc)
 
     if use_singles:
         ordered_rows: list[tuple[float, dict]] = sorted(
@@ -9022,7 +8875,7 @@ def _find_related_by_keywords(
         emit_floor = min_hits
         allow_weak = explicit
 
-    eligible: list[dict] = []
+    out: list[dict] = []
     for _sc, c in ordered_rows:
         hits, _base, matched, theme_hits = _keyword_overlap(
             str(c.get("title") or ""), keywords
@@ -9044,13 +8897,10 @@ def _find_related_by_keywords(
         item["keyword_hits"] = hits
         item["matched_keywords"] = matched
         item["hit_keywords"] = matched
-        eligible.append(item)
-    if explicit:
-        out = eligible[:max_n]
-    else:
-        out = _diversify_body_keyword_rows(eligible, keywords, max_n)
-    for item in out:
-        seen.add(format_display_code(str(item.get("code") or "")))
+        out.append(item)
+        seen.add(format_display_code(str(c.get("code") or "")))
+        if len(out) >= max_n:
+            break
     return out[:max_n]
 
 
@@ -9127,23 +8977,6 @@ def _is_compilation_title(title: str | None) -> bool:
     if _COMPILATION_TITLE_RE.search(compact):
         return True
     return _COMPILATION_BEST_RE.search(raw) is not None
-
-
-def _related_has_real_cover(row: dict | None) -> bool:
-    """True when a related row can show a real jacket or still.
-
-    now_printing and a missing cover are not usable. A cid alone is not
-    enough here: it can still resolve to the placeholder.
-    """
-    if not isinstance(row, dict):
-        return False
-    cover = str(row.get("cover") or row.get("cover_url") or "").strip()
-    if cover.startswith("http") and not is_now_printing_url(cover):
-        return True
-    stills = row.get("stills") if isinstance(row.get("stills"), list) else []
-    return any(
-        str(u or "").startswith("http") and not is_now_printing_url(str(u)) for u in stills
-    )
 
 
 def _row_has_usable_gallery(row: dict | None) -> bool:
@@ -10872,95 +10705,6 @@ def _job_from_vision_row(row: dict) -> dict:
     return {"kind": "unknown", "code": "", "title": "", "row": row}
 
 
-def _slot_needs_related(row: dict | None) -> bool:
-    """A finished catalog hit can take a related carousel.
-
-    Timed-out, unidentified, and stub cards stay without related.
-    """
-    if not isinstance(row, dict) or not row.get("ok"):
-        return False
-    if row.get("stub") or row.get("unidentified") or row.get("timed_out"):
-        return False
-    if _catalog_code_of(row):
-        return True
-    title = str(row.get("title") or "")
-    return bool(is_usable_title(title) and not title.startswith("（"))
-
-
-def _keep_time_for_related(results: list, deadline: float | None) -> bool:
-    """Stop new identify slots once a catalog hit exists and related needs the clock.
-
-    The first slot still searches. After that, leftover identify time is for
-    carousels, not for another frame that would come back with an empty one.
-    """
-    if not any(_slot_needs_related(r) for r in results):
-        return False
-    return _seconds_left(deadline) < float(MULTI_RELATED_BUDGET_S)
-
-
-def _fill_related_for_finished_slots(
-    results: list[dict],
-    *,
-    identify_deadline: float | None,
-    on_progress=None,
-    budget_s: float | None = None,
-) -> int:
-    """Attach related for finished catalog slots.
-
-    The identify clock is not the related clock. A batch that already used
-    the identify budget still spends MULTI_RELATED_BUDGET_S on carousels,
-    as long as that stays inside the worker wall (identify deadline + 80s,
-    gunicorn is 240s). Slots are filled in finish order. A slot starts only
-    when a useful slice remains, so the shared budget cannot become an
-    empty crumb on every slot. Timed-out slots are left alone.
-    """
-    if not results:
-        return 0
-    now = time.monotonic()
-    window = float(MULTI_RELATED_BUDGET_S if budget_s is None else budget_s)
-    rel_end = now + max(0.0, window)
-    if identify_deadline is not None:
-        # 80s past the 150s identify mark is still inside the 240s worker.
-        rel_end = min(rel_end, float(identify_deadline) + 80.0)
-    total_rel = 0
-    floor = float(MULTI_RELATED_SLOT_FLOOR_S)
-    for i, row in enumerate(results):
-        if not isinstance(row, dict):
-            continue
-        if not _slot_needs_related(row):
-            row.setdefault("related_by_title", [])
-            continue
-        left = rel_end - time.monotonic()
-        if left < floor:
-            row.setdefault("related_by_title", [])
-            continue
-        later = sum(1 for r in results[i + 1 :] if _slot_needs_related(r))
-        if later and left >= floor * 2:
-            slot_budget = min(12.0, max(floor, left - floor))
-        else:
-            slot_budget = min(14.0, left)
-        try:
-            _progress(
-                on_progress,
-                "done",
-                "active",
-                f"相關作品 {i + 1}/{len(results)}…",
-                0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
-            )
-            filled = attach_related_by_title(row, budget_sec=slot_budget, per_item=False)
-            rel = list(filled.get("related_by_title") or [])
-            row["related_by_title"] = rel
-            total_rel += len(rel)
-            if rel and _catalog_code_of(row):
-                try:
-                    offline_cache_put(row)
-                except Exception:
-                    pass
-        except Exception:
-            row.setdefault("related_by_title", [])
-    return total_rel
-
-
 def run_multi_identify_pipeline(
     images: list[tuple[bytes, str | None]],
     *,
@@ -11270,11 +11014,7 @@ def run_multi_identify_pipeline(
         for ji, job in enumerate(jobs):
             if getattr(_BATCH, "active", False):
                 _BATCH.jacket_incomplete = False
-            if (
-                job.get("kind") == "timeout"
-                or _seconds_left(deadline) < MULTI_SLOT_RESERVE_S
-                or _keep_time_for_related(results, deadline)
-            ):
+            if job.get("kind") == "timeout" or _seconds_left(deadline) < MULTI_SLOT_RESERVE_S:
                 for rest in jobs[ji:]:
                     rest_row = rest.get("row") if isinstance(rest.get("row"), dict) else None
                     one = _time_budget_slot(rest_row)
@@ -11656,15 +11396,45 @@ def run_multi_identify_pipeline(
             "封面就緒" if payload.get("cover") else "部分無封面",
             0.92,
         )
-        # Related for every finished catalog hit. This clock is not the
-        # leftover of the identify deadline: that leftover used to be <1.5s
-        # and every carousel stayed empty, including the first success.
+        # Related for EVERY main hit (each screenshot row gets its own carousel siblings).
         _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94)
-        total_rel = _fill_related_for_finished_slots(
-            results,
-            identify_deadline=deadline,
-            on_progress=on_progress,
-        )
+        total_rel = 0
+        def _slot_needs_related(row: dict) -> bool:
+            if not isinstance(row, dict) or not row.get("ok") or row.get("stub") or row.get("unidentified"):
+                return False
+            if _catalog_code_of(row):
+                return True
+            title = str(row.get("title") or "")
+            return bool(is_usable_title(title) and not title.startswith("（"))
+
+        n_ok = sum(1 for r in results if _slot_needs_related(r))
+        # One shared related budget. The old floor of 8s per slot made 14 images
+        # spend more than a minute after identify had already finished.
+        related_left = min(float(MULTI_RELATED_BUDGET_S), max(0.0, _seconds_left(deadline) - 1.5))
+        if n_ok <= 1:
+            per_budget = min(12.0, related_left)
+        else:
+            per_budget = min(8.0, related_left / max(n_ok, 1))
+        for i, row in enumerate(results):
+            if not _slot_needs_related(row) or per_budget < 1.0 or _seconds_left(deadline) < 1.5:
+                if isinstance(row, dict):
+                    row.setdefault("related_by_title", [])
+                continue
+            try:
+                _progress(
+                    on_progress,
+                    "done",
+                    "active",
+                    f"相關作品 {i + 1}/{len(results)}…",
+                    0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
+                )
+                slot_budget = min(per_budget, max(0.0, _seconds_left(deadline) - 0.4))
+                filled = attach_related_by_title(row, budget_sec=slot_budget, per_item=False)
+                rel = list(filled.get("related_by_title") or [])
+                row["related_by_title"] = rel
+                total_rel += len(rel)
+            except Exception:
+                row.setdefault("related_by_title", [])
         # Top-level related mirrors first work (compat); gallery uses each results[].related_by_title
         if results and isinstance(results[0], dict):
             payload["related_by_title"] = list(results[0].get("related_by_title") or [])
@@ -12865,9 +12635,8 @@ def cdn_file():
 def related_by_title_api():
     """Fetch related works: title≤5 + keyword≤5 + actress≤3 (caps; history detail).
 
-    A non-empty seed without upgrade is returned unchanged (no shrink).
-    upgrade=true re-ranks under the current rules and merges: new hits lead,
-    and every saved row with a real cover is kept. An empty seed is a first fill.
+    POST may include seed related so we skip filled buckets and fill missing
+    title_zh on existing slides within HISTORY_RELATED_TITLE_ZH_BUDGET.
     """
     body = request.get_json(silent=True) if request.method == "POST" else None
     body = body if isinstance(body, dict) else {}
@@ -12883,35 +12652,23 @@ def related_by_title_api():
     seed = body.get("seed") or body.get("related") or body.get("related_by_title") or []
     if not isinstance(seed, list):
         seed = []
-    seed_items = [x for x in seed if isinstance(x, dict) and str(x.get("code") or "").strip()]
-    upgrade = bool(body.get("upgrade"))
-    # Without upgrade, a saved carousel is not searched again and is not
-    # cap-shrunk. upgrade re-ranks, then keeps every saved real cover.
-    frozen = bool(seed_items) and not upgrade
     wrap: dict = {
         "ok": True,
         "code": code or None,
         "title": title,
-        "related_by_title": list(seed_items) if seed_items else [],
+        "related_by_title": _cap_related_buckets(seed),
     }
     try:
-        if upgrade and seed_items and (is_usable_title(title) or actress):
-            fresh = None
-            try:
-                fresh = find_related_by_title(
-                    title,
-                    exclude_code=code or None,
-                    max_n=5,
-                    actress=actress,
-                    budget_sec=16.0,
-                )
-            except Exception:
-                fresh = None
-            if fresh is None:
-                wrap["related_by_title"] = [dict(x) for x in seed_items]
-            else:
-                wrap["related_by_title"] = _merge_related_upgrade(seed_items, fresh)
-        elif not seed_items and (is_usable_title(title) or actress):
+        rel = wrap["related_by_title"]
+        t, k, a = _related_bucket_counts(rel)
+        need_related = (
+            (t < RELATED_THEME_CAP and is_usable_title(title))
+            or (k < RELATED_KEYWORD_CAP and is_usable_title(title))
+            or (a < RELATED_ACTRESS_CAP and bool(actress))
+        )
+        # Skip the 16s related search when buckets are already at cap so this
+        # pass can spend its wall-clock on missing title_zh instead.
+        if need_related:
             try:
                 items = find_related_by_title(
                     title,
@@ -12919,12 +12676,14 @@ def related_by_title_api():
                     max_n=5,
                     actress=actress,
                     budget_sec=16.0,
+                    seed=rel,
+                    fill_theme=t < RELATED_THEME_CAP,
+                    fill_keyword=k < RELATED_KEYWORD_CAP,
+                    fill_actress=a < RELATED_ACTRESS_CAP,
                 )
-                wrap["related_by_title"] = list(items or [])
+                wrap["related_by_title"] = _merge_related_for_cache(rel, items)
             except Exception:
                 pass
-        elif frozen:
-            wrap["related_by_title"] = list(seed_items)
         for item in wrap.get("related_by_title") or []:
             try:
                 _backfill_item_stills(item)
