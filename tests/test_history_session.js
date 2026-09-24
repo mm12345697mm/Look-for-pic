@@ -34,11 +34,16 @@ function makeEl(tag, id) {
       if (!String(v)) this.children = [];
     },
     get textContent() {
-      return this._text;
+      const kids = this.children || [];
+      if (kids.length) {
+        return kids.map((c) => (c && c.textContent != null ? String(c.textContent) : '')).join('');
+      }
+      return this._text || '';
     },
     set textContent(v) {
-      this._text = String(v);
-      this._html = String(v);
+      this._text = v == null ? '' : String(v);
+      this._html = this._text;
+      this.children = [];
     },
     classList: {
       toggle(name, on) {
@@ -829,7 +834,7 @@ function walkNodes(node, acc) {
   const flat = walkNodes(blocks[0]);
   const at = (cls) => flat.findIndex((n) => n.className === cls);
   const meta = flat.find((n) => n.className === 'card-meta');
-  assert.ok(meta && String(meta.innerHTML || '').indexOf('女優') !== -1);
+  assert.ok(meta && String(meta.textContent || '').indexOf('女優') !== -1);
   assert.ok(flat.indexOf(meta) < at('work-actions'), 'actress line before copy buttons');
   assert.ok(at('work-actions') < at('cover-wrap'), 'copy buttons before cover');
   assert.ok(at('cover-wrap') < at('stills-label'), 'cover before stills');
@@ -883,6 +888,125 @@ function walkNodes(node, acc) {
   assert.strictEqual(stillChips.map((c) => c.textContent).join('・'), kws.join('・'));
 }
 
+// Title display keeps the full Japanese string, including an official internal
+// ellipsis. Footer keywords do not split mid-token. Every gallery main
+// (including multi slot 2) has its own chips. The night-bus card uses the
+// stored NHDTC-254 catalog title, not the vision sentence that searched it.
+{
+  const ja =
+    '息子からの母親不倫NTR告白 ママ不倫してるよ？可憐な妻が息子の家庭教師の絶倫チ●ポにナマでイカされて何度も何度も中出しに溺れて… 弥生みづき';
+  const zh = '兒子的家教';
+  const shown = H.formatDisplayTitle(ja, zh);
+  assert.strictEqual(shown, ja + '（' + zh + '）');
+  assert.ok(shown.indexOf(ja) === 0, 'do not cut the Japanese title before （中文）');
+  assert.ok(shown.indexOf('…') > 0 && shown.indexOf('…') < shown.indexOf('（'));
+  assert.strictEqual(H.formatDisplayTitle(ja, ''), ja);
+  assert.ok(H.formatDisplayTitle(ja, '').indexOf('（）') === -1);
+  const busAtoms = H.segmentDisplayText('關鍵字相關（夜行バス）', ['夜行バス']);
+  assert.ok(busAtoms.some((s) => s.atom && s.text === '夜行バス'));
+  assert.ok(!busAtoms.some((s) => s.text === '夜行バ' || s.text === 'バ' || s.text === 'ス'));
+  const verbAtoms = H.segmentDisplayText('ナマでイカされて何度も', []);
+  assert.ok(
+    verbAtoms.some((s) => s.atom && s.text.indexOf('イカ') === 0 && s.text.indexOf('されて') !== -1),
+    verbAtoms.map((s) => s.text).join('|')
+  );
+  assert.ok(!verbAtoms.some((s) => s.text === 'イ' || s.text === 'カ'));
+
+  const tutorJa =
+    '「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! 息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2';
+  const busJa =
+    '就寝中の夜行バスで指マンされた恐怖に目を開けられず寝たふりしながらイキまくる気弱女子5 増量中出しSP';
+  const busZh =
+    '五個膽小的女孩在夜間巴士上睡覺時被人猥褻，嚇得睜不開眼，卻在假裝睡覺的同時失控地達到高潮——超大噴射特輯';
+  const cover = 'https://pics.dmm.co.jp/digital/video/1nhdtc00254/1nhdtc00254pl.jpg';
+  const tutorKws = ['息子の家庭教師', '家庭教師', '息子'];
+  const busKws = ['夜行バス', '指マン', 'SP', '中出し'];
+  H.paintHistoryDetail({
+    id: 'multi-two-mains',
+    works: [
+      {
+        code: 'DANDYA-001',
+        title: tutorJa,
+        actress: '大浦真奈美',
+        studio: 'DANDY',
+        line: 'main',
+        cover: cover,
+        theme_keywords: tutorKws,
+        related: [
+          { code: 'SER-001', title: '同系列', line: 'theme', why: '片名相近', cover: cover },
+          { code: 'KW-010', title: '家庭教師もの', line: 'keyword', why: '關鍵字×2', cover: cover },
+        ],
+      },
+      {
+        code: 'NHDTC-254',
+        title: busJa,
+        title_zh: busZh,
+        actress: '中城葵',
+        studio: 'ナチュラルハイ',
+        line: 'multi',
+        cover: cover,
+        theme_keywords: busKws,
+        visual_mismatch: true,
+        visual_note: '未核對圖片（人物／衣服／姿勢與這張上傳圖不符）',
+        related: [
+          { code: 'NHDTC-235', title: '夜行バス逆NTR', line: 'theme', why: '片名相近', cover: cover },
+          { code: 'BUS-002', title: '夜行バスで挿入', line: 'keyword', why: '關鍵字', cover: cover },
+        ],
+      },
+      {
+        code: 'DANDY-893',
+        title: '候補だけ',
+        line: 'candidate',
+        cover: cover,
+        theme_keywords: tutorKws,
+        related: [{ code: 'SER-009', title: '系列', line: 'theme', why: '片名相近', cover: cover }],
+      },
+    ],
+  });
+  const blocks = walkNodes(getEl('history-detail')).filter((n) => n.className === 'work-carousel-block');
+  assert.strictEqual(blocks.length, 3);
+  function chipsOf(block) {
+    return walkNodes(block)
+      .filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'))
+      .map((n) => n.textContent);
+  }
+  assert.deepStrictEqual(chipsOf(blocks[0]), tutorKws);
+  assert.deepStrictEqual(chipsOf(blocks[1]), busKws);
+  assert.deepStrictEqual(chipsOf(blocks[2]), []);
+  blocks.slice(0, 2).forEach((block, i) => {
+    const kids = (block.children || []).map((c) => c.className);
+    const sectionAt = kids.indexOf('work-main-section');
+    const chipAt = kids.indexOf('kw-related-panel');
+    assert.ok(sectionAt === 0 && chipAt > sectionAt, 'work ' + i + ' chips under the main block');
+    const slides = walkNodes(block).filter((n) => n.className === 'work-carousel-slide');
+    slides.slice(1).forEach((slide) => {
+      assert.strictEqual(
+        walkNodes(slide).filter((n) => n.className === 'kw-chip').length,
+        0
+      );
+    });
+  });
+  const title0 = walkNodes(blocks[0]).find((n) => n.className === 'card-title');
+  assert.strictEqual(title0 && title0.textContent, tutorJa);
+  const title1 = walkNodes(blocks[1]).find((n) => n.className === 'card-title');
+  assert.strictEqual(title1 && title1.textContent, busJa + '（' + busZh + '）');
+  assert.ok(title1.textContent.indexOf('小悪魔') === -1);
+  assert.ok(
+    walkNodes(title1).some((n) => n.className === 'cjk-atom' && n.textContent === '夜行バス'),
+    '夜行バス stays one atom in the title'
+  );
+  const hint1 = walkNodes(blocks[1]).find((n) => n.className === 'work-carousel-hint');
+  assert.ok(hint1 && hint1.textContent.indexOf('夜行バス') !== -1, hint1 && hint1.textContent);
+  assert.ok(
+    walkNodes(hint1).some((n) => n.className === 'cjk-atom' && n.textContent === '夜行バス'),
+    hint1 && hint1.textContent
+  );
+  assert.ok(!walkNodes(hint1).some((n) => n.className === 'cjk-atom' && n.textContent === '夜行バ'));
+  const note = walkNodes(blocks[1]).find((n) => n.className === 'card-visual-note');
+  assert.ok(note && note.textContent.indexOf('未核對圖片') !== -1, note && note.textContent);
+  assert.ok(!walkNodes(blocks[0]).some((n) => n.className === 'card-visual-note'));
+}
+
 // Hit keywords sit beside the 關鍵字 badge; actress notes do not split the keyword block
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/snis00978/snis00978pl.jpg';
@@ -933,11 +1057,12 @@ function walkNodes(node, acc) {
     return html.slice(0, 80);
   });
   assert.deepStrictEqual(badges, ['片名相近', '關鍵字', '關鍵字', '同演員', '同演員']);
-  const venx = walkNodes(slides[2]).map((n) => n._html || '').join('\n');
-  assert.ok(venx.indexOf('card-hit-kw') !== -1, venx.slice(0, 300));
+  const venxNodes = walkNodes(slides[2]);
+  assert.ok(venxNodes.some((n) => n.className === 'card-hit-kw'));
+  const venx = venxNodes.map((n) => n.textContent || '').join('\n');
   assert.ok(venx.indexOf('巨乳') !== -1 && venx.indexOf('ノーブラ') !== -1);
-  const bare = walkNodes(slides[3]).map((n) => n._html || '').join('\n');
-  assert.ok(bare.indexOf('card-hit-kw') === -1, 'do not invent hit keywords');
+  const bare = walkNodes(slides[3]);
+  assert.ok(!bare.some((n) => n.className === 'card-hit-kw'), 'do not invent hit keywords');
 }
 
 (async function () {

@@ -2321,5 +2321,336 @@ class TestActressQueryKeep(unittest.TestCase):
         )
 
 
+class TestTitleCutAndMultiVisual(unittest.TestCase):
+    """Catalog titles stay with their own Chinese, and each upload is re-checked.
+
+    Ground truth is the stored multi-image session: a 家庭教師 title search
+    (DANDYA-001) and a 夜行バス title search whose 主選 was NHDTC-254. The
+    vision sentence 小悪魔女子は is a different phrase from that catalog title.
+    """
+
+    FULL_JA = (
+        "息子からの母親不倫NTR告白 ママ不倫してるよ？"
+        "可憐な妻が息子の家庭教師の絶倫チ●ポにナマでイカされて何度も何度も中出しに溺れて… 弥生みづき"
+    )
+    DANDY_TITLE = TestDandyCodeLookupAndVisualLock.DANDY_TITLE
+    TUTOR_QUERY = "今日も息子の家庭教師とセックスしています"
+    NHDTC_JA = (
+        "就寝中の夜行バスで指マンされた恐怖に目を開けられず寝たふりしながらイキまくる気弱女子5 増量中出しSP"
+    )
+    NHDTC_ZH = (
+        "五個膽小的女孩在夜間巴士上睡覺時被人猥褻，嚇得睜不開眼，卻在假裝睡覺的同時失控地達到高潮——超大噴射特輯"
+    )
+    BUS_QUERY = "夜行バスで激ヤバ合体ロングスカート内でこっそり挿入しちゃう小悪魔女子は"
+    SIBLING_TITLE = "夜行バスで逆NTRを仕掛ける清楚美脚"
+
+    def test_choose_display_title_keeps_catalog_when_vision_is_cut(self):
+        cut = self.FULL_JA.split("イカされて")[0] + "…"
+        self.assertTrue(cut.endswith("…"))
+        self.assertNotIn("弥生みづき", cut)
+        self.assertEqual(S.choose_display_title(self.FULL_JA, cut), self.FULL_JA)
+        kept = S.apply_vision_meta(
+            {"title": self.FULL_JA, "title_zh": "既有中文", "ok": True},
+            {"title": cut},
+        )
+        self.assertEqual(kept.get("title"), self.FULL_JA)
+        self.assertEqual(kept.get("title_zh"), "既有中文")
+        # Official internal ellipsis is part of the title, not a UI cut.
+        self.assertEqual(S.choose_display_title(self.FULL_JA, self.FULL_JA), self.FULL_JA)
+        self.assertEqual(S.choose_display_title(self.FULL_JA, None), self.FULL_JA)
+        self.assertEqual(S.choose_display_title(None, self.BUS_QUERY), self.BUS_QUERY)
+
+    def test_divergent_vision_keeps_catalog_title_and_its_chinese(self):
+        self.assertFalse(S._titles_are_same_phrase(self.NHDTC_JA, self.BUS_QUERY))
+        self.assertEqual(S.choose_display_title(self.NHDTC_JA, self.BUS_QUERY), self.NHDTC_JA)
+        kept = S.apply_vision_meta(
+            {"title": self.NHDTC_JA, "title_zh": self.NHDTC_ZH, "ok": True},
+            {"title": self.BUS_QUERY},
+        )
+        self.assertEqual(kept.get("title"), self.NHDTC_JA)
+        self.assertEqual(kept.get("title_zh"), self.NHDTC_ZH)
+        self.assertNotIn("小悪魔", kept.get("title") or "")
+        # A longer read of the same line may extend a short catalog prefix.
+        short = self.NHDTC_JA[:12]
+        self.assertTrue(self.NHDTC_JA.startswith(short))
+        self.assertEqual(S.choose_display_title(short, self.NHDTC_JA), self.NHDTC_JA)
+        # A different phrase does not replace even a short catalog title.
+        self.assertEqual(S.choose_display_title("短い題", self.FULL_JA), "短い題")
+
+    def test_unlocked_slot_is_marked_unverified_with_its_own_keywords(self):
+        reject = {
+            "same_work": False,
+            "confidence": 0.2,
+            "match_person": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+        seen = []
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            self.assertEqual(user, b"bus-image")
+            seen.append([c.get("code") for c in cands])
+            ranked = []
+            for c in cands:
+                item = dict(c)
+                item["visual"] = dict(reject)
+                item["visual_score"] = 0.15
+                ranked.append(item)
+            return ranked, {
+                "visual_ranked": True,
+                "visual_lock": False,
+                "note": "僅排序未鎖定（封面與劇照皆未同時符合同一作品與衣服）",
+                "compared": len(ranked),
+            }
+
+        with mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank), mock.patch.object(
+            S, "search_by_title", return_value=None
+        ):
+            out = S.verify_work_against_image(
+                {
+                    "ok": True,
+                    "code": "NHDTC-254",
+                    "title": self.NHDTC_JA,
+                    "title_zh": self.NHDTC_ZH,
+                    "actress": "中城葵",
+                    "cover": "https://example.com/bus.jpg",
+                    "stills": ["https://example.com/bus-s.jpg"],
+                    "candidates": [
+                        {
+                            "code": "NHDTC-254",
+                            "title": self.NHDTC_JA,
+                            "cover": "https://example.com/bus.jpg",
+                        },
+                        {
+                            "code": "NHDTC-25402",
+                            "title": "清楚美脚娘",
+                            "cover": "https://example.com/25402.jpg",
+                        },
+                        {
+                            "code": "NHDTC-235",
+                            "title": self.SIBLING_TITLE,
+                            "cover": "https://example.com/235.jpg",
+                        },
+                    ],
+                },
+                b"bus-image",
+                api_key="test-key",
+                vision_title=self.BUS_QUERY,
+            )
+        self.assertEqual(out.get("code"), "NHDTC-254")
+        self.assertEqual(out.get("title"), self.NHDTC_JA)
+        self.assertEqual(out.get("title_zh"), self.NHDTC_ZH)
+        self.assertFalse(out.get("visual_lock"))
+        self.assertTrue(out.get("visual_mismatch"))
+        self.assertIn("未核對圖片", out.get("visual_note") or "")
+        kws = out.get("theme_keywords") or []
+        self.assertIn("夜行バス", kws)
+        self.assertIn("指マン", kws)
+        self.assertNotIn("家庭教師", kws)
+        self.assertNotIn("息子", kws)
+        self.assertNotIn("小悪魔", kws)
+        self.assertTrue(seen and "NHDTC-254" in seen[0] and "NHDTC-235" in seen[0], seen)
+
+    def _rank_factory(self, img1, img2, lock_code_for_image):
+        rank_calls = []
+        lock = {
+            "same_work": True,
+            "confidence": 0.93,
+            "match_person": True,
+            "match_face": True,
+            "match_accessories": True,
+            "match_clothes": True,
+            "match_pose": True,
+        }
+        reject = {
+            "same_work": False,
+            "confidence": 0.2,
+            "match_person": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            rank_calls.append({"image": user, "codes": [c.get("code") for c in cands]})
+            want = lock_code_for_image(user)
+            ranked = []
+            for c in cands:
+                item = dict(c)
+                take = want and str(item.get("code") or "") == want
+                item["visual"] = dict(lock if take else reject)
+                item["visual_score"] = 0.91 if take else 0.12
+                ranked.append(item)
+            ranked.sort(
+                key=lambda it: (
+                    1 if (it.get("visual") or {}).get("match_clothes") and (it.get("visual") or {}).get("same_work") else 0,
+                    float(it.get("visual_score") or 0),
+                ),
+                reverse=True,
+            )
+            best = (ranked[0].get("visual") if ranked else {}) or {}
+            locked = bool(best.get("same_work") and best.get("match_clothes"))
+            return ranked, {
+                "visual_ranked": True,
+                "visual_lock": locked,
+                "note": "已對照使用者原圖（視覺鎖定）" if locked else "僅排序未鎖定",
+                "compared": len(ranked),
+                "note_stills": True,
+            }
+
+        return fake_rank, rank_calls
+
+    def _multi_patches(self, img1, img2, fake_rank, fake_search):
+        def fake_vision(image_bytes, mime, api_key):
+            if image_bytes == img1:
+                return {"title": self.TUTOR_QUERY}
+            return {"title": self.BUS_QUERY}
+
+        def fake_pipe(**kwargs):
+            self.assertIsNone(kwargs.get("image_bytes"))
+            title = str(kwargs.get("user_title") or "")
+            if "家庭教師" in title:
+                return {
+                    "ok": True,
+                    "code": "DANDYA-001",
+                    "title": self.DANDY_TITLE,
+                    "actress": "大浦真奈美",
+                    "studio": "DANDY",
+                    "cover": "https://example.com/t.jpg",
+                    "stills": ["https://example.com/t-s.jpg"],
+                    "candidates": [
+                        {
+                            "code": "DANDYA-001",
+                            "title": self.DANDY_TITLE,
+                            "cover": "https://example.com/t.jpg",
+                            "stills": ["https://example.com/t-s.jpg"],
+                        }
+                    ],
+                }, 200
+            return {
+                "ok": True,
+                "code": "NHDTC-254",
+                "title": self.NHDTC_JA,
+                "title_zh": self.NHDTC_ZH,
+                "actress": "中城葵",
+                "studio": "ナチュラルハイ",
+                "cover": "https://example.com/bus.jpg",
+                "stills": ["https://example.com/bus-s.jpg"],
+                "candidates": [
+                    {
+                        "code": "NHDTC-254",
+                        "title": self.NHDTC_JA,
+                        "cover": "https://example.com/bus.jpg",
+                        "stills": ["https://example.com/bus-s.jpg"],
+                    },
+                    {
+                        "code": "NHDTC-25402",
+                        "title": "清楚美脚娘",
+                        "actress": "中城葵",
+                        "cover": "https://example.com/25402.jpg",
+                        "stills": ["https://example.com/25402-s.jpg"],
+                    },
+                    {
+                        "code": "NHDTC-235",
+                        "title": self.SIBLING_TITLE,
+                        "cover": "https://example.com/235.jpg",
+                        "stills": ["https://example.com/235-s.jpg"],
+                    },
+                ],
+            }, 200
+
+        def fake_attach(result, **kwargs):
+            S._recompute_theme_keywords(result)
+            result["related_by_title"] = list(result.get("related_by_title") or [])
+            return result
+
+        return (
+            mock.patch.object(S, "get_gemini_api_key", return_value="test-key"),
+            mock.patch.object(S, "call_gemini_vision", side_effect=fake_vision),
+            mock.patch.object(S, "run_identify_pipeline", side_effect=fake_pipe),
+            mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank),
+            mock.patch.object(S, "search_by_title", side_effect=fake_search),
+            mock.patch.object(S, "attach_related_by_title", side_effect=fake_attach),
+        )
+
+    def test_multi_keeps_unverified_catalog_hit_and_separate_keywords(self):
+        img1 = b"tutor-image"
+        img2 = b"bus-image"
+        searches = []
+        fake_rank, rank_calls = self._rank_factory(
+            img1, img2, lambda user: "DANDYA-001" if user == img1 else None
+        )
+
+        def fake_search(title, actress=None):
+            searches.append(str(title or ""))
+            return None
+
+        patches = self._multi_patches(img1, img2, fake_rank, fake_search)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            payload, status = S.run_multi_identify_pipeline([(img1, "a.jpg"), (img2, "b.jpg")])
+
+        self.assertEqual(status, 200)
+        results = payload.get("results") or []
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].get("code"), "DANDYA-001")
+        self.assertEqual(results[0].get("title"), self.DANDY_TITLE)
+        self.assertTrue(results[0].get("visual_lock"))
+        self.assertFalse(results[0].get("visual_mismatch"))
+        self.assertIn("家庭教師", results[0].get("theme_keywords") or [])
+        self.assertIn("息子の家庭教師", results[0].get("theme_keywords") or [])
+        self.assertNotIn("夜行バス", results[0].get("theme_keywords") or [])
+        bus = results[1]
+        self.assertEqual(bus.get("code"), "NHDTC-254")
+        self.assertEqual(bus.get("title"), self.NHDTC_JA)
+        self.assertEqual(bus.get("title_zh"), self.NHDTC_ZH)
+        self.assertNotIn("小悪魔", bus.get("title") or "")
+        self.assertFalse(bus.get("visual_lock"))
+        self.assertTrue(bus.get("visual_mismatch"))
+        self.assertIn("未核對圖片", bus.get("visual_note") or "")
+        kws = bus.get("theme_keywords") or []
+        self.assertIn("夜行バス", kws)
+        self.assertIn("指マン", kws)
+        self.assertNotIn("家庭教師", kws)
+        self.assertNotIn("息子", kws)
+        images = [c["image"] for c in rank_calls]
+        self.assertIn(img1, images)
+        self.assertIn(img2, images)
+        bus_pools = [c["codes"] for c in rank_calls if c["image"] == img2]
+        self.assertTrue(bus_pools, rank_calls)
+        self.assertIn("NHDTC-254", bus_pools[0])
+        self.assertIn("NHDTC-235", bus_pools[0])
+        self.assertTrue(searches and all("夜行バス" in q and "家庭教師" not in q for q in searches), searches)
+
+    def test_multi_switches_when_another_candidate_locks(self):
+        img1 = b"tutor-image"
+        img2 = b"bus-image"
+        fake_rank, rank_calls = self._rank_factory(
+            img1,
+            img2,
+            lambda user: "DANDYA-001" if user == img1 else ("NHDTC-235" if user == img2 else None),
+        )
+
+        def fake_search(title, actress=None):
+            raise AssertionError("a locking sibling must win before a second title search")
+
+        patches = self._multi_patches(img1, img2, fake_rank, fake_search)
+        with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+            payload, status = S.run_multi_identify_pipeline([(img1, "a.jpg"), (img2, "b.jpg")])
+
+        self.assertEqual(status, 200)
+        results = payload.get("results") or []
+        self.assertEqual(results[0].get("code"), "DANDYA-001")
+        self.assertIn("家庭教師", results[0].get("theme_keywords") or [])
+        bus = results[1]
+        self.assertEqual(bus.get("code"), "NHDTC-235")
+        self.assertEqual(bus.get("title"), self.SIBLING_TITLE)
+        self.assertFalse(bus.get("title_zh"))
+        self.assertTrue(bus.get("visual_lock"))
+        self.assertFalse(bus.get("visual_mismatch"))
+        self.assertNotIn("家庭教師", bus.get("theme_keywords") or [])
+        self.assertNotIn("指マン", bus.get("theme_keywords") or [])
+        self.assertNotEqual(bus.get("title"), self.NHDTC_JA)
+        self.assertTrue(any(c["image"] == img2 and "NHDTC-235" in c["codes"] for c in rank_calls))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

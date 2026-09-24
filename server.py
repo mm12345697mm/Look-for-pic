@@ -2981,13 +2981,79 @@ def lookup_demo(code: str) -> dict | None:
         return dict(works[cid])
     return None
 
+_TITLE_CUT_TAIL = re.compile(r"(?:…+|‥+|\.{3,})\s*$")
+
+
+def _title_is_cut(title: str | None) -> bool:
+    """True when a title ends in an ellipsis, not when … sits inside a full title."""
+    return bool(_TITLE_CUT_TAIL.search((title or "").strip()))
+
+
+def _title_stem(title: str) -> str:
+    return _TITLE_CUT_TAIL.sub("", (title or "").strip()).strip()
+
+
+def _titles_are_same_phrase(a: str | None, b: str | None) -> bool:
+    """One title, not two scenes that only share a keyword such as 夜行バス.
+
+    Equal, or one stem is a real prefix of the other (OCR cut or a longer
+    read of the same line). A trailing … is ignored; an internal … is not.
+    """
+    left = _title_stem(re.sub(r"\s+", " ", (a or "").strip()))
+    right = _title_stem(re.sub(r"\s+", " ", (b or "").strip()))
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    return len(shorter) >= 8 and longer.startswith(shorter)
+
+
+def choose_display_title(catalog: str | None, vision: str | None) -> str | None:
+    """Pick the on-card Japanese title. Never invent Chinese.
+
+    The resolved work's catalog title stays when the vision/OCR string is a
+    different phrase (夜行バスで激ヤバ…小悪魔女子は must not replace
+    就寝中の夜行バスで指マン…). Vision is used only when there is no catalog
+    title, or when it is the same phrase: a trailing cut keeps the longer
+    catalog line, and a longer read of that same line may extend it.
+    An official title that only contains an internal … is kept whole.
+    """
+    cat = re.sub(r"\s+", " ", (catalog or "").strip())
+    vis = re.sub(r"\s+", " ", (vision or "").strip())
+    if not vis:
+        return cat or None
+    if not cat:
+        return vis
+    if not _titles_are_same_phrase(cat, vis):
+        return cat
+    cat_cut = _title_is_cut(cat)
+    vis_cut = _title_is_cut(vis)
+    if vis_cut and not cat_cut:
+        return cat
+    if cat_cut and not vis_cut and len(vis) > len(_title_stem(cat)):
+        return vis
+    if len(vis) > len(cat) + 3 and not vis_cut:
+        return vis
+    return cat
+
+
 def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
-    """Prefer vision title (and fill missing actress/studio) over OCR/lookup."""
+    """Fill missing actress/studio from vision. Keep the catalog title.
+
+    A vision string replaces the Japanese title only when it is the same
+    phrase. title_zh belongs to the catalog title and is cleared when the
+    Japanese title actually changes to a different phrase. Never invent Chinese.
+    """
     if not vision_meta:
         return payload
     vt = vision_meta.get("title")
     if vt:
-        payload["title"] = vt
+        before = str(payload.get("title") or "")
+        chosen = choose_display_title(before, vt)
+        payload["title"] = chosen
+        if before and chosen and not _titles_are_same_phrase(before, str(chosen)):
+            payload["title_zh"] = None
     if vision_meta.get("actress") and not payload.get("actress"):
         payload["actress"] = vision_meta["actress"]
     if vision_meta.get("studio") and not payload.get("studio"):
@@ -4037,10 +4103,12 @@ def identify_code(
         else:
             message = "僅 CDN（無標題）— 已嘗試 AVBase、JAVLibrary、JavBus、DuckDuckGo、Gemini"
 
-    # Prefer vision title; fill missing fields from vision
+    # Prefer the catalog title. A different vision phrase must not replace it
+    # or keep that work's Chinese line beside the other sentence.
+    catalog_title = title
     if vision_meta:
         if vision_meta.get("title"):
-            title = vision_meta["title"]
+            title = choose_display_title(title, vision_meta.get("title"))
             if message:
                 message = f"看圖辨識＋{message}"
             else:
@@ -4065,6 +4133,12 @@ def identify_code(
         # Prefer Chinese from online meta if present
         if meta and isinstance(meta, dict):
             title_zh = meta.get("title_zh")
+        if (
+            catalog_title
+            and title
+            and not _titles_are_same_phrase(str(catalog_title), str(title))
+        ):
+            title_zh = None
         title_zh = resolve_chinese_title(
             display,
             title_ja=title,
@@ -6903,6 +6977,112 @@ def build_multi_fail_stub(job: dict, *, why: str = "多圖未找到資料") -> d
     }
 
 
+def _append_unique_note(payload: dict, note: str) -> None:
+    text = (note or "").strip()
+    if not text or not isinstance(payload, dict):
+        return
+    for key in ("message", "related_note"):
+        prev = str(payload.get(key) or "").strip()
+        if text in prev:
+            continue
+        payload[key] = (prev + "；" + text).strip("；") if prev else text
+
+
+def _collect_visual_pool(*groups) -> list[dict]:
+    """Coded works for one image's visual compare, first occurrence wins."""
+    pool: list[dict] = []
+    seen: set[str] = set()
+    for group in groups:
+        for raw in group or []:
+            if not isinstance(raw, dict):
+                continue
+            cand = _payload_as_visual_candidate(raw)
+            if not cand:
+                continue
+            code = str(cand.get("code") or "")
+            if not code or code in seen:
+                continue
+            seen.add(code)
+            pool.append(cand)
+    return pool
+
+
+def _mark_visual_mismatch(payload: dict, note: str) -> dict:
+    payload["visual_lock"] = False
+    payload["visual_mismatch"] = True
+    payload["visual_note"] = note
+    _append_unique_note(payload, note)
+    return payload
+
+
+def verify_work_against_image(
+    result: dict,
+    image_bytes: bytes | None,
+    *,
+    api_key: str | None = None,
+    vision_title: str | None = None,
+) -> dict:
+    """Visually re-check one uploaded image against its own catalog candidates.
+
+    Same lock rule as single-image identify: person + clothes (cover, then
+    stills). A locking candidate replaces the slot. A hit that does not lock
+    is not kept as a verified match — another candidate is preferred, otherwise
+    the card stays with an honest 未核對圖片 note. Keywords are restamped from
+    the title that remains, so slots do not share each other's chips.
+    """
+    if not isinstance(result, dict) or not result.get("ok"):
+        return result
+    out = dict(result)
+    key = (api_key or get_gemini_api_key() or "").strip()
+    if not image_bytes or not key:
+        out["visual_lock"] = False
+        return out
+    pool = _collect_visual_pool([out], out.get("candidates"))
+    if not pool:
+        _mark_visual_mismatch(out, "未核對圖片（沒有可比較的封面或劇照）")
+        _recompute_theme_keywords(out)
+        return out
+    ranked, meta = rank_candidates_by_visual(image_bytes, pool, api_key=key)
+    locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
+    if not locked:
+        query = str(vision_title or "").strip()
+        extras: list[dict] = []
+        if is_usable_title(query):
+            try:
+                hit = search_by_title(query, actress=out.get("actress"))
+            except Exception:
+                hit = None
+            if isinstance(hit, dict):
+                extras.append(hit)
+                extras.extend(hit.get("candidates") or [])
+        wider = _collect_visual_pool(pool, extras)
+        if len(wider) > len(pool):
+            ranked, meta = rank_candidates_by_visual(image_bytes, wider, api_key=key)
+            locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
+    if not (meta or {}).get("visual_ranked"):
+        _mark_visual_mismatch(out, "未核對圖片（無法比對封面或劇照）")
+        _recompute_theme_keywords(out)
+        return out
+    prev = format_display_code(str(out.get("code") or ""))
+    out = _apply_visual_winner(out, ranked, meta, promote_candidates=False)
+    new = format_display_code(str(out.get("code") or ""))
+    if prev and new and prev != new:
+        winner = ranked[0] if ranked else {}
+        # Do not keep the rejected work's Chinese title, stills, or related row.
+        out["title_zh"] = (winner.get("title_zh") if isinstance(winner, dict) else None) or None
+        out["stills"] = list((winner.get("stills") if isinstance(winner, dict) else None) or [])
+        out["related_by_title"] = []
+        out["related"] = []
+    out["visual_lock"] = bool(locked)
+    if locked:
+        out["visual_mismatch"] = False
+        out["visual_note"] = ""
+    else:
+        _mark_visual_mismatch(out, "未核對圖片（人物／衣服／姿勢與這張上傳圖不符）")
+    _recompute_theme_keywords(out)
+    return out
+
+
 def run_multi_identify_pipeline(
     images: list[tuple[bytes, str | None]],
     *,
@@ -7090,7 +7270,7 @@ def run_multi_identify_pipeline(
             200,
         )
 
-    _progress(on_progress, "verify", "skipped", "多圖路徑：逐部查詢", 0.52)
+    _progress(on_progress, "verify", "active", "逐張對照原圖的人物／衣服／姿勢…", 0.52)
     results: list[dict] = []
     failed_jobs: list[dict] = []
     for ji, job in enumerate(jobs):
@@ -7120,8 +7300,7 @@ def run_multi_identify_pipeline(
                     on_progress=None,
                     skip_related=True,
                 )
-                # Prefer vision title when present
-                if vm and vm.get("title") and one.get("ok"):
+                if vm and one.get("ok"):
                     one = apply_vision_meta(one, vm)
             else:
                 # Already vision'd above — resolve by title only (no second vision)
@@ -7135,6 +7314,14 @@ def run_multi_identify_pipeline(
                 )
                 if vm and one.get("ok"):
                     one = apply_vision_meta(one, vm)
+            if one.get("ok"):
+                slot_image = (row or {}).get("image_bytes") if isinstance(row, dict) else None
+                one = verify_work_against_image(
+                    one,
+                    slot_image,
+                    api_key=api_key,
+                    vision_title=(vm or {}).get("title") if isinstance(vm, dict) else None,
+                )
         except Exception as e:
             one = empty_identify(message=f"查詢失敗：{e}")
         if not one.get("ok"):
