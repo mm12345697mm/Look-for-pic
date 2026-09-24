@@ -620,6 +620,15 @@ function walkNodes(node, acc) {
     '息子の家庭教師・家庭教師・10秒挿入・肉欲教育・息子・ママ'
   );
   assert.strictEqual(H.normalizeKeywordList(['あ', '中']).join('・'), '');
+  // Edition/format tags are not chips. OL stays. A glued BOD pair is dropped.
+  assert.strictEqual(
+    H.normalizeKeywordList(['BOD', '中出し', '叔母', 'VOL', 'Blu-ray', 'OL', '交尾BOD', 'VR']).join('・'),
+    '中出し・叔母・OL・VR'
+  );
+  assert.strictEqual(
+    H.formatKeywordListLabel('關鍵字相關', ['BOD', '中出し']),
+    '關鍵字相關（中出し）'
+  );
 }
 
 // Keyword chips on a card that already has a 關鍵字 related section
@@ -740,6 +749,10 @@ function walkNodes(node, acc) {
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'theme'), theme_keywords: [] }));
   assert.ok(H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: [] }));
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['眼鏡'] }));
+  // Cached BOD must be refreshed from the title, even when other chips remain.
+  assert.ok(H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['BOD', '中出し'] }));
+  assert.ok(H.workNeedsThemeKeywords({ related: [], theme_keywords: ['BOD', '中出し'] }));
+  assert.ok(!H.workNeedsThemeKeywords({ related: [], theme_keywords: ['叔母', '交尾'] }));
 }
 
 // Tutor-title multi-candidate: chips sit under the 主作品 block only.

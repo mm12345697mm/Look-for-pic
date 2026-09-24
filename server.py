@@ -4808,10 +4808,10 @@ _WEAK_THEME_TOKENS = frozenset(
 )
 
 # Productive title suffixes. Noun + suffix is one theme when the noun is glued
-# on (ノーブラ誘惑, 巨乳沼, 肉欲教育, 羞恥教育). Bare 誘惑 / 沼 / 教育 are not chips.
-# The noun window is the same 2–8 kanji/katakana run as 誘惑 / 沼 (性教育 is one
-# kanji short of that window, so it is not minted from a single 性).
-_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼", "教育")
+# on (ノーブラ誘惑, 巨乳沼, 肉欲教育, 羞恥教育, 搾精旅行). Bare 誘惑 / 沼 / 教育
+# / 旅行 are not chips. The noun window is the same 2–8 kanji/katakana run
+# (性教育 is one kanji short of that window, so it is not minted from a single 性).
+_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼", "教育", "旅行")
 
 # Kinship / pronoun nouns that form selectable XのY chips (彼女の妹).
 # One-character members are chips only as part of such a phrase, not as leftovers.
@@ -4822,6 +4822,16 @@ _RELATION_NOUNS: tuple[str, ...] = (
     "彼女",
     "彼氏",
     "義妹",
+    "義母",
+    "義父",
+    "義姉",
+    "義兄",
+    "義弟",
+    "義娘",
+    "従姉",
+    "従妹",
+    "叔母",
+    "叔父",
     "息子",
     "ママ",
     "ボク",
@@ -4847,15 +4857,35 @@ _ROLE_THEME_NOUNS = frozenset(
         "秘書",
     }
 )
-# Edition / episode marks. Not theme chips. OL is not in this set: it stays an
-# occupation keyword. These tokens are junk even without a number (VOL, EP);
-# VOL.2 / 第2巻 / 第十二話 are the numbered forms.
-_EDITION_LATIN = frozenset({"vol", "volume", "ep", "episode"})
+# Edition / format marks. Not theme chips, ever — not even "if the title
+# prints them prominently". OL is not in this set: it stays an occupation
+# keyword. VR is not in this set either: it is a product theme.
+# Junk even without a number (VOL, EP, BOD, BD, DVD, Blu-ray);
+# VOL.2 / 第2巻 / 第十二話 are the numbered forms. (BOD) / （Blu-ray） are the
+# parenthetical disc-edition tags catalog sites append after the actress.
+_EDITION_LATIN = frozenset(
+    {
+        "vol",
+        "volume",
+        "ep",
+        "episode",
+        "bod",
+        "bd",
+        "dvd",
+        "uhd",
+        "bluray",
+        "4k",
+    }
+)
 _EDITION_MARKER_RE = re.compile(
-    r"(?i)(?<![A-Za-z])(?:vol(?:ume)?|ep(?:isode)?)(?![A-Za-z])"
+    r"(?i)(?<![A-Za-z0-9])(?:"
+    r"vol(?:ume)?|ep(?:isode)?|bluray|blu[\s\-‐－]?ray|uhd|bod|dvd|(?:4|４)k|bd"
+    r")(?![A-Za-z])"
     r"(?:\s*[\.．]?\s*[0-9０-９]+)?"
     r"|第\s*[0-9０-９一二三四五六七八九十百千〇零]+\s*[巻話章集回]"
+    r"|ブルーレイ(?:ディスク)?"
 )
+_PAREN_GROUP_RE = re.compile(r"[\(（\[【［]([^\)）\]】］]{0,40})[\)）\]】］]")
 _RELATION_NOUN_SET = frozenset(_RELATION_NOUNS)
 _KINSHIP_ROLE_SET = frozenset(n for n in _RELATION_NOUNS if n not in _PRONOUN_NOUNS)
 
@@ -4888,6 +4918,16 @@ _THEME_KEYWORD_LEXICON = (
     "温泉",
     "寝取",
     "義妹",
+    "義母",
+    "義父",
+    "義姉",
+    "義兄",
+    "義弟",
+    "義娘",
+    "従姉",
+    "従妹",
+    "叔母",
+    "叔父",
     "彼女",
     "息子",
     "ママ",
@@ -4898,12 +4938,17 @@ _THEME_KEYWORD_LEXICON = (
     "CA",
     "ノーブラ",
     "中出し",
+    "交尾",
+    "童貞",
+    "絶倫",
+    "搾精",
     "顔射",
     "拘束",
     "監禁",
     "痴女",
     "逆レ",
     "毎朝",
+    "毎晩",
     "通勤",
     "会社",
     "オフィス",
@@ -4946,6 +4991,21 @@ _SHORT_THEME_NOUNS = frozenset(
         "女医",
         "痴女",
         "義妹",
+        "義母",
+        "義父",
+        "義姉",
+        "義兄",
+        "義弟",
+        "義娘",
+        "従姉",
+        "従妹",
+        "叔母",
+        "叔父",
+        "交尾",
+        "童貞",
+        "絶倫",
+        "搾精",
+        "毎晩",
         "巨乳",
         "美乳",
         "爆乳",
@@ -4991,30 +5051,88 @@ def _keyword_index(text: str, kw: str) -> int:
     return text.find(kw)
 
 
-def _is_edition_marker_span(text: str, start: int, end: int) -> bool:
-    """True when this Latin span is VOL / Vol / EP, numbered or not.
+def _fold_fullwidth_latin(text: str) -> str:
+    """Map Ａ-Ｚ / ａ-ｚ to ASCII. Length-preserving. Digits stay as written."""
+    if not text:
+        return ""
+    out: list[str] = []
+    for ch in text:
+        o = ord(ch)
+        if 0xFF21 <= o <= 0xFF3A or 0xFF41 <= o <= 0xFF5A:
+            out.append(chr(o - 0xFEE0))
+        else:
+            out.append(ch)
+    return "".join(out)
 
-    OL is never an edition mark. Numbered forms (VOL.2) are removed up front by
-    _strip_edition_markers; this guards the Latin pass if a bare token remains.
+
+def _is_edition_marker_token(tok: str) -> bool:
+    """True for disc/edition junk: BOD, (already-unwrapped) Blu-ray, VOL.2, 第2巻.
+
+    OL and VR are not edition marks. A theme word that merely sits beside a
+    format tag is not itself junk.
     """
-    tok = (text or "")[start:end].casefold()
-    return tok in _EDITION_LATIN
+    raw = (tok or "").strip()
+    if not raw:
+        return False
+    folded = _fold_fullwidth_latin(raw).strip()
+    if re.fullmatch(r"(?i)blu[\s\-‐－]?ray", folded):
+        return True
+    if re.fullmatch(r"第\s*[0-9０-９一二三四五六七八九十百千〇零]+\s*[巻話章集回]", raw):
+        return True
+    if folded in {"ブルーレイ", "ブルーレイディスク"}:
+        return True
+    compact = re.sub(r"[\s\.．·・‐－\-]+", "", folded).casefold()
+    if compact in _EDITION_LATIN or compact in {"ブルーレイ", "ブルーレイディスク"}:
+        return True
+    if re.fullmatch(r"(?:vol(?:ume)?|ep(?:isode)?|bod|bd|dvd|uhd|bluray|4k)[0-9]+", compact):
+        return True
+    return False
+
+
+def _is_edition_marker_span(text: str, start: int, end: int) -> bool:
+    """True when this Latin span is VOL / BOD / BD / DVD, numbered or not.
+
+    OL is never an edition mark. Numbered forms (VOL.2) and parenthetical
+    (BOD) / (Blu-ray) are removed up front by _strip_edition_markers; this
+    guards the Latin pass if a bare token remains.
+    """
+    return _is_edition_marker_token((text or "")[start:end])
 
 
 def _strip_edition_markers(text: str) -> str:
-    """Drop episode/volume junk before keyword extraction.
+    """Drop episode/volume/disc junk before keyword extraction.
 
-    Removes VOL / Vol / VOL.2 / VOLUME 2 / EP.2 and 第N巻-style counters
-    (第2巻, 第２話, 第十二巻, 第2回). Does not touch a real occupation token OL.
+    Removes VOL / Vol / VOL.2 / EP.2, 第N巻-style counters, and format tags
+    BOD / BD / DVD / Blu-ray / ブルーレイ / 4K / UHD. A parenthetical that is
+    only a format tag — (BOD), （Blu-ray）, 【BD】 — is removed whole. A
+    parenthetical that mixes a format tag with real words keeps those words.
+    Does not touch occupation OL or theme VR.
     """
     if not text:
         return ""
-    return _EDITION_MARKER_RE.sub(" ", text)
+    folded = _fold_fullwidth_latin(text)
+
+    def _paren(m: re.Match) -> str:
+        inner = m.group(1) or ""
+        cleaned = _EDITION_MARKER_RE.sub(" ", inner)
+        compact_clean = re.sub(r"[\s・,，/|．\.]+", "", cleaned)
+        compact_inner = re.sub(r"[\s・,，/|．\.]+", "", inner)
+        if not compact_clean:
+            return " "
+        if compact_clean != compact_inner:
+            return " " + cleaned + " "
+        return m.group(0)
+
+    out = _PAREN_GROUP_RE.sub(_paren, folded)
+    out = _EDITION_MARKER_RE.sub(" ", out)
+    out = re.sub(r"[\(（\[【［]\s*[\)）\]】］]", " ", out)
+    return out
 
 
 def _title_sibling_phrases(title: str) -> list[str]:
     """Distinctive title phrases for 片名相近 / same-series catalog search."""
     raw = normalize_ocr_title(title) or (title or "").strip()
+    raw = _strip_edition_markers(raw)
     t = re.sub(r"\s+", "", raw)
     if len(t) < 6:
         return []
@@ -5208,6 +5326,71 @@ def _extract_time_action_phrases(title: str) -> list[str]:
     return out
 
 
+# Trip-length settings (一泊二日, 二泊三日, 2泊3日). One numeral on each side
+# so 十一泊十二日 is not sliced into 一泊二. Not edition junk.
+_STAY_NUM = r"[0-9０-９一二三四五六七八九十]"
+_STAY_FIND_RE = re.compile(rf"(?<!{_STAY_NUM})({_STAY_NUM}泊{_STAY_NUM}日)")
+
+# Glued act compounds (連続中出し). The bare act may stay a weak chip;
+# the prefixed form is the theme. A kanji immediately before 連続 blocks
+# a false cut such as 非連続中出し.
+_ACT_PREFIXES: tuple[str, ...] = ("連続",)
+_ACT_CORES: tuple[str, ...] = (
+    "セックス",
+    "中出し",
+    "フェラ",
+    "挿入",
+    "射精",
+    "顔射",
+    "交尾",
+)
+_PREFIXED_ACT_RE = re.compile(
+    r"(?<![\u4e00-\u9fff])("
+    + "|".join(re.escape(p) for p in _ACT_PREFIXES)
+    + r")("
+    + "|".join(re.escape(a) for a in sorted(_ACT_CORES, key=len, reverse=True))
+    + r")"
+)
+
+
+def _extract_stay_phrases(title: str) -> list[str]:
+    """In-title N泊M日 settings (一泊二日). Surface form, not a translation."""
+    text = re.sub(r"\s+", "", title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _STAY_FIND_RE.finditer(text):
+        phrase = m.group(1)
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        out.append(phrase)
+    return out
+
+
+def _is_stay_keyword(tok: str) -> bool:
+    t = re.sub(r"\s+", "", tok or "")
+    return _STAY_FIND_RE.fullmatch(t) is not None
+
+
+def _extract_prefixed_act_phrases(title: str) -> list[str]:
+    """In-title prefix+act compounds (連続中出し). Not a Chinese rewrite."""
+    text = re.sub(r"\s+", "", title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _PREFIXED_ACT_RE.finditer(text):
+        phrase = m.group(1) + m.group(2)
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        out.append(phrase)
+    return out
+
+
+def _is_prefixed_act_keyword(tok: str) -> bool:
+    t = re.sub(r"\s+", "", tok or "")
+    return _PREFIXED_ACT_RE.fullmatch(t) is not None
+
+
 def _time_phrase_in_text(phrase: str, text: str) -> bool:
     """Substring hit of any spelling. A longer number's tail (110秒) is not 10秒."""
     folded = _fold_digits(text or "")
@@ -5276,10 +5459,30 @@ def _is_relation_phrase(tok: str) -> bool:
     return left in _KINSHIP_ROLE_SET and right in _ROLE_THEME_NOUNS
 
 
+def _contains_edition_marker(tok: str) -> bool:
+    """True when the token is, or still contains, disc/edition junk.
+
+    Catches a glued pair such as 交尾BOD as well as a bare BOD / VOL.2.
+    """
+    raw = (tok or "").strip()
+    if not raw:
+        return False
+    if _is_edition_marker_token(raw):
+        return True
+    return _EDITION_MARKER_RE.search(_fold_fullwidth_latin(raw)) is not None
+
+
 def _keyword_token_ok(tok: str) -> bool:
-    """Chip/query token length. 妹 is allowed; other 1-char scraps are not."""
+    """Chip/query token length. 妹 is allowed; other 1-char scraps are not.
+
+    Edition/format tokens (BOD, Blu-ray, VOL, 第2巻) are never chips, even
+    when a cached list or a re-search payload still contains them, and even
+    when a pair query glued one onto a real theme word.
+    """
     t = (tok or "").strip()
     if not t or len(t) > 24:
+        return False
+    if _contains_edition_marker(t):
         return False
     if len(t) >= 2:
         return True
@@ -5447,7 +5650,10 @@ def _chip_contains_part(compound: str, part: str) -> bool:
     if compound.count("の") == 1:
         left, right = compound.split("の", 1)
         return part == left or part == right
-    return compound.startswith(part)
+    if compound.startswith(part):
+        return True
+    # 連続中出し covers the act 中出し; it does not start with that act.
+    return _is_prefixed_act_keyword(compound) and compound.endswith(part)
 
 
 def _subsumed_keyword_parts(keywords: list[str] | None) -> set[str]:
@@ -5553,6 +5759,11 @@ def _rank_theme_keywords(
     heads = {noun for noun in compound_head.values() if noun}
 
     def _tier(tok: str) -> int:
+        # 一泊二日 / 連続中出し are productive theme chips, beside lexicon nouns.
+        # Do this before the compound-head tier: 中出し is weak, and that must
+        # not demote the prefixed act that contains it.
+        if _is_stay_keyword(tok) or _is_prefixed_act_keyword(tok):
+            return 1
         head = compound_head.get(tok)
         if head and not _is_weak_theme_token(tok) and not _is_relation_phrase(tok):
             known = (not _is_weak_theme_token(head)) and (
@@ -5630,13 +5841,17 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
     彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
-    and both parts. Weak halves stay selectable, but a longer chip is ordered
+    and both parts. Specific kinship in the lexicon (叔母, 義母, 義姉, …) is a
+    theme chip when the title says it; generic 彼女 / 妹 stay selectable but
+    weak. Weak halves stay selectable, but a longer chip is ordered
     before its own shorter chips. Unrelated theme nouns (巨乳) stay ahead of
-    彼女の妹. Bare 誘惑 / 教育 are
-    not chips unless glued to a noun. A time+action hook (10秒で挿入, 3分で絶頂)
-    becomes one compact chip (10秒挿入) and is searched like other theme nouns.
-    Edition / episode junk (VOL, Vol, VOL.2, EP.2, 第2巻, 第十二話) is stripped
-    before matching, so it cannot become a chip or a leftover scrap. OL stays
+    彼女の妹. Bare 誘惑 / 教育 / 旅行 are
+    not chips unless glued to a noun (搾精旅行). A time+action hook
+    (10秒で挿入, 3分で絶頂) becomes one compact chip (10秒挿入). A stay
+    (一泊二日) and a prefixed act (連続中出し) are chips in catalog spelling,
+    never a Chinese rewrite. Edition / format junk (VOL, Vol.2, EP.2, 第2巻,
+    BOD, (BOD), BD, DVD, Blu-ray, ブルーレイ) is stripped before matching, so
+    it cannot become a chip, a leftover scrap, or an automatic query. OL stays
     in the lexicon: it is an occupation chip when the title actually contains
     that token, and it does not match inside VOL. Leftover {4,6} scraps run
     only when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
@@ -5681,6 +5896,10 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
         _add(right)
     for canon in _extract_time_action_phrases(t):
         _add(canon)
+    for phrase in _extract_stay_phrases(t):
+        _add(phrase)
+    for phrase in _extract_prefixed_act_phrases(t):
+        _add(phrase)
 
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
         if _keyword_index(t_norm, kw) < 0:
@@ -5758,7 +5977,7 @@ def _matched_theme_keywords(candidate_title: str, keywords: list[str] | None) ->
     hit: list[str] = []
     for kw in keywords:
         tok = str(kw or "").strip()
-        if not tok:
+        if not tok or _is_edition_marker_token(tok):
             continue
         if any(_alias_in_title(al, text) for al in _theme_keyword_aliases(tok)):
             hit.append(tok)
@@ -6069,22 +6288,37 @@ def _auto_keyword_needs_single_fallback(
     return True
 
 
+def _keyword_list_has_edition_marker(raw) -> bool:
+    """True when a stored chip list still contains BOD / VOL / Blu-ray junk."""
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，、・/|]+", raw)
+    if not isinstance(raw, (list, tuple)):
+        return False
+    return any(_contains_edition_marker(str(item or "")) for item in raw)
+
+
 def _stamp_theme_keywords(payload: dict) -> dict:
     """Attach theme_keywords + keyword_queries on a work so the UI does not re-guess.
 
     Keeps a non-empty list already on the payload. Fills from the title otherwise.
+    A stored list that still contains an edition/format tag (BOD, VOL, Blu-ray)
+    is stale: re-extract from the title instead of dropping the tag and keeping
+    the thin remainder (BOD + 中出し → 中出し only).
     """
     if not isinstance(payload, dict):
         return payload
     title = str(payload.get("title") or "")
     actress = str(payload.get("actress") or "").strip() or None
     existing = payload.get("theme_keywords")
-    if isinstance(existing, list) and existing:
+    stale = _keyword_list_has_edition_marker(existing) or _keyword_list_has_edition_marker(
+        payload.get("keyword_queries")
+    )
+    if isinstance(existing, list) and existing and not stale:
         kws = _normalize_keyword_list(existing)
     else:
         kws = _extract_title_theme_keywords(title, actress=actress)
     existing_q = payload.get("keyword_queries")
-    if isinstance(existing_q, list) and existing_q:
+    if isinstance(existing_q, list) and existing_q and not stale:
         queries = _normalize_keyword_list(existing_q, limit=8)
     else:
         queries = _keyword_search_queries(title, kws, selected_only=False)
@@ -6096,8 +6330,9 @@ def _stamp_theme_keywords(payload: dict) -> dict:
 def _recompute_theme_keywords(payload: dict) -> dict:
     """Replace chips from the current extractor whenever a title is present.
 
-    Cached pre-#15 lists (a lone 家庭教師, or VOL/OL junk) must not stick on
-    read. An empty title falls back to _stamp_theme_keywords.
+    Cached pre-#15 lists (a lone 家庭教師, or VOL/OL junk) and later BOD /
+    Blu-ray lists must not stick on read or re-identify. An empty title falls
+    back to _stamp_theme_keywords.
     """
     if not isinstance(payload, dict):
         return payload
