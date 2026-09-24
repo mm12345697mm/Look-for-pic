@@ -2348,11 +2348,9 @@
     const slides = [];
     const mainSlide = document.createElement('div');
     mainSlide.className = 'work-carousel-slide';
-    const mainCard = buildWorkCard(mainWork, {
-      slide: true,
-      badgeLabel: lineLabel(mainWork.line || 'main'),
-    });
-    mainSlide.appendChild(mainCard);
+    mainSlide.appendChild(
+      buildWorkCard(mainWork, { slide: true, badgeLabel: lineLabel(mainWork.line || 'main') })
+    );
     track.appendChild(mainSlide);
     slides.push(mainSlide);
 
@@ -2382,58 +2380,22 @@
       window.requestAnimationFrame(updatePager);
     }, { passive: true });
 
-    // Track first, then hint/pager as snug footer under stills (no stretch gap)
+    // Track first, then hint/pager as snug footer under stills (no stretch gap).
+    // Chips sit under this primary card only — never inside related slides.
     block.appendChild(track);
     block.appendChild(head);
-    mountKeywordResearch(block, mainWork, related, themeKeywords, mainCard);
+    if (String((mainWork && mainWork.line) || 'main') === 'main') {
+      mountKeywordResearch(block, mainWork, related, themeKeywords);
+    }
     return block;
   }
 
-  function elementHasClass(el, name) {
-    if (!el) return false;
-    if (el.classList && el.classList.contains(name)) return true;
-    return String(el.className || '').split(/\s+/).indexOf(name) !== -1;
-  }
-
-  function findChildByClass(root, className) {
-    const kids = (root && root.children) || [];
-    for (let i = 0; i < kids.length; i++) {
-      if (elementHasClass(kids[i], className)) return kids[i];
-    }
-    return null;
-  }
-
-  /** Place node directly under the copy/download bar. Falls back to append. */
-  function insertAfterActionBar(card, node) {
-    const actions = findChildByClass(card, 'work-actions');
-    const parent = actions && actions.parentNode;
-    if (!parent) return false;
-    if (typeof parent.insertBefore === 'function') {
-      parent.insertBefore(node, actions.nextSibling || null);
-      return true;
-    }
-    const kids = parent.children;
-    if (kids && typeof kids.indexOf === 'function' && typeof kids.splice === 'function') {
-      const i = kids.indexOf(actions);
-      if (i >= 0) {
-        kids.splice(i + 1, 0, node);
-        node.parentNode = parent;
-        return true;
-      }
-    }
-    if (typeof parent.appendChild === 'function') {
-      parent.appendChild(node);
-      return true;
-    }
-    return false;
-  }
-
   /**
-   * Keyword chips under the copy/download buttons, plus a separate bottom row.
-   * Chips come from this work's theme_keywords (main and 片名候選 cards).
+   * Keyword chips + 搜尋 under the 主作品 block, not inside the card and not
+   * on 片名 / 關鍵字 / 同演員 slides or title-search candidate cards.
    * Re-search uses only the selected chips (server enforces multi-hit / cap 10).
    */
-  function mountKeywordResearch(block, mainWork, related, themeKeywords, card) {
+  function mountKeywordResearch(block, mainWork, related, themeKeywords) {
     const hasKeyword = (related || []).some((rw) => {
       const why = String((rw && rw.why) || '');
       const line = String((rw && rw.line) || '');
@@ -2620,7 +2582,7 @@
       el.addEventListener('pointerdown', stopCarouselBubble);
       el.addEventListener('touchstart', stopCarouselBubble, { passive: true });
     });
-    if (!insertAfterActionBar(card, panel)) block.appendChild(panel);
+    block.appendChild(panel);
     block.appendChild(research);
   }
 
