@@ -2109,8 +2109,14 @@ function walkNodes(node, acc) {
       'complete cards stay uncluttered'
     );
     assert.ok(
-      H.workHasUsableCover({ cover: 'data:image/jpeg;base64,xx', titleOnly: true })
+      !H.workHasUsableCover({ cover: 'data:image/jpeg;base64,xx', titleOnly: true }),
+      'upload data URL is not a catalog jacket'
     );
+    assert.ok(H.slotNeedsCodeEntry({ skipped: true }));
+    assert.ok(H.workNeedsManualFix({ skipped: true, code: '', title: '', cover: '' }));
+    assert.ok(H.slotNeedsCodeEntry({ unidentified: true, code: '未辨識', title: '（這張尚未辨識）' }));
+    assert.ok(H.slotNeedsCodeEntry({ titleOnly: true, code: '片名搜尋', title: '未解析' }));
+    assert.ok(!H.slotNeedsCodeEntry({ code: 'AAA-001', title: '地味な眼鏡', cover: 'https://pics.dmm.co.jp/x.jpg' }));
   }
 
   {
@@ -2133,8 +2139,23 @@ function walkNodes(node, acc) {
       { ok: false },
       'data:image/jpeg;base64,cover'
     );
-    assert.strictEqual(local.cover, 'data:image/jpeg;base64,cover');
+    assert.strictEqual(local.cover, '');
+    assert.ok(String(local.cover).indexOf('data:') !== 0);
     assert.strictEqual(local.title, '有名無圖');
+    const stolen = H.mergeManualFixIntoWork(
+      { code: '片名搜尋', title: '未解析', titleOnly: true, cover: 'data:image/jpeg;base64,UPLOAD', userPreview: 'data:image/jpeg;base64,UPLOAD' },
+      {
+        ok: true,
+        code: 'JUFE-271',
+        title: '地味な眼鏡',
+        cid: 'jufe00271',
+        cover: 'data:image/jpeg;base64,UPLOAD',
+        user_preview: 'data:image/jpeg;base64,UPLOAD',
+      }
+    );
+    assert.strictEqual(stolen.code, 'JUFE-271');
+    assert.ok(String(stolen.cover).indexOf('https://pics.dmm.co.jp/') === 0, stolen.cover);
+    assert.ok(String(stolen.cover).indexOf('data:') === -1);
   }
 
   {
@@ -3090,6 +3111,327 @@ function walkNodes(node, acc) {
       assert.ok(detailText.indexOf('時間不夠') === -1);
       assert.ok(detailText.indexOf('尚未查完') === -1);
       assert.ok(detailText.indexOf('尚未鎖定') === -1);
+    } finally {
+      context.fetch = prevFetch;
+      context.FormData = prevForm;
+    }
+  }
+
+  // Unresolved slots: typed 番號／名稱 re-identifies into the same carousel, catalog jacket only.
+  {
+    const coverA = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
+    const coverJ = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg';
+    const stillJ = 'https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg';
+    const coverB = 'https://pics.dmm.co.jp/digital/video/bbb00002/bbb00002pl.jpg';
+    const coverC = 'https://pics.dmm.co.jp/digital/video/ccc00009/ccc00009pl.jpg';
+    const upload = 'data:image/jpeg;base64,UNRESOLVEDUPLOAD';
+    const titleOpen = '彼婦の妹のニテブラ誘惑に負け';
+    const session = {
+      ok: true,
+      code: 'AAA-001',
+      title: '已解析的主作品',
+      cover: coverA,
+      session_id: 'ses_manual_slot',
+      results: [
+        {
+          ok: true,
+          code: 'AAA-001',
+          title: '已解析的主作品',
+          cover: coverA,
+          from_image_index: 1,
+          line: 'main',
+          related_by_title: [
+            {
+              code: 'REL-101',
+              title: '相關甲',
+              line: 'theme',
+              why: '片名相近',
+              cover: coverA,
+            },
+          ],
+        },
+        {
+          ok: true,
+          code: 'TITLE-SEARCH',
+          title: titleOpen,
+          needs_code: true,
+          cover: upload,
+          user_preview: upload,
+          from_image_index: 2,
+          line: 'multi',
+          theme_keywords: ['巨乳', '誘惑'],
+        },
+        {
+          ok: false,
+          skipped: true,
+          code: null,
+          title: null,
+          cover: null,
+          from_image_index: 3,
+          user_preview: upload,
+          line: 'multi',
+        },
+        {
+          ok: true,
+          code: 'TITLE-SEARCH',
+          title: '（這張尚未辨識）',
+          unidentified: true,
+          cover: null,
+          from_image_index: 4,
+          line: 'multi',
+        },
+      ],
+    };
+    const gallery = H.galleryFromIdentify(session);
+    assert.strictEqual(gallery.items.length, 4);
+    assert.ok(!H.workNeedsManualFix(gallery.items[0]));
+    assert.strictEqual(gallery.items[1].code, '片名搜尋');
+    assert.ok(gallery.items[1].cover !== upload);
+    assert.ok(!gallery.items[1].cover, 'title-search must not keep the upload as the cover');
+    assert.ok(H.slotNeedsCodeEntry(gallery.items[1]));
+    assert.ok(H.workNeedsManualFix(gallery.items[2]));
+    assert.strictEqual(gallery.items[3].code, '未辨識');
+    assert.ok(H.slotNeedsCodeEntry(gallery.items[3]));
+
+    const works = H.sessionWorksFromIdentify(session);
+    assert.strictEqual(works.length, 4);
+    const savedList = H.loadHistory();
+    savedList.unshift({
+      id: 'h-manual-slot',
+      kind: 'session',
+      ts: Date.now(),
+      code: works[0].code,
+      title: works[0].title,
+      cover: coverA,
+      userShots: [upload],
+      works: works,
+    });
+    H.saveHistory(savedList);
+    if (typeof context.scrollTo !== 'function') context.scrollTo = function () {};
+    H.renderGallery(gallery);
+
+    function blocksOf(root) {
+      return walkNodes(root).filter((n) => n.className === 'work-carousel-block');
+    }
+    function firstCode(block) {
+      const node = walkNodes(block).find((n) => n.className === 'card-code');
+      return node ? node.textContent : '';
+    }
+    function mainCard(block) {
+      return walkNodes(block).find((n) => String(n.className || '').split(' ')[0] === 'card');
+    }
+    const blocks = blocksOf(getEl('gallery-cards'));
+    assert.strictEqual(blocks.length, 4, 'four upload slots stay vertical');
+    assert.ok(!walkNodes(blocks[0]).some((n) => n.className === 'manual-fix-form'));
+    const form1 = walkNodes(blocks[1]).find((n) => n.className === 'manual-fix-form');
+    assert.ok(form1, 'title-search slot shows manual entry');
+    assert.ok(String(form1.className).indexOf('hidden') === -1, 'unresolved form is open');
+    assert.ok(walkNodes(blocks[1]).some((n) => n.className === 'manual-fix-code'));
+    assert.ok(walkNodes(blocks[1]).some((n) => n.className === 'manual-fix-title'));
+    const captions1 = walkNodes(blocks[1])
+      .filter((n) => n.className === 'manual-fix-caption')
+      .map((n) => n.textContent);
+    assert.deepStrictEqual(captions1, ['番號', '名稱']);
+    const placeholder1 = walkNodes(blocks[1]).find((n) => n.className === 'cover-placeholder');
+    assert.ok(placeholder1, 'title-search slot keeps an empty cover placeholder');
+    assert.ok(String(placeholder1.innerHTML).indexOf('尚未解析番號') !== -1, placeholder1.innerHTML);
+    assert.ok(String(placeholder1.innerHTML).indexOf('請手動輸入番號或名稱') !== -1, placeholder1.innerHTML);
+    assert.ok(walkNodes(blocks[2]).some((n) => String(n.className || '').indexOf('btn-reidentify') !== -1));
+    assert.ok(walkNodes(blocks[2]).some((n) => n.className === 'manual-fix-code'), 'skipped slot can type a 番號');
+    assert.ok(walkNodes(blocks[3]).some((n) => n.className === 'manual-fix-form'));
+    const titleInput3 = walkNodes(blocks[3]).find((n) => n.className === 'manual-fix-title');
+    assert.strictEqual(titleInput3.value, '', 'placeholder unidentified title is not submitted as a name');
+
+    const forms = [];
+    function RecForm() {
+      this.pairs = [];
+      forms.push(this);
+    }
+    RecForm.prototype.append = function (k, v) {
+      this.pairs.push([String(k), v]);
+    };
+    const prevFetch = context.fetch;
+    const prevForm = context.FormData;
+    context.FormData = RecForm;
+    const jufe = {
+      ok: true,
+      code: 'JUFE-271',
+      title: '地味な眼鏡では隠し切れない',
+      title_zh: '土味眼鏡藏不住',
+      actress: '女優甲',
+      cid: 'jufe00271',
+      cover: coverJ,
+      stills: [stillJ, upload],
+      user_preview: upload,
+      theme_keywords: ['巨乳', '誘惑'],
+      related_by_title: [
+        {
+          code: 'REL-271',
+          title: '眼鏡の関連',
+          title_zh: '眼鏡相關',
+          line: 'keyword',
+          why: '關鍵字',
+          cover: coverJ,
+        },
+      ],
+    };
+    const beta = {
+      ok: true,
+      code: 'BBB-002',
+      title: '跳過後手動番號',
+      cid: 'bbb00002',
+      cover: upload,
+      user_preview: upload,
+      stills: [coverB],
+    };
+    const gamma = {
+      ok: true,
+      code: 'CCC-009',
+      title: '目錄裡的另一部',
+      title_zh: '另一部中文',
+      cid: 'ccc00009',
+      cover: coverC,
+      stills: [coverC],
+    };
+    context.fetch = async (url) => {
+      const u = String(url || '');
+      if (u.indexOf('/api/identify/stream') !== -1) {
+        return { ok: false, status: 404, headers: { get: () => '' }, body: null, json: async () => ({}) };
+      }
+      if (u.indexOf('/api/identify') !== -1) {
+        const body = forms[forms.length - 1];
+        const pair = (k) => body && body.pairs && body.pairs.find((p) => p[0] === k);
+        const asked = (pair('code') && pair('code')[1]) || '';
+        const title = (pair('title') && pair('title')[1]) || '';
+        let payload = jufe;
+        if (asked === 'BBB-002') payload = beta;
+        else if (!asked && title.indexOf('目錄') !== -1) payload = gamma;
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => payload,
+        };
+      }
+      return { ok: false, status: 404, headers: { get: () => '' }, json: async () => ({ ok: false }) };
+    };
+    try {
+      const codeInput = walkNodes(blocks[1]).find((n) => n.className === 'manual-fix-code');
+      codeInput.value = 'jufe-271';
+      const apply1 = walkNodes(blocks[1]).find((n) => String(n.className || '').indexOf('manual-fix-apply') !== -1);
+      assert.strictEqual(apply1.textContent, '核對');
+      apply1.click();
+      const fixed = await H.manualTask();
+      assert.strictEqual(fixed.ok, true, fixed && fixed.reason);
+      assert.strictEqual(fixed.slotIndex, 1);
+      assert.strictEqual(fixed.work.code, 'JUFE-271');
+      assert.ok(String(fixed.work.cover).indexOf('jufe00271pl') !== -1, fixed.work.cover);
+      assert.ok(String(fixed.work.cover).indexOf('data:') === -1);
+      assert.notStrictEqual(fixed.work.cover, upload);
+      forms.forEach((form) => {
+        const keys = form.pairs.map((p) => p[0]);
+        assert.ok(keys.indexOf('image') === -1, 'typed 番號 must not send the upload: ' + keys.join(','));
+        assert.ok(keys.indexOf('images') === -1, keys.join(','));
+      });
+      assert.ok(forms.some((form) => form.pairs.some((p) => p[0] === 'code' && p[1] === 'JUFE-271')));
+      assert.ok(forms.some((form) => form.pairs.some((p) => p[0] === 'slot_index' && String(p[1]) === '2')));
+
+      let after = blocksOf(getEl('gallery-cards'));
+      assert.strictEqual(after.length, 4, 'manual identify stays in the same slot');
+      assert.strictEqual(firstCode(after[0]), 'AAA-001');
+      assert.strictEqual(firstCode(after[1]), 'JUFE-271');
+      assert.strictEqual(firstCode(after[2]), '');
+      assert.strictEqual(firstCode(after[3]), '未辨識');
+      const imgs1 = walkNodes(after[1]).filter((n) => n.tagName === 'IMG').map((n) => String(n.src || ''));
+      assert.ok(imgs1.some((s) => s.indexOf('jufe00271pl') !== -1), imgs1.join(','));
+      imgs1.forEach((s) => {
+        assert.ok(s.indexOf('data:') !== 0, s);
+        assert.ok(s.indexOf('blob:') !== 0, s);
+      });
+      const chipText = walkNodes(after[1]).map((n) => n.textContent || '').join('\n');
+      assert.ok(chipText.indexOf('巨乳（巨乳）') !== -1, chipText);
+      assert.ok(chipText.indexOf('土味眼鏡藏不住') !== -1, chipText);
+      assert.ok(chipText.indexOf('REL-271') !== -1, chipText);
+      assert.ok(walkNodes(after[0]).some((n) => n.className === 'card-code' && n.textContent === 'REL-101'));
+      assert.ok(!walkNodes(after[1]).some((n) => n.className === 'manual-fix-form'), 'resolved slot drops the manual form');
+
+      let stored = H.loadHistory().find((x) => x.id === 'h-manual-slot');
+      assert.strictEqual(stored.works.length, 4);
+      assert.strictEqual(stored.works[0].code, 'AAA-001');
+      assert.strictEqual(stored.works[0].related[0].code, 'REL-101');
+      assert.strictEqual(stored.code, 'AAA-001');
+      assert.strictEqual(stored.cover, coverA);
+      assert.strictEqual(stored.userShots[0], upload);
+      assert.strictEqual(stored.works[1].code, 'JUFE-271');
+      assert.strictEqual(stored.works[1].title_zh, '土味眼鏡藏不住');
+      assert.ok(String(stored.works[1].cover).indexOf('jufe00271pl') !== -1);
+      assert.ok(String(stored.works[1].cover).indexOf('data:') === -1);
+      assert.ok(stored.works[1].stills.indexOf(stillJ) !== -1);
+      assert.ok(stored.works[1].stills.every((u) => String(u).indexOf('data:') !== 0));
+      assert.ok(stored.works[1].related.some((r) => r.code === 'REL-271'));
+      assert.ok(stored.works[1].theme_keywords.indexOf('巨乳') !== -1);
+      assert.ok(stored.works[2].skipped);
+      assert.ok(stored.works[3].unidentified || stored.works[3].code === 'TITLE-SEARCH');
+
+      const skipCode = walkNodes(after[2]).find((n) => n.className === 'manual-fix-code');
+      skipCode.value = 'BBB-002';
+      const applySkip = walkNodes(after[2]).find((n) => String(n.className || '').indexOf('manual-fix-apply') !== -1);
+      applySkip.click();
+      const skippedFixed = await H.manualTask();
+      assert.strictEqual(skippedFixed.ok, true, skippedFixed && skippedFixed.reason);
+      assert.strictEqual(skippedFixed.slotIndex, 2);
+      assert.strictEqual(skippedFixed.work.code, 'BBB-002');
+      assert.ok(String(skippedFixed.work.cover).indexOf('bbb00002pl') !== -1, skippedFixed.work.cover);
+      assert.ok(String(skippedFixed.work.cover).indexOf('data:') === -1);
+      after = blocksOf(getEl('gallery-cards'));
+      assert.strictEqual(after.length, 4);
+      assert.strictEqual(firstCode(after[0]), 'AAA-001');
+      assert.strictEqual(firstCode(after[1]), 'JUFE-271');
+      assert.strictEqual(firstCode(after[2]), 'BBB-002');
+      assert.strictEqual(firstCode(after[3]), '未辨識');
+      stored = H.loadHistory().find((x) => x.id === 'h-manual-slot');
+      assert.strictEqual(stored.works[1].code, 'JUFE-271');
+      assert.strictEqual(stored.works[2].code, 'BBB-002');
+      assert.ok(!stored.works[2].skipped);
+      assert.ok(String(stored.works[2].cover).indexOf('https://') === 0);
+      assert.strictEqual(stored.works[3].code, 'TITLE-SEARCH');
+      assert.strictEqual(stored.code, 'AAA-001');
+
+      assert.strictEqual(H.openHistoryDetail('h-manual-slot'), true);
+      const detailBlocks = blocksOf(getEl('history-detail'));
+      assert.strictEqual(detailBlocks.length, 4);
+      assert.strictEqual(firstCode(detailBlocks[1]), 'JUFE-271');
+      assert.ok(walkNodes(detailBlocks[3]).some((n) => n.className === 'manual-fix-code'));
+      const detailTitle = walkNodes(detailBlocks[3]).find((n) => n.className === 'manual-fix-title');
+      detailTitle.value = '目錄裡的另一部';
+      const detailApply = walkNodes(detailBlocks[3]).find(
+        (n) => String(n.className || '').indexOf('manual-fix-apply') !== -1
+      );
+      detailApply.click();
+      const detailFixed = await H.manualTask();
+      assert.strictEqual(detailFixed.ok, true, detailFixed && detailFixed.reason);
+      assert.strictEqual(detailFixed.slotIndex, 3);
+      assert.strictEqual(detailFixed.work.code, 'CCC-009');
+      assert.strictEqual(detailFixed.work.cover, coverC);
+      const detailAfter = blocksOf(getEl('history-detail'));
+      assert.strictEqual(detailAfter.length, 4, 'history detail keeps the same slots');
+      assert.strictEqual(firstCode(detailAfter[0]), 'AAA-001');
+      assert.strictEqual(firstCode(detailAfter[1]), 'JUFE-271');
+      assert.strictEqual(firstCode(detailAfter[2]), 'BBB-002');
+      assert.strictEqual(firstCode(detailAfter[3]), 'CCC-009');
+      stored = H.loadHistory().find((x) => x.id === 'h-manual-slot');
+      assert.strictEqual(stored.works.length, 4);
+      assert.strictEqual(stored.works[3].code, 'CCC-009');
+      assert.strictEqual(stored.works[3].cover, coverC);
+      assert.strictEqual(stored.works[1].code, 'JUFE-271');
+      assert.strictEqual(stored.userShots[0], upload);
+      assert.strictEqual(stored.code, 'AAA-001');
+      const toast = String(getEl('lfp-toast').textContent || '');
+      assert.ok(toast.indexOf('已核對封面') !== -1, toast);
+      assert.ok(toast.indexOf('時間不夠') === -1, toast);
+      assert.ok(toast.indexOf('尚未查完') === -1, toast);
+      assert.ok(toast.indexOf('尚未鎖定') === -1, toast);
+      assert.ok(mainCard(detailAfter[3]), 'resolved history card is still in its carousel');
     } finally {
       context.fetch = prevFetch;
       context.FormData = prevForm;

@@ -13369,12 +13369,16 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                if (
-                    n_images == 1
-                    and session_id
-                    and slot_index_raw
+                # Image retry (n_images == 1) keeps the old patch rule.
+                # A typed 番號／名稱 has no upload (n_images == 0) and still
+                # replaces that same frame when the catalog identify succeeded.
+                patch_slot = (
+                    bool(session_id)
+                    and bool(slot_index_raw)
                     and isinstance(result, dict)
-                ):
+                    and (n_images == 1 or (n_images == 0 and result.get("ok")))
+                )
+                if patch_slot:
                     try:
                         slot_n = int(slot_index_raw)
                     except (TypeError, ValueError):
