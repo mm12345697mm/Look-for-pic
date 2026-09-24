@@ -240,19 +240,78 @@
     return !normalizeKeywordList(raw).length;
   }
 
+  function relatedHasPersistedMembership(related) {
+    return (related || []).some((r) => r && String(r.code || '').trim());
+  }
+
   function relatedBucketsNeedFill(related, opts) {
+    // Caps are maxima. A saved list — even a short one — is finished.
+    // Search only when related was never stored and we have a title or actress.
     opts = opts || {};
-    const counts = { theme: 0, keyword: 0, actress: 0 };
-    (related || []).forEach((r) => {
-      const ln = relatedLineFromRaw(r);
-      if (counts[ln] != null) counts[ln] += 1;
-    });
+    if (relatedHasPersistedMembership(related)) return false;
     const hasTitle = !!(opts.title && String(opts.title).trim());
     const hasActress = !!(opts.actress && String(opts.actress).trim());
-    if (hasTitle && counts.theme < 5) return true;
-    if (hasTitle && counts.keyword < 5) return true;
-    if (hasActress && counts.actress < 3) return true;
-    return false;
+    return hasTitle || hasActress;
+  }
+
+  function applyTitleZhOntoRelated(existing, incoming) {
+    const byCode = {};
+    (incoming || []).forEach((r) => {
+      if (!r || !r.code) return;
+      byCode[String(r.code)] = r;
+    });
+    return (existing || []).map((r) => {
+      if (!r || !r.code) return r;
+      const hit =
+        byCode[String(r.code)] ||
+        (incoming || []).find((row) => row && row.code && codesMatch(row.code, r.code));
+      const zh = hit ? String(hit.title_zh || hit.titleZh || '').trim() : '';
+      if (!zh || String(r.title_zh || r.titleZh || '').trim()) return r;
+      return Object.assign({}, r, { title_zh: zh });
+    });
+  }
+
+  function relatedItemKey(r) {
+    if (!r || !String(r.code || '').trim()) return '';
+    const code = parseCodeParts(String(r.code))
+      ? formatDisplayCode(String(r.code))
+      : String(r.code);
+    return code + '|' + relatedLineFromRaw(r);
+  }
+
+  /** Codes plus bucket lines, in carousel order. Title text is not part of it. */
+  function relatedMembershipKey(related) {
+    return (related || []).map(relatedItemKey).filter(Boolean).join('\n');
+  }
+
+  function historyRelatedKey(rec) {
+    return historySessionWorks(rec)
+      .map((w) => relatedMembershipKey(w && w.related))
+      .join('\n||\n');
+  }
+
+  /**
+   * New ranking leads. A saved row with a real cover is kept even when the
+   * fresh list is shorter. An empty fresh list does not wipe the saved one.
+   */
+  function mergeRelatedUpgrade(existing, incoming) {
+    const fresh = Array.isArray(incoming) ? incoming : [];
+    const saved = Array.isArray(existing) ? existing : [];
+    if (!fresh.length) return saved.slice();
+    const out = [];
+    const seen = {};
+    function push(r) {
+      const key = relatedItemKey(r);
+      const code = key.split('|')[0];
+      if (!code || seen[code]) return;
+      seen[code] = true;
+      out.push(r);
+    }
+    fresh.forEach(push);
+    saved.forEach((r) => {
+      if (r && workHasUsableCover(r)) push(r);
+    });
+    return out;
   }
 
   function workNeedsTitleZh(w) {
@@ -370,6 +429,20 @@
     return buckets.theme.concat(buckets.keyword, buckets.actress);
   }
 
+  /** Same bucket order as the cap, without dropping rows that are under a maximum. */
+  function groupSavedRelated(items) {
+    const buckets = { theme: [], keyword: [], actress: [] };
+    const other = [];
+    (items || []).forEach((r) => {
+      if (!r || !(r.code || r.title)) return;
+      const line = relatedLineFromRaw(r);
+      const row = Object.assign({}, r, { line: line });
+      if (buckets[line]) buckets[line].push(row);
+      else other.push(row);
+    });
+    return buckets.theme.concat(buckets.keyword, buckets.actress, other);
+  }
+
   function mergeRelatedIncremental(existing, incoming) {
     const byKey = {};
     const order = [];
@@ -426,9 +499,11 @@
           ? match.related_by_title
           : (match.related || []).filter(isRelatedBucketItem);
         if (donorRelated.length) {
-          nw.related = nw.related && nw.related.length
-            ? mergeRelatedIncremental(nw.related, donorRelated)
-            : slimRelatedForHistory(donorRelated);
+          if (relatedHasPersistedMembership(nw.related)) {
+            nw.related = applyTitleZhOntoRelated(nw.related, donorRelated);
+          } else {
+            nw.related = slimRelatedForHistory(donorRelated);
+          }
         }
         if (match.cover && !nw.cover) nw.cover = match.cover;
         return nw;
@@ -836,6 +911,8 @@
       userPreview: String(raw.user_preview || raw.userPreview || '').trim(),
       fromImageIndex: raw.from_image_index || raw.fromImageIndex || null,
       relatedByTitle,
+      preserveRelated: !!(raw.preserve_related || raw.preserveRelated),
+      relatedLoading: !!(raw.related_loading || raw.relatedLoading),
       themeKeywords: normalizeKeywordList(raw.theme_keywords || raw.themeKeywords),
       keywordQueries: normalizeKeywordList(raw.keyword_queries || raw.keywordQueries),
       matchedKeywords: normalizeKeywordList(
@@ -2935,9 +3012,11 @@
    * Multiple mains stack vertically in the gallery.
    */
   function buildWorkCarousel(mainWork) {
-    const related = capRelatedBuckets(
-      Array.isArray(mainWork.relatedByTitle) ? mainWork.relatedByTitle : []
-    );
+    const rawRelated = Array.isArray(mainWork.relatedByTitle) ? mainWork.relatedByTitle : [];
+    // History shows the saved membership. A fresh identify still respects the caps.
+    const related = mainWork.preserveRelated
+      ? groupSavedRelated(rawRelated)
+      : capRelatedBuckets(rawRelated);
     const block = document.createElement('section');
     block.className = 'work-carousel-block';
 
@@ -2959,6 +3038,8 @@
           ' 張',
         themeKeywords
       );
+    } else if (mainWork.relatedLoading) {
+      hint.textContent = '相關載入中…';
     } else {
       hint.textContent = '主作品（尚無相關可左右滑）';
     }
@@ -3717,6 +3798,8 @@
         unidentified: !!w.unidentified,
         from_image_index: w.from_image_index || null,
         line: i === 0 ? 'main' : (w.line || 'multi'),
+        preserve_related: true,
+        related_loading: !!w.related_loading,
       })),
     };
   }
@@ -3809,21 +3892,19 @@
     return rec.id;
   }
 
-  async function fillWorkRelatedGaps(work, recId, workIndex) {
-    const before = work;
-    work = backfillWorkTreeLocal(work);
-    if (work !== before) {
-      const localPatch = { stills: work.stills, cid: work.cid };
-      if (Array.isArray(work.related)) localPatch.related = work.related;
-      persistHistoryWork(recId, workIndex, localPatch);
-    }
-    const related = work.related || [];
-    const need =
-      relatedNeedsTitleZh(related) ||
-      relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
-      workNeedsTitleZh(work) ||
-      workNeedsThemeKeywords(work);
-    if (!need) return work;
+  function workCanSearchRelated(work) {
+    if (!work) return false;
+    return !!(
+      (work.title && String(work.title).trim()) ||
+      (work.actress && String(work.actress).trim())
+    );
+  }
+
+  /** Re-rank in memory. Does not write the opened history row. */
+  async function recomputeWorkRelated(work) {
+    work = backfillWorkTreeLocal(work) || work;
+    const related = (work && work.related) || [];
+    if (!workCanSearchRelated(work)) return work;
     try {
       const res = await fetch('/api/related-by-title', {
         method: 'POST',
@@ -3833,30 +3914,69 @@
           code: work.code || '',
           actress: work.actress || '',
           seed: related,
+          upgrade: true,
         }),
       });
       const data = await res.json();
-      if (data && data.ok && Array.isArray(data.related_by_title)) {
-        const incoming = data.related_by_title;
-        const merged = related && related.length
-          ? mergeRelatedIncremental(related, incoming)
-          : slimRelatedForHistory(incoming);
-        const patch = { related: merged, stills: work.stills, cid: work.cid };
-        const incomingZh = String(data.title_zh || '').trim();
-        if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
-          patch.title_zh = incomingZh;
-        }
-        const incomingKw = normalizeKeywordList(data.theme_keywords);
-        if (incomingKw.length) patch.theme_keywords = incomingKw;
-        const incomingQ = normalizeKeywordList(data.keyword_queries);
-        if (incomingQ.length) patch.keyword_queries = incomingQ;
-        work = backfillWorkTreeLocal(Object.assign({}, work, patch));
-        patch.stills = work.stills;
-        patch.related = work.related;
-        persistHistoryWork(recId, workIndex, patch);
+      if (!data || !data.ok || !Array.isArray(data.related_by_title)) return work;
+      const merged = mergeRelatedUpgrade(related, data.related_by_title);
+      const patch = { related: merged, related_loading: false };
+      const incomingZh = String(data.title_zh || '').trim();
+      if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
+        patch.title_zh = incomingZh;
       }
-    } catch (_) {}
-    return work;
+      const incomingKw = normalizeKeywordList(data.theme_keywords);
+      if (incomingKw.length) patch.theme_keywords = incomingKw;
+      const incomingQ = normalizeKeywordList(data.keyword_queries);
+      if (incomingQ.length) patch.keyword_queries = incomingQ;
+      return Object.assign({}, work, patch);
+    } catch (_) {
+      return work;
+    }
+  }
+
+  /**
+   * A changed related set becomes a new history row. The opened row is not
+   * rewritten. An identical code|line list does not append another row.
+   */
+  function commitRelatedUpgrade(source, nextWorks) {
+    if (!source || !Array.isArray(nextWorks) || !nextWorks.length) return null;
+    const nextKey = nextWorks.map((w) => relatedMembershipKey(w && w.related)).join('\n||\n');
+    const prevKey = historyRelatedKey(source);
+    if (nextKey === prevKey) return null;
+    const code = String((nextWorks[0] && nextWorks[0].code) || source.code || '');
+    const list = loadHistory();
+    const duplicate = list.some((rec) => {
+      if (!rec || historyRelatedKey(rec) !== nextKey) return false;
+      const recCode = String((historySessionWorks(rec)[0] || {}).code || rec.code || '');
+      if (!code || !recCode) return true;
+      return codesMatch(code, recCode) || recCode === code;
+    });
+    if (duplicate) return null;
+    const first = nextWorks[0] || {};
+    const rec = {
+      id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      ts: Date.now(),
+      kind: source.kind || 'session',
+      ok: source.ok !== false,
+      code: code || source.code || '',
+      title: first.title || source.title || '',
+      title_zh: first.title_zh || source.title_zh || '',
+      cover: first.cover || source.cover || '',
+      stills: first.stills || source.stills || [],
+      actress: first.actress || source.actress || '',
+      userShots: historyUserShots(source),
+      message: source.message || '',
+      related: first.related || [],
+      theme_keywords: first.theme_keywords || source.theme_keywords || [],
+      keyword_queries: first.keyword_queries || source.keyword_queries || [],
+      upgraded_from: source.id,
+      works: nextWorks.map((w) => Object.assign({}, w, { related_loading: false })),
+    };
+    const nextList = loadHistory();
+    nextList.unshift(rec);
+    saveHistory(nextList.slice(0, HISTORY_MAX));
+    return rec.id;
   }
 
   function paintHistoryDetail(rec) {
@@ -3915,25 +4035,28 @@
   async function enrichHistoryDetail(rec, id) {
     try {
       const works = historySessionWorks(rec);
-      let changed = false;
       const nextWorks = [];
       for (let i = 0; i < works.length; i++) {
-        const next = await fillWorkRelatedGaps(works[i], id, i);
-        if (
-          next !== works[i] ||
-          JSON.stringify(next && next.related) !== JSON.stringify(works[i] && works[i].related) ||
-          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '') ||
-          JSON.stringify((next && next.theme_keywords) || []) !==
-            JSON.stringify((works[i] && works[i].theme_keywords) || [])
-        ) {
-          changed = true;
-        }
-        nextWorks.push(next);
+        nextWorks.push(await recomputeWorkRelated(works[i]));
       }
       if (viewingHistoryId !== id) return;
-      if (!changed) return;
-      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: nextWorks });
-      paintHistoryDetail(fresh);
+      const newId = commitRelatedUpgrade(rec, nextWorks);
+      if (viewingHistoryId !== id) return;
+      const showedLoading = historySessionWorks(rec).some(
+        (w) => workCanSearchRelated(w) && !relatedHasPersistedMembership((w && w.related) || [])
+      );
+      if (!newId) {
+        // Leave the screen alone when nothing changed. Repaint only to clear
+        // a loading hint that was drawn for an empty related list.
+        if (showedLoading) {
+          const same = loadHistory().find((x) => x.id === id) || rec;
+          paintHistoryDetail(same);
+        }
+        return;
+      }
+      viewingHistoryId = newId;
+      const created = loadHistory().find((x) => x.id === newId);
+      if (created) paintHistoryDetail(created);
     } catch (_) {}
   }
 
@@ -3941,7 +4064,17 @@
     const rec = loadHistory().find((x) => x.id === id);
     if (!rec) return false;
     viewingHistoryId = id;
-    paintHistoryDetail(rec);
+    const works = historySessionWorks(rec).map((w) => {
+      if (!w) return w;
+      if (
+        workCanSearchRelated(w) &&
+        !relatedHasPersistedMembership(w.related || [])
+      ) {
+        return Object.assign({}, w, { related_loading: true });
+      }
+      return w;
+    });
+    paintHistoryDetail(Object.assign({}, rec, { works: works }));
     showScreen('history-detail');
     hideUserShots();
     hideProgress();
