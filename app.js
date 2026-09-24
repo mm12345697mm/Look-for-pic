@@ -479,6 +479,8 @@
       keyword_queries: normalizeKeywordList(src.keyword_queries || src.keywordQueries),
       visual_mismatch: !!(src.visual_mismatch || src.visualMismatch),
       visual_note: String(src.visual_note || src.visualNote || '').trim(),
+      unidentified: !!(src.unidentified || src.frame_unidentified),
+      from_image_index: src.from_image_index || src.fromImageIndex || null,
     };
   }
 
@@ -492,7 +494,14 @@
       if (!item || isRelatedBucketItem(item)) return;
       const work = slimWorkForHistory(item, data, line);
       if (!work.code && !work.title) return;
-      const key = work.code ? String(work.code).toUpperCase() : ('t:' + work.title);
+      const idx = work.from_image_index;
+      const key = idx
+        ? 'i:' + idx
+        : work.unidentified
+          ? 'u:' + works.length
+          : work.code
+            ? String(work.code).toUpperCase()
+            : 't:' + work.title;
       if (seen[key]) return;
       seen[key] = true;
       works.push(work);
@@ -752,16 +761,20 @@
 
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
+    const unidentified = !!(raw.unidentified || raw.frame_unidentified);
     const titleOnly =
+      unidentified ||
       !rawCode ||
       rawCode === 'TITLE-SEARCH' ||
       rawCode.toLowerCase() === 'null' ||
       !parseCodeParts(rawCode);
-    const code = titleOnly
-      ? rawCode === 'TITLE-SEARCH' || !rawCode
-        ? '片名搜尋'
-        : formatDisplayCode(rawCode)
-      : formatDisplayCode(rawCode);
+    const code = unidentified
+      ? '未辨識'
+      : titleOnly
+        ? rawCode === 'TITLE-SEARCH' || !rawCode
+          ? '片名搜尋'
+          : formatDisplayCode(rawCode)
+        : formatDisplayCode(rawCode);
     // Never invent DMM CID from the display code: padded guesses (dosd00008)
     // often redirect to now_printing after the server already cleared cover.
     const cid = String(raw.cid || '');
@@ -797,6 +810,9 @@
       cover,
       stills,
       titleOnly,
+      unidentified,
+      userPreview: String(raw.user_preview || raw.userPreview || '').trim(),
+      fromImageIndex: raw.from_image_index || raw.fromImageIndex || null,
       relatedByTitle,
       themeKeywords: normalizeKeywordList(raw.theme_keywords || raw.themeKeywords),
       keywordQueries: normalizeKeywordList(raw.keyword_queries || raw.keywordQueries),
@@ -1294,13 +1310,25 @@
   function appendCover(coverWrap, w) {
     coverWrap._lfpWork = w;
     const url = (w.cover || '').trim();
+    const preview = String((w && w.userPreview) || '').trim();
+    if ((!url || (w.titleOnly && !isLocalCoverUrl(url))) && isLocalCoverUrl(preview)) {
+      const shot = document.createElement('img');
+      shot.alt = '這張上傳圖';
+      shot.loading = 'lazy';
+      shot.decoding = 'async';
+      shot.src = preview;
+      coverWrap.appendChild(shot);
+      return;
+    }
     if (!url || (w.titleOnly && !isLocalCoverUrl(url))) {
       coverWrap.classList.add('is-empty');
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
-      ph.innerHTML = w.titleOnly
-        ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
-        : '<strong>暫無封面</strong><span>請確認番號</span>';
+      ph.innerHTML = w.unidentified
+        ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
+        : w.titleOnly
+          ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
+          : '<strong>暫無封面</strong><span>請確認番號</span>';
       coverWrap.appendChild(ph);
       return;
     }
@@ -3269,6 +3297,8 @@
         keyword_queries: normalizeKeywordList(w.keyword_queries || w.keywordQueries),
         visual_mismatch: !!(w.visual_mismatch || w.visualMismatch),
         visual_note: String(w.visual_note || w.visualNote || '').trim(),
+        unidentified: !!w.unidentified,
+        from_image_index: w.from_image_index || null,
         line: i === 0 ? 'main' : (w.line || 'multi'),
       })),
     };

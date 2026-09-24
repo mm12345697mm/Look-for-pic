@@ -8,5 +8,6 @@ __pycache__/
 
 !_recovered_helpers.marshal
 
-# Server offline identify cache (runtime)
+# Server offline identify cache and per-frame session log (runtime)
 data/offline-cache.json
+data/identify-sessions.json
