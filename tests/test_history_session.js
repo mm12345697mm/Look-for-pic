@@ -729,7 +729,8 @@ function walkNodes(node, acc) {
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['眼鏡'] }));
 }
 
-// Tutor-title multi-candidate: chips under the action buttons on every listed card.
+// Tutor-title multi-candidate: chips sit under the 主作品 block only.
+// Candidate / related cards (DANDY-893, 片名 / 關鍵字 / 同演員) do not get a chip row.
 // Hint names 片名 / 關鍵字 / 同演員 only for buckets that are actually present.
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/dandya00001/dandya00001pl.jpg';
@@ -807,17 +808,27 @@ function walkNodes(node, acc) {
   assert.ok(hint0 && hint0.textContent.indexOf('片名') !== -1, hint0 && hint0.textContent);
   assert.ok(hint0 && hint0.textContent.indexOf('關鍵字') !== -1, hint0 && hint0.textContent);
   assert.ok(hint0 && hint0.textContent.indexOf('同演員') !== -1, hint0 && hint0.textContent);
-  blocks.forEach((block, i) => {
-    const card = walkNodes(block).find((n) => String(n.className || '').indexOf('card') !== -1 && String(n.className || '').indexOf('work-carousel') === -1);
-    assert.ok(card, 'card ' + i);
-    const classes = (card.children || []).map((c) => c.className);
-    const actionAt = classes.indexOf('work-actions');
-    const chipAt = classes.indexOf('kw-related-panel');
-    const coverAt = classes.indexOf('cover-wrap');
-    assert.ok(actionAt >= 0 && chipAt === actionAt + 1 && coverAt === chipAt + 1, classes.join('|'));
-    const chips = walkNodes(card).filter((n) => n.getAttribute && n.getAttribute('data-kw'));
-    assert.strictEqual(chips.map((c) => c.textContent).join('・'), kws.join('・'), 'card ' + i);
+  const mainKids = (blocks[0].children || []).map((c) => c.className);
+  const trackAt = mainKids.indexOf('work-carousel-track');
+  const chipBlockAt = mainKids.indexOf('kw-related-panel');
+  assert.ok(trackAt >= 0 && chipBlockAt > trackAt, mainKids.join('|'));
+  const mainCard = walkNodes(blocks[0]).find((n) => String(n.className || '').indexOf('card') !== -1 && String(n.className || '').indexOf('work-carousel') === -1);
+  assert.ok(mainCard);
+  const mainCardClasses = (mainCard.children || []).map((c) => c.className);
+  assert.ok(mainCardClasses.indexOf('kw-related-panel') === -1, mainCardClasses.join('|'));
+  assert.ok(mainCardClasses.indexOf('work-actions') >= 0);
+  assert.ok(mainCardClasses.indexOf('cover-wrap') > mainCardClasses.indexOf('work-actions'));
+  const mainChips = walkNodes(blocks[0]).filter((n) => n.getAttribute && n.getAttribute('data-kw') && n.className === 'kw-chip');
+  assert.strictEqual(mainChips.map((c) => c.textContent).join('・'), kws.join('・'));
+  const mainSlides = walkNodes(blocks[0]).filter((n) => n.className === 'work-carousel-slide');
+  mainSlides.slice(1).forEach((slide, i) => {
+    const inside = walkNodes(slide).filter((n) => n.getAttribute && n.getAttribute('data-kw'));
+    assert.strictEqual(inside.length, 0, 'related slide ' + i);
+    assert.ok(!walkNodes(slide).some((n) => n.className === 'kw-related-panel'));
   });
+  const otherChips = walkNodes(blocks[1]).filter((n) => n.getAttribute && n.getAttribute('data-kw'));
+  assert.strictEqual(otherChips.length, 0, 'DANDY-893 must not render chips');
+  assert.ok(!walkNodes(blocks[1]).some((n) => n.className === 'kw-related-panel'));
 
   H.paintHistoryDetail({
     id: 'dandy-no-kw-bucket',
