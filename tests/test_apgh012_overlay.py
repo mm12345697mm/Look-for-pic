@@ -143,6 +143,12 @@ class TestApgh012Overlay(unittest.TestCase):
         variants = S._confusion_variants("QLQ-621")
         self.assertIn("QUQ-624", variants)
 
+    def test_one_digit_neighbor_is_probed_early(self):
+        variants = S._confusion_variants("ABCD-818")
+        self.assertIn("ABCD-816", variants[:8])
+        variants = S._confusion_variants("ABH-801")
+        self.assertIn("ABN-801", variants[:12])
+
     def test_jacket_pick_prefers_the_matching_cover(self):
         def cover(code):
             if code == "GOOD-100":

@@ -1257,6 +1257,22 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
                     texts.append(run_tesseract(str(band_path)))
                 except Exception:
                     continue
+            # A small 品番 in the bottom margin is missed by the full frame.
+            # One high-contrast strip is enough; jacket match drops a misread.
+            if not _trusted_ocr_codes("\n".join(texts)):
+                try:
+                    strip = img.crop((0, int(h * 0.58), w, h))
+                    strip = ImageOps.autocontrast(strip)
+                    strip = ImageEnhance.Contrast(strip).enhance(1.8)
+                    strip = strip.resize(
+                        (max(8, strip.width * 3), max(8, strip.height * 3)),
+                        Image.Resampling.LANCZOS,
+                    )
+                    strip_path = td_path / "bottom.png"
+                    strip.save(strip_path, format="PNG")
+                    texts.append(run_tesseract(str(strip_path), lang="eng"))
+                except Exception:
+                    pass
 
     joined = "\n".join(t for t in texts if t and not str(t).startswith("[tesseract"))
     # Scene-text reader is optional. Its lines are not the title; they only
@@ -1450,12 +1466,14 @@ _OCR_CONFUSION = {
     "G": "6C",
     "C": "G",
     "T": "J",
+    "H": "N",
+    "N": "H",
     "0": "8O",
     "1": "47",
     "4": "1",
     "5": "6",
     "6": "580",
-    "8": "03B",
+    "8": "603B",
     "2": "7",
     "3": "8",
     "7": "1",
@@ -1545,7 +1563,11 @@ def _confusion_variants(code: str, limit: int = 24) -> list[str]:
                     nxt[i] = a
                     nxt[j] = b
                     rest.append(nxt)
-    for nxt in priority + singles + rest:
+    digit_singles = [nxt for nxt in singles if any(nxt[i] != chars[i] for i in range(nlab, len(chars)))]
+    letter_singles = [nxt for nxt in singles if nxt not in digit_singles]
+    # One-character misreads first (6/8, O/D). Two-character neighbors after,
+    # so the jacket probe is not spent before the single-character fix.
+    for nxt in digit_singles + letter_singles + priority + rest:
         push(nxt)
         if len(out) >= limit:
             break
@@ -10865,10 +10887,9 @@ def run_identify_pipeline(
                 (extra_msg + " " if extra_msg else "")
                 + f"封面與原圖鎖定番號 {format_display_code(printed)}。"
             )
-        elif printed and not codes_compared:
-            code = printed
-            search_mode = "code"
-        elif had_codes and codes_compared:
+        elif had_codes and (codes_compared or printed):
+            # An OCR token with no jacket score is not a 品番. Title cues
+            # take over instead of keeping that unread confirmation.
             if code:
                 extra_msg = (
                     (extra_msg + " " if extra_msg else "")
