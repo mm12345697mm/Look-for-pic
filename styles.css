@@ -711,11 +711,19 @@ label.btn {
   font-size: 0.95rem;
 }
 
-/* Manual fix: only on cards missing cover and/or title */
+/* Manual fix: unresolved slots (no 品番) and cards missing a catalog cover or name */
 .manual-fix {
   padding: 0 14px 12px;
   touch-action: manipulation;
 }
+.manual-fix-hint {
+  margin: 0;
+  font-size: 0.75rem;
+  color: var(--muted);
+  line-height: 1.4;
+}
+.manual-fix-caption { font-weight: 700; }
+.manual-fix-toggle[hidden] { display: none !important; }
 .manual-fix-toggle {
   display: inline-flex;
   align-items: center;

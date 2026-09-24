@@ -64,6 +64,7 @@
   let identifyBusy = false;
   let promoteBusy = false;
   let lastPromoteTask = null;
+  let lastManualTask = null;
   let promoteEpoch = 0;
 
   function batchQueryKeepsFrames(fileCount, busy, openFrame) {
@@ -283,9 +284,9 @@
 
   function workHasUsableCover(w) {
     const url = String((w && w.cover) || '').trim();
-    if (!url || isNowPrintingUrl(url)) return false;
-    if (w && w.titleOnly && !isLocalCoverUrl(url)) return false;
-    return true;
+    if (!url || isNowPrintingUrl(url) || isLocalCoverUrl(url)) return false;
+    if (w && w.titleOnly) return false;
+    return isCatalogMediaUrl(url);
   }
 
   function workHasUsableTitle(w) {
@@ -293,41 +294,102 @@
     return !!(t && t !== '（無標題）');
   }
 
-  /** Missing cover and/or name — user can fix without the bot. */
+  /** No parsed 品番: title search, unidentified, skipped, or an empty slot. */
+  function slotNeedsCodeEntry(w) {
+    if (!w) return false;
+    if (w.skipped || w.unidentified || w.titleOnly) return true;
+    const code = String(w.code || '').trim();
+    if (!code || code === '片名搜尋' || code === '未辨識' || code === 'TITLE-SEARCH') return true;
+    if (code.toLowerCase() === 'null') return true;
+    return !parseCodeParts(code);
+  }
+
+  /** Missing code, cover, and/or name — user can fix this same slot. */
   function workNeedsManualFix(w) {
-    if (!w || w.skipped) return false;
+    if (!w) return false;
+    if (slotNeedsCodeEntry(w)) return true;
     return !workHasUsableCover(w) || !workHasUsableTitle(w);
   }
 
+  function usableManualTitle(raw) {
+    const t = String(raw || '').trim();
+    if (!t || t === '（無標題）' || t === '（這張尚未辨識）' || t === '（片名未解析）') return '';
+    return t;
+  }
+
+  /**
+   * Fold a catalog identify into this slot.
+   * localCoverUrl is ignored: the upload / data: / blob is never the main cover.
+   */
   function mergeManualFixIntoWork(oldW, data, localCoverUrl) {
-    const usable =
-      data &&
-      typeof data === 'object' &&
-      (parseCodeParts(String(data.code || '')) ||
-        String(data.title || '').trim() ||
-        String(data.cover || data.cover_url || '').trim());
-    const incoming = usable ? workFromApi(data, (oldW && oldW.line) || 'main') : null;
-    const next = Object.assign({}, oldW || {});
-    if (incoming) {
-      if (incoming.code && (!incoming.titleOnly || parseCodeParts(incoming.code))) {
-        next.code = incoming.code;
-      }
-      if (incoming.title) next.title = incoming.title;
-      if (incoming.titleZh) next.titleZh = incoming.titleZh;
-      if (incoming.actress) next.actress = incoming.actress;
-      if (incoming.studio) next.studio = incoming.studio;
-      if (incoming.cid) next.cid = incoming.cid;
-      if (incoming.cover) next.cover = incoming.cover;
-      if (incoming.stills && incoming.stills.length) next.stills = incoming.stills;
-      if (incoming.relatedByTitle && incoming.relatedByTitle.length) {
-        next.relatedByTitle = incoming.relatedByTitle;
+    void localCoverUrl;
+    const prior = Object.assign({}, oldW || {});
+    const raw = data && typeof data === 'object' ? data : null;
+    const rawCode = raw ? String(raw.code || '').trim() : '';
+    const rawTitle = raw ? usableManualTitle(raw.title) : '';
+    const rawCover = raw ? String(raw.cover || raw.cover_url || '').trim() : '';
+    const rawCid = raw ? String(raw.cid || '').trim() : '';
+    const hasSignal = !!(
+      (rawCode && rawCode !== 'TITLE-SEARCH' && parseCodeParts(rawCode)) ||
+      rawTitle ||
+      (rawCover && !isLocalCoverUrl(rawCover)) ||
+      rawCid
+    );
+    if (!hasSignal) {
+      prior.cover = catalogOnlyUrl(prior.cover, prior.cid);
+      if (isLocalCoverUrl(prior.cover)) prior.cover = '';
+      return prior;
+    }
+    const incoming = workFromApi(raw, (prior.line) || 'main');
+    const next = Object.assign({}, prior);
+    const coded = !!(
+      incoming.code &&
+      incoming.code !== '片名搜尋' &&
+      incoming.code !== '未辨識' &&
+      parseCodeParts(incoming.code)
+    );
+    if (coded) {
+      next.code = incoming.code;
+      next.titleOnly = false;
+      next.unidentified = false;
+      next.skipped = false;
+    } else {
+      next.skipped = false;
+      next.unidentified = false;
+      if (!reliablePromoteCode(prior)) {
+        next.code = '片名搜尋';
+        next.titleOnly = true;
       }
     }
-    if ((!next.cover || isNowPrintingUrl(next.cover)) && localCoverUrl) {
-      next.cover = localCoverUrl;
+    if (rawTitle || (coded && incoming.title)) next.title = incoming.title || rawTitle;
+    if (incoming.titleZh) next.titleZh = incoming.titleZh;
+    if (incoming.actress) next.actress = incoming.actress;
+    if (incoming.actressZh) next.actressZh = incoming.actressZh;
+    if (incoming.studio) next.studio = incoming.studio;
+    if (incoming.studioZh) next.studioZh = incoming.studioZh;
+    if (incoming.cid) next.cid = incoming.cid;
+    const jacket = catalogOnlyUrl(incoming.cover, incoming.cid || next.cid);
+    if (jacket) next.cover = jacket;
+    else next.cover = catalogOnlyUrl(prior.cover, next.cid || prior.cid);
+    if (isLocalCoverUrl(next.cover)) next.cover = '';
+    if (incoming.stills && incoming.stills.length) {
+      next.stills = incoming.stills.filter((u) => isCatalogMediaUrl(u));
     }
-    if (parseCodeParts(next.code) && next.code !== '片名搜尋') next.titleOnly = false;
-    else if (isLocalCoverUrl(next.cover)) next.titleOnly = !!next.titleOnly;
+    if (incoming.relatedByTitle && incoming.relatedByTitle.length) {
+      next.relatedByTitle = incoming.relatedByTitle;
+    }
+    if (incoming.themeKeywords && incoming.themeKeywords.length) {
+      next.themeKeywords = incoming.themeKeywords;
+    }
+    if (incoming.keywordQueries && incoming.keywordQueries.length) {
+      next.keywordQueries = incoming.keywordQueries;
+    }
+    next.userPreview = String((prior.userPreview || prior.user_preview) || '').trim();
+    next.fromImageIndex = prior.fromImageIndex || prior.from_image_index || incoming.fromImageIndex || null;
+    next.line = prior.line || incoming.line || 'main';
+    if (next.userPreview && next.cover === next.userPreview) {
+      next.cover = catalogOnlyUrl('', next.cid);
+    }
     return next;
   }
 
@@ -2049,8 +2111,8 @@
         : w.unidentified
           ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
           : w.titleOnly
-            ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
-            : '<strong>暫無封面</strong><span>請確認番號</span>';
+            ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號或名稱</span>'
+            : '<strong>暫無封面</strong><span>請確認番號或名稱</span>';
       coverWrap.appendChild(ph);
       return;
     }
@@ -2193,13 +2255,19 @@
     card.appendChild(meta);
     if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
-    if (w.skipped) card.appendChild(buildReidentifyButton(w));
     if (workNeedsManualFix(w)) {
       card.appendChild(buildManualFixPanel(w, card));
     }
+    if (w.skipped || originalSlotFile(w)) card.appendChild(buildReidentifyButton(w));
     if (!w.skipped) appendStillsScroll(card, w, '劇照（橫滑）');
     if (w.skipped) card.classList.add('is-skipped');
     return card;
+  }
+
+  function originalSlotFile(w) {
+    const idx = Number(w && (w.fromImageIndex || w.from_image_index));
+    if (!(idx > 0)) return null;
+    return slotUploadFiles[idx - 1] || null;
   }
 
   function buildReidentifyButton(w) {
@@ -2293,109 +2361,403 @@
     card.replaceWith(nextCard);
   }
 
+  function slotImageIndex(w) {
+    const n = Number(w && (w.fromImageIndex || w.from_image_index));
+    return n > 0 ? n : 0;
+  }
+
+  function unresolvedCodeToken(code) {
+    const c = String(code || '').trim();
+    if (!c || c === '片名搜尋' || c === 'TITLE-SEARCH' || c === '未辨識' || c.toLowerCase() === 'null') {
+      return '#open';
+    }
+    if (!parseCodeParts(c)) return '#open';
+    return formatDisplayCode(c);
+  }
+
+  function indexOfGallerySlot(list, oldW) {
+    const rows = Array.isArray(list) ? list : [];
+    const imageIndex = slotImageIndex(oldW);
+    if (imageIndex) {
+      const at = rows.findIndex((w) => slotImageIndex(w) === imageIndex);
+      if (at >= 0) return at;
+    }
+    const ident = rows.findIndex((w) => w === oldW);
+    if (ident >= 0) return ident;
+    const code = reliablePromoteCode(oldW);
+    if (code) {
+      const hits = [];
+      rows.forEach((w, i) => {
+        if (reliablePromoteCode(w) && codesMatch(w.code, code)) hits.push(i);
+      });
+      if (hits.length === 1) return hits[0];
+    }
+    return -1;
+  }
+
+  function isMainSlideCard(card) {
+    if (!card) return true;
+    const block = closestEl(card, 'work-carousel-block');
+    if (!block) return true;
+    const slides = [];
+    function collect(node) {
+      if (!node) return;
+      if (elHasClass(node, 'work-carousel-slide')) slides.push(node);
+      (node.children || []).forEach(collect);
+    }
+    collect(block);
+    if (!slides.length) return true;
+    let el = card;
+    while (el) {
+      if (el === slides[0]) return true;
+      el = el.parentNode || el.parentElement || null;
+    }
+    return false;
+  }
+
+  function historyRowMatchesGallery(works, gallery) {
+    if (!works || !gallery || works.length !== gallery.length || !works.length) return false;
+    for (let i = 0; i < works.length; i++) {
+      const w = works[i];
+      const g = gallery[i];
+      if (!w || !g) return false;
+      if (!!w.skipped !== !!g.skipped) return false;
+      const wi = slotImageIndex(w);
+      const gi = slotImageIndex(g);
+      if (wi && gi && wi !== gi) return false;
+      if (unresolvedCodeToken(w.code) !== unresolvedCodeToken(g.code)) return false;
+      if (unresolvedCodeToken(w.code) === '#open') {
+        const wt = String(w.title || '');
+        const gt = String(g.title || '');
+        if (wt && gt && wt !== gt) return false;
+      }
+    }
+    return true;
+  }
+
+  function findHistoryIndexForManual(list, beforeItems, preferId) {
+    const rows = Array.isArray(list) ? list : [];
+    if (preferId) {
+      const i = rows.findIndex((x) => x && x.id === preferId);
+      if (i >= 0 && historyRowMatchesGallery(historySessionWorks(rows[i]), beforeItems)) return i;
+    }
+    for (let i = 0; i < rows.length; i++) {
+      if (historyRowMatchesGallery(historySessionWorks(rows[i]), beforeItems)) return i;
+    }
+    return -1;
+  }
+
+  function pickManualIdentifySource(data) {
+    if (!data || typeof data !== 'object') return null;
+    function coded(row) {
+      if (!row || typeof row !== 'object') return false;
+      const c = String(row.code || '').trim();
+      return !!(c && c !== 'TITLE-SEARCH' && parseCodeParts(c));
+    }
+    if (coded(data)) return data;
+    const rows = Array.isArray(data.results) ? data.results : [];
+    const fromResults = rows.find(coded);
+    if (fromResults) return fromResults;
+    const cands = Array.isArray(data.candidates) ? data.candidates : [];
+    const fromCands = cands.find(coded);
+    if (fromCands) {
+      return Object.assign({}, fromCands, {
+        related_by_title: fromCands.related_by_title || fromCands.related || data.related_by_title || [],
+        theme_keywords: fromCands.theme_keywords || data.theme_keywords || [],
+        keyword_queries: fromCands.keyword_queries || data.keyword_queries || [],
+        needs_code: false,
+        unidentified: false,
+      });
+    }
+    if (rows[0]) return rows[0];
+    if (usableManualTitle(data.title) || data.ok) return data;
+    return null;
+  }
+
+  function finalizeManualWork(prior, source) {
+    const next = mergeManualFixIntoWork(prior, source, '');
+    next.line = (prior && prior.line) || next.line || 'main';
+    next.fromImageIndex = (prior && (prior.fromImageIndex || prior.from_image_index)) || next.fromImageIndex || null;
+    next.userPreview = String((prior && (prior.userPreview || prior.user_preview)) || '').trim();
+    if (next.userPreview && next.cover === next.userPreview) next.cover = catalogOnlyUrl('', next.cid);
+    if (isLocalCoverUrl(next.cover)) next.cover = catalogOnlyUrl('', next.cid);
+    return next;
+  }
+
+  function historyWorkFromResolvedSlot(nextW, prior) {
+    const hist = galleryWorkToHistoryWork(nextW);
+    const idx = slotImageIndex(prior) || slotImageIndex(nextW);
+    if (idx) hist.from_image_index = idx;
+    const preview = String((prior && (prior.userPreview || prior.user_preview)) || nextW.userPreview || '').trim();
+    if (preview) hist.user_preview = preview;
+    hist.skipped = false;
+    hist.unidentified = !!nextW.unidentified && !reliablePromoteCode(nextW);
+    hist.cover = catalogOnlyUrl(hist.cover, hist.cid);
+    if (isLocalCoverUrl(hist.cover)) hist.cover = '';
+    return hist;
+  }
+
+  function syncIdentifyPayloadSlot(prior, nextW, slotIndex) {
+    if (!lastIdentifyPayload || !Array.isArray(lastIdentifyPayload.results) || !lastIdentifyPayload.results.length) {
+      return;
+    }
+    const imageIndex = slotImageIndex(prior) || (slotIndex + 1);
+    const single = {
+      ok: true,
+      code: nextW.code,
+      title: nextW.title,
+      title_zh: nextW.titleZh || nextW.title_zh || '',
+      actress: nextW.actress || '',
+      actress_zh: nextW.actressZh || nextW.actress_zh || '',
+      studio: nextW.studio || '',
+      studio_zh: nextW.studioZh || nextW.studio_zh || '',
+      cid: nextW.cid || '',
+      cover: catalogOnlyUrl(nextW.cover, nextW.cid),
+      stills: (nextW.stills || []).filter((u) => isCatalogMediaUrl(u)),
+      related_by_title: nextW.relatedByTitle || [],
+      theme_keywords: nextW.themeKeywords || nextW.theme_keywords || [],
+      keyword_queries: nextW.keywordQueries || nextW.keyword_queries || [],
+      skipped: false,
+      unidentified: !!nextW.unidentified && !reliablePromoteCode(nextW),
+      user_preview: nextW.userPreview || '',
+      from_image_index: imageIndex,
+      line: nextW.line || (slotIndex === 0 ? 'main' : 'multi'),
+    };
+    lastIdentifyPayload = mergeSlotRetryIntoIdentify(lastIdentifyPayload, imageIndex, single);
+  }
+
+  function paintManualSlot(items, slotIndex) {
+    const host = blockAtSlot(galleryCards, slotIndex);
+    const nextBlock = buildWorkCarousel(items[slotIndex]);
+    if (!host || !replaceNode(host, nextBlock)) {
+      const notice = galleryNotice && !galleryNotice.hidden ? galleryNotice.textContent : null;
+      renderGallery({ items: items, notice: notice });
+      return;
+    }
+    if (galleryCount) galleryCount.textContent = String(items.length) + ' 部';
+  }
+
+  /**
+   * Put a catalog identify back into the same vertical gallery slot.
+   * Other uploads stay. Candidates do not become new rows.
+   */
+  function placeManualWorkInSlot(oldW, source, card, preferHistoryId) {
+    const surface = card ? surfaceForCard(card) : (viewingHistoryId ? 'history' : 'gallery');
+    const block = card ? closestEl(card, 'work-carousel-block') : null;
+    const mainSlide = isMainSlideCard(card);
+
+    if (!mainSlide && card) {
+      const nextW = finalizeManualWork(oldW, source);
+      nextW.line = (oldW && oldW.line) || nextW.line || 'theme';
+      const nextCard = buildWorkCard(nextW, {
+        slide: true,
+        badgeLabel: lineLabel(nextW.line),
+      });
+      replaceNode(card, nextCard);
+      return { work: nextW, slotIndex: block ? carouselSlotIndex(block) : 0 };
+    }
+
+    if (surface === 'history' && viewingHistoryId) {
+      const list = loadHistory();
+      const idx = list.findIndex((x) => x && x.id === viewingHistoryId);
+      const rec = idx >= 0 ? list[idx] : null;
+      const works = historySessionWorks(rec);
+      let slotIndex = block ? carouselSlotIndex(block) : indexOfGallerySlot(works, oldW);
+      if (slotIndex < 0 || slotIndex >= works.length) slotIndex = 0;
+      const prior = historyWorkToGallery(works[slotIndex], slotIndex) || oldW || {};
+      const nextW = finalizeManualWork(prior, source);
+      const hist = historyWorkFromResolvedSlot(nextW, prior);
+      if (idx >= 0) writePromotedHistorySlot(idx, slotIndex, hist);
+      const fresh = loadHistory().find((x) => x && x.id === viewingHistoryId);
+      if (fresh) paintHistoryDetail(fresh);
+      return { work: nextW, slotIndex: slotIndex };
+    }
+
+    const before = (lastGalleryItems || []).slice();
+    let slotIndex = block ? carouselSlotIndex(block) : indexOfGallerySlot(before, oldW);
+    if (slotIndex < 0) slotIndex = 0;
+    const prior = before[slotIndex] || oldW || {};
+    const nextW = finalizeManualWork(prior, source);
+    const items = before.slice();
+    if (!items.length) items.push(nextW);
+    else if (slotIndex >= items.length) items.push(nextW);
+    else items[slotIndex] = nextW;
+    lastGalleryItems = items;
+    syncIdentifyPayloadSlot(prior, nextW, slotIndex);
+    paintManualSlot(items, slotIndex);
+    const hist = historyWorkFromResolvedSlot(nextW, prior);
+    const list = loadHistory();
+    const hIdx = findHistoryIndexForManual(list, before, preferHistoryId);
+    if (hIdx >= 0) writePromotedHistorySlot(hIdx, slotIndex, hist);
+    else rememberPromotedSession(before, slotIndex, hist, 'gallery');
+    return { work: nextW, slotIndex: slotIndex };
+  }
+
+  async function identifyManualSlot(opts) {
+    const work = (opts && opts.work) || {};
+    const idx = slotImageIndex(work);
+    const sessionId = (lastIdentifyPayload && lastIdentifyPayload.session_id) || '';
+    const payload = {
+      images: opts && opts.file ? [opts.file] : [],
+      code: (opts && opts.code) || '',
+      title: (opts && opts.title) || '',
+    };
+    const streamOpts = { quiet: true };
+    if (idx > 0) streamOpts.slotIndex = idx;
+    if (sessionId) streamOpts.sessionId = sessionId;
+    try {
+      const streamed = await apiIdentifyStream(payload, null, streamOpts);
+      if (streamed && streamed.superseded) {
+        const err = new Error('superseded');
+        err.superseded = true;
+        throw err;
+      }
+      if (streamed && streamed.data) return streamed.data;
+    } catch (err) {
+      if (err && (err.followed || err.superseded)) throw err;
+    }
+    const classic = await apiIdentify(payload);
+    return classic && classic.data;
+  }
+
   async function applyManualWorkFix(oldW, fields, card) {
     const codeRaw = String((fields && fields.code) || '').trim();
-    const titleRaw = String((fields && fields.title) || '').trim();
+    const titleRaw = usableManualTitle((fields && fields.title) || '');
     const file = fields && fields.file;
     const code = parseCodeParts(codeRaw) ? formatDisplayCode(codeRaw) : '';
     const titleLooksCode = !code && AV_CODE_INPUT_RE.test(titleRaw);
     const sendCode = code || (titleLooksCode ? formatDisplayCode(titleRaw) : '');
     const sendTitle = titleLooksCode ? '' : titleRaw;
     if (!sendCode && !sendTitle && !file) {
-      showToast('請輸入番號／片名或上傳圖片');
+      showToast('請輸入番號或名稱');
       return { ok: false, reason: 'empty' };
     }
 
-    let localCover = '';
-    if (file) {
+    let preferHistoryId = viewingHistoryId || '';
+    if (historySavePromise) {
       try {
-        localCover =
-          (await downscaleFileToDataUrl(file, 280 * 1024, 720)) ||
-          (await smallFileDataUrl(file, 280 * 1024)) ||
-          '';
-      } catch (_) {
-        localCover = '';
-      }
+        preferHistoryId = preferHistoryId || (await historySavePromise) || '';
+      } catch (_) {}
     }
 
     let data = null;
-    if (sendCode || sendTitle || file) {
-      try {
-        const res = await apiIdentify({
-          images: file ? [file] : [],
-          code: sendCode || '',
-          title: sendTitle || '',
-        });
-        data = res && res.data;
-      } catch (err) {
-        data = null;
-        if (!file) {
-          showToast((err && err.message) || '修正失敗');
-          return { ok: false, reason: 'fetch' };
-        }
-      }
+    try {
+      data = await identifyManualSlot({
+        code: sendCode,
+        title: sendTitle,
+        file: sendCode || sendTitle ? null : file,
+        work: oldW,
+      });
+    } catch (err) {
+      if (err && err.superseded) return { ok: false, reason: 'superseded' };
+      showToast((err && err.message) || '修正失敗');
+      return { ok: false, reason: 'fetch' };
     }
 
-    const identified =
-      data &&
-      data.ok &&
-      (parseCodeParts(String(data.code || '')) ||
-        (data.title && String(data.title).trim()) ||
-        (Array.isArray(data.results) && data.results.length));
-    if (!identified && !localCover) {
-      showToast((data && data.message) || '找不到作品，請再試番號或上傳封面');
-      return { ok: false, reason: 'miss' };
+    const source = pickManualIdentifySource(data);
+    const sourceCode = source ? String(source.code || '').trim() : '';
+    const identified = !!(
+      source &&
+      ((sourceCode && sourceCode !== 'TITLE-SEARCH' && parseCodeParts(sourceCode)) ||
+        usableManualTitle(source.title) ||
+        catalogOnlyUrl(source.cover || source.cover_url, source.cid))
+    );
+    if (!identified) {
+      showToast((data && data.message) || '找不到作品，請再試番號或名稱');
+      return { ok: false, reason: 'miss', data: data };
     }
 
-    const source = identified
-      ? Array.isArray(data.results) && data.results[0]
-        ? data.results[0]
-        : data
-      : null;
-    const nextW = mergeManualFixIntoWork(oldW, source, localCover);
-    persistManualWorkFix(oldW, nextW, {});
-    replaceWorkOnScreen(card, oldW, nextW);
-    showToast(workNeedsManualFix(nextW) ? '已套用，仍可再補資料' : '已更新');
-    return { ok: true, work: nextW };
+    const placed = placeManualWorkInSlot(oldW, source, card, preferHistoryId);
+    if (!placed || !placed.work) {
+      showToast('無法更新這個欄位');
+      return { ok: false, reason: 'place' };
+    }
+    showToast(workNeedsManualFix(placed.work) ? '已套用，仍可再補番號或名稱' : '已核對封面');
+    return { ok: true, work: placed.work, slotIndex: placed.slotIndex };
   }
 
   function buildManualFixPanel(w, card) {
+    const openNow = slotNeedsCodeEntry(w);
     const box = document.createElement('div');
-    box.className = 'manual-fix';
+    box.className = 'manual-fix' + (openNow ? ' is-open' : '');
     const toggle = document.createElement('button');
     toggle.type = 'button';
     toggle.className = 'manual-fix-toggle';
     toggle.textContent = '手動修正';
-    toggle.setAttribute('aria-expanded', 'false');
+    toggle.setAttribute('aria-expanded', openNow ? 'true' : 'false');
     const form = document.createElement('div');
-    form.className = 'manual-fix-form hidden';
-    form.innerHTML =
-      '<label class="manual-fix-label">番號' +
-      '<input class="manual-fix-code" type="text" inputmode="text" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="例：JUFE-271" /></label>' +
-      '<label class="manual-fix-label">片名' +
-      '<input class="manual-fix-title" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="日文或中文片名" /></label>' +
-      '<div class="manual-fix-row">' +
-      '<button type="button" class="btn btn-secondary btn-sm manual-fix-upload">上傳圖片</button>' +
-      '<span class="manual-fix-file-name" hidden></span>' +
-      '</div>' +
-      '<div class="manual-fix-row">' +
-      '<button type="button" class="btn btn-sm manual-fix-apply">套用</button>' +
-      '<button type="button" class="btn btn-ghost btn-sm manual-fix-cancel">取消</button>' +
-      '</div>';
-    const codeEl = form.querySelector('.manual-fix-code');
-    const titleEl = form.querySelector('.manual-fix-title');
-    const nameEl = form.querySelector('.manual-fix-file-name');
-    const uploadBtn = form.querySelector('.manual-fix-upload');
-    const applyBtn = form.querySelector('.manual-fix-apply');
-    const cancelBtn = form.querySelector('.manual-fix-cancel');
-    if (codeEl && w && w.code && parseCodeParts(w.code)) codeEl.value = formatDisplayCode(w.code);
-    if (titleEl && w && w.title) titleEl.value = w.title;
+    form.className = openNow ? 'manual-fix-form' : 'manual-fix-form hidden';
+    const hint = document.createElement('p');
+    hint.className = 'manual-fix-hint';
+    hint.textContent = '輸入番號或名稱，核對目錄封面';
+    function caption(text) {
+      const span = document.createElement('span');
+      span.className = 'manual-fix-caption';
+      span.textContent = text;
+      return span;
+    }
+    function field(captionText, className, placeholder) {
+      const label = document.createElement('label');
+      label.className = 'manual-fix-label';
+      label.appendChild(caption(captionText));
+      const input = document.createElement('input');
+      input.className = className;
+      input.type = 'text';
+      input.setAttribute('inputmode', 'text');
+      input.setAttribute('autocomplete', 'off');
+      input.setAttribute('spellcheck', 'false');
+      input.setAttribute('placeholder', placeholder);
+      input.setAttribute('aria-label', captionText);
+      label.appendChild(input);
+      return { label: label, input: input };
+    }
+    const codeField = field('番號', 'manual-fix-code', '例：JUFE-271');
+    codeField.input.setAttribute('autocapitalize', 'characters');
+    const titleField = field('名稱', 'manual-fix-title', '日文或中文片名');
+    titleField.input.setAttribute('autocapitalize', 'off');
+    const uploadRow = document.createElement('div');
+    uploadRow.className = 'manual-fix-row';
+    const uploadBtn = document.createElement('button');
+    uploadBtn.type = 'button';
+    uploadBtn.className = 'btn btn-secondary btn-sm manual-fix-upload';
+    uploadBtn.textContent = '上傳圖片';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'manual-fix-file-name';
+    nameEl.hidden = true;
+    uploadRow.appendChild(uploadBtn);
+    uploadRow.appendChild(nameEl);
+    const actionRow = document.createElement('div');
+    actionRow.className = 'manual-fix-row';
+    const applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.className = 'btn btn-sm manual-fix-apply';
+    applyBtn.textContent = '核對';
+    applyBtn.setAttribute('aria-label', '以番號或名稱再識別並核對封面');
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'btn btn-ghost btn-sm manual-fix-cancel';
+    cancelBtn.textContent = '取消';
+    actionRow.appendChild(applyBtn);
+    actionRow.appendChild(cancelBtn);
+    form.appendChild(hint);
+    form.appendChild(codeField.label);
+    form.appendChild(titleField.label);
+    form.appendChild(uploadRow);
+    form.appendChild(actionRow);
+    const codeEl = codeField.input;
+    const titleEl = titleField.input;
+    const knownCode = reliablePromoteCode(w);
+    if (codeEl && knownCode) codeEl.value = knownCode;
+    if (titleEl) titleEl.value = usableManualTitle(w && w.title);
+    if (openNow) toggle.hidden = true;
     let picked = null;
 
     function setOpen(on) {
-      form.classList.toggle('hidden', !on);
+      form.className = on ? 'manual-fix-form' : 'manual-fix-form hidden';
+      if (form.classList && form.classList.toggle) form.classList.toggle('hidden', !on);
       toggle.setAttribute('aria-expanded', on ? 'true' : 'false');
       toggle.hidden = !!on;
+      box.className = 'manual-fix' + (on ? ' is-open' : '');
     }
     bindWorkAction(toggle, () => setOpen(true));
     if (cancelBtn) {
@@ -2424,8 +2786,8 @@
       bindWorkAction(applyBtn, () => {
         if (applyBtn.disabled) return;
         applyBtn.disabled = true;
-        applyBtn.textContent = '套用中…';
-        applyManualWorkFix(
+        applyBtn.textContent = '核對中…';
+        lastManualTask = applyManualWorkFix(
           w,
           {
             code: codeEl ? codeEl.value : '',
@@ -2433,9 +2795,10 @@
             file: picked,
           },
           card
-        ).finally(() => {
+        );
+        lastManualTask.finally(() => {
           applyBtn.disabled = false;
-          applyBtn.textContent = '套用';
+          applyBtn.textContent = '核對';
         });
       });
     }
@@ -5313,6 +5676,7 @@
       replaceHistorySessionWorks,
       workNeedsTitleZh,
       workNeedsManualFix,
+      slotNeedsCodeEntry,
       batchQueryKeepsFrames,
       workHasUsableCover,
       workHasUsableTitle,
@@ -5333,6 +5697,7 @@
       promotedGalleryWork,
       promoteRelatedToMain,
       promoteTask: () => lastPromoteTask,
+      manualTask: () => lastManualTask,
       renderGallery,
     };
   } catch (_) {}

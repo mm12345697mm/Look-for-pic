@@ -258,6 +258,75 @@ class TestSkipSlot(unittest.TestCase):
         self.assertEqual(frames[2].get("final_code"), "CCC-003")
         self.assertEqual(frames[2].get("final_title"), "丙")
 
+    def test_manual_code_patches_unresolved_slot_without_upload(self):
+        record = S._build_identify_session(
+            {"image_count": 3, "result_count": 3, "message": "多圖", "ok": True},
+            [
+                {"index": 1, "final_code": "AAA-001", "final_title": "甲", "skipped": False},
+                {
+                    "index": 2,
+                    "final_code": "TITLE-SEARCH",
+                    "final_title": "未解析的片名",
+                    "title_only": True,
+                    "needs_code": True,
+                    "skipped": False,
+                },
+                {"index": 3, "final_code": None, "final_title": None, "skipped": True},
+            ],
+        )
+        saved = S.identify_session_put(record)
+        self.assertTrue(saved)
+        cover = "https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271pl.jpg"
+        seen = {}
+
+        def fake_pipeline(**kwargs):
+            seen["kwargs"] = kwargs
+            return {
+                "ok": True,
+                "code": "JUFE-271",
+                "title": "地味な眼鏡では隠し切れない",
+                "title_zh": "土味眼鏡藏不住",
+                "cid": "jufe00271",
+                "cover": cover,
+                "stills": [
+                    "https://pics.dmm.co.jp/digital/video/jufe00271/jufe00271jp-1.jpg"
+                ],
+            }, 200
+
+        with mock.patch.object(S, "run_identify_pipeline", side_effect=fake_pipeline):
+            client = S.app.test_client()
+            res = client.post(
+                "/api/identify/stream",
+                data={
+                    "code": "JUFE-271",
+                    "title": "未解析的片名",
+                    "session_id": saved["id"],
+                    "slot_index": "2",
+                },
+            )
+            body = res.get_data(as_text=True)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertIn("JUFE-271", body)
+        self.assertIn("slot_patched", body)
+        self.assertIn(cover, body)
+        self.assertNotIn("data:image", body)
+        self.assertNotIn("blob:", body)
+        for phrase in FALSE_TIMEOUT:
+            self.assertNotIn(phrase, body)
+        self.assertIsNone(seen["kwargs"].get("image_bytes"))
+        self.assertEqual(seen["kwargs"].get("user_code"), "JUFE-271")
+        fresh = S.identify_session_get(saved["id"])
+        frames = fresh.get("frames") or []
+        self.assertEqual(frames[0].get("final_code"), "AAA-001")
+        self.assertEqual(frames[1].get("final_code"), "JUFE-271")
+        self.assertIn("眼鏡", frames[1].get("final_title") or "")
+        self.assertFalse(frames[1].get("title_only"))
+        self.assertFalse(frames[1].get("needs_code"))
+        self.assertFalse(frames[1].get("skipped"))
+        self.assertTrue(frames[2].get("skipped"))
+        self.assertIsNone(frames[2].get("final_code"))
+
 
 if __name__ == "__main__":
     unittest.main()
