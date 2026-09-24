@@ -170,6 +170,79 @@ class TestNoSharedIdentifyWall(unittest.TestCase):
             walk(rel)
         walk(payload.get("related_by_title") or [])
 
+    def test_successful_identify_cover_is_catalog_jacket_not_the_upload(self):
+        """The query image must not become the main work's cover or stills."""
+        upload = "data:image/jpeg;base64,QUJD"
+        code, title = "CAMP-100", SWIM
+        cid = "camp100"
+        jacket = f"https://pics.dmm.co.jp/digital/video/{cid}/{cid}pl.jpg"
+
+        def fake_vision(image_bytes, mime, api_key):
+            return {"code": code, "title": title, "actress": "誰か"}
+
+        def fake_identify(**kwargs):
+            return {
+                "ok": True,
+                "code": code,
+                "title": title,
+                "actress": "誰か",
+                "cid": cid,
+                "cover": upload,
+                "stills": [upload],
+                "user_preview": upload,
+            }, 200
+
+        def fake_verify(hit, *args, **kwargs):
+            return hit
+
+        def fake_related(result, **kwargs):
+            out = dict(result)
+            out["related_by_title"] = []
+            return out
+
+        images = [(_png(b"\x01"), "a.png"), (_png(b"\x02"), "b.png")]
+        with mock.patch.object(S, "get_gemini_api_key", return_value="test-key"), mock.patch.object(
+            S, "call_gemini_vision", side_effect=fake_vision
+        ), mock.patch.object(
+            S, "run_identify_pipeline", side_effect=fake_identify
+        ), mock.patch.object(
+            S, "verify_work_against_image", side_effect=fake_verify
+        ), mock.patch.object(
+            S, "attach_related_by_title", side_effect=fake_related
+        ), mock.patch.object(S, "offline_cache_put", return_value=None):
+            payload, status = S.run_multi_identify_pipeline(images)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("cover"), jacket)
+        self.assertNotEqual(payload.get("cover"), upload)
+        self.assertNotIn("QUJD", str(payload.get("cover") or ""))
+        for row in payload.get("results") or []:
+            self.assertEqual(row.get("cover"), jacket)
+            self.assertNotEqual(row.get("cover"), row.get("user_preview"))
+            for u in row.get("stills") or []:
+                self.assertTrue(str(u).startswith("https://pics.dmm.co.jp/"), u)
+                self.assertNotIn("QUJD", str(u))
+                self.assertNotEqual(u, upload)
+
+        kept = S._lock_work_catalog_media(
+            {
+                "code": code,
+                "cid": cid,
+                "cover": jacket,
+                "stills": [f"https://pics.dmm.co.jp/digital/video/{cid}/{cid}jp-1.jpg"],
+                "user_preview": upload,
+            }
+        )
+        self.assertEqual(kept["cover"], jacket)
+        self.assertEqual(kept["user_preview"], upload)
+        self.assertNotEqual(kept["cover"], kept["user_preview"])
+
+        cleared = S._lock_work_catalog_media(
+            {"code": code, "cover": upload, "stills": [upload], "user_preview": upload}
+        )
+        self.assertFalse(cleared.get("cover"))
+        self.assertEqual(cleared.get("stills"), [])
+
 
 class TestKyonyuKeywordPriority(unittest.TestCase):
     def test_swim_title_keeps_kyonyu_chip_and_stays_searchable(self):

@@ -1909,7 +1909,30 @@ function walkNodes(node, acc) {
       ],
     });
     const main = gallery.items[0];
-    assert.strictEqual(main.userPreview, upload);
+    assert.strictEqual(main.cover, 'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg');
+    assert.notStrictEqual(main.cover, upload);
+    assert.ok(main.stills.every((u) => /^https:\/\//.test(u) && u.indexOf('UPLOAD') === -1));
+    const stolen = H.galleryFromIdentify({
+      ok: true,
+      code: 'CAMP-100',
+      title: '巨乳水泳部員の媚薬合宿',
+      cid: 'camp100',
+      cover: upload,
+      stills: [upload],
+      user_preview: upload,
+    });
+    const stolenMain = stolen.items[0];
+    assert.strictEqual(
+      stolenMain.cover,
+      'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg'
+    );
+    assert.notStrictEqual(stolenMain.cover, upload);
+    assert.notStrictEqual(stolenMain.cover, stolenMain.userPreview);
+    assert.ok(stolenMain.stills.length > 0);
+    stolenMain.stills.forEach((u) => {
+      assert.ok(/^https:\/\//.test(u), u);
+      assert.ok(u.indexOf('UPLOAD') === -1, u);
+    });
     const rel = main.relatedByTitle[0];
     assert.ok(/^https:\/\//.test(rel.cover), rel.cover);
     assert.ok(rel.cover.indexOf('body00101') !== -1, rel.cover);

@@ -773,6 +773,11 @@
     return line === 'theme' || line === 'keyword' || line === 'actress';
   }
 
+  function isCatalogMediaUrl(url) {
+    const s = String(url || '').trim();
+    return /^https?:\/\//i.test(s) && !isLocalCoverUrl(s) && !isNowPrintingUrl(s);
+  }
+
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
     const unidentified = !!(raw.unidentified || raw.frame_unidentified);
@@ -791,24 +796,23 @@
         : formatDisplayCode(rawCode);
     const lineOut = line || raw.line || 'main';
     const relatedSlide = isRelatedCarouselLine(lineOut);
+    const preview = String(raw.user_preview || raw.userPreview || '').trim();
     // Never invent DMM CID from the display code: padded guesses (dosd00008)
     // often redirect to now_printing after the server already cleared cover.
     const cid = String(raw.cid || '');
     let cover = String(raw.cover || raw.cover_url || '').trim();
-    if (isNowPrintingUrl(cover)) cover = '';
-    // Related carousel is catalog jackets only. An upload data/blob URL is not a cover.
-    if (relatedSlide && (!/^https?:\/\//i.test(cover) || isLocalCoverUrl(cover))) cover = '';
+    if (isNowPrintingUrl(cover) || !isCatalogMediaUrl(cover) || (preview && cover === preview)) {
+      cover = '';
+    }
+    // The query image is not the main cover. A cid restores the catalog jacket.
     if (!cover && cid && !isNowPrintingUrl(cid)) {
       cover = coverUrl(cid);
-      if (isNowPrintingUrl(cover)) cover = '';
+      if (!isCatalogMediaUrl(cover)) cover = '';
     }
     let stills = Array.isArray(raw.stills) && raw.stills.length
-      ? raw.stills.map((u) => String(u || '')).filter((u) => u && !isNowPrintingUrl(u))
+      ? raw.stills.map((u) => String(u || '')).filter((u) => isCatalogMediaUrl(u) && u !== preview)
       : [];
-    if (relatedSlide) {
-      stills = stills.filter((u) => /^https?:\/\//i.test(u) && !isLocalCoverUrl(u));
-    }
-    if (!stills.length && cid) {
+    if (!stills.length && cid && !isNowPrintingUrl(cid)) {
       stills = stillUrls(cid, 10);
     }
     let relatedByTitle = [];
@@ -1333,21 +1337,9 @@
     coverWrap._lfpWork = w;
     const url = (w.cover || '').trim();
     const preview = String((w && w.userPreview) || '').trim();
-    // The user's upload stays on their own card. Related / keyword slides do not use it.
-    if (
-      !isRelatedCarouselLine(w && w.line) &&
-      (!url || (w.titleOnly && !isLocalCoverUrl(url))) &&
-      isLocalCoverUrl(preview)
-    ) {
-      const shot = document.createElement('img');
-      shot.alt = '這張上傳圖';
-      shot.loading = 'lazy';
-      shot.decoding = 'async';
-      shot.src = preview;
-      coverWrap.appendChild(shot);
-      return;
-    }
-    if (!url || (w.titleOnly && !isLocalCoverUrl(url))) {
+    // Main cover is the catalog jacket. The query image stays in the upload strip.
+    const catalog = isCatalogMediaUrl(url) && url !== preview;
+    if (!catalog) {
       coverWrap.classList.add('is-empty');
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
@@ -1386,6 +1378,7 @@
     const set = workImageSet(w);
     const coverOffset = w && w.cover ? 1 : 0;
     (w.stills || []).forEach((url, i) => {
+      if (!isCatalogMediaUrl(url)) return;
       const img = document.createElement('img');
       img.src = url;
       img.alt = (w.code || '') + ' 劇照 ' + (i + 1);

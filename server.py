@@ -4548,6 +4548,66 @@ def _catalog_jacket_url(url) -> str:
     return s
 
 
+def _is_upload_media_url(url, preview: str | None = None) -> bool:
+    """True for a query-image data/blob URL, or a cover that is that preview."""
+    s = str(url or "").strip()
+    if not s:
+        return False
+    low = s.lower()
+    if low.startswith("data:") or low.startswith("blob:"):
+        return True
+    shot = str(preview or "").strip()
+    return bool(shot) and s == shot
+
+
+def _lock_work_catalog_media(work: dict | None) -> dict | None:
+    """Main cover and stills are catalog jackets, never the upload frame.
+
+    A data/blob URL, or the same URL as user_preview, is the query image.
+    When this work has a cid, that slot becomes the catalog jacket instead.
+    """
+    if not isinstance(work, dict):
+        return work
+    preview = str(work.get("user_preview") or work.get("userPreview") or "").strip()
+    cid = str(work.get("cid") or "").strip()
+    if is_now_printing_url(cid):
+        cid = ""
+    cover = str(work.get("cover") or work.get("cover_url") or "").strip()
+    if _is_upload_media_url(cover, preview) or (cover and not _catalog_jacket_url(cover)):
+        restored = cover_url(cid) if cid else ""
+        cover = restored if _catalog_jacket_url(restored) else ""
+    elif not _catalog_jacket_url(cover):
+        cover = ""
+    work["cover"] = cover or None
+    if "cover_url" in work:
+        work["cover_url"] = cover or None
+    raw_stills = work.get("stills") if isinstance(work.get("stills"), list) else []
+    had_upload_still = any(_is_upload_media_url(u, preview) for u in raw_stills)
+    stills: list[str] = []
+    for u in raw_stills:
+        clean = _catalog_jacket_url(u)
+        if clean and not _is_upload_media_url(clean, preview) and clean not in stills:
+            stills.append(clean)
+    if not stills and had_upload_still and cid:
+        stills = still_urls(cid, 10)
+    work["stills"] = stills
+    return work
+
+
+def _lock_identify_payload_media(payload: dict | None) -> dict | None:
+    """Strip the query image off the main work and every listed result."""
+    if not isinstance(payload, dict):
+        return payload
+    _lock_work_catalog_media(payload)
+    for key in ("results", "candidates"):
+        rows = payload.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            _lock_work_catalog_media(row)
+    return payload
+
+
 def _sanitize_related_row(item: dict) -> dict:
     """Related slides show catalog jackets only, never the user's upload."""
     row = dict(item)
@@ -9998,7 +10058,8 @@ def run_multi_identify_pipeline(
             user_title=user_title,
             on_progress=on_progress,
         )
-        return attach_related_by_title(result, budget_sec=14.0), status
+        result = attach_related_by_title(result, budget_sec=14.0)
+        return _lock_identify_payload_media(result), status
 
     n = len(images)
     api_key = get_gemini_api_key()
@@ -10629,6 +10690,7 @@ def run_multi_identify_pipeline(
     if total_rel:
         done_detail += f"；相關共 {total_rel}"
     _progress(on_progress, "done", "done", done_detail, 1.0)
+    _lock_identify_payload_media(payload)
     _attach_saved_session(payload, _frames_from_multi(vision_rows, results))
     return payload, 200
 
@@ -10865,6 +10927,7 @@ def _complete_identify_result(
         result.setdefault("related_by_title", [])
     _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
+    _lock_identify_payload_media(result)
     try:
         offline_cache_put(result, image_hash=image_hash)
     except Exception:
