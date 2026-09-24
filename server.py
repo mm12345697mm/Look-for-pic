@@ -10198,6 +10198,7 @@ def run_multi_identify_pipeline(
             "active",
             f"辨識第 {idx}/{n} 張…",
             0.05 + 0.35 * (i / max(n, 1)),
+            phase="辨識中",
         )
         row: dict = {
             "index": idx,
@@ -10438,6 +10439,7 @@ def run_multi_identify_pipeline(
             "active",
             f"搜尋第 {ji + 1}/{len(jobs)} 張…",
             0.55 + 0.25 * (ji / max(len(jobs), 1)),
+            phase="目錄查詢",
         )
         row = job.get("row") if isinstance(job.get("row"), dict) else None
         vm = None
@@ -10639,6 +10641,14 @@ def run_multi_identify_pipeline(
                     one = _unidentified_slot(row)
 
         if one.get("ok") and _catalog_code_of(one):
+            _progress(
+                on_progress,
+                "search",
+                "active",
+                f"封面鎖定第 {ji + 1}/{len(jobs)} 張…",
+                0.55 + 0.25 * ((ji + 0.5) / max(len(jobs), 1)),
+                phase="封面鎖定",
+            )
             try:
                 one = verify_work_against_image(
                     one,
@@ -10767,7 +10777,7 @@ def run_multi_identify_pipeline(
         0.92,
     )
     # Related for EVERY main hit (each screenshot row gets its own carousel siblings).
-    _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94)
+    _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94, phase="相關作品")
     total_rel = 0
     def _slot_needs_related(row: dict) -> bool:
         if not isinstance(row, dict) or not row.get("ok") or row.get("stub") or row.get("unidentified"):
@@ -10792,6 +10802,7 @@ def run_multi_identify_pipeline(
                 "active",
                 f"相關作品 {i + 1}/{len(results)}…",
                 0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
+                phase="相關作品",
             )
             filled = attach_related_by_title(row, budget_sec=per_budget, per_item=False)
             rel = _sanitize_related_rows(filled.get("related_by_title") or [])
@@ -10830,8 +10841,19 @@ IDENTIFY_STEPS = (
 )
 
 
-def _progress(cb, step: str, status: str, detail: str = "", progress: float | None = None) -> None:
-    """Safe progress callback. status: pending|active|done|skipped|error."""
+def _progress(
+    cb,
+    step: str,
+    status: str,
+    detail: str = "",
+    progress: float | None = None,
+    phase: str | None = None,
+) -> None:
+    """Safe progress callback. status: pending|active|done|skipped|error.
+
+    `phase` is only the label beside the active step (辨識中, 目錄查詢,
+    封面鎖定, 相關作品). It does not change identify or the jacket lock.
+    """
     if not cb:
         return
     if progress is None:
@@ -10849,7 +10871,15 @@ def _progress(cb, step: str, status: str, detail: str = "", progress: float | No
         except ValueError:
             progress = 0.0
     try:
-        cb({"step": step, "status": status, "detail": detail or "", "progress": round(float(progress), 3)})
+        evt = {
+            "step": step,
+            "status": status,
+            "detail": detail or "",
+            "progress": round(float(progress), 3),
+        }
+        if phase:
+            evt["phase"] = phase
+        cb(evt)
     except Exception:
         pass
 
@@ -11191,7 +11221,7 @@ def run_identify_pipeline(
     if image_bytes is not None:
         mime = detect_image_mime(image_bytes, filename)
         if api_key:
-            _progress(on_progress, "vision", "active", "Gemini 看圖辨識中…", 1 / 6)
+            _progress(on_progress, "vision", "active", "Gemini 看圖辨識中…", 1 / 6, phase="辨識中")
             try:
                 vision_meta = call_gemini_vision(image_bytes, mime, api_key)
                 vision_used = True
@@ -11473,7 +11503,7 @@ def run_identify_pipeline(
         vactress = vision_meta.get("actress")
         vstudio = vision_meta.get("studio")
         _progress(on_progress, "parse", "done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
-        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6, phase="目錄查詢")
         phrase_extras = list(text_queries or [])
         phrase_blob = "\n".join(
             str(part or "")
@@ -11540,7 +11570,7 @@ def run_identify_pipeline(
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
             already_locked = bool((hit.get("visual_meta") or {}).get("visual_lock"))
             if n_pre >= 1 and image_bytes and not already_locked:
-                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6, phase="封面鎖定")
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
             search_mode = "title"
@@ -11568,7 +11598,7 @@ def run_identify_pipeline(
             if len(coded) >= 1:
                 hit2 = hit or {"candidates": coded, "title": vtitle}
                 if len(coded) >= 1 and image_bytes:
-                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6, phase="封面鎖定")
                     hit2 = apply_visual_rank_to_hit(hit2, image_bytes, api_key=api_key)
                     vmeta = hit2.get("visual_meta") or {}
                     if vmeta.get("visual_ranked"):
@@ -11672,7 +11702,7 @@ def run_identify_pipeline(
     if not code and user_title:
         search_mode = "title"
         _progress(on_progress, "parse", "done", f"使用片名：{user_title[:40]}", 3 / 6)
-        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6, phase="目錄查詢")
         hit = None
         try:
             hit = search_by_title(user_title, actress=(user_actress or "").strip() or None)
@@ -11698,7 +11728,7 @@ def run_identify_pipeline(
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
             if n_pre >= 1 and image_bytes:
-                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6, phase="封面鎖定")
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
             title_search_hit = hit
@@ -11730,7 +11760,7 @@ def run_identify_pipeline(
             if coded:
                 hit2 = hit
                 if len(coded) >= 1 and image_bytes:
-                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
+                    _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6, phase="封面鎖定")
                     hit2 = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
                     vmeta = hit2.get("visual_meta") or {}
                     if vmeta.get("visual_ranked"):

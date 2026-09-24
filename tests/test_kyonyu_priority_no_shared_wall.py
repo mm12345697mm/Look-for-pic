@@ -114,6 +114,13 @@ class TestNoSharedIdentifyWall(unittest.TestCase):
         kwargs = {}
         if "deadline" in inspect.signature(S.run_multi_identify_pipeline).parameters:
             kwargs["deadline"] = time.monotonic() - 30
+        step_phases: list[str] = []
+
+        def on_progress(evt):
+            if isinstance(evt, dict) and evt.get("phase"):
+                step_phases.append(str(evt["phase"]))
+
+        kwargs["on_progress"] = on_progress
         with mock.patch.object(S, "get_gemini_api_key", return_value="test-key"), mock.patch.object(
             S, "call_gemini_vision", side_effect=fake_vision
         ), mock.patch.object(
@@ -144,6 +151,11 @@ class TestNoSharedIdentifyWall(unittest.TestCase):
         self.assertEqual(kinds.count("related"), 4)
         self.assertLess(kinds.index("vision"), kinds.index("identify"))
         self.assertLess(max(i for i, k in enumerate(kinds) if k == "lock"), kinds.index("related"))
+        for label in ("辨識中", "目錄查詢", "封面鎖定", "相關作品"):
+            self.assertIn(label, step_phases, step_phases)
+        self.assertLess(step_phases.index("辨識中"), step_phases.index("目錄查詢"))
+        self.assertLess(step_phases.index("目錄查詢"), step_phases.index("封面鎖定"))
+        self.assertLess(step_phases.index("封面鎖定"), step_phases.index("相關作品"))
 
         def walk(rows):
             for row in rows or []:
