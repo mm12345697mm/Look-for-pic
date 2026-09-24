@@ -11,4 +11,3 @@ __pycache__/
 # Server offline identify cache and per-frame session log (runtime)
 data/offline-cache.json
 data/identify-sessions.json
-data/identify-jobs.json

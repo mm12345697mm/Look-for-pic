@@ -60,12 +60,6 @@
   let pendingFiles = [];
   let batchFiles = [];
   let identifyBusy = false;
-  const ACTIVE_JOB_KEY = 'lfp_active_identify_job_v1';
-  let activeJobId = null;
-  let jobSettled = false;
-  let jobFollow = null;
-  let streamAttached = false;
-  let activeHandleResult = null;
 
   function batchQueryKeepsFrames(fileCount, busy, openFrame) {
     return fileCount > 1 && !!(busy || openFrame);
@@ -778,23 +772,19 @@
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
     const unidentified = !!(raw.unidentified || raw.frame_unidentified);
-    const timedOut = !!(raw.timed_out || raw.timedOut);
     const titleOnly =
       unidentified ||
-      timedOut ||
       !rawCode ||
       rawCode === 'TITLE-SEARCH' ||
       rawCode.toLowerCase() === 'null' ||
       !parseCodeParts(rawCode);
-    const code = timedOut
-      ? '尚未查完'
-      : unidentified
-        ? '未辨識'
-        : titleOnly
-          ? rawCode === 'TITLE-SEARCH' || !rawCode
-            ? '片名搜尋'
-            : formatDisplayCode(rawCode)
-          : formatDisplayCode(rawCode);
+    const code = unidentified
+      ? '未辨識'
+      : titleOnly
+        ? rawCode === 'TITLE-SEARCH' || !rawCode
+          ? '片名搜尋'
+          : formatDisplayCode(rawCode)
+        : formatDisplayCode(rawCode);
     // Never invent DMM CID from the display code: padded guesses (dosd00008)
     // often redirect to now_printing after the server already cleared cover.
     const cid = String(raw.cid || '');
@@ -831,8 +821,6 @@
       stills,
       titleOnly,
       unidentified,
-      timedOut,
-      message: raw.message ? String(raw.message) : '',
       userPreview: String(raw.user_preview || raw.userPreview || '').trim(),
       fromImageIndex: raw.from_image_index || raw.fromImageIndex || null,
       relatedByTitle,
@@ -885,7 +873,7 @@
   function hideProgress() {
     if (!progressPanel) return;
     progressPanel.classList.add('hidden');
-    progressPanel.classList.remove('is-complete', 'is-failed', 'is-live');
+    progressPanel.classList.remove('is-complete', 'is-failed');
     progressPanel.setAttribute('aria-busy', 'false');
     setProgressCollapsed(false);
     progressFinished = false;
@@ -897,7 +885,7 @@
     progressState = {};
     progressLabels = {};
     progressFinished = false;
-    progressPanel.classList.remove('is-complete', 'is-failed', 'is-live');
+    progressPanel.classList.remove('is-complete', 'is-failed');
     progressStepsEl.innerHTML = '';
     list.forEach((s) => {
       progressState[s.id] = 'pending';
@@ -1037,349 +1025,6 @@
     }
   }
 
-  function isIdentifyServerFailure(msg) {
-    const text = String(msg || '');
-    return /伺服器錯誤|伺服器逾時|伺服器回應無效|stream_incomplete|stream_interrupted|多圖辨識被中斷|時間上限/.test(
-      text
-    );
-  }
-
-  function rememberPartialSlot(list, slot) {
-    if (!slot || typeof slot !== 'object') return;
-    const idx = slot.from_image_index || slot.fromImageIndex;
-    if (!idx) {
-      list.push(slot);
-      return;
-    }
-    const at = list.findIndex((s) => (s.from_image_index || s.fromImageIndex) === idx);
-    if (at >= 0) list[at] = slot;
-    else list.push(slot);
-  }
-
-  /**
-   * Stream died or the worker was killed mid-batch. Keep finished slots and
-   * mark the rest as 尚未查完 — never as 查詢不到.
-   */
-  function interruptedBatchPayload(images, partialSlots) {
-    const n = images && images.length ? images.length : 0;
-    const slots = [];
-    (partialSlots || []).forEach((slot) => rememberPartialSlot(slots, slot));
-    const have = new Set(
-      slots.map((s) => s.from_image_index || s.fromImageIndex).filter((v) => v != null)
-    );
-    for (let i = 1; i <= n; i++) {
-      if (have.has(i)) continue;
-      slots.push({
-        ok: true,
-        timed_out: true,
-        unidentified: false,
-        code: 'TITLE-SEARCH',
-        title: '（這張尚未查完）',
-        from_image_index: i,
-        message: '伺服器逾時，這張被中斷。請再上傳這張重查一次。不是查詢不到。',
-        why: '伺服器逾時',
-        line: 'multi',
-        needs_code: true,
-      });
-    }
-    slots.sort(
-      (a, b) => (a.from_image_index || a.fromImageIndex || 0) - (b.from_image_index || b.fromImageIndex || 0)
-    );
-    return {
-      ok: true,
-      multi: true,
-      partial: true,
-      server_interrupted: true,
-      image_count: n,
-      result_count: slots.length,
-      results: slots,
-      message: '伺服器逾時，多圖辨識被中斷。已完成的會保留。未完成的請再上傳重查，不是查詢不到。',
-      related_note: '未完成的請再上傳這張重查，不是查詢不到',
-    };
-  }
-
-  function identifyProgressLabel(status, done, total) {
-    const doneN = Math.max(0, Number(done) || 0);
-    const totalN = Math.max(0, Number(total) || 0);
-    const count = totalN ? '已完成 ' + doneN + '／共 ' + totalN : '';
-    if (status === 'running') return count && doneN ? '還在找 · ' + count : '還在找';
-    if (status === 'stalled') return count ? '卡住或逾時可再補 · ' + count : '卡住或逾時可再補';
-    if (status === 'error') return count ? '伺服器錯誤 · ' + count : '伺服器錯誤';
-    if (totalN && doneN < totalN) return count ? count + ' · 其餘可再補' : '其餘可再補';
-    return count || '已完成';
-  }
-
-  function loadActiveJob() {
-    try {
-      const raw = localStorage.getItem(ACTIVE_JOB_KEY);
-      if (!raw) return null;
-      const rec = JSON.parse(raw);
-      return rec && rec.jobId ? rec : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function saveActiveJob(rec) {
-    if (!rec || !rec.jobId) return;
-    try {
-      localStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify(rec));
-    } catch (_) {}
-  }
-
-  function clearActiveJob() {
-    activeJobId = null;
-    try {
-      localStorage.removeItem(ACTIVE_JOB_KEY);
-    } catch (_) {}
-  }
-
-  function rememberIdentifyJob(jobId, imageCount) {
-    if (!jobId) return;
-    activeJobId = String(jobId);
-    jobSettled = false;
-    const prev = loadActiveJob() || {};
-    saveActiveJob({
-      jobId: activeJobId,
-      imageCount: Number(imageCount || prev.imageCount) || 0,
-      doneCount: Number(prev.doneCount) || 0,
-      status: 'running',
-      message: '還在找',
-      savedAt: Date.now(),
-    });
-  }
-
-  function noteLiveStatus(status, done, total) {
-    const label = identifyProgressLabel(status, done, total);
-    const kind = status === 'running' ? 'busy' : status === 'done' && done === total ? 'ok' : 'err';
-    setStatus(label, kind);
-    updateProgressSummary(label);
-    if (progressPanel) {
-      progressPanel.classList.add('is-live');
-      progressPanel.classList.remove('hidden');
-    }
-    const rec = loadActiveJob();
-    if (rec && rec.jobId) {
-      rec.status = status;
-      rec.doneCount = done;
-      rec.imageCount = total || rec.imageCount;
-      rec.message = label;
-      rec.savedAt = Date.now();
-      saveActiveJob(rec);
-    }
-    return label;
-  }
-
-  /**
-   * A background kill, disconnect, or stall. Finished slots stay.
-   * Unfinished slots stay incomplete. This is not 查詢不到.
-   */
-  function resumePayloadFromJob(job) {
-    job = job || {};
-    const status = job.status || 'running';
-    if (status === 'done' && job.result && typeof job.result === 'object') {
-      const data = job.result;
-      if (
-        data.partial ||
-        (Array.isArray(data.results) && data.results.some((r) => r && (r.timed_out || r.timedOut)))
-      ) {
-        data.partial = true;
-      }
-      return data;
-    }
-    const slots = Array.isArray(job.slots) ? job.slots : [];
-    const total = Math.max(Number(job.image_count) || 0, slots.length);
-    const images = new Array(total).fill({ name: 'frame.jpg' });
-    const data = interruptedBatchPayload(images, slots);
-    const done = (data.results || []).filter((r) => r && !r.timed_out).length;
-    const n = (data.results || []).length;
-    if (status === 'error') {
-      data.server_error = true;
-      data.message = identifyProgressLabel('error', done, n);
-      data.related_note = '伺服器錯誤。未完成的不是查詢不到，請再上傳重查';
-    } else {
-      data.stalled = true;
-      data.message = identifyProgressLabel('stalled', done, n);
-      data.related_note = '卡住或逾時可再補。不是查詢不到';
-      (data.results || []).forEach((row) => {
-        if (!row || !row.timed_out) return;
-        row.message = '卡住或逾時，這張可再補。請再上傳這張重查一次。不是查詢不到。';
-        row.why = '卡住或逾時可再補';
-      });
-    }
-    data.image_count = n;
-    return data;
-  }
-
-  function stopJobFollow() {
-    if (jobFollow && jobFollow.timer) clearTimeout(jobFollow.timer);
-    jobFollow = null;
-  }
-
-  function presentResumeGallery(data) {
-    identifyBusy = false;
-    const results = data.results || [];
-    const done = results.filter((r) => r && !r.timed_out && !r.timedOut).length;
-    const total = data.image_count || results.length;
-    const kind = data.server_error ? 'error' : data.stalled || data.server_interrupted ? 'stalled' : 'done';
-    const label = noteLiveStatus(kind, done, total);
-    applyProgressEvent({
-      step: 'done',
-      status: kind === 'done' && done === total && !data.partial ? 'done' : 'error',
-      detail: data.message || label,
-      progress: 1,
-    });
-    if (progressPanel) {
-      progressPanel.classList.remove('hidden');
-      progressPanel.classList.add('is-live');
-      progressPanel.setAttribute('aria-busy', 'false');
-      if (kind === 'done' && !data.partial && !data.server_interrupted && !data.stalled) {
-        progressPanel.classList.add('is-complete');
-        progressPanel.classList.remove('is-failed');
-      } else {
-        progressPanel.classList.add('is-failed');
-        progressPanel.classList.remove('is-complete');
-        setProgressCollapsed(false);
-      }
-    }
-    renderGallery(galleryFromIdentify(data));
-    showScreen('gallery');
-    if (kind === 'done' && data.ok && !data.partial && !data.server_interrupted && !data.stalled && !data.server_error) {
-      appendHistoryFromIdentify(data, []).catch(() => {});
-    }
-  }
-
-  function settleFromJob(job, myRun) {
-    if (jobSettled) return;
-    if (myRun != null && myRun !== runId) return;
-    jobSettled = true;
-    stopJobFollow();
-    streamAttached = false;
-    clearActiveJob();
-    const data = resumePayloadFromJob(job);
-    if (activeHandleResult && myRun === runId) {
-      activeHandleResult(data);
-      return;
-    }
-    presentResumeGallery(data);
-  }
-
-  function beginJobFollow(jobId, imageCount, myRun) {
-    if (!jobId) return;
-    stopJobFollow();
-    jobSettled = false;
-    activeJobId = String(jobId);
-    const total = Number(imageCount) || 0;
-    saveActiveJob({
-      jobId: activeJobId,
-      imageCount: total,
-      status: 'running',
-      message: '還在找',
-      savedAt: Date.now(),
-    });
-    const state = { jobId: activeJobId, myRun: myRun, timer: null, tick: null };
-    jobFollow = state;
-    const tick = async () => {
-      if (jobFollow !== state || jobSettled) return;
-      if (myRun != null && myRun !== runId) return;
-      let job = null;
-      try {
-        const res = await fetch('/api/identify/jobs/' + encodeURIComponent(state.jobId), { cache: 'no-store' });
-        if (jobFollow !== state || jobSettled || (myRun != null && myRun !== runId)) return;
-        if (res.status === 404) {
-          settleFromJob(
-            {
-              status: 'stalled',
-              image_count: total,
-              done_count: 0,
-              slots: [],
-            },
-            myRun
-          );
-          return;
-        }
-        if (!res.ok) throw new Error('伺服器錯誤');
-        const body = await res.json();
-        job = body && body.job;
-      } catch (_) {
-        if (jobFollow !== state || jobSettled) return;
-        const rec = loadActiveJob();
-        noteLiveStatus('running', (rec && rec.doneCount) || 0, total);
-        state.timer = setTimeout(tick, 2500);
-        return;
-      }
-      if (!job || jobFollow !== state || jobSettled) return;
-      noteLiveStatus(
-        job.status === 'running' ? 'running' : job.status,
-        job.done_count || 0,
-        job.image_count || total
-      );
-      if (job.progress && job.progress.step) applyProgressEvent(job.progress);
-      if (job.status === 'running') {
-        state.timer = setTimeout(tick, 2500);
-        return;
-      }
-      settleFromJob(job, myRun);
-    };
-    state.tick = tick;
-    tick();
-  }
-
-  function pageIsHidden() {
-    try {
-      return document.visibilityState === 'hidden';
-    } catch (_) {
-      return false;
-    }
-  }
-
-  function onIdentifyVisibility() {
-    if (pageIsHidden()) {
-      const rec = loadActiveJob();
-      if (rec && rec.jobId && !jobSettled) {
-        rec.hiddenAt = Date.now();
-        saveActiveJob(rec);
-      }
-      return;
-    }
-    const rec = loadActiveJob();
-    if (!rec || !rec.jobId || jobSettled) return;
-    if (progressPanel) progressPanel.classList.remove('hidden');
-    if (jobFollow && jobFollow.tick) {
-      if (jobFollow.timer) clearTimeout(jobFollow.timer);
-      jobFollow.timer = null;
-      jobFollow.tick();
-      return;
-    }
-    // The SSE socket may still look open after iOS freezes it. Poll the job.
-    beginJobFollow(rec.jobId, rec.imageCount || 0, runId);
-  }
-
-  function resumeStoredIdentifyJob() {
-    const rec = loadActiveJob();
-    if (!rec || !rec.jobId || jobSettled) return;
-    const myRun = ++runId;
-    identifyBusy = true;
-    const n = Number(rec.imageCount) || 0;
-    showProgress(
-      n > 1
-        ? [
-            { id: 'receive', label: '接收圖片（' + n + ' 張）' },
-            { id: 'vision', label: '逐張看圖辨識' },
-            { id: 'parse', label: '彙整番號／片名' },
-            { id: 'verify', label: '核對片名與番號' },
-            { id: 'search', label: '搜尋作品資料' },
-            { id: 'cover', label: '抓取封面與劇照' },
-            { id: 'done', label: '完成，進入畫廊' },
-          ]
-        : DEFAULT_STEPS
-    );
-    showScreen('home');
-    if (progressPanel) progressPanel.classList.add('is-live');
-    noteLiveStatus('running', rec.doneCount || 0, n);
-    beginJobFollow(rec.jobId, n, myRun);
-  }
-
   async function apiIdentifyStream({ images, image, code, title } = {}, onProgress) {
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
@@ -1403,12 +1048,7 @@
     let buffer = '';
     let finalData = null;
     let httpStatus = res.status;
-    let jobId = null;
-    let imageCount = imgs.length;
-    const partialSlots = [];
-    streamAttached = true;
 
-    try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1428,44 +1068,19 @@
         } catch (_) {
           continue;
         }
-        if (evt.type === 'job' && evt.job_id) {
-          jobId = String(evt.job_id);
-          imageCount = Number(evt.image_count) || imageCount;
-          rememberIdentifyJob(jobId, imageCount);
-          noteLiveStatus('running', 0, imageCount);
-        } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
+        if (evt.type === 'steps' && Array.isArray(evt.steps)) {
           showProgress(evt.steps);
-          if (jobId) {
-            if (progressPanel) progressPanel.classList.add('is-live');
-            const doneNow = partialSlots.filter((s) => !(s.timed_out || s.timedOut)).length;
-            noteLiveStatus('running', doneNow, imageCount);
-          }
         } else if (evt.type === 'progress') {
-          if (evt.slot) rememberPartialSlot(partialSlots, evt.slot);
           if (onProgress) onProgress(evt);
           else applyProgressEvent(evt);
-          if (jobId) {
-            const done = partialSlots.filter((s) => !(s.timed_out || s.timedOut)).length;
-            noteLiveStatus('running', done, imageCount || partialSlots.length);
-          }
         } else if (evt.type === 'result') {
           finalData = evt.data;
           if (typeof evt.status === 'number') httpStatus = evt.status;
         }
       }
     }
-    if (!finalData) {
-      const err = new Error('stream_incomplete');
-      err.code = 'stream_interrupted';
-      err.partialSlots = partialSlots;
-      err.jobId = jobId;
-      err.imageCount = imageCount;
-      throw err;
-    }
-    return { status: httpStatus, data: finalData, partialSlots, jobId: jobId };
-    } finally {
-      streamAttached = false;
-    }
+    if (!finalData) throw new Error('stream_incomplete');
+    return { status: httpStatus, data: finalData };
   }
 
   async function apiIdentify({ images, image, code, title } = {}) {
@@ -1475,18 +1090,11 @@
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
     const res = await fetch('/api/identify', { method: 'POST', body: fd });
-    let data = null;
+    let data;
     try {
       data = await res.json();
     } catch (_) {
-      throw new Error(res.status >= 500 ? '伺服器錯誤' : '伺服器回應無效');
-    }
-    if (res.status >= 500) {
-      const err = new Error((data && data.message) || '伺服器錯誤');
-      err.httpStatus = res.status;
-      err.data = data;
-      err.partialSlots = data && Array.isArray(data.results) ? data.results : [];
-      throw err;
+      throw new Error('伺服器回應無效');
     }
     return { status: res.status, data };
   }
@@ -1668,11 +1276,6 @@
 
   function resetBaseline() {
     runId += 1;
-    jobSettled = true;
-    stopJobFollow();
-    clearActiveJob();
-    streamAttached = false;
-    activeHandleResult = null;
     identifyBusy = false;
     batchFiles = [];
     setStatus('');
@@ -1733,11 +1336,9 @@
       coverWrap.classList.add('is-empty');
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
-      ph.innerHTML = w.timedOut
-        ? '<strong>尚未查完</strong><span>請再上傳這張重查一次，不是查詢不到</span>'
-        : w.unidentified
-          ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
-          : w.titleOnly
+      ph.innerHTML = w.unidentified
+        ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
+        : w.titleOnly
           ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
           : '<strong>暫無封面</strong><span>請確認番號</span>';
       coverWrap.appendChild(ph);
@@ -1837,12 +1438,6 @@
         ? '女優：' + w.actress + (w.studio ? ' · ' + w.studio : '')
         : String(w.studio);
       meta.appendChild(actressEl);
-    }
-    if (w.timedOut) {
-      const noteEl = document.createElement('p');
-      noteEl.className = 'card-visual-note';
-      noteEl.textContent = w.message || '這張時間不夠，還沒鎖定。請再上傳這張重查一次。不是查詢不到。';
-      meta.appendChild(noteEl);
     }
     if (w.visualMismatch) {
       const noteEl = document.createElement('p');
@@ -3951,11 +3546,6 @@
 
   async function runIdentify({ images, image, code, title } = {}, myRun) {
     const imgs = images && images.length ? images : image ? [image] : [];
-    stopJobFollow();
-    jobSettled = false;
-    streamAttached = false;
-    clearActiveJob();
-    activeHandleResult = null;
     identifyBusy = true;
     if (imgs.length > 1) batchFiles = imgs.slice();
     const busyMsg = imgs.length > 1
@@ -4015,15 +3605,6 @@
       const hasTitle = !!(data.title && String(data.title).trim());
       const hasResults = Array.isArray(data.results) && data.results.length > 0;
 
-      if (
-        imgs.length > 1 &&
-        isIdentifyServerFailure(data && data.message) &&
-        !(hasResults && data.ok)
-      ) {
-        handleResult(interruptedBatchPayload(imgs, data && data.results));
-        return;
-      }
-
       if (!data.ok || (!hasCode && !hasTitle && !hasResults)) {
         const msg =
           data.message ||
@@ -4034,68 +3615,39 @@
         applyProgressEvent({ step: 'done', status: 'error', detail: msg, progress: 1 });
         progressPanel.setAttribute('aria-busy', 'false');
         setProgressCollapsed(false);
-        if (!isIdentifyServerFailure(msg)) showOcrPrompt(myRun);
+        showOcrPrompt(myRun);
         return;
       }
 
-      const partial = !!(data.partial || data.server_interrupted || data.stalled || data.server_error);
-      const finished = hasResults
-        ? data.results.filter((r) => r && !(r.timed_out || r.timedOut)).length
-        : 0;
-      const total = Number(data.image_count) || (hasResults ? data.results.length : 0);
-      const liveKind = data.server_error
-        ? 'error'
-        : data.stalled || data.server_interrupted
-          ? 'stalled'
-          : 'done';
-      const liveLabel = identifyProgressLabel(liveKind, finished, total);
       applyProgressEvent({
         step: 'done',
-        status: partial ? 'error' : 'done',
-        detail: partial ? data.message || liveLabel : '完成',
+        status: 'done',
+        detail: '完成',
         progress: 1,
       });
-      if (partial) {
-        setStatus(liveLabel, liveKind === 'error' ? 'err' : 'err');
-        updateProgressSummary(liveLabel);
-        if (progressDetailEl && data.message && data.message !== liveLabel) {
-          progressDetailEl.textContent = String(data.message);
-        }
-      }
       const go = () => {
         if (myRun !== runId) return;
         // Keep progress collapsed (not expanded) above gallery; auto-hide shortly
+        setProgressCollapsed(true);
         if (progressPanel) {
           progressPanel.classList.remove('hidden');
+          progressPanel.classList.add('is-complete');
           progressPanel.setAttribute('aria-busy', 'false');
-          if (partial) {
-            setProgressCollapsed(false);
-            progressPanel.classList.add('is-failed', 'is-live');
-            progressPanel.classList.remove('is-complete');
-          } else {
-            setProgressCollapsed(true);
-            progressPanel.classList.add('is-complete');
-          }
         }
         const result = galleryFromIdentify(data);
         renderGallery(result);
-        const allTimedOut =
-          hasResults && data.results.every((r) => r && (r.timed_out || r.timedOut));
-        if (!allTimedOut && !data.server_interrupted) {
-          appendHistoryFromIdentify(data, imgs).catch(() => {});
-        }
+        // Persist history (async thumbs)
+        appendHistoryFromIdentify(data, imgs).catch(() => {});
         // Clear pending selection but keep sticky shots until 重新開始
         clearPending(false);
         // Auto-hide progress so it cannot permanently cover gallery bottom/footer
         const hideRun = myRun;
-        if (!partial) {
-          setTimeout(() => {
-            if (hideRun !== runId) return;
-            if (progressPanel && progressPanel.classList.contains('is-complete')) {
-              hideProgress();
-            }
-          }, 1400);
-        }
+        setTimeout(() => {
+          if (hideRun !== runId) return;
+          if (progressPanel && progressPanel.classList.contains('is-complete')) {
+            hideProgress();
+          }
+        }, 1400);
       };
       setTimeout(go, 280);
     };
@@ -4103,31 +3655,11 @@
     try {
       let data;
       try {
-        activeHandleResult = handleResult;
         const streamed = await apiIdentifyStream({ images: imgs, code, title }, applyProgressEvent);
-        if (myRun !== runId || jobSettled) return;
-        jobSettled = true;
-        stopJobFollow();
-        clearActiveJob();
+        if (myRun !== runId) return;
         data = streamed.data;
       } catch (streamErr) {
-        if (myRun !== runId || jobSettled) return;
-        const streamMsg = (streamErr && streamErr.message) || '';
-        const interrupted =
-          streamMsg === 'stream_incomplete' || (streamErr && streamErr.code === 'stream_interrupted');
-        // The SSE connection died (phone background, proxy, timeout). The job
-        // keeps running on the server. Reconnect to it instead of posting the
-        // whole batch again or calling the miss 查詢不到.
-        if (interrupted && streamErr && streamErr.jobId) {
-          beginJobFollow(streamErr.jobId, imgs.length || streamErr.imageCount || 0, myRun);
-          return;
-        }
-        // A killed multi-image stream must not start a second full /api/identify.
-        // That second request is what turned the whole batch into 伺服器錯誤.
-        if (imgs.length > 1 && interrupted) {
-          handleResult(interruptedBatchPayload(imgs, streamErr.partialSlots));
-          return;
-        }
+        if (myRun !== runId) return;
         const abort = { aborted: false };
         const sim = simulateProgress({ images: imgs, code, title }, abort);
         try {
@@ -4146,21 +3678,11 @@
       handleResult(data);
     } catch (e) {
       if (myRun !== runId) return;
-      const msg = (e && e.message) || String(e);
-      if (e && e.jobId && !jobSettled) {
-        beginJobFollow(e.jobId, imgs.length || e.imageCount || 0, myRun);
-        return;
-      }
-      if (imgs.length > 1 && isIdentifyServerFailure(msg)) {
-        const slots = (e && e.partialSlots) || (e && e.data && e.data.results) || [];
-        handleResult(interruptedBatchPayload(imgs, slots));
-        return;
-      }
       identifyBusy = false;
-      applyProgressEvent({ step: 'done', status: 'error', detail: msg, progress: 1 });
-      setStatus(msg, 'err');
+      applyProgressEvent({ step: 'done', status: 'error', detail: (e && e.message) || String(e), progress: 1 });
+      setStatus((e && e.message) || String(e), 'err');
       progressPanel.setAttribute('aria-busy', 'false');
-      if (!isIdentifyServerFailure(msg)) showOcrPrompt(myRun);
+      showOcrPrompt(myRun);
     }
   }
 
@@ -4544,23 +4066,6 @@
       shareReadyMessage,
       downloadWorkMedia,
       offerSaveImageFiles,
-      isIdentifyServerFailure,
-      interruptedBatchPayload,
-      identifyProgressLabel,
-      resumePayloadFromJob,
     };
   } catch (_) {}
-
-  if (document && typeof document.addEventListener === 'function') {
-    document.addEventListener('visibilitychange', onIdentifyVisibility);
-    document.addEventListener('pageshow', onIdentifyVisibility);
-    document.addEventListener('pagehide', () => {
-      const rec = loadActiveJob();
-      if (rec && rec.jobId && !jobSettled) {
-        rec.hiddenAt = Date.now();
-        saveActiveJob(rec);
-      }
-    });
-  }
-  resumeStoredIdentifyJob();
 })();
