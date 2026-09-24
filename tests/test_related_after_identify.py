@@ -327,6 +327,157 @@ class TestKeywordCoverRank(unittest.TestCase):
             self.assertLess(codes.index("DRUG-002"), codes.index("DRUG-001"))
 
 
+class TestFirstSlotKyonyuSurvivesBatch(unittest.TestCase):
+    """#26's shared related clock emptied the first finished slot.
+
+    A swim-camp title still has 巨乳 in its chips (#27). If related never
+    runs, the keyword hits that used to sit under that chip disappear too.
+    A title that does not say 巨乳 must not gain the chip.
+    """
+
+    SWIM = "巨乳水泳部員 媚薬漬けレ●プ合宿"
+    DRUG = "媚薬漬けで抗えない合宿"
+
+    def _slot(self, code: str, title: str) -> dict:
+        return {
+            "ok": True,
+            "code": code,
+            "title": title,
+            "actress": "架空泳子",
+            "cover": "https://example.com/camp.jpg",
+            "related_by_title": [],
+        }
+
+    def _keyword_hits(self) -> list[dict]:
+        return [
+            {
+                "code": "BODY-101",
+                "title": "巨乳を媚薬漬けにした夜",
+                "line": "keyword",
+                "why": "關鍵字×2",
+                "cover": "https://example.com/b1.jpg",
+                "matched_keywords": ["巨乳", "媚薬漬け"],
+                "keyword_hits": 2,
+            },
+            {
+                "code": "BODY-202",
+                "title": "巨乳だけの合宿",
+                "line": "keyword",
+                "why": "關鍵字×2",
+                "cover": "https://example.com/b2.jpg",
+                "matched_keywords": ["巨乳", "合宿"],
+                "keyword_hits": 2,
+            },
+        ]
+
+    def test_spent_identify_clock_still_keeps_kyonyu_on_the_first_slot(self):
+        swim = self._slot("CAMP-100", self.SWIM)
+        drug = self._slot("DRUG-100", self.DRUG)
+        waiting = {
+            "ok": True,
+            "timed_out": True,
+            "code": "尚未查完",
+            "title": "（這張尚未查完）",
+            "related_by_title": [],
+        }
+        seen_titles: list[str] = []
+
+        def fake_find(title, **_kwargs):
+            seen_titles.append(str(title or ""))
+            if "巨乳" in str(title or ""):
+                return self._keyword_hits()
+            return [
+                {
+                    "code": "DRUG-002",
+                    "title": "媚薬漬けの合宿記録",
+                    "line": "keyword",
+                    "why": "關鍵字×2",
+                    "cover": "https://example.com/d2.jpg",
+                    "matched_keywords": ["媚薬漬け", "合宿"],
+                    "keyword_hits": 2,
+                }
+            ]
+
+        with mock.patch.object(S, "find_related_by_title", side_effect=fake_find), mock.patch.object(
+            S, "resolve_chinese_title", return_value=None
+        ), mock.patch.object(S, "offline_cache_put"):
+            n = S._fill_related_for_finished_slots(
+                [swim, waiting, drug],
+                identify_deadline=time.monotonic() - 2,
+            )
+        self.assertGreaterEqual(n, 2)
+        self.assertTrue(any("巨乳" in t for t in seen_titles), seen_titles)
+        self.assertIn("巨乳", swim.get("theme_keywords") or [], swim.get("theme_keywords"))
+        self.assertIn("合宿", swim.get("theme_keywords") or [])
+        keyword = [r for r in swim.get("related_by_title") or [] if r.get("line") == "keyword"]
+        codes = [r.get("code") for r in keyword]
+        self.assertIn("BODY-101", codes, codes)
+        self.assertIn("BODY-202", codes, codes)
+        self.assertTrue(all("巨乳" in str(r.get("title") or "") for r in keyword), keyword)
+        self.assertFalse(waiting.get("related_by_title"))
+        self.assertNotIn("巨乳", drug.get("theme_keywords") or [], drug.get("theme_keywords"))
+        drug_kw = [r for r in drug.get("related_by_title") or [] if r.get("line") == "keyword"]
+        self.assertTrue(drug_kw)
+        self.assertTrue(all("巨乳" not in str(r.get("title") or "") for r in drug_kw))
+
+    def test_multi_batch_first_result_keeps_kyonyu_keyword_hits(self):
+        """The gallery's first card is results[0]. Its chips and keyword hits stay."""
+        blob = _png()
+        images = [(blob, "swim.png"), (blob, "other.png")]
+
+        def instant(**kwargs):
+            code = str(kwargs.get("user_code") or "")
+            title = self.SWIM if code == "CAMP-100" else self.DRUG
+            return self._slot(code or "CAMP-100", title), 200
+
+        def fake_find(title, **_kwargs):
+            if "巨乳" in str(title or ""):
+                return self._keyword_hits()
+            return [
+                {
+                    "code": "DRUG-002",
+                    "title": "媚薬漬けの合宿記録",
+                    "line": "keyword",
+                    "why": "關鍵字×2",
+                    "cover": "https://example.com/d2.jpg",
+                    "matched_keywords": ["媚薬漬け", "合宿"],
+                    "keyword_hits": 2,
+                }
+            ]
+
+        with mock.patch.object(S, "get_gemini_api_key", return_value=""), mock.patch.object(
+            S, "ocr_image_bytes", side_effect=["CAMP-100", "DRUG-100"]
+        ), mock.patch.object(
+            S, "run_identify_pipeline", side_effect=instant
+        ), mock.patch.object(
+            S, "verify_work_against_image", side_effect=lambda one, *a, **k: one
+        ), mock.patch.object(
+            S, "find_related_by_title", side_effect=fake_find
+        ), mock.patch.object(
+            S, "resolve_chinese_title", return_value=None
+        ), mock.patch.object(S, "offline_cache_put"):
+            payload, status = S.run_multi_identify_pipeline(
+                images,
+                deadline=time.monotonic() + 120,
+            )
+        self.assertEqual(status, 200)
+        results = payload.get("results") or []
+        self.assertGreaterEqual(len(results), 1)
+        first = results[0]
+        self.assertEqual(first.get("code"), "CAMP-100")
+        self.assertIn("巨乳", first.get("title") or "")
+        self.assertIn("巨乳", first.get("theme_keywords") or [], first.get("theme_keywords"))
+        self.assertIn("合宿", first.get("theme_keywords") or [])
+        keyword = [r for r in first.get("related_by_title") or [] if r.get("line") == "keyword"]
+        codes = [r.get("code") for r in keyword]
+        self.assertIn("BODY-101", codes, codes)
+        self.assertIn("BODY-202", codes, codes)
+        self.assertEqual(payload.get("related_by_title"), first.get("related_by_title"))
+        self.assertIn("巨乳", payload.get("theme_keywords") or [])
+        if len(results) > 1 and results[1].get("code") == "DRUG-100":
+            self.assertNotIn("巨乳", results[1].get("theme_keywords") or [])
+
+
 class TestRelatedApiFreezesSavedMembership(unittest.TestCase):
     def test_under_cap_seed_is_not_researched_or_shrunk(self):
         seed = [
