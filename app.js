@@ -58,6 +58,16 @@
 
   /** @type {{ id: string, file: File, url: string }[]} */
   let pendingFiles = [];
+  let batchFiles = [];
+  let identifyBusy = false;
+
+  function batchQueryKeepsFrames(fileCount, busy, openFrame) {
+    return fileCount > 1 && !!(busy || openFrame);
+  }
+
+  function galleryHasOpenFrame() {
+    return (lastGalleryItems || []).some((w) => w && (w.unidentified || w.titleOnly));
+  }
   /** Object URLs / dataURLs for sticky comparison (cleared on 重新開始) */
   let lastUserShotUrls = [];
   let viewingHistoryId = null;
@@ -1266,6 +1276,8 @@
 
   function resetBaseline() {
     runId += 1;
+    identifyBusy = false;
+    batchFiles = [];
     setStatus('');
     hideProgress();
     hideOcrPrompt();
@@ -3534,6 +3546,8 @@
 
   async function runIdentify({ images, image, code, title } = {}, myRun) {
     const imgs = images && images.length ? images : image ? [image] : [];
+    identifyBusy = true;
+    if (imgs.length > 1) batchFiles = imgs.slice();
     const busyMsg = imgs.length > 1
       ? '多圖辨識中（' + imgs.length + ' 張）…'
       : imgs.length
@@ -3582,6 +3596,7 @@
 
     const handleResult = (data) => {
       if (myRun !== runId) return;
+      identifyBusy = false;
       const hasCode =
         data.code &&
         data.code !== 'TITLE-SEARCH' &&
@@ -3663,6 +3678,7 @@
       handleResult(data);
     } catch (e) {
       if (myRun !== runId) return;
+      identifyBusy = false;
       applyProgressEvent({ step: 'done', status: 'error', detail: (e && e.message) || String(e), progress: 1 });
       setStatus((e && e.message) || String(e), 'err');
       progressPanel.setAttribute('aria-busy', 'false');
@@ -3916,14 +3932,13 @@
       setStatus('請輸入番號或片名', 'err');
       return;
     }
+    const keep = batchQueryKeepsFrames(batchFiles.length, identifyBusy, galleryHasOpenFrame());
     const myRun = ++runId;
     hideOcrPrompt();
-    hideUserShots();
-    if (AV_CODE_INPUT_RE.test(v)) {
-      runIdentify({ code: v }, myRun);
-    } else {
-      runIdentify({ title: v }, myRun);
-    }
+    if (!keep) hideUserShots();
+    const payload = AV_CODE_INPUT_RE.test(v) ? { code: v } : { title: v };
+    if (keep) payload.images = batchFiles.slice();
+    runIdentify(payload, myRun);
   }
 
   if ($('btn-code')) $('btn-code').addEventListener('click', submitTypedInput);
@@ -3949,13 +3964,12 @@
     $('btn-ocr-submit').addEventListener('click', () => {
       const v = (ocrCodeInput && ocrCodeInput.value.trim()) || '';
       if (!v) return;
+      const keep = batchQueryKeepsFrames(batchFiles.length, identifyBusy, galleryHasOpenFrame());
       const newRun = ++runId;
       hideOcrPrompt();
-      if (AV_CODE_INPUT_RE.test(v)) {
-        runIdentify({ code: v }, newRun);
-      } else {
-        runIdentify({ title: v }, newRun);
-      }
+      const payload = AV_CODE_INPUT_RE.test(v) ? { code: v } : { title: v };
+      if (keep) payload.images = batchFiles.slice();
+      runIdentify(payload, newRun);
     });
   }
 
@@ -4036,6 +4050,7 @@
       relatedBucketsNeedFill,
       workNeedsTitleZh,
       workNeedsManualFix,
+      batchQueryKeepsFrames,
       workHasUsableCover,
       workHasUsableTitle,
       mergeManualFixIntoWork,

@@ -1882,6 +1882,11 @@ function walkNodes(node, acc) {
     assert.ok(String(rec.works[0].cover).indexOf('jufe00271pl') !== -1);
   }
 
+  assert.strictEqual(H.batchQueryKeepsFrames(5, true, false), true);
+  assert.strictEqual(H.batchQueryKeepsFrames(5, false, true), true);
+  assert.strictEqual(H.batchQueryKeepsFrames(5, false, false), false);
+  assert.strictEqual(H.batchQueryKeepsFrames(1, true, true), false);
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

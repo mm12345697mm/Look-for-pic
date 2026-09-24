@@ -68,6 +68,126 @@ WORKS = {
 
 
 class TestApgh012Overlay(unittest.TestCase):
+    def test_ocr_noise_is_not_a_product_code(self):
+        self.assertEqual(S._trusted_ocr_codes("rake 12\nshat          676\nyr 33"), [])
+        self.assertEqual(S._sole_trusted_ocr_code("APGH-012\n舌技が神")[0], "APGH-012")
+        self.assertIsNone(S._sole_trusted_ocr_code("APGH-012\nAPGH-015")[0])
+
+    def test_series_jacket_lock_beats_a_short_unique_phrase(self):
+        """No 品番. A short unique hit must not beat a jacket-locked series volume."""
+        series_title = "架空シリーズの長い共通タイトルで巻だけが違う作品群"
+        volumes = [
+            _work("SER-001", series_title),
+            _work("SER-002", series_title),
+            _work("SER-003", series_title),
+        ]
+        slogan = _work("SLG-009", "短い標語だけの別作品")
+
+        def search(title, actress=None):
+            q = re.sub(r"\s+", "", str(title or ""))
+            if q == "共通題名":
+                hit = dict(volumes[0])
+                hit["candidates"] = [dict(v) for v in volumes]
+                return hit
+            if "標語" in q or q == "短い標語":
+                hit = dict(slogan)
+                hit["candidates"] = [dict(slogan)]
+                return hit
+            return None
+
+        def lock(image, cands):
+            for cand in cands or []:
+                if S.format_display_code(str(cand.get("code") or "")) == "SER-002":
+                    winner = dict(cand)
+                    winner["jacket_score"] = 0.91
+                    return winner
+            return None
+
+        resolved = None
+        with mock.patch.multiple(
+            S,
+            search_by_title=mock.Mock(side_effect=search),
+            _jacket_lock_winner=mock.Mock(side_effect=lock),
+        ):
+            resolved = S._resolve_unnumbered_cover(
+                ["短い標語", "共通題名"],
+                b"cover-bytes",
+            )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.get("code"), "SER-002")
+        self.assertTrue((resolved.get("visual_meta") or {}).get("visual_lock"))
+
+    def test_jacket_match_keeps_code_when_ocr_title_disagrees(self):
+        meta = {
+            "ok": False,
+            "cover_ok": True,
+            "cover": "https://example.com/ser-002.jpg",
+            "title_ok": False,
+            "reason": "片名不符(sim=0.10)",
+        }
+        with mock.patch.object(S, "_jacket_score_against_url", return_value=0.91):
+            keep, score = S._ocr_code_survives_title_mismatch(meta, b"img")
+        self.assertTrue(keep)
+        self.assertGreaterEqual(score, 0.70)
+        with mock.patch.object(S, "_jacket_score_against_url", return_value=0.22):
+            keep_low, _score = S._ocr_code_survives_title_mismatch(meta, b"img")
+        self.assertFalse(keep_low)
+
+    def test_glued_runtime_is_a_code_candidate(self):
+        cands = S._ocr_code_candidates("作品 ABCD-100240分\nrake 12")
+        self.assertIn("ABCD-100", cands)
+        self.assertNotIn("ABCD-100240", cands)
+        self.assertEqual(S._trusted_ocr_codes("rake 12"), [])
+
+    def test_confusion_variants_include_letter_and_digit_neighbor(self):
+        variants = S._confusion_variants("QLQ-621")
+        self.assertIn("QUQ-624", variants)
+
+    def test_jacket_pick_prefers_the_matching_cover(self):
+        def cover(code):
+            if code == "GOOD-100":
+                return "cid", "https://example.com/good.jpg"
+            return "cid", "https://example.com/bad.jpg"
+
+        def score(image, url):
+            return 0.93 if "good" in str(url) else 0.21
+
+        with mock.patch.object(S, "resolve_cover_cid", side_effect=cover):
+            with mock.patch.object(S, "_jacket_score_against_url", side_effect=score):
+                picked, best, compared = S._pick_code_by_jacket(
+                    ["BAD-621", "GOOD-100"], b"img"
+                )
+        self.assertTrue(compared)
+        self.assertEqual(picked, "GOOD-100")
+        self.assertGreaterEqual(best, 0.70)
+
+    def test_prefix_queries_skip_symbol_smears(self):
+        blob = "xyz !! をな属人金欲にい ff\n短い標語です？！"
+        prefixes = S._ocr_line_prefixes(blob)
+        self.assertTrue(any(p.startswith("短い標語") for p in prefixes), prefixes)
+        self.assertFalse(any("をな属" in p for p in prefixes), prefixes)
+
+    def test_official_title_chips_are_compounds_not_slices(self):
+        chips = S._extract_title_theme_keywords(APGH_TITLE, actress=ACTRESS)
+        blob = " ".join(chips)
+        for bad in ("人っきりのプ", "人っきりりプ", "ライベート補", "習で全部面倒"):
+            self.assertNotIn(bad, chips, blob)
+        for good in ("先生", "2人っきり", "プライベート補習", "面倒みてあげる"):
+            self.assertIn(good, chips, blob)
+
+    def test_manual_code_pins_slogan_frame_not_a_resolved_neighbor(self):
+        rows = [
+            {"code": "JUFE-271", "title": "地味な眼鏡では隠し切れない美人OL"},
+            {"code": None, "title": "舌技が神"},
+            {"code": None, "title": "根スケベ妻と精飲"},
+        ]
+        self.assertTrue(S._pin_manual_query(rows, "apgh-012", ""))
+        self.assertEqual(rows[0]["code"], "JUFE-271")
+        self.assertEqual(rows[1]["code"], "APGH-012")
+        self.assertIsNone(rows[2]["code"])
+        self.assertTrue(S._pin_manual_query(rows, "APGH-012", ""))
+
+
     def _identify(self, code, ocr_preview=None, vision_meta=None):
         disp = S.format_display_code(str(code))
         row = WORKS.get(disp)
