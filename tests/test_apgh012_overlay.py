@@ -223,8 +223,13 @@ class TestApgh012Overlay(unittest.TestCase):
             return []
 
         with mock.patch.object(S, "fetch_avbase_title_results", side_effect=search_rows):
-            hit = S.search_by_title(shared)
-        self.assertEqual((hit or {}).get("code"), "TIGHT-002")
+            bare = S.search_by_title(shared)
+            named = S.search_by_title(shared, actress="名前")
+            exact = S.search_by_title(shared + " 名前")
+        self.assertTrue((bare or {}).get("series_unresolved"))
+        self.assertFalse(S.parse_code_parts(str((bare or {}).get("code") or "")))
+        self.assertEqual((named or {}).get("code"), "TIGHT-002")
+        self.assertEqual((exact or {}).get("code"), "TIGHT-002")
 
     def test_alias_labels_and_comparisons_are_not_chips(self):
         title = "架空題は溢れる欲望と自分以上に勢いが凄い！！ (仮名)アキさん"

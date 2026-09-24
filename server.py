@@ -3734,6 +3734,115 @@ def _boost_title_score(item: dict, *phrases: str) -> dict:
     return item
 
 
+def _trailing_billed_name(title: str | None) -> str:
+    """Short name after the series line (先生が… 柊ゆうき). Not a slogan."""
+    raw = re.sub(r"\s+", " ", (normalize_ocr_title(title) or title or "")).strip()
+    parts = [p for p in raw.split(" ") if p]
+    if len(parts) < 2:
+        return ""
+    tail = parts[-1]
+    head = "".join(parts[:-1])
+    if len(head) < 8 or not (2 <= len(tail) <= 8):
+        return ""
+    if not re.fullmatch(r"[\u3040-\u30ff\u4e00-\u9fff・]+", tail):
+        return ""
+    return tail
+
+
+def _core_title(title: str | None) -> str:
+    raw = re.sub(r"\s+", " ", (normalize_ocr_title(title) or title or "")).strip()
+    name = _trailing_billed_name(raw)
+    if name:
+        raw = raw[: raw.rfind(name)].strip()
+    return re.sub(r"\s+", "", raw)
+
+
+def _select_title_volume(
+    cands: list[dict] | None,
+    query: str,
+    actress: str | None = None,
+) -> tuple[dict | None, bool]:
+    """Pick one catalog row for a typed title.
+
+    Returns (row, ambiguous). Ambiguous is true when several volumes share the
+    core title and neither an exact line nor a billed name distinguishes them.
+    Catalog order is not a tie-break.
+    """
+    rows = [c for c in (cands or []) if isinstance(c, dict) and c.get("code")]
+    if not rows:
+        return None, False
+    q_compact = re.sub(r"\s+", "", normalize_ocr_title(query) or query or "")
+    exact = [
+        c
+        for c in rows
+        if q_compact
+        and re.sub(r"\s+", "", normalize_ocr_title(c.get("title")) or str(c.get("title") or ""))
+        == q_compact
+    ]
+    if len(exact) == 1:
+        return exact[0], False
+    pool = exact if len(exact) > 1 else rows
+    q_core = _core_title(query)
+    tied = []
+    for c in pool:
+        core = _core_title(c.get("title") or "")
+        if q_core and core and (core == q_core or q_compact == core):
+            tied.append(c)
+    if len(tied) <= 1:
+        return (tied[0] if tied else rows[0]), False
+    name = re.sub(r"\s+", "", (actress or "").strip())
+    if len(name) >= 2:
+        matched = []
+        for c in tied:
+            blob = re.sub(
+                r"\s+",
+                "",
+                str(c.get("title") or "") + str(c.get("actress") or ""),
+            )
+            if name in blob:
+                matched.append(c)
+        if len(matched) == 1:
+            return matched[0], False
+    return None, True
+
+
+def _title_search_result(
+    cands: list[dict],
+    query: str,
+    actress: str | None = None,
+    *,
+    title_zh: str | None = None,
+    pack,
+) -> dict | None:
+    """One volume, or an unresolved series when the title alone cannot choose."""
+    best, ambiguous = _select_title_volume(cands, query, actress)
+    if ambiguous:
+        return {
+            "code": None,
+            "title": query,
+            "actress": (actress or "").strip() or None,
+            "series_unresolved": True,
+            "candidates": list(cands or []),
+            "score": None,
+            "source": "title",
+        }
+    if not best:
+        return None
+    out = {
+        "code": best.get("code"),
+        "title": best.get("title") or query,
+        "title_zh": best.get("title_zh") or title_zh,
+        "actress": best.get("actress") or actress,
+        "studio": best.get("studio"),
+        "cover": best.get("cover"),
+        "cid": best.get("cid"),
+        "source": best.get("source"),
+        "score": best.get("score"),
+        "title_fit": best.get("title_fit"),
+    }
+    return pack(out, cands)
+
+
 def search_by_title(title: str, actress: str | None = None) -> dict | None:
     """
     Resolve a title to work code(s) and optional cover.
@@ -3852,18 +3961,7 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
             break
     early_av = filter_title_candidates(early_av, min_score=0.30)
     if early_av and (early_av[0].get("score") or 0) >= 0.45:
-        best = early_av[0]
-        out = {
-            "code": best.get("code"),
-            "title": best.get("title") or original_title,
-            "actress": best.get("actress") or actress,
-            "studio": best.get("studio"),
-            "cover": best.get("cover"),
-            "cid": best.get("cid"),
-            "source": best.get("source"),
-            "score": best.get("score"),
-        }
-        return _pack(out, early_av)
+        return _title_search_result(early_av, original_title, _actress_hint, pack=_pack)
 
     # 0a2) Distinctive short n-grams when full OCR title still misses (censored glyphs / truncation)
     if not early_av or (early_av and (early_av[0].get("score") or 0) < 0.45):
@@ -3899,18 +3997,7 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
                     break
             early_av = filter_title_candidates(early_av, min_score=0.30)
             if early_av and (early_av[0].get("score") or 0) >= 0.45:
-                best = early_av[0]
-                out = {
-                    "code": best.get("code"),
-                    "title": best.get("title") or original_title,
-                    "actress": best.get("actress") or actress,
-                    "studio": best.get("studio"),
-                    "cover": best.get("cover"),
-                    "cid": best.get("cid"),
-                    "source": best.get("source"),
-                    "score": best.get("score"),
-                }
-                return _pack(out, early_av)
+                return _title_search_result(early_av, original_title, _actress_hint, pack=_pack)
         except Exception:
             pass
 
@@ -4060,19 +4147,11 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
             if not good:
                 return None
             best = good[0]
+            good = [best]
 
-    out = {
-        "code": best.get("code"),
-        "title": best.get("title") or title,
-        "title_zh": best.get("title_zh") or query_title_zh,
-        "actress": best.get("actress") or actress,
-        "studio": best.get("studio"),
-        "cover": best.get("cover"),
-        "cid": best.get("cid"),
-        "source": best.get("source"),
-        "score": best.get("score"),
-    }
-    return _pack(out, good)
+    return _title_search_result(
+        good, original_title, _actress_hint, title_zh=query_title_zh, pack=_pack
+    )
 
 
 
@@ -10675,6 +10754,7 @@ def run_identify_pipeline(
     filename: str | None = None,
     user_code: str = "",
     user_title: str = "",
+    user_actress: str = "",
     on_progress=None,
     skip_related: bool = False,
 ) -> tuple[dict, int]:
@@ -11285,9 +11365,25 @@ def run_identify_pipeline(
         _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
         hit = None
         try:
-            hit = search_by_title(user_title)
+            hit = search_by_title(user_title, actress=(user_actress or "").strip() or None)
         except Exception as se:
             extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+
+        if hit and hit.get("series_unresolved") and not image_bytes:
+            _progress(on_progress, "search", "done", "同系列多部，片名無法分卷", 4 / 6)
+            _progress(on_progress, "cover", "skipped", "不指定番號", 5 / 6)
+            _progress(on_progress, "done", "done", "完成（系列未分卷）", 1.0)
+            return (
+                title_only_payload(
+                    title=user_title,
+                    actress=(user_actress or "").strip() or None,
+                    message=(
+                        (extra_msg + " " if extra_msg else "")
+                        + f"以片名「{user_title}」對上同系列多部，沒有女優或圖片可分卷，不指定番號。"
+                    ),
+                ),
+                200,
+            )
 
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
