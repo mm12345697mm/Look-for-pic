@@ -1887,6 +1887,41 @@ function walkNodes(node, acc) {
   assert.strictEqual(H.batchQueryKeepsFrames(5, false, false), false);
   assert.strictEqual(H.batchQueryKeepsFrames(1, true, true), false);
 
+  // Related carousel covers are catalog jackets. The upload preview stays on the main card.
+  {
+    const upload = 'data:image/jpeg;base64,UPLOADBYTES';
+    const gallery = H.galleryFromIdentify({
+      ok: true,
+      code: 'CAMP-100',
+      title: '巨乳水泳部員の媚薬合宿',
+      cover: 'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg',
+      user_preview: upload,
+      related_by_title: [
+        {
+          code: 'BODY-101',
+          title: '巨乳だけの合宿',
+          line: 'keyword',
+          cid: 'body00101',
+          cover: upload,
+          stills: [upload, 'https://pics.dmm.co.jp/digital/video/body101/body101jp-1.jpg'],
+          user_preview: upload,
+        },
+      ],
+    });
+    const main = gallery.items[0];
+    assert.strictEqual(main.userPreview, upload);
+    const rel = main.relatedByTitle[0];
+    assert.ok(/^https:\/\//.test(rel.cover), rel.cover);
+    assert.ok(rel.cover.indexOf('body00101') !== -1, rel.cover);
+    assert.strictEqual(rel.userPreview, '');
+    assert.ok(rel.stills.length > 0);
+    rel.stills.forEach((u) => {
+      assert.ok(/^https:\/\//.test(u), u);
+      assert.ok(u.indexOf('UPLOAD') === -1, u);
+    });
+    assert.ok(rel.stills.indexOf('https://pics.dmm.co.jp/digital/video/body101/body101jp-1.jpg') !== -1);
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

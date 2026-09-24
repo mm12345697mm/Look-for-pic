@@ -769,6 +769,10 @@
     return c || t;
   }
 
+  function isRelatedCarouselLine(line) {
+    return line === 'theme' || line === 'keyword' || line === 'actress';
+  }
+
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
     const unidentified = !!(raw.unidentified || raw.frame_unidentified);
@@ -785,11 +789,15 @@
           ? '片名搜尋'
           : formatDisplayCode(rawCode)
         : formatDisplayCode(rawCode);
+    const lineOut = line || raw.line || 'main';
+    const relatedSlide = isRelatedCarouselLine(lineOut);
     // Never invent DMM CID from the display code: padded guesses (dosd00008)
     // often redirect to now_printing after the server already cleared cover.
     const cid = String(raw.cid || '');
     let cover = String(raw.cover || raw.cover_url || '').trim();
     if (isNowPrintingUrl(cover)) cover = '';
+    // Related carousel is catalog jackets only. An upload data/blob URL is not a cover.
+    if (relatedSlide && (!/^https?:\/\//i.test(cover) || isLocalCoverUrl(cover))) cover = '';
     if (!cover && cid && !isNowPrintingUrl(cid)) {
       cover = coverUrl(cid);
       if (isNowPrintingUrl(cover)) cover = '';
@@ -797,12 +805,14 @@
     let stills = Array.isArray(raw.stills) && raw.stills.length
       ? raw.stills.map((u) => String(u || '')).filter((u) => u && !isNowPrintingUrl(u))
       : [];
+    if (relatedSlide) {
+      stills = stills.filter((u) => /^https?:\/\//i.test(u) && !isLocalCoverUrl(u));
+    }
     if (!stills.length && cid) {
       stills = stillUrls(cid, 10);
     }
-    const lineOut = line || raw.line || 'main';
     let relatedByTitle = [];
-    if (lineOut !== 'theme' && lineOut !== 'keyword' && lineOut !== 'actress') {
+    if (!relatedSlide) {
       const relRaw = Array.isArray(raw.related_by_title) && raw.related_by_title.length
         ? raw.related_by_title
         : (Array.isArray(raw.related) ? raw.related.filter(isRelatedBucketItem) : []);
@@ -821,7 +831,7 @@
       stills,
       titleOnly,
       unidentified,
-      userPreview: String(raw.user_preview || raw.userPreview || '').trim(),
+      userPreview: relatedSlide ? '' : String(raw.user_preview || raw.userPreview || '').trim(),
       fromImageIndex: raw.from_image_index || raw.fromImageIndex || null,
       relatedByTitle,
       themeKeywords: normalizeKeywordList(raw.theme_keywords || raw.themeKeywords),
@@ -1323,7 +1333,12 @@
     coverWrap._lfpWork = w;
     const url = (w.cover || '').trim();
     const preview = String((w && w.userPreview) || '').trim();
-    if ((!url || (w.titleOnly && !isLocalCoverUrl(url))) && isLocalCoverUrl(preview)) {
+    // The user's upload stays on their own card. Related / keyword slides do not use it.
+    if (
+      !isRelatedCarouselLine(w && w.line) &&
+      (!url || (w.titleOnly && !isLocalCoverUrl(url))) &&
+      isLocalCoverUrl(preview)
+    ) {
       const shot = document.createElement('img');
       shot.alt = '這張上傳圖';
       shot.loading = 'lazy';

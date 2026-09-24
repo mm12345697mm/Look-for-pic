@@ -4538,10 +4538,70 @@ def _related_bucket_counts(items) -> tuple[int, int, int]:
     return t, k, a
 
 
+def _catalog_jacket_url(url) -> str:
+    """http(s) catalog jacket. Upload data/blob URLs and placeholders are not."""
+    s = str(url or "").strip()
+    if not (s.startswith("https://") or s.startswith("http://")):
+        return ""
+    if is_now_printing_url(s):
+        return ""
+    return s
+
+
+def _sanitize_related_row(item: dict) -> dict:
+    """Related slides show catalog jackets only, never the user's upload."""
+    row = dict(item)
+    for key in ("user_preview", "userPreview", "image_bytes"):
+        row.pop(key, None)
+    if "cover" in row or "cover_url" in row:
+        cover = _catalog_jacket_url(row.get("cover") or row.get("cover_url"))
+        if "cover" in row:
+            row["cover"] = cover or None
+        if "cover_url" in row:
+            row["cover_url"] = cover or None
+    stills_in = row.get("stills")
+    if isinstance(stills_in, list):
+        stills: list[str] = []
+        for u in stills_in:
+            clean = _catalog_jacket_url(u)
+            if clean and clean not in stills:
+                stills.append(clean)
+        row["stills"] = stills
+    return row
+
+
+def _sanitize_related_rows(items) -> list[dict]:
+    return [_sanitize_related_row(x) for x in (items or []) if isinstance(x, dict)]
+
+
+def _matched_keywords_of(item: dict | None) -> list[str]:
+    if not isinstance(item, dict):
+        return []
+    raw = item.get("matched_keywords") or item.get("hit_keywords") or []
+    if not isinstance(raw, list):
+        return []
+    return [str(x).strip() for x in raw if str(x or "").strip()]
+
+
+def _row_matches_body_generic(item: dict | None) -> bool:
+    return any(_is_body_generic_token(k) for k in _matched_keywords_of(item))
+
+
+def _related_has_real_cover(row: dict | None) -> bool:
+    """True when the row can show a catalog jacket or still, not an upload."""
+    if not isinstance(row, dict):
+        return False
+    cover = _catalog_jacket_url(row.get("cover") or row.get("cover_url"))
+    if cover:
+        return True
+    stills = row.get("stills") if isinstance(row.get("stills"), list) else []
+    return any(_catalog_jacket_url(u) for u in stills)
+
+
 def _cap_related_buckets(items) -> list[dict]:
     """Keep existing order within each bucket; enforce 5+5+3 maxima; no padding."""
     theme: list[dict] = []
-    keyword: list[dict] = []
+    keyword_pool: list[dict] = []
     actress: list[dict] = []
     seen: set[str] = set()
     for x in items or []:
@@ -4555,44 +4615,51 @@ def _cap_related_buckets(items) -> list[dict]:
         if not rc or rc in seen:
             continue
         seen.add(rc)
-        item = dict(x)
+        item = _sanitize_related_row(dict(x))
         item["code"] = rc
         item["line"] = _related_line_of(item)
         ln = item["line"]
         if ln == "theme" and len(theme) < RELATED_THEME_CAP:
             theme.append(item)
-        elif ln == "keyword" and len(keyword) < RELATED_KEYWORD_CAP:
-            keyword.append(item)
+        elif ln == "keyword":
+            keyword_pool.append(item)
         elif ln == "actress" and len(actress) < RELATED_ACTRESS_CAP:
             actress.append(item)
-    keyword.sort(key=_keyword_related_sort_key, reverse=True)
-    return theme + keyword[:RELATED_KEYWORD_CAP] + actress
+    # Without a body-size hit, keep the first five then the #25 sort.
+    # With 巨乳 / 美乳 / 爆乳 in the pool, rank those first so a later
+    # coverless row cannot fill the cap ahead of them.
+    if any(_row_matches_body_generic(it) for it in keyword_pool):
+        keyword_pool.sort(key=_keyword_related_sort_key, reverse=True)
+        keyword = keyword_pool[:RELATED_KEYWORD_CAP]
+    else:
+        keyword = keyword_pool[:RELATED_KEYWORD_CAP]
+        keyword.sort(key=_keyword_related_sort_key, reverse=True)
+    return theme + keyword + actress
 
 
 def _keyword_related_sort_key(item: dict | None) -> tuple:
-    """Order inside the keyword bucket: distinctive theme, then hit count.
+    """Order inside the keyword bucket: body-size hit, then theme, then hits.
 
     A ママ-only row must not outrank 家庭教師 / 肉欲教育 / 10秒挿入 just because
     the catalog score was high. More hits still win among the same tier.
     Relation phrases sit ahead of bare kinship when theme hits are tied at zero.
+    When the row matched 巨乳 / 美乳 / 爆乳, that hit stays ahead of a weak
+    title, and a real jacket stays ahead of a coverless one.
     """
     if not isinstance(item, dict):
-        return (0, 0, 0)
+        return (0, 0, 0, 0, 0)
     hits = int(item.get("keyword_hits") or 0)
-    matched = item.get("matched_keywords") or item.get("hit_keywords") or []
-    if not isinstance(matched, list):
-        matched = []
+    matched = _matched_keywords_of(item)
     theme = 0
     compound = 0
-    for raw in matched:
-        tok = str(raw or "").strip()
-        if not tok:
-            continue
+    for tok in matched:
         if _is_auto_theme_keyword(tok):
             theme += 1
         if _is_relation_phrase(tok):
             compound += 1
-    return (1 if theme else 0, hits, 1 if compound else 0)
+    body = 1 if any(_is_body_generic_token(tok) for tok in matched) else 0
+    show = 1 if body and _related_has_real_cover(item) else 0
+    return (body, show, 1 if theme else 0, hits, 1 if compound else 0)
 
 
 def _merge_unique_urls(primary, secondary, *, cap: int = 20) -> list[str]:
@@ -7074,6 +7141,28 @@ def _is_weak_theme_token(tok: str) -> bool:
     return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
 
 
+# Body-size words are real chips when the title says them. They are not weak
+# generics and they are not dropped once another theme is present.
+_BODY_GENERIC_TOKENS = frozenset({"巨乳", "美乳", "爆乳"})
+
+
+def _is_body_generic_token(tok: str) -> bool:
+    return (tok or "").strip() in _BODY_GENERIC_TOKENS
+
+
+def _keyword_query_is_required_chip(q: str, keywords: list[str] | None) -> bool:
+    """True when this query is the 巨乳 / 美乳 / 爆乳 chip itself.
+
+    A compound may spend the keyword time window. The body-size chip is still
+    issued so a swim-camp title does not lose its 巨乳 hits.
+    """
+    tok = (q or "").strip()
+    if not tok or not _is_body_generic_token(tok):
+        return False
+    chips = {str(k or "").strip() for k in (keywords or []) if str(k or "").strip()}
+    return tok in chips
+
+
 def _is_relation_noun(tok: str) -> bool:
     return (tok or "").strip() in _RELATION_NOUN_SET
 
@@ -8217,11 +8306,11 @@ def _find_related_by_keywords(
                 continue
             _remember(strict, code, sc, c)
 
-    def _fetch_query(q: str) -> list[dict]:
+    def _fetch_query(q: str, *, force: bool = False) -> list[dict]:
         if not q or q in fetched:
             return []
         fetched.add(q)
-        if _time.monotonic() - t0 > budget:
+        if not force and _time.monotonic() - t0 > budget:
             return []
         rows: list[dict] = []
         for fetch in (
@@ -8229,7 +8318,7 @@ def _find_related_by_keywords(
             fetch_jav321_title_results,
             fetch_javlibrary_title_results,
         ):
-            if _time.monotonic() - t0 > budget:
+            if not force and _time.monotonic() - t0 > budget:
                 break
             try:
                 rows.extend(fetch(q, actress=None)[:10])
@@ -8240,9 +8329,11 @@ def _find_related_by_keywords(
         return rows
 
     for q in queries:
-        if _time.monotonic() >= min(primary_end, t0 + budget):
-            break
-        _ingest(_fetch_query(q))
+        # Compounds may spend the window. 巨乳 / 美乳 / 爆乳 are still issued.
+        required = (not explicit) and _keyword_query_is_required_chip(q, keywords)
+        if not required and _time.monotonic() >= min(primary_end, t0 + budget):
+            continue
+        _ingest(_fetch_query(q, force=required))
 
     if _auto_keyword_needs_single_fallback(
         explicit=explicit,
@@ -8251,11 +8342,12 @@ def _find_related_by_keywords(
         max_n=max_n,
     ):
         for q in _keyword_fallback_singles(keywords):
-            if _time.monotonic() - t0 > budget:
-                break
+            required = (not explicit) and _keyword_query_is_required_chip(q, keywords)
             if q in fetched:
                 continue
-            _ingest(_fetch_query(q))
+            if not required and _time.monotonic() - t0 > budget:
+                continue
+            _ingest(_fetch_query(q, force=required))
 
     use_singles = _auto_keyword_needs_single_fallback(
         explicit=explicit,
@@ -8299,7 +8391,7 @@ def _find_related_by_keywords(
         emit_floor = min_hits
         allow_weak = explicit
 
-    out: list[dict] = []
+    eligible: list[dict] = []
     for _sc, c in ordered_rows:
         hits, _base, matched, theme_hits = _keyword_overlap(
             str(c.get("title") or ""), keywords
@@ -8321,11 +8413,35 @@ def _find_related_by_keywords(
         item["keyword_hits"] = hits
         item["matched_keywords"] = matched
         item["hit_keywords"] = matched
-        out.append(item)
-        seen.add(format_display_code(str(c.get("code") or "")))
-        if len(out) >= max_n:
-            break
-    return out[:max_n]
+        eligible.append(item)
+    out = _prefer_body_keyword_rows(eligible, keywords, max_n)
+    for item in out:
+        seen.add(format_display_code(str(item.get("code") or "")))
+    return _sanitize_related_rows(out)
+
+
+def _prefer_body_keyword_rows(
+    eligible: list[dict],
+    keywords: list[str] | None,
+    max_n: int,
+) -> list[dict]:
+    """Keep 巨乳 / 美乳 / 爆乳 hits inside the keyword cap.
+
+    Covered body-size hits lead, then coverless body-size hits, then the
+    other rows in their existing rank. A weak or coverless title does not
+    fill the cap ahead of a 巨乳 hit. Titles that never say 巨乳 are unchanged.
+    """
+    if max_n <= 0:
+        return []
+    if not any(_is_body_generic_token(k) for k in (keywords or [])):
+        return list(eligible[:max_n])
+    body = [it for it in eligible if _row_matches_body_generic(it)]
+    other = [it for it in eligible if not _row_matches_body_generic(it)]
+    if not body:
+        return list(eligible[:max_n])
+    covered = [it for it in body if _related_has_real_cover(it)]
+    bare = [it for it in body if not _related_has_real_cover(it)]
+    return (covered + bare + other)[:max_n]
 
 
 def _actress_name_matches(query: str, candidate: str) -> bool:
@@ -8719,16 +8835,22 @@ def find_related_by_title(
             item["hit_keywords"] = item["matched_keywords"]
         normalized.append(item)
     theme_items = [x for x in normalized if x.get("line") == "theme"][:title_cap]
-    keyword_items = [x for x in normalized if x.get("line") == "keyword"][:keyword_cap]
+    keyword_items = [x for x in normalized if x.get("line") == "keyword"]
     actress_items = [x for x in normalized if x.get("line") == "actress"][:actress_cap]
     other_items = [
         x
         for x in normalized
         if x.get("line") not in {"theme", "keyword", "actress"}
     ]
-    # Within keyword tier: distinctive theme hits, then more keyword hits.
-    keyword_items.sort(key=_keyword_related_sort_key, reverse=True)
-    return theme_items + keyword_items + actress_items + other_items
+    # Within keyword tier: a 巨乳 hit is ranked before the cap so a weak
+    # title cannot push it out. Other titles keep the first-five #25 cut.
+    if any(_row_matches_body_generic(it) for it in keyword_items):
+        keyword_items.sort(key=_keyword_related_sort_key, reverse=True)
+        keyword_items = keyword_items[:keyword_cap]
+    else:
+        keyword_items = keyword_items[:keyword_cap]
+        keyword_items.sort(key=_keyword_related_sort_key, reverse=True)
+    return _sanitize_related_rows(theme_items + keyword_items + actress_items + other_items)
 
 
 
@@ -10488,14 +10610,16 @@ def run_multi_identify_pipeline(
                 0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
             )
             filled = attach_related_by_title(row, budget_sec=per_budget, per_item=False)
-            rel = list(filled.get("related_by_title") or [])
+            rel = _sanitize_related_rows(filled.get("related_by_title") or [])
             row["related_by_title"] = rel
             total_rel += len(rel)
         except Exception:
             row.setdefault("related_by_title", [])
     # Top-level related mirrors first work (compat); gallery uses each results[].related_by_title
     if results and isinstance(results[0], dict):
-        payload["related_by_title"] = list(results[0].get("related_by_title") or [])
+        payload["related_by_title"] = _sanitize_related_rows(
+            results[0].get("related_by_title") or []
+        )
         payload["theme_keywords"] = list(results[0].get("theme_keywords") or [])
         payload["keyword_queries"] = list(results[0].get("keyword_queries") or [])
     else:
