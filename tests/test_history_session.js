@@ -729,6 +729,123 @@ function walkNodes(node, acc) {
   assert.ok(!H.workNeedsThemeKeywords({ related: related(1, 'keyword'), theme_keywords: ['眼鏡'] }));
 }
 
+// Tutor-title multi-candidate: chips under the action buttons on every listed card.
+// Hint names 片名 / 關鍵字 / 同演員 only for buckets that are actually present.
+{
+  const cover = 'https://pics.dmm.co.jp/digital/video/dandya00001/dandya00001pl.jpg';
+  const kws = ['家庭教師', '10秒挿入', '肉欲教育', '息子の家庭教師', '息子', 'ママ'];
+  const titleJa = '「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入';
+  const titleZh = '今天又跟兒子的家教上床了';
+  assert.strictEqual(H.formatDisplayTitle(titleJa, ''), titleJa);
+  assert.ok(H.formatDisplayTitle(titleJa, '').indexOf('（）') === -1);
+  assert.strictEqual(H.formatDisplayTitle(titleJa, titleZh), titleJa + '（' + titleZh + '）');
+
+  const data = {
+    ok: true,
+    code: 'DANDYA-001',
+    title: titleJa,
+    title_zh: titleZh,
+    actress: '大浦真奈美',
+    studio: 'DANDY',
+    theme_keywords: kws,
+    keyword_queries: ['家庭教師', '10秒挿入'],
+    search_mode: 'title',
+    related_by_title: [
+      { code: 'SER-001', title: '同系列', line: 'theme', why: '片名相近', cover: cover },
+      {
+        code: 'KW-010',
+        title: '肉欲教育ママ',
+        line: 'keyword',
+        why: '關鍵字×2',
+        matched_keywords: ['肉欲教育', 'ママ'],
+        cover: cover,
+      },
+      { code: 'MDBK-434', title: '別作品', line: 'actress', why: '同演員', cover: cover },
+    ],
+    candidates: [
+      {
+        code: 'DANDYA-001',
+        title: titleJa,
+        title_zh: titleZh,
+        actress: '大浦真奈美',
+        studio: 'DANDY',
+        theme_keywords: kws,
+        keyword_queries: ['家庭教師'],
+        line: 'candidate',
+      },
+      {
+        code: 'DANDY-893',
+        title: '息子の家庭教師とセックスしています',
+        actress: '竹内夏希',
+        studio: 'DANDY',
+        theme_keywords: kws,
+        keyword_queries: ['家庭教師', '10秒挿入'],
+        line: 'candidate',
+      },
+    ],
+  };
+  const works = H.sessionWorksFromIdentify(data);
+  assert.strictEqual(works.length, 2);
+  assert.strictEqual(works[0].code, 'DANDYA-001');
+  assert.strictEqual(works[1].code, 'DANDY-893');
+  assert.strictEqual(works[0].theme_keywords.join('・'), kws.join('・'));
+  assert.strictEqual(works[1].theme_keywords.join('・'), kws.join('・'));
+  assert.ok(!works[1].title_zh, 'do not invent Chinese for the other candidate');
+  const gallery = H.galleryFromIdentify(data);
+  assert.strictEqual(gallery.items[0].themeKeywords.join('・'), kws.join('・'));
+  assert.strictEqual(gallery.items[1].code, 'DANDY-893');
+  assert.strictEqual(gallery.items[1].themeKeywords.join('・'), kws.join('・'));
+  assert.strictEqual(
+    H.formatDisplayTitle(gallery.items[0].title, gallery.items[0].titleZh),
+    titleJa + '（' + titleZh + '）'
+  );
+
+  H.paintHistoryDetail({ id: 'dandy-multi', works: works });
+  const blocks = walkNodes(getEl('history-detail')).filter((n) => n.className === 'work-carousel-block');
+  assert.strictEqual(blocks.length, 2);
+  const hint0 = walkNodes(blocks[0]).find((n) => n.className === 'work-carousel-hint');
+  assert.ok(hint0 && hint0.textContent.indexOf('片名') !== -1, hint0 && hint0.textContent);
+  assert.ok(hint0 && hint0.textContent.indexOf('關鍵字') !== -1, hint0 && hint0.textContent);
+  assert.ok(hint0 && hint0.textContent.indexOf('同演員') !== -1, hint0 && hint0.textContent);
+  blocks.forEach((block, i) => {
+    const card = walkNodes(block).find((n) => String(n.className || '').indexOf('card') !== -1 && String(n.className || '').indexOf('work-carousel') === -1);
+    assert.ok(card, 'card ' + i);
+    const classes = (card.children || []).map((c) => c.className);
+    const actionAt = classes.indexOf('work-actions');
+    const chipAt = classes.indexOf('kw-related-panel');
+    const coverAt = classes.indexOf('cover-wrap');
+    assert.ok(actionAt >= 0 && chipAt === actionAt + 1 && coverAt === chipAt + 1, classes.join('|'));
+    const chips = walkNodes(card).filter((n) => n.getAttribute && n.getAttribute('data-kw'));
+    assert.strictEqual(chips.map((c) => c.textContent).join('・'), kws.join('・'), 'card ' + i);
+  });
+
+  H.paintHistoryDetail({
+    id: 'dandy-no-kw-bucket',
+    works: [
+      {
+        code: 'DANDYA-001',
+        title: titleJa,
+        title_zh: titleZh,
+        actress: '大浦真奈美',
+        line: 'main',
+        theme_keywords: kws,
+        keyword_queries: ['家庭教師'],
+        related: [
+          { code: 'SER-001', title: '同系列', line: 'theme', why: '片名相近', cover: cover },
+          { code: 'MDBK-434', title: '別作品', line: 'actress', why: '同演員', cover: cover },
+        ],
+      },
+    ],
+  });
+  const only = walkNodes(getEl('history-detail'));
+  const hint = only.find((n) => n.className === 'work-carousel-hint');
+  assert.ok(hint && hint.textContent.indexOf('片名') !== -1, hint && hint.textContent);
+  assert.ok(hint && hint.textContent.indexOf('同演員') !== -1, hint && hint.textContent);
+  assert.ok(hint && hint.textContent.indexOf('關鍵字') === -1, hint && hint.textContent);
+  const stillChips = only.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
+  assert.strictEqual(stillChips.map((c) => c.textContent).join('・'), kws.join('・'));
+}
+
 // Hit keywords sit beside the 關鍵字 badge; actress notes do not split the keyword block
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/snis00978/snis00978pl.jpg';

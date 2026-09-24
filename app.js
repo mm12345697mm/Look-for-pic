@@ -450,10 +450,19 @@
       ? formatDisplayCode(String(codeRaw))
       : String(codeRaw || '');
     const relatedSrc = pickRelatedSource(src, lineOut === 'main', fb);
+    // Another 番號 must not inherit this query's Chinese title. Missing
+    // title_zh stays Japanese-only; never invent a translation.
+    const sameCode = !!(
+      src.code &&
+      fb.code &&
+      codesMatch(String(src.code), String(fb.code))
+    );
+    const titleZh = String(src.title_zh || src.titleZh || '').trim()
+      || (sameCode ? String(fb.title_zh || fb.titleZh || '').trim() : '');
     return {
       code: code,
       title: src.title || fb.title || '',
-      title_zh: src.title_zh || src.titleZh || fb.title_zh || '',
+      title_zh: titleZh,
       cover: src.cover || fb.cover || '',
       cid: src.cid || fb.cid || '',
       stills: Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
@@ -2339,9 +2348,11 @@
     const slides = [];
     const mainSlide = document.createElement('div');
     mainSlide.className = 'work-carousel-slide';
-    mainSlide.appendChild(
-      buildWorkCard(mainWork, { slide: true, badgeLabel: lineLabel(mainWork.line || 'main') })
-    );
+    const mainCard = buildWorkCard(mainWork, {
+      slide: true,
+      badgeLabel: lineLabel(mainWork.line || 'main'),
+    });
+    mainSlide.appendChild(mainCard);
     track.appendChild(mainSlide);
     slides.push(mainSlide);
 
@@ -2374,24 +2385,62 @@
     // Track first, then hint/pager as snug footer under stills (no stretch gap)
     block.appendChild(track);
     block.appendChild(head);
-    mountKeywordResearch(block, mainWork, related, themeKeywords);
+    mountKeywordResearch(block, mainWork, related, themeKeywords, mainCard);
     return block;
   }
 
+  function elementHasClass(el, name) {
+    if (!el) return false;
+    if (el.classList && el.classList.contains(name)) return true;
+    return String(el.className || '').split(/\s+/).indexOf(name) !== -1;
+  }
+
+  function findChildByClass(root, className) {
+    const kids = (root && root.children) || [];
+    for (let i = 0; i < kids.length; i++) {
+      if (elementHasClass(kids[i], className)) return kids[i];
+    }
+    return null;
+  }
+
+  /** Place node directly under the copy/download bar. Falls back to append. */
+  function insertAfterActionBar(card, node) {
+    const actions = findChildByClass(card, 'work-actions');
+    const parent = actions && actions.parentNode;
+    if (!parent) return false;
+    if (typeof parent.insertBefore === 'function') {
+      parent.insertBefore(node, actions.nextSibling || null);
+      return true;
+    }
+    const kids = parent.children;
+    if (kids && typeof kids.indexOf === 'function' && typeof kids.splice === 'function') {
+      const i = kids.indexOf(actions);
+      if (i >= 0) {
+        kids.splice(i + 1, 0, node);
+        node.parentNode = parent;
+        return true;
+      }
+    }
+    if (typeof parent.appendChild === 'function') {
+      parent.appendChild(node);
+      return true;
+    }
+    return false;
+  }
+
   /**
-   * Keyword chips + a separate bottom row.
-   * Shown only when this card already has a 關鍵字 related section.
+   * Keyword chips under the copy/download buttons, plus a separate bottom row.
+   * Chips come from this work's theme_keywords (main and 片名候選 cards).
    * Re-search uses only the selected chips (server enforces multi-hit / cap 10).
    */
-  function mountKeywordResearch(block, mainWork, related, themeKeywords) {
+  function mountKeywordResearch(block, mainWork, related, themeKeywords, card) {
     const hasKeyword = (related || []).some((rw) => {
       const why = String((rw && rw.why) || '');
       const line = String((rw && rw.line) || '');
       return line === 'keyword' || why.includes('關鍵字');
     });
-    if (!hasKeyword) return;
-
     const keywords = normalizeKeywordList(themeKeywords);
+    if (!keywords.length && !hasKeyword) return;
     const panel = document.createElement('div');
     panel.className = 'kw-related-panel';
     const label = document.createElement('div');
@@ -2571,7 +2620,7 @@
       el.addEventListener('pointerdown', stopCarouselBubble);
       el.addEventListener('touchstart', stopCarouselBubble, { passive: true });
     });
-    block.appendChild(panel);
+    if (!insertAfterActionBar(card, panel)) block.appendChild(panel);
     block.appendChild(research);
   }
 
