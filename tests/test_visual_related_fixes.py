@@ -637,20 +637,20 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
     def test_mida616_prefers_compound_then_kyonyu(self):
         kws = S._extract_title_theme_keywords(self.MIDA, actress="福田ゆあ")
         self.assertGreaterEqual(len(kws), 2, kws)
-        self.assertEqual(kws[0], "ノーブラ誘惑", kws)
+        # ノーブラ誘惑 is two chips. 巨乳 stays ahead of the weak 誘惑 half.
+        self.assertNotIn("ノーブラ誘惑", kws)
+        self.assertEqual(kws[0], "ノーブラ", kws)
         self.assertEqual(kws[1], "巨乳", kws)
-        # Noun half of the compound stays, but does not outrank 巨乳.
-        self.assertIn("ノーブラ", kws)
-        self.assertGreater(kws.index("ノーブラ"), kws.index("巨乳"))
-        self.assertLess(kws.index("ノーブラ誘惑"), kws.index("ノーブラ"))
+        self.assertIn("誘惑", kws)
+        self.assertLess(kws.index("巨乳"), kws.index("誘惑"))
         for rel in ("彼女の妹", "彼女", "妹"):
             self.assertIn(rel, kws, kws)
             self.assertGreater(kws.index(rel), kws.index("巨乳"), kws)
-            self.assertGreater(kws.index(rel), kws.index("ノーブラ誘惑"), kws)
+            self.assertGreater(kws.index(rel), kws.index("ノーブラ"), kws)
         self.assertLess(kws.index("彼女の妹"), kws.index("彼女"))
         self.assertLess(kws.index("彼女"), kws.index("妹"))
-        # Bare 誘惑 is only the action half. ボク is not part of an XのY relation pair here.
-        for absent in ("誘惑", "負け", "ボク", "私"):
+        # ボク is not part of an XのY relation pair here.
+        for absent in ("負け", "ボク", "私", "ノーブラ誘惑"):
             self.assertNotIn(absent, kws, kws)
         # noun+沼 in this title is kept, behind the circled theme nouns.
         self.assertIn("ナマ乳沼", kws)
@@ -661,14 +661,15 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
         qs = S._keyword_search_queries(self.MIDA, kws)
         self.assertTrue(qs, qs)
         self.assertLessEqual(len(qs), 8)
-        self.assertEqual(qs[0], "ノーブラ誘惑", qs)
+        self.assertEqual(qs[0], "ノーブラ", qs)
         self.assertIn("巨乳", qs[:4])
+        self.assertIn("誘惑", qs)
+        self.assertNotIn("ノーブラ誘惑", qs)
         self.assertIn("彼女の妹", qs)
         self.assertGreater(qs.index("彼女の妹"), qs.index("巨乳"))
-        self.assertGreater(qs.index("彼女の妹"), qs.index("ノーブラ誘惑"))
+        self.assertGreater(qs.index("彼女の妹"), qs.index("ノーブラ"))
         self.assertNotIn("彼女", qs)
         self.assertNotIn("妹", qs)
-        self.assertNotIn("誘惑", qs)
         selected = S._keyword_search_queries(
             self.MIDA, ["彼女の妹", "妹"], selected_only=True
         )

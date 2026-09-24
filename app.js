@@ -60,12 +60,6 @@
   let pendingFiles = [];
   let batchFiles = [];
   let identifyBusy = false;
-  const ACTIVE_JOB_KEY = 'lfp_active_identify_job_v1';
-  let activeJobId = null;
-  let jobSettled = false;
-  let jobFollow = null;
-  let streamAttached = false;
-  let activeHandleResult = null;
 
   function batchQueryKeepsFrames(fileCount, busy, openFrame) {
     return fileCount > 1 && !!(busy || openFrame);
@@ -262,56 +256,11 @@
     });
     return (existing || []).map((r) => {
       if (!r || !r.code) return r;
-      const hit =
-        byCode[String(r.code)] ||
-        (incoming || []).find((row) => row && row.code && codesMatch(row.code, r.code));
+      const hit = byCode[String(r.code)];
       const zh = hit ? String(hit.title_zh || hit.titleZh || '').trim() : '';
       if (!zh || String(r.title_zh || r.titleZh || '').trim()) return r;
       return Object.assign({}, r, { title_zh: zh });
     });
-  }
-
-  function relatedItemKey(r) {
-    if (!r || !String(r.code || '').trim()) return '';
-    const code = parseCodeParts(String(r.code))
-      ? formatDisplayCode(String(r.code))
-      : String(r.code);
-    return code + '|' + relatedLineFromRaw(r);
-  }
-
-  /** Codes plus bucket lines, in carousel order. Title text is not part of it. */
-  function relatedMembershipKey(related) {
-    return (related || []).map(relatedItemKey).filter(Boolean).join('\n');
-  }
-
-  function historyRelatedKey(rec) {
-    return historySessionWorks(rec)
-      .map((w) => relatedMembershipKey(w && w.related))
-      .join('\n||\n');
-  }
-
-  /**
-   * New ranking leads. A saved row with a real cover is kept even when the
-   * fresh list is shorter. An empty fresh list does not wipe the saved one.
-   */
-  function mergeRelatedUpgrade(existing, incoming) {
-    const fresh = Array.isArray(incoming) ? incoming : [];
-    const saved = Array.isArray(existing) ? existing : [];
-    if (!fresh.length) return saved.slice();
-    const out = [];
-    const seen = {};
-    function push(r) {
-      const key = relatedItemKey(r);
-      const code = key.split('|')[0];
-      if (!code || seen[code]) return;
-      seen[code] = true;
-      out.push(r);
-    }
-    fresh.forEach(push);
-    saved.forEach((r) => {
-      if (r && workHasUsableCover(r)) push(r);
-    });
-    return out;
   }
 
   function workNeedsTitleZh(w) {
@@ -429,20 +378,6 @@
     return buckets.theme.concat(buckets.keyword, buckets.actress);
   }
 
-  /** Same bucket order as the cap, without dropping rows that are under a maximum. */
-  function groupSavedRelated(items) {
-    const buckets = { theme: [], keyword: [], actress: [] };
-    const other = [];
-    (items || []).forEach((r) => {
-      if (!r || !(r.code || r.title)) return;
-      const line = relatedLineFromRaw(r);
-      const row = Object.assign({}, r, { line: line });
-      if (buckets[line]) buckets[line].push(row);
-      else other.push(row);
-    });
-    return buckets.theme.concat(buckets.keyword, buckets.actress, other);
-  }
-
   function mergeRelatedIncremental(existing, incoming) {
     const byKey = {};
     const order = [];
@@ -499,11 +434,9 @@
           ? match.related_by_title
           : (match.related || []).filter(isRelatedBucketItem);
         if (donorRelated.length) {
-          if (relatedHasPersistedMembership(nw.related)) {
-            nw.related = applyTitleZhOntoRelated(nw.related, donorRelated);
-          } else {
-            nw.related = slimRelatedForHistory(donorRelated);
-          }
+          nw.related = nw.related && nw.related.length
+            ? mergeRelatedIncremental(nw.related, donorRelated)
+            : slimRelatedForHistory(donorRelated);
         }
         if (match.cover && !nw.cover) nw.cover = match.cover;
         return nw;
@@ -564,6 +497,9 @@
       cid: src.cid || fb.cid || '',
       stills: Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
       actress: src.actress || fb.actress || '',
+      actress_zh: String(src.actress_zh || src.actressZh || fb.actress_zh || fb.actressZh || '').trim(),
+      studio: src.studio || fb.studio || '',
+      studio_zh: String(src.studio_zh || src.studioZh || fb.studio_zh || fb.studioZh || '').trim(),
       line: lineOut,
       related: slimRelatedForHistory(relatedSrc),
       theme_keywords: normalizeKeywordList(src.theme_keywords || src.themeKeywords),
@@ -685,7 +621,9 @@
     return items;
   }
 
-  /** Unique chip labels from an API list. Does not invent keywords from a title. */
+  /** Unique chip labels from an API list. Does not invent keywords from a title.
+   *  ノーブラ誘惑 is two chips, never one compound.
+   */
   function normalizeKeywordList(raw) {
     const out = [];
     const seen = {};
@@ -693,18 +631,127 @@
       ? raw
       : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
     items.forEach((item) => {
-      const s = String(item || '').trim();
-      if (!keywordTokenOk(s) || seen[s]) return;
-      seen[s] = true;
-      out.push(s);
+      const rawTok = String(item || '').trim();
+      const pieces = rawTok === 'ノーブラ誘惑' ? ['ノーブラ', '誘惑'] : [rawTok];
+      pieces.forEach((s) => {
+        if (!keywordTokenOk(s) || seen[s]) return;
+        seen[s] = true;
+        out.push(s);
+      });
     });
     return orderCompoundsBeforeParts(out).slice(0, 10);
+  }
+
+  /**
+   * Traditional Chinese gloss for a keyword chip. Lexicon only — never a
+   * guessed catalog title. Same-script words (巨乳, 誘惑) still get the
+   * parenthetical the chip rule asks for.
+   */
+  const KEYWORD_GLOSS = {
+    '巨乳': '巨乳',
+    '美乳': '美乳',
+    '爆乳': '爆乳',
+    'ノーブラ': '無胸罩',
+    '誘惑': '誘惑',
+    '水泳部': '游泳社',
+    '合宿': '集訓',
+    '媚薬': '媚藥',
+    '媚藥': '媚藥',
+    '水着': '泳衣',
+    'スク水': '學校泳衣',
+    'スクール水着': '學校泳衣',
+    '満員': '滿員',
+    '滿員': '滿員',
+    '電車': '電車',
+    '痴漢': '痴漢',
+    '癡漢': '痴漢',
+    '彼女': '女朋友',
+    '妹': '妹妹',
+    '彼女の妹': '女朋友的妹妹',
+    '姉': '姐姐',
+    '兄': '哥哥',
+    '弟': '弟弟',
+    '息子': '兒子',
+    'ママ': '媽媽',
+    '家庭教師': '家教',
+    '息子の家庭教師': '兒子的家教',
+    '肉欲教育': '肉慾教育',
+    '羞恥教育': '羞恥教育',
+    '10秒挿入': '10秒插入',
+    '眼鏡': '眼鏡',
+    'メガネ': '眼鏡',
+    '地味': '土味',
+    '美人': '美人',
+    'OL': 'OL',
+    '中出し': '中出',
+    '叔母': '叔母',
+    'ナマ乳沼': '生乳沼',
+    '巨乳沼': '巨乳沼',
+    'オイル': '精油',
+    '温泉': '溫泉',
+    '人妻': '人妻',
+    '痴女': '痴女',
+    'パンスト': '絲襪',
+    '夜行バス': '夜間巴士',
+    '指マン': '指交',
+    '声我慢': '忍住聲音',
+    '羞恥': '羞恥',
+    '美尻': '美臀',
+    '乳首': '乳頭',
+    '女教師': '女教師',
+    'ナース': '護士',
+    '女医': '女醫師',
+    '秘書': '秘書',
+    '童貞': '處男',
+    '絶倫': '性能力強',
+    '搾精': '榨精',
+    '顔射': '顏射',
+    '拘束': '拘束',
+    '監禁': '監禁',
+    '調教': '調教',
+    '開発': '開發',
+    '開發': '開發',
+    'マッサージ': '按摩',
+    'エステ': '美容',
+    '寝取': '寢取',
+    '義妹': '義妹',
+    '義母': '義母',
+    '義父': '義父',
+    '義姉': '義姉',
+    '義兄': '義兄',
+    '下着': '內衣',
+    '通勤': '通勤',
+    '会社': '公司',
+    'オフィス': '辦公室',
+    '毎朝': '每天早上',
+    '毎晩': '每天晚上',
+    '交尾': '交尾',
+    '逆NTR': '反向NTR',
+    'CA': '空姐',
+    'VR': 'VR',
+    'SP': '特別篇',
+  };
+
+  function keywordGloss(tok) {
+    const s = String(tok || '').trim();
+    if (!s || !Object.prototype.hasOwnProperty.call(KEYWORD_GLOSS, s)) return '';
+    return KEYWORD_GLOSS[s];
+  }
+
+  /** Chip label: 日文（中文）. Unmapped tokens stay as-is (no invented gloss). */
+  function formatKeywordChip(tok) {
+    const s = String(tok || '').trim();
+    const zh = keywordGloss(s);
+    if (!s) return '';
+    if (!zh) return s;
+    if (s.indexOf('（' + zh + '）') !== -1 || s.indexOf('(' + zh + ')') !== -1) return s;
+    return s + '（' + zh + '）';
   }
 
   function formatKeywordListLabel(prefix, keywords) {
     const kws = normalizeKeywordList(keywords);
     if (!kws.length) return prefix;
-    return prefix + '（' + kws.join('・') + '）';
+    return prefix + '（' + kws.map(formatKeywordChip).join('・') + '）';
   }
 
   function cjkScript(ch) {
@@ -842,6 +889,19 @@
     return ja + '（' + zh + '）';
   }
 
+  /**
+   * Actress / studio / series name. Chinese only when the catalog supplied it.
+   * Kanji names still get the parenthetical. No name_zh → Japanese only.
+   */
+  function formatPersonName(nameJa, nameZh) {
+    const ja = stripEmptyParens(nameJa);
+    const zh = stripEmptyParens(nameZh);
+    if (!ja) return '';
+    if (!zh || zh === ja) return ja;
+    if (ja.indexOf('（' + zh + '）') !== -1 || ja.indexOf('(' + zh + ')') !== -1) return ja;
+    return ja + '（' + zh + '）';
+  }
+
   /** Clipboard string for 番號+名稱: CODE then newline then the on-screen title. */
   function formatCodeTitleClipboard(code, displayTitle) {
     const c = String(code || '').trim();
@@ -850,44 +910,54 @@
     return c || t;
   }
 
+  function isRelatedCarouselLine(line) {
+    return line === 'theme' || line === 'keyword' || line === 'actress';
+  }
+
+  function isCatalogMediaUrl(url) {
+    const s = String(url || '').trim();
+    return /^https?:\/\//i.test(s) && !isLocalCoverUrl(s) && !isNowPrintingUrl(s);
+  }
+
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
     const unidentified = !!(raw.unidentified || raw.frame_unidentified);
-    const timedOut = !!(raw.timed_out || raw.timedOut);
     const titleOnly =
       unidentified ||
-      timedOut ||
       !rawCode ||
       rawCode === 'TITLE-SEARCH' ||
       rawCode.toLowerCase() === 'null' ||
       !parseCodeParts(rawCode);
-    const code = timedOut
-      ? '尚未查完'
-      : unidentified
-        ? '未辨識'
-        : titleOnly
-          ? rawCode === 'TITLE-SEARCH' || !rawCode
-            ? '片名搜尋'
-            : formatDisplayCode(rawCode)
-          : formatDisplayCode(rawCode);
+    const code = unidentified
+      ? '未辨識'
+      : titleOnly
+        ? rawCode === 'TITLE-SEARCH' || !rawCode
+          ? '片名搜尋'
+          : formatDisplayCode(rawCode)
+        : formatDisplayCode(rawCode);
+    const lineOut = line || raw.line || 'main';
+    const relatedSlide = isRelatedCarouselLine(lineOut);
+    const preview = String(raw.user_preview || raw.userPreview || '').trim();
     // Never invent DMM CID from the display code: padded guesses (dosd00008)
     // often redirect to now_printing after the server already cleared cover.
     const cid = String(raw.cid || '');
     let cover = String(raw.cover || raw.cover_url || '').trim();
-    if (isNowPrintingUrl(cover)) cover = '';
+    if (isNowPrintingUrl(cover) || !isCatalogMediaUrl(cover) || (preview && cover === preview)) {
+      cover = '';
+    }
+    // The query image is not the main cover. A cid restores the catalog jacket.
     if (!cover && cid && !isNowPrintingUrl(cid)) {
       cover = coverUrl(cid);
-      if (isNowPrintingUrl(cover)) cover = '';
+      if (!isCatalogMediaUrl(cover)) cover = '';
     }
     let stills = Array.isArray(raw.stills) && raw.stills.length
-      ? raw.stills.map((u) => String(u || '')).filter((u) => u && !isNowPrintingUrl(u))
+      ? raw.stills.map((u) => String(u || '')).filter((u) => isCatalogMediaUrl(u) && u !== preview)
       : [];
-    if (!stills.length && cid) {
+    if (!stills.length && cid && !isNowPrintingUrl(cid)) {
       stills = stillUrls(cid, 10);
     }
-    const lineOut = line || raw.line || 'main';
     let relatedByTitle = [];
-    if (lineOut !== 'theme' && lineOut !== 'keyword' && lineOut !== 'actress') {
+    if (!relatedSlide) {
       const relRaw = Array.isArray(raw.related_by_title) && raw.related_by_title.length
         ? raw.related_by_title
         : (Array.isArray(raw.related) ? raw.related.filter(isRelatedBucketItem) : []);
@@ -898,7 +968,9 @@
       title: raw.title ? String(raw.title) : '',
       titleZh: String(raw.title_zh || raw.titleZh || '').trim(),
       actress: raw.actress ? String(raw.actress) : '',
+      actressZh: String(raw.actress_zh || raw.actressZh || '').trim(),
       studio: raw.studio ? String(raw.studio) : '',
+      studioZh: String(raw.studio_zh || raw.studioZh || '').trim(),
       cid,
       line: lineOut,
       why: raw.why ? String(raw.why) : '',
@@ -906,13 +978,9 @@
       stills,
       titleOnly,
       unidentified,
-      timedOut,
-      message: raw.message ? String(raw.message) : '',
-      userPreview: String(raw.user_preview || raw.userPreview || '').trim(),
+      userPreview: relatedSlide ? '' : String(raw.user_preview || raw.userPreview || '').trim(),
       fromImageIndex: raw.from_image_index || raw.fromImageIndex || null,
       relatedByTitle,
-      preserveRelated: !!(raw.preserve_related || raw.preserveRelated),
-      relatedLoading: !!(raw.related_loading || raw.relatedLoading),
       themeKeywords: normalizeKeywordList(raw.theme_keywords || raw.themeKeywords),
       keywordQueries: normalizeKeywordList(raw.keyword_queries || raw.keywordQueries),
       matchedKeywords: normalizeKeywordList(
@@ -955,10 +1023,59 @@
     }
   }
 
+  function stepLabel(stepId) {
+    return progressLabels[stepId] || (DEFAULT_STEPS.find((s) => s.id === stepId) || {}).label || stepId;
+  }
+
+  function phaseLabelForEvent(evt) {
+    if (!evt || evt.status !== 'active') return '';
+    if (evt.phase) return String(evt.phase);
+    const step = evt.step;
+    const detail = String(evt.detail || '');
+    if (step === 'vision') return '辨識中';
+    if (step === 'search') return '目錄查詢';
+    if (step === 'verify' || step === 'cover') return '封面鎖定';
+    if (step === 'done' && detail.indexOf('相關') !== -1) return '相關作品';
+    return '';
+  }
+
+  function listStepRows(root) {
+    if (!root) return [];
+    if (root.querySelectorAll) {
+      const found = root.querySelectorAll('.progress-step');
+      if (found && found.length) return Array.from(found);
+    }
+    return Array.from(root.children || []).filter((n) => {
+      if (!n) return false;
+      if (n.dataset && n.dataset.step) return true;
+      return String(n.className || '').indexOf('progress-step') !== -1;
+    });
+  }
+
+  function findStepRow(root, stepId) {
+    if (!root) return null;
+    if (root.querySelector) {
+      const hit = root.querySelector('[data-step="' + stepId + '"]');
+      if (hit) return hit;
+    }
+    const rows = listStepRows(root);
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].dataset && rows[i].dataset.step === stepId) return rows[i];
+    }
+    return null;
+  }
+
   function setStepPhase(li, phase) {
     if (!li) return;
     const text = phase ? String(phase) : '';
     let el = li.querySelector && li.querySelector('.step-phase');
+    if (!el && li.children) {
+      el = Array.from(li.children).find((n) => {
+        if (!n) return false;
+        if (n.classList && n.classList.contains('step-phase')) return true;
+        return String(n.className || '').indexOf('step-phase') !== -1;
+      }) || null;
+    }
     if (!el && text && document && document.createElement) {
       el = document.createElement('span');
       el.className = 'step-phase';
@@ -974,14 +1091,10 @@
     }
   }
 
-  function stepLabel(stepId) {
-    return progressLabels[stepId] || (DEFAULT_STEPS.find((s) => s.id === stepId) || {}).label || stepId;
-  }
-
   function hideProgress() {
     if (!progressPanel) return;
     progressPanel.classList.add('hidden');
-    progressPanel.classList.remove('is-complete', 'is-failed', 'is-live');
+    progressPanel.classList.remove('is-complete', 'is-failed');
     progressPanel.setAttribute('aria-busy', 'false');
     setProgressCollapsed(false);
     progressFinished = false;
@@ -993,7 +1106,7 @@
     progressState = {};
     progressLabels = {};
     progressFinished = false;
-    progressPanel.classList.remove('is-complete', 'is-failed', 'is-live');
+    progressPanel.classList.remove('is-complete', 'is-failed');
     progressStepsEl.innerHTML = '';
     list.forEach((s) => {
       progressState[s.id] = 'pending';
@@ -1021,24 +1134,23 @@
     const step = evt.step;
     const status = evt.status || 'active';
     progressState[step] = status;
-    const li = progressStepsEl.querySelector('[data-step="' + step + '"]');
+    const li = findStepRow(progressStepsEl, step);
     if (li) {
       li.className = 'progress-step is-' + status;
-      setStepPhase(li, status === 'active' ? evt.phase : '');
+      setStepPhase(li, phaseLabelForEvent(evt));
     }
     if (status === 'active') {
-      const rows = progressStepsEl.children || [];
-      Array.from(rows).forEach((row) => {
+      listStepRows(progressStepsEl).forEach((row) => {
         if (row !== li) setStepPhase(row, '');
       });
     }
     if (status === 'active' || status === 'done') {
-      const ids = Array.from(progressStepsEl.querySelectorAll('.progress-step')).map((n) => n.dataset.step);
+      const ids = listStepRows(progressStepsEl).map((n) => n.dataset.step);
       const idx = ids.indexOf(step);
       for (let i = 0; i < idx; i++) {
         if (progressState[ids[i]] === 'pending') {
           progressState[ids[i]] = 'done';
-          const prev = progressStepsEl.querySelector('[data-step="' + ids[i] + '"]');
+          const prev = findStepRow(progressStepsEl, ids[i]);
           if (prev) {
             prev.className = 'progress-step is-done';
             setStepPhase(prev, '');
@@ -1146,347 +1258,45 @@
     }
   }
 
-  function isIdentifyServerFailure(msg) {
-    const text = String(msg || '');
-    return /伺服器錯誤|伺服器逾時|伺服器回應無效|stream_incomplete|stream_interrupted|多圖辨識被中斷|時間上限/.test(
-      text
-    );
-  }
-
-  function rememberPartialSlot(list, slot) {
-    if (!slot || typeof slot !== 'object') return;
-    const idx = slot.from_image_index || slot.fromImageIndex;
-    if (!idx) {
-      list.push(slot);
-      return;
-    }
-    const at = list.findIndex((s) => (s.from_image_index || s.fromImageIndex) === idx);
-    if (at >= 0) list[at] = slot;
-    else list.push(slot);
-  }
-
-  /**
-   * Stream died or the worker was killed mid-batch. Keep finished slots and
-   * mark the rest as 尚未查完 — never as 查詢不到.
-   */
-  function interruptedBatchPayload(images, partialSlots) {
-    const n = images && images.length ? images.length : 0;
-    const slots = [];
-    (partialSlots || []).forEach((slot) => rememberPartialSlot(slots, slot));
-    const have = new Set(
-      slots.map((s) => s.from_image_index || s.fromImageIndex).filter((v) => v != null)
-    );
-    for (let i = 1; i <= n; i++) {
-      if (have.has(i)) continue;
-      slots.push({
-        ok: true,
-        timed_out: true,
-        unidentified: false,
-        code: 'TITLE-SEARCH',
-        title: '（這張尚未查完）',
-        from_image_index: i,
-        message: '伺服器逾時，這張被中斷。請再上傳這張重查一次。不是查詢不到。',
-        why: '伺服器逾時',
-        line: 'multi',
-        needs_code: true,
-      });
-    }
-    slots.sort(
-      (a, b) => (a.from_image_index || a.fromImageIndex || 0) - (b.from_image_index || b.fromImageIndex || 0)
-    );
-    return {
-      ok: true,
-      multi: true,
-      partial: true,
-      server_interrupted: true,
-      image_count: n,
-      result_count: slots.length,
-      results: slots,
-      message: '伺服器逾時，多圖辨識被中斷。已完成的會保留。未完成的請再上傳重查，不是查詢不到。',
-      related_note: '未完成的請再上傳這張重查，不是查詢不到',
-    };
-  }
-
-  function identifyProgressLabel(status, done, total) {
-    const doneN = Math.max(0, Number(done) || 0);
-    const totalN = Math.max(0, Number(total) || 0);
-    const count = totalN ? '已完成 ' + doneN + '／共 ' + totalN : '';
-    if (status === 'running') return count && doneN ? '還在找 · ' + count : '還在找';
-    if (status === 'stalled') return count ? '卡住或逾時可再補 · ' + count : '卡住或逾時可再補';
-    if (status === 'error') return count ? '伺服器錯誤 · ' + count : '伺服器錯誤';
-    if (totalN && doneN < totalN) return count ? count + ' · 其餘可再補' : '其餘可再補';
-    return count || '已完成';
-  }
-
-  function loadActiveJob() {
-    try {
-      const raw = localStorage.getItem(ACTIVE_JOB_KEY);
-      if (!raw) return null;
-      const rec = JSON.parse(raw);
-      return rec && rec.jobId ? rec : null;
-    } catch (_) {
-      return null;
-    }
-  }
-
-  function saveActiveJob(rec) {
-    if (!rec || !rec.jobId) return;
-    try {
-      localStorage.setItem(ACTIVE_JOB_KEY, JSON.stringify(rec));
-    } catch (_) {}
-  }
-
-  function clearActiveJob() {
-    activeJobId = null;
-    try {
-      localStorage.removeItem(ACTIVE_JOB_KEY);
-    } catch (_) {}
-  }
-
-  function rememberIdentifyJob(jobId, imageCount) {
-    if (!jobId) return;
-    activeJobId = String(jobId);
-    jobSettled = false;
-    const prev = loadActiveJob() || {};
-    saveActiveJob({
-      jobId: activeJobId,
-      imageCount: Number(imageCount || prev.imageCount) || 0,
-      doneCount: Number(prev.doneCount) || 0,
-      status: 'running',
-      message: '還在找',
-      savedAt: Date.now(),
-    });
-  }
-
-  function noteLiveStatus(status, done, total) {
-    const label = identifyProgressLabel(status, done, total);
-    const kind = status === 'running' ? 'busy' : status === 'done' && done === total ? 'ok' : 'err';
-    setStatus(label, kind);
-    updateProgressSummary(label);
-    if (progressPanel) {
-      progressPanel.classList.add('is-live');
-      progressPanel.classList.remove('hidden');
-    }
-    const rec = loadActiveJob();
-    if (rec && rec.jobId) {
-      rec.status = status;
-      rec.doneCount = done;
-      rec.imageCount = total || rec.imageCount;
-      rec.message = label;
-      rec.savedAt = Date.now();
-      saveActiveJob(rec);
-    }
-    return label;
-  }
-
-  /**
-   * A background kill, disconnect, or stall. Finished slots stay.
-   * Unfinished slots stay incomplete. This is not 查詢不到.
-   */
   function resumePayloadFromJob(job) {
-    job = job || {};
-    const status = job.status || 'running';
-    if (status === 'done' && job.result && typeof job.result === 'object') {
-      const data = job.result;
-      if (
-        data.partial ||
-        (Array.isArray(data.results) && data.results.some((r) => r && (r.timed_out || r.timedOut)))
-      ) {
-        data.partial = true;
-      }
-      return data;
-    }
-    const slots = Array.isArray(job.slots) ? job.slots : [];
-    const total = Math.max(Number(job.image_count) || 0, slots.length);
-    const images = new Array(total).fill({ name: 'frame.jpg' });
-    const data = interruptedBatchPayload(images, slots);
-    const done = (data.results || []).filter((r) => r && !r.timed_out).length;
-    const n = (data.results || []).length;
-    if (status === 'error') {
-      data.server_error = true;
-      data.message = identifyProgressLabel('error', done, n);
-      data.related_note = '伺服器錯誤。未完成的不是查詢不到，請再上傳重查';
-    } else {
-      data.stalled = true;
-      data.message = identifyProgressLabel('stalled', done, n);
-      data.related_note = '卡住或逾時可再補。不是查詢不到';
-      (data.results || []).forEach((row) => {
-        if (!row || !row.timed_out) return;
-        row.message = '卡住或逾時，這張可再補。請再上傳這張重查一次。不是查詢不到。';
-        row.why = '卡住或逾時可再補';
-      });
-    }
-    data.image_count = n;
+    if (!job || (job.status !== 'done' && job.status !== 'error')) return null;
+    const data = job.result;
+    if (!data || typeof data !== 'object') return null;
     return data;
   }
 
-  function stopJobFollow() {
-    if (jobFollow && jobFollow.timer) clearTimeout(jobFollow.timer);
-    jobFollow = null;
-  }
+  // Four images × 600s, plus a minute so the last slot can be written.
+  const IDENTIFY_JOB_FOLLOW_MS = 4 * 600 * 1000 + 60 * 1000;
 
-  function presentResumeGallery(data) {
-    identifyBusy = false;
-    const results = data.results || [];
-    const done = results.filter((r) => r && !r.timed_out && !r.timedOut).length;
-    const total = data.image_count || results.length;
-    const kind = data.server_error ? 'error' : data.stalled || data.server_interrupted ? 'stalled' : 'done';
-    const label = noteLiveStatus(kind, done, total);
-    applyProgressEvent({
-      step: 'done',
-      status: kind === 'done' && done === total && !data.partial ? 'done' : 'error',
-      detail: data.message || label,
-      progress: 1,
-    });
-    if (progressPanel) {
-      progressPanel.classList.remove('hidden');
-      progressPanel.classList.add('is-live');
-      progressPanel.setAttribute('aria-busy', 'false');
-      if (kind === 'done' && !data.partial && !data.server_interrupted && !data.stalled) {
-        progressPanel.classList.add('is-complete');
-        progressPanel.classList.remove('is-failed');
-      } else {
-        progressPanel.classList.add('is-failed');
-        progressPanel.classList.remove('is-complete');
-        setProgressCollapsed(false);
-      }
-    }
-    renderGallery(galleryFromIdentify(data));
-    showScreen('gallery');
-    if (kind === 'done' && data.ok && !data.partial && !data.server_interrupted && !data.stalled && !data.server_error) {
-      appendHistoryFromIdentify(data, []).catch(() => {});
-    }
-  }
-
-  function settleFromJob(job, myRun) {
-    if (jobSettled) return;
-    if (myRun != null && myRun !== runId) return;
-    jobSettled = true;
-    stopJobFollow();
-    streamAttached = false;
-    clearActiveJob();
-    const data = resumePayloadFromJob(job);
-    if (activeHandleResult && myRun === runId) {
-      activeHandleResult(data);
-      return;
-    }
-    presentResumeGallery(data);
-  }
-
-  function beginJobFollow(jobId, imageCount, myRun) {
-    if (!jobId) return;
-    stopJobFollow();
-    jobSettled = false;
-    activeJobId = String(jobId);
-    const total = Number(imageCount) || 0;
-    saveActiveJob({
-      jobId: activeJobId,
-      imageCount: total,
-      status: 'running',
-      message: '還在找',
-      savedAt: Date.now(),
-    });
-    const state = { jobId: activeJobId, myRun: myRun, timer: null, tick: null };
-    jobFollow = state;
-    const tick = async () => {
-      if (jobFollow !== state || jobSettled) return;
-      if (myRun != null && myRun !== runId) return;
-      let job = null;
+  async function followIdentifyJob(jobId, onProgress) {
+    const deadline = Date.now() + IDENTIFY_JOB_FOLLOW_MS;
+    let wait = 400;
+    while (Date.now() < deadline) {
+      await sleep(wait);
+      wait = Math.min(5000, wait + 400);
+      let body = null;
       try {
-        const res = await fetch('/api/identify/jobs/' + encodeURIComponent(state.jobId), { cache: 'no-store' });
-        if (jobFollow !== state || jobSettled || (myRun != null && myRun !== runId)) return;
-        if (res.status === 404) {
-          settleFromJob(
-            {
-              status: 'stalled',
-              image_count: total,
-              done_count: 0,
-              slots: [],
-            },
-            myRun
-          );
-          return;
+        const res = await fetch('/api/identify/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
+        try {
+          body = await res.json();
+        } catch (_) {
+          body = null;
         }
-        if (!res.ok) throw new Error('伺服器錯誤');
-        const body = await res.json();
-        job = body && body.job;
       } catch (_) {
-        if (jobFollow !== state || jobSettled) return;
-        const rec = loadActiveJob();
-        noteLiveStatus('running', (rec && rec.doneCount) || 0, total);
-        state.timer = setTimeout(tick, 2500);
-        return;
+        continue;
       }
-      if (!job || jobFollow !== state || jobSettled) return;
-      noteLiveStatus(
-        job.status === 'running' ? 'running' : job.status,
-        job.done_count || 0,
-        job.image_count || total
-      );
-      if (job.progress && job.progress.step) applyProgressEvent(job.progress);
-      if (job.status === 'running') {
-        state.timer = setTimeout(tick, 2500);
-        return;
-      }
-      settleFromJob(job, myRun);
-    };
-    state.tick = tick;
-    tick();
-  }
-
-  function pageIsHidden() {
-    try {
-      return document.visibilityState === 'hidden';
-    } catch (_) {
-      return false;
+      const job = body && body.job;
+      if (!job) continue;
+      if (job.progress && onProgress) onProgress(job.progress);
+      const ready = resumePayloadFromJob(job);
+      if (ready) return ready;
+      // A late heartbeat can look stalled. Keep the real result; do not
+      // paint 時間不夠 / 尚未查完 / 尚未鎖定 while the job can still finish.
     }
-  }
-
-  function onIdentifyVisibility() {
-    if (pageIsHidden()) {
-      const rec = loadActiveJob();
-      if (rec && rec.jobId && !jobSettled) {
-        rec.hiddenAt = Date.now();
-        saveActiveJob(rec);
-      }
-      return;
-    }
-    const rec = loadActiveJob();
-    if (!rec || !rec.jobId || jobSettled) return;
-    if (progressPanel) progressPanel.classList.remove('hidden');
-    if (jobFollow && jobFollow.tick) {
-      if (jobFollow.timer) clearTimeout(jobFollow.timer);
-      jobFollow.timer = null;
-      jobFollow.tick();
-      return;
-    }
-    // The SSE socket may still look open after iOS freezes it. Poll the job.
-    beginJobFollow(rec.jobId, rec.imageCount || 0, runId);
-  }
-
-  function resumeStoredIdentifyJob() {
-    const rec = loadActiveJob();
-    if (!rec || !rec.jobId || jobSettled) return;
-    const myRun = ++runId;
-    identifyBusy = true;
-    const n = Number(rec.imageCount) || 0;
-    showProgress(
-      n > 1
-        ? [
-            { id: 'receive', label: '接收圖片（' + n + ' 張）' },
-            { id: 'vision', label: '逐張看圖辨識' },
-            { id: 'parse', label: '彙整番號／片名' },
-            { id: 'verify', label: '核對片名與番號' },
-            { id: 'search', label: '搜尋作品資料' },
-            { id: 'cover', label: '抓取封面與劇照' },
-            { id: 'done', label: '完成，進入畫廊' },
-          ]
-        : DEFAULT_STEPS
-    );
-    showScreen('home');
-    if (progressPanel) progressPanel.classList.add('is-live');
-    noteLiveStatus('running', rec.doneCount || 0, n);
-    beginJobFollow(rec.jobId, n, myRun);
+    const err = new Error('查詢還在伺服器上，請稍後再開');
+    err.jobId = jobId;
+    err.followed = true;
+    throw err;
   }
 
   async function apiIdentifyStream({ images, image, code, title } = {}, onProgress) {
@@ -1512,12 +1322,8 @@
     let buffer = '';
     let finalData = null;
     let httpStatus = res.status;
-    let jobId = null;
-    let imageCount = imgs.length;
-    const partialSlots = [];
-    streamAttached = true;
+    let jobId = '';
 
-    try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -1539,42 +1345,31 @@
         }
         if (evt.type === 'job' && evt.job_id) {
           jobId = String(evt.job_id);
-          imageCount = Number(evt.image_count) || imageCount;
-          rememberIdentifyJob(jobId, imageCount);
-          noteLiveStatus('running', 0, imageCount);
         } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
           showProgress(evt.steps);
-          if (jobId) {
-            if (progressPanel) progressPanel.classList.add('is-live');
-            const doneNow = partialSlots.filter((s) => !(s.timed_out || s.timedOut)).length;
-            noteLiveStatus('running', doneNow, imageCount);
-          }
         } else if (evt.type === 'progress') {
-          if (evt.slot) rememberPartialSlot(partialSlots, evt.slot);
           if (onProgress) onProgress(evt);
           else applyProgressEvent(evt);
-          if (jobId) {
-            const done = partialSlots.filter((s) => !(s.timed_out || s.timedOut)).length;
-            noteLiveStatus('running', done, imageCount || partialSlots.length);
-          }
         } else if (evt.type === 'result') {
           finalData = evt.data;
           if (typeof evt.status === 'number') httpStatus = evt.status;
         }
       }
     }
+    if (!finalData && jobId) {
+      try {
+        finalData = await followIdentifyJob(jobId, onProgress);
+      } catch (e) {
+        if (e && !e.jobId) e.jobId = jobId;
+        throw e;
+      }
+    }
     if (!finalData) {
       const err = new Error('stream_incomplete');
-      err.code = 'stream_interrupted';
-      err.partialSlots = partialSlots;
-      err.jobId = jobId;
-      err.imageCount = imageCount;
+      if (jobId) err.jobId = jobId;
       throw err;
     }
-    return { status: httpStatus, data: finalData, partialSlots, jobId: jobId };
-    } finally {
-      streamAttached = false;
-    }
+    return { status: httpStatus, data: finalData };
   }
 
   async function apiIdentify({ images, image, code, title } = {}) {
@@ -1584,18 +1379,11 @@
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
     const res = await fetch('/api/identify', { method: 'POST', body: fd });
-    let data = null;
+    let data;
     try {
       data = await res.json();
     } catch (_) {
-      throw new Error(res.status >= 500 ? '伺服器錯誤' : '伺服器回應無效');
-    }
-    if (res.status >= 500) {
-      const err = new Error((data && data.message) || '伺服器錯誤');
-      err.httpStatus = res.status;
-      err.data = data;
-      err.partialSlots = data && Array.isArray(data.results) ? data.results : [];
-      throw err;
+      throw new Error('伺服器回應無效');
     }
     return { status: res.status, data };
   }
@@ -1777,11 +1565,6 @@
 
   function resetBaseline() {
     runId += 1;
-    jobSettled = true;
-    stopJobFollow();
-    clearActiveJob();
-    streamAttached = false;
-    activeHandleResult = null;
     identifyBusy = false;
     batchFiles = [];
     setStatus('');
@@ -1829,24 +1612,15 @@
     coverWrap._lfpWork = w;
     const url = (w.cover || '').trim();
     const preview = String((w && w.userPreview) || '').trim();
-    if ((!url || (w.titleOnly && !isLocalCoverUrl(url))) && isLocalCoverUrl(preview)) {
-      const shot = document.createElement('img');
-      shot.alt = '這張上傳圖';
-      shot.loading = 'lazy';
-      shot.decoding = 'async';
-      shot.src = preview;
-      coverWrap.appendChild(shot);
-      return;
-    }
-    if (!url || (w.titleOnly && !isLocalCoverUrl(url))) {
+    // Main cover is the catalog jacket. The query image stays in the upload strip.
+    const catalog = isCatalogMediaUrl(url) && url !== preview;
+    if (!catalog) {
       coverWrap.classList.add('is-empty');
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
-      ph.innerHTML = w.timedOut
-        ? '<strong>尚未查完</strong><span>請再上傳這張重查一次，不是查詢不到</span>'
-        : w.unidentified
-          ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
-          : w.titleOnly
+      ph.innerHTML = w.unidentified
+        ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
+        : w.titleOnly
           ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
           : '<strong>暫無封面</strong><span>請確認番號</span>';
       coverWrap.appendChild(ph);
@@ -1879,6 +1653,7 @@
     const set = workImageSet(w);
     const coverOffset = w && w.cover ? 1 : 0;
     (w.stills || []).forEach((url, i) => {
+      if (!isCatalogMediaUrl(url)) return;
       const img = document.createElement('img');
       img.src = url;
       img.alt = (w.code || '') + ' 劇照 ' + (i + 1);
@@ -1942,16 +1717,12 @@
     if (w.actress || w.studio) {
       const actressEl = document.createElement('p');
       actressEl.className = 'card-actress';
-      actressEl.textContent = w.actress
-        ? '女優：' + w.actress + (w.studio ? ' · ' + w.studio : '')
-        : String(w.studio);
+      const act = formatPersonName(w.actress, w.actressZh || w.actress_zh);
+      const stu = formatPersonName(w.studio, w.studioZh || w.studio_zh);
+      actressEl.textContent = act
+        ? '女優：' + act + (stu ? ' · ' + stu : '')
+        : stu;
       meta.appendChild(actressEl);
-    }
-    if (w.timedOut) {
-      const noteEl = document.createElement('p');
-      noteEl.className = 'card-visual-note';
-      noteEl.textContent = w.message || '這張時間不夠，還沒鎖定。請再上傳這張重查一次。不是查詢不到。';
-      meta.appendChild(noteEl);
     }
     if (w.visualMismatch) {
       const noteEl = document.createElement('p');
@@ -1980,7 +1751,7 @@
       hitKeywords.forEach((kw) => {
         const hit = document.createElement('span');
         hit.className = 'card-hit-kw';
-        hit.textContent = kw;
+        hit.textContent = formatKeywordChip(kw);
         hitWrap.appendChild(hit);
       });
       badgeRow.appendChild(hitWrap);
@@ -3044,11 +2815,9 @@
    * Multiple mains stack vertically in the gallery.
    */
   function buildWorkCarousel(mainWork) {
-    const rawRelated = Array.isArray(mainWork.relatedByTitle) ? mainWork.relatedByTitle : [];
-    // History shows the saved membership. A fresh identify still respects the caps.
-    const related = mainWork.preserveRelated
-      ? groupSavedRelated(rawRelated)
-      : capRelatedBuckets(rawRelated);
+    const related = capRelatedBuckets(
+      Array.isArray(mainWork.relatedByTitle) ? mainWork.relatedByTitle : []
+    );
     const block = document.createElement('section');
     block.className = 'work-carousel-block';
 
@@ -3070,8 +2839,6 @@
           ' 張',
         themeKeywords
       );
-    } else if (mainWork.relatedLoading) {
-      hint.textContent = '相關載入中…';
     } else {
       hint.textContent = '主作品（尚無相關可左右滑）';
     }
@@ -3290,10 +3057,10 @@
         const chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'kw-chip';
-        chip.textContent = kw;
+        chip.textContent = formatKeywordChip(kw);
         chip.setAttribute('data-kw', kw);
         chip.setAttribute('aria-pressed', 'false');
-        chip.title = kw;
+        chip.title = formatKeywordChip(kw);
         bindWorkAction(chip, () => {
           const on = !selected[kw];
           if (on) selected[kw] = true;
@@ -3806,6 +3573,9 @@
       title: first.title || rec.title || '',
       title_zh: first.title_zh || rec.title_zh || '',
       actress: first.actress || rec.actress || '',
+      actress_zh: first.actress_zh || rec.actress_zh || '',
+      studio: first.studio || rec.studio || '',
+      studio_zh: first.studio_zh || rec.studio_zh || '',
       cover: first.cover || rec.cover || '',
       stills: Array.isArray(first.stills) ? first.stills : (rec.stills || []),
       related_by_title: first.related || rec.related || [],
@@ -3819,6 +3589,9 @@
         title: w.title,
         title_zh: w.title_zh,
         actress: w.actress,
+        actress_zh: w.actress_zh || '',
+        studio: w.studio || '',
+        studio_zh: w.studio_zh || '',
         cid: w.cid,
         cover: w.cover,
         stills: w.stills || [],
@@ -3830,8 +3603,6 @@
         unidentified: !!w.unidentified,
         from_image_index: w.from_image_index || null,
         line: i === 0 ? 'main' : (w.line || 'multi'),
-        preserve_related: true,
-        related_loading: !!w.related_loading,
       })),
     };
   }
@@ -3924,19 +3695,21 @@
     return rec.id;
   }
 
-  function workCanSearchRelated(work) {
-    if (!work) return false;
-    return !!(
-      (work.title && String(work.title).trim()) ||
-      (work.actress && String(work.actress).trim())
-    );
-  }
-
-  /** Re-rank in memory. Does not write the opened history row. */
-  async function recomputeWorkRelated(work) {
-    work = backfillWorkTreeLocal(work) || work;
-    const related = (work && work.related) || [];
-    if (!workCanSearchRelated(work)) return work;
+  async function fillWorkRelatedGaps(work, recId, workIndex) {
+    const before = work;
+    work = backfillWorkTreeLocal(work);
+    if (work !== before) {
+      const localPatch = { stills: work.stills, cid: work.cid };
+      if (Array.isArray(work.related)) localPatch.related = work.related;
+      persistHistoryWork(recId, workIndex, localPatch);
+    }
+    const related = work.related || [];
+    const need =
+      relatedNeedsTitleZh(related) ||
+      relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
+      workNeedsTitleZh(work) ||
+      workNeedsThemeKeywords(work);
+    if (!need) return work;
     try {
       const res = await fetch('/api/related-by-title', {
         method: 'POST',
@@ -3946,69 +3719,35 @@
           code: work.code || '',
           actress: work.actress || '',
           seed: related,
-          upgrade: true,
         }),
       });
       const data = await res.json();
-      if (!data || !data.ok || !Array.isArray(data.related_by_title)) return work;
-      const merged = mergeRelatedUpgrade(related, data.related_by_title);
-      const patch = { related: merged, related_loading: false };
-      const incomingZh = String(data.title_zh || '').trim();
-      if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
-        patch.title_zh = incomingZh;
+      if (data && data.ok && Array.isArray(data.related_by_title)) {
+        const incoming = data.related_by_title;
+        // A saved related list is frozen. A later search must not shrink 14↔9.
+        // Chinese titles may be copied onto the same rows; membership stays.
+        const frozen = relatedHasPersistedMembership(related);
+        const merged = frozen
+          ? applyTitleZhOntoRelated(related, incoming)
+          : (related && related.length
+            ? mergeRelatedIncremental(related, incoming)
+            : slimRelatedForHistory(incoming));
+        const patch = { related: merged, stills: work.stills, cid: work.cid };
+        const incomingZh = String(data.title_zh || '').trim();
+        if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
+          patch.title_zh = incomingZh;
+        }
+        const incomingKw = normalizeKeywordList(data.theme_keywords);
+        if (incomingKw.length) patch.theme_keywords = incomingKw;
+        const incomingQ = normalizeKeywordList(data.keyword_queries);
+        if (incomingQ.length) patch.keyword_queries = incomingQ;
+        work = backfillWorkTreeLocal(Object.assign({}, work, patch));
+        patch.stills = work.stills;
+        patch.related = work.related;
+        persistHistoryWork(recId, workIndex, patch);
       }
-      const incomingKw = normalizeKeywordList(data.theme_keywords);
-      if (incomingKw.length) patch.theme_keywords = incomingKw;
-      const incomingQ = normalizeKeywordList(data.keyword_queries);
-      if (incomingQ.length) patch.keyword_queries = incomingQ;
-      return Object.assign({}, work, patch);
-    } catch (_) {
-      return work;
-    }
-  }
-
-  /**
-   * A changed related set becomes a new history row. The opened row is not
-   * rewritten. An identical code|line list does not append another row.
-   */
-  function commitRelatedUpgrade(source, nextWorks) {
-    if (!source || !Array.isArray(nextWorks) || !nextWorks.length) return null;
-    const nextKey = nextWorks.map((w) => relatedMembershipKey(w && w.related)).join('\n||\n');
-    const prevKey = historyRelatedKey(source);
-    if (nextKey === prevKey) return null;
-    const code = String((nextWorks[0] && nextWorks[0].code) || source.code || '');
-    const list = loadHistory();
-    const duplicate = list.some((rec) => {
-      if (!rec || historyRelatedKey(rec) !== nextKey) return false;
-      const recCode = String((historySessionWorks(rec)[0] || {}).code || rec.code || '');
-      if (!code || !recCode) return true;
-      return codesMatch(code, recCode) || recCode === code;
-    });
-    if (duplicate) return null;
-    const first = nextWorks[0] || {};
-    const rec = {
-      id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
-      ts: Date.now(),
-      kind: source.kind || 'session',
-      ok: source.ok !== false,
-      code: code || source.code || '',
-      title: first.title || source.title || '',
-      title_zh: first.title_zh || source.title_zh || '',
-      cover: first.cover || source.cover || '',
-      stills: first.stills || source.stills || [],
-      actress: first.actress || source.actress || '',
-      userShots: historyUserShots(source),
-      message: source.message || '',
-      related: first.related || [],
-      theme_keywords: first.theme_keywords || source.theme_keywords || [],
-      keyword_queries: first.keyword_queries || source.keyword_queries || [],
-      upgraded_from: source.id,
-      works: nextWorks.map((w) => Object.assign({}, w, { related_loading: false })),
-    };
-    const nextList = loadHistory();
-    nextList.unshift(rec);
-    saveHistory(nextList.slice(0, HISTORY_MAX));
-    return rec.id;
+    } catch (_) {}
+    return work;
   }
 
   function paintHistoryDetail(rec) {
@@ -4067,28 +3806,25 @@
   async function enrichHistoryDetail(rec, id) {
     try {
       const works = historySessionWorks(rec);
+      let changed = false;
       const nextWorks = [];
       for (let i = 0; i < works.length; i++) {
-        nextWorks.push(await recomputeWorkRelated(works[i]));
-      }
-      if (viewingHistoryId !== id) return;
-      const newId = commitRelatedUpgrade(rec, nextWorks);
-      if (viewingHistoryId !== id) return;
-      const showedLoading = historySessionWorks(rec).some(
-        (w) => workCanSearchRelated(w) && !relatedHasPersistedMembership((w && w.related) || [])
-      );
-      if (!newId) {
-        // Leave the screen alone when nothing changed. Repaint only to clear
-        // a loading hint that was drawn for an empty related list.
-        if (showedLoading) {
-          const same = loadHistory().find((x) => x.id === id) || rec;
-          paintHistoryDetail(same);
+        const next = await fillWorkRelatedGaps(works[i], id, i);
+        if (
+          next !== works[i] ||
+          JSON.stringify(next && next.related) !== JSON.stringify(works[i] && works[i].related) ||
+          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '') ||
+          JSON.stringify((next && next.theme_keywords) || []) !==
+            JSON.stringify((works[i] && works[i].theme_keywords) || [])
+        ) {
+          changed = true;
         }
-        return;
+        nextWorks.push(next);
       }
-      viewingHistoryId = newId;
-      const created = loadHistory().find((x) => x.id === newId);
-      if (created) paintHistoryDetail(created);
+      if (viewingHistoryId !== id) return;
+      if (!changed) return;
+      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: nextWorks });
+      paintHistoryDetail(fresh);
     } catch (_) {}
   }
 
@@ -4096,17 +3832,7 @@
     const rec = loadHistory().find((x) => x.id === id);
     if (!rec) return false;
     viewingHistoryId = id;
-    const works = historySessionWorks(rec).map((w) => {
-      if (!w) return w;
-      if (
-        workCanSearchRelated(w) &&
-        !relatedHasPersistedMembership(w.related || [])
-      ) {
-        return Object.assign({}, w, { related_loading: true });
-      }
-      return w;
-    });
-    paintHistoryDetail(Object.assign({}, rec, { works: works }));
+    paintHistoryDetail(rec);
     showScreen('history-detail');
     hideUserShots();
     hideProgress();
@@ -4116,11 +3842,6 @@
 
   async function runIdentify({ images, image, code, title } = {}, myRun) {
     const imgs = images && images.length ? images : image ? [image] : [];
-    stopJobFollow();
-    jobSettled = false;
-    streamAttached = false;
-    clearActiveJob();
-    activeHandleResult = null;
     identifyBusy = true;
     if (imgs.length > 1) batchFiles = imgs.slice();
     const busyMsg = imgs.length > 1
@@ -4180,15 +3901,6 @@
       const hasTitle = !!(data.title && String(data.title).trim());
       const hasResults = Array.isArray(data.results) && data.results.length > 0;
 
-      if (
-        imgs.length > 1 &&
-        isIdentifyServerFailure(data && data.message) &&
-        !(hasResults && data.ok)
-      ) {
-        handleResult(interruptedBatchPayload(imgs, data && data.results));
-        return;
-      }
-
       if (!data.ok || (!hasCode && !hasTitle && !hasResults)) {
         const msg =
           data.message ||
@@ -4199,68 +3911,39 @@
         applyProgressEvent({ step: 'done', status: 'error', detail: msg, progress: 1 });
         progressPanel.setAttribute('aria-busy', 'false');
         setProgressCollapsed(false);
-        if (!isIdentifyServerFailure(msg)) showOcrPrompt(myRun);
+        showOcrPrompt(myRun);
         return;
       }
 
-      const partial = !!(data.partial || data.server_interrupted || data.stalled || data.server_error);
-      const finished = hasResults
-        ? data.results.filter((r) => r && !(r.timed_out || r.timedOut)).length
-        : 0;
-      const total = Number(data.image_count) || (hasResults ? data.results.length : 0);
-      const liveKind = data.server_error
-        ? 'error'
-        : data.stalled || data.server_interrupted
-          ? 'stalled'
-          : 'done';
-      const liveLabel = identifyProgressLabel(liveKind, finished, total);
       applyProgressEvent({
         step: 'done',
-        status: partial ? 'error' : 'done',
-        detail: partial ? data.message || liveLabel : '完成',
+        status: 'done',
+        detail: '完成',
         progress: 1,
       });
-      if (partial) {
-        setStatus(liveLabel, liveKind === 'error' ? 'err' : 'err');
-        updateProgressSummary(liveLabel);
-        if (progressDetailEl && data.message && data.message !== liveLabel) {
-          progressDetailEl.textContent = String(data.message);
-        }
-      }
       const go = () => {
         if (myRun !== runId) return;
         // Keep progress collapsed (not expanded) above gallery; auto-hide shortly
+        setProgressCollapsed(true);
         if (progressPanel) {
           progressPanel.classList.remove('hidden');
+          progressPanel.classList.add('is-complete');
           progressPanel.setAttribute('aria-busy', 'false');
-          if (partial) {
-            setProgressCollapsed(false);
-            progressPanel.classList.add('is-failed', 'is-live');
-            progressPanel.classList.remove('is-complete');
-          } else {
-            setProgressCollapsed(true);
-            progressPanel.classList.add('is-complete');
-          }
         }
         const result = galleryFromIdentify(data);
         renderGallery(result);
-        const allTimedOut =
-          hasResults && data.results.every((r) => r && (r.timed_out || r.timedOut));
-        if (!allTimedOut && !data.server_interrupted) {
-          appendHistoryFromIdentify(data, imgs).catch(() => {});
-        }
+        // Persist history (async thumbs)
+        appendHistoryFromIdentify(data, imgs).catch(() => {});
         // Clear pending selection but keep sticky shots until 重新開始
         clearPending(false);
         // Auto-hide progress so it cannot permanently cover gallery bottom/footer
         const hideRun = myRun;
-        if (!partial) {
-          setTimeout(() => {
-            if (hideRun !== runId) return;
-            if (progressPanel && progressPanel.classList.contains('is-complete')) {
-              hideProgress();
-            }
-          }, 1400);
-        }
+        setTimeout(() => {
+          if (hideRun !== runId) return;
+          if (progressPanel && progressPanel.classList.contains('is-complete')) {
+            hideProgress();
+          }
+        }, 1400);
       };
       setTimeout(go, 280);
     };
@@ -4268,31 +3951,17 @@
     try {
       let data;
       try {
-        activeHandleResult = handleResult;
         const streamed = await apiIdentifyStream({ images: imgs, code, title }, applyProgressEvent);
-        if (myRun !== runId || jobSettled) return;
-        jobSettled = true;
-        stopJobFollow();
-        clearActiveJob();
+        if (myRun !== runId) return;
         data = streamed.data;
       } catch (streamErr) {
-        if (myRun !== runId || jobSettled) return;
-        const streamMsg = (streamErr && streamErr.message) || '';
-        const interrupted =
-          streamMsg === 'stream_incomplete' || (streamErr && streamErr.code === 'stream_interrupted');
-        // The SSE connection died (phone background, proxy, timeout). The job
-        // keeps running on the server. Reconnect to it instead of posting the
-        // whole batch again or calling the miss 查詢不到.
-        if (interrupted && streamErr && streamErr.jobId) {
-          beginJobFollow(streamErr.jobId, imgs.length || streamErr.imageCount || 0, myRun);
-          return;
+        if (myRun !== runId) return;
+        if (streamErr && streamErr.followed) {
+          throw streamErr;
         }
-        // A killed multi-image stream must not start a second full /api/identify.
-        // That second request is what turned the whole batch into 伺服器錯誤.
-        if (imgs.length > 1 && interrupted) {
-          handleResult(interruptedBatchPayload(imgs, streamErr.partialSlots));
-          return;
-        }
+        if (streamErr && streamErr.jobId) {
+          data = await followIdentifyJob(streamErr.jobId, applyProgressEvent);
+        } else {
         const abort = { aborted: false };
         const sim = simulateProgress({ images: imgs, code, title }, abort);
         try {
@@ -4307,25 +3976,16 @@
           abort.aborted = true;
           throw e;
         }
+        }
       }
       handleResult(data);
     } catch (e) {
       if (myRun !== runId) return;
-      const msg = (e && e.message) || String(e);
-      if (e && e.jobId && !jobSettled) {
-        beginJobFollow(e.jobId, imgs.length || e.imageCount || 0, myRun);
-        return;
-      }
-      if (imgs.length > 1 && isIdentifyServerFailure(msg)) {
-        const slots = (e && e.partialSlots) || (e && e.data && e.data.results) || [];
-        handleResult(interruptedBatchPayload(imgs, slots));
-        return;
-      }
       identifyBusy = false;
-      applyProgressEvent({ step: 'done', status: 'error', detail: msg, progress: 1 });
-      setStatus(msg, 'err');
+      applyProgressEvent({ step: 'done', status: 'error', detail: (e && e.message) || String(e), progress: 1 });
+      setStatus((e && e.message) || String(e), 'err');
       progressPanel.setAttribute('aria-busy', 'false');
-      if (!isIdentifyServerFailure(msg)) showOcrPrompt(myRun);
+      showOcrPrompt(myRun);
     }
   }
 
@@ -4691,6 +4351,12 @@
       appendHistoryFromIdentify,
       relatedNeedsTitleZh,
       relatedBucketsNeedFill,
+      showProgress,
+      applyProgressEvent,
+      formatKeywordChip,
+      formatPersonName,
+      resumePayloadFromJob,
+      IDENTIFY_JOB_FOLLOW_MS,
       workNeedsTitleZh,
       workNeedsManualFix,
       batchQueryKeepsFrames,
@@ -4709,25 +4375,6 @@
       shareReadyMessage,
       downloadWorkMedia,
       offerSaveImageFiles,
-      isIdentifyServerFailure,
-      interruptedBatchPayload,
-      identifyProgressLabel,
-      resumePayloadFromJob,
-      showProgress,
-      applyProgressEvent,
     };
   } catch (_) {}
-
-  if (document && typeof document.addEventListener === 'function') {
-    document.addEventListener('visibilitychange', onIdentifyVisibility);
-    document.addEventListener('pageshow', onIdentifyVisibility);
-    document.addEventListener('pagehide', () => {
-      const rec = loadActiveJob();
-      if (rec && rec.jobId && !jobSettled) {
-        rec.hiddenAt = Date.now();
-        saveActiveJob(rec);
-      }
-    });
-  }
-  resumeStoredIdentifyJob();
 })();

@@ -466,11 +466,31 @@ function related(n, line) {
   assert.ok(H.relatedNeedsTitleZh(fullNoZh));
   assert.ok(H.relatedBucketsNeedFill([], { title: 'テーマ' }));
   assert.ok(!H.relatedBucketsNeedFill([], { title: '' }));
-  const shortSaved = related(2, 'theme').concat(related(1, 'keyword'));
-  assert.ok(
-    !H.relatedBucketsNeedFill(shortSaved, { title: 'テーマ', actress: '誰か' }),
-    'a saved short list is finished; caps are maxima'
-  );
+  const shortSaved = related(4, 'theme').concat(related(3, 'keyword'), related(2, 'actress'));
+  assert.strictEqual(shortSaved.length, 9);
+  assert.ok(!H.relatedBucketsNeedFill(shortSaved, { title: '巨乳水泳部', actress: '誰か' }));
+  assert.ok(H.relatedBucketsNeedFill([], { title: '巨乳水泳部', actress: '誰か' }));
+}
+
+// Sub-progress sits beside the active step and does not rewrite identify.
+{
+  H.showProgress();
+  const steps = getEl('progress-steps').children;
+  assert.ok(steps.length >= 4, 'progress rows exist');
+  function row(id) {
+    return steps.find((n) => n.dataset && n.dataset.step === id);
+  }
+  H.applyProgressEvent({ step: 'vision', status: 'active', detail: 'Gemini 看圖辨識中…', progress: 0.2 });
+  assert.strictEqual(row('vision').dataset.phase, '辨識中');
+  H.applyProgressEvent({ step: 'search', status: 'active', detail: '搜尋作品資料…', progress: 0.55 });
+  assert.ok(!row('vision').dataset.phase);
+  assert.strictEqual(row('search').dataset.phase, '目錄查詢');
+  H.applyProgressEvent({ step: 'cover', status: 'active', detail: '抓取封面', progress: 0.88 });
+  assert.strictEqual(row('cover').dataset.phase, '封面鎖定');
+  H.applyProgressEvent({ step: 'done', status: 'active', detail: '為每部作品補齊相關…', progress: 0.94 });
+  assert.strictEqual(row('done').dataset.phase, '相關作品');
+  const phase = (row('done').children || []).find((n) => String(n.className || '').indexOf('step-phase') !== -1);
+  assert.ok(phase && phase.textContent === '相關作品');
   assert.ok(H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '' }));
   assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
 }
@@ -614,7 +634,7 @@ function walkNodes(node, acc) {
 {
   assert.strictEqual(
     H.normalizeKeywordList(['ノーブラ誘惑', '巨乳', '彼女の妹', '彼女', '妹', '誘']).join('・'),
-    'ノーブラ誘惑・巨乳・彼女の妹・彼女・妹'
+    'ノーブラ・誘惑・巨乳・彼女の妹・彼女・妹'
   );
   assert.strictEqual(
     H.normalizeKeywordList(['巨乳', '電車', '彼女', '妹', '彼女の妹']).join('・'),
@@ -632,19 +652,33 @@ function walkNodes(node, acc) {
   );
   assert.strictEqual(
     H.formatKeywordListLabel('關鍵字相關', ['BOD', '中出し']),
-    '關鍵字相關（中出し）'
+    '關鍵字相關（' + H.formatKeywordChip('中出し') + '）'
   );
+  assert.strictEqual(H.formatKeywordChip('ノーブラ'), 'ノーブラ（無胸罩）');
+  assert.strictEqual(H.formatKeywordChip('誘惑'), '誘惑（誘惑）');
+  assert.strictEqual(H.formatKeywordChip('水泳部'), '水泳部（游泳社）');
+  assert.strictEqual(H.formatKeywordChip('合宿'), '合宿（集訓）');
+  assert.strictEqual(H.formatKeywordChip('媚薬'), '媚薬（媚藥）');
+  assert.strictEqual(H.formatKeywordChip('巨乳'), '巨乳（巨乳）');
+  assert.strictEqual(H.formatPersonName('福田ゆあ', ''), '福田ゆあ');
+  assert.ok(H.formatPersonName('福田ゆあ', '').indexOf('（') === -1);
+  assert.strictEqual(H.formatPersonName('福田ゆあ', '福田由愛'), '福田ゆあ（福田由愛）');
+  assert.strictEqual(H.IDENTIFY_JOB_FOLLOW_MS, 4 * 600 * 1000 + 60 * 1000);
+  assert.strictEqual(H.resumePayloadFromJob({ status: 'stalled' }), null);
+  assert.strictEqual(H.resumePayloadFromJob({ status: 'running', result: { ok: true } }), null);
+  const doneJob = H.resumePayloadFromJob({ status: 'done', result: { ok: true, code: 'AAA-001' } });
+  assert.strictEqual(doneJob.code, 'AAA-001');
 }
 
 // Keyword chips on a card that already has a 關鍵字 related section
 {
   assert.strictEqual(
     H.formatKeywordListLabel('關鍵字相關', ['眼鏡', '地味', 'OL']),
-    '關鍵字相關（眼鏡・地味・OL）'
+    '關鍵字相關（' + ['眼鏡', '地味', 'OL'].map(H.formatKeywordChip).join('・') + '）'
   );
   assert.strictEqual(
     H.formatKeywordListLabel('關鍵字再搜', ['眼鏡', '地味']),
-    '關鍵字再搜（眼鏡・地味）'
+    '關鍵字再搜（' + ['眼鏡', '地味'].map(H.formatKeywordChip).join('・') + '）'
   );
   const data = {
     ok: true,
@@ -681,12 +715,14 @@ function walkNodes(node, acc) {
   const labels = nodes
     .filter((n) => n.className === 'kw-related-label')
     .map((n) => n.textContent);
-  assert.ok(labels.indexOf('關鍵字相關（眼鏡・地味・OL）') !== -1, labels.join('|'));
+  const glossed = '關鍵字相關（' + ['眼鏡', '地味', 'OL'].map(H.formatKeywordChip).join('・') + '）';
+  assert.ok(labels.indexOf(glossed) !== -1, labels.join('|'));
   const chips = nodes.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
-  assert.strictEqual(chips.map((c) => c.textContent).join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(chips.map((c) => c.getAttribute('data-kw')).join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(chips.map((c) => c.textContent).join('・'), ['眼鏡', '地味', 'OL'].map(H.formatKeywordChip).join('・'));
   const hint = nodes.find((n) => n.className === 'work-carousel-hint');
   assert.ok(
-    hint && hint.textContent.indexOf('關鍵字相關（眼鏡・地味・OL）') !== -1,
+    hint && hint.textContent.indexOf(glossed) !== -1,
     hint && hint.textContent
   );
   const search = nodes.find((n) => String(n.className || '').indexOf('kw-search') !== -1);
@@ -868,7 +904,8 @@ function walkNodes(node, acc) {
   assert.ok(mainCardClasses.indexOf('work-actions') >= 0);
   assert.ok(mainCardClasses.indexOf('cover-wrap') > mainCardClasses.indexOf('work-actions'));
   const mainChips = walkNodes(blocks[0]).filter((n) => n.getAttribute && n.getAttribute('data-kw') && n.className === 'kw-chip');
-  assert.strictEqual(mainChips.map((c) => c.textContent).join('・'), kws.join('・'));
+  assert.strictEqual(mainChips.map((c) => c.getAttribute('data-kw')).join('・'), kws.join('・'));
+  assert.ok(mainChips.every((c) => c.textContent.indexOf('（') !== -1));
   const mainSlides = walkNodes(blocks[0]).filter((n) => n.className === 'work-carousel-slide');
   mainSlides.slice(1).forEach((slide, i) => {
     const inside = walkNodes(slide).filter((n) => n.getAttribute && n.getAttribute('data-kw'));
@@ -903,7 +940,7 @@ function walkNodes(node, acc) {
   assert.ok(hint && hint.textContent.indexOf('同演員') !== -1, hint && hint.textContent);
   assert.ok(hint && hint.textContent.indexOf('關鍵字') === -1, hint && hint.textContent);
   const stillChips = only.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
-  assert.strictEqual(stillChips.map((c) => c.textContent).join('・'), kws.join('・'));
+  assert.strictEqual(stillChips.map((c) => c.getAttribute('data-kw')).join('・'), kws.join('・'));
 }
 
 // Title display keeps the full Japanese string, including an official internal
@@ -986,7 +1023,7 @@ function walkNodes(node, acc) {
   function chipsOf(block) {
     return walkNodes(block)
       .filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'))
-      .map((n) => n.textContent);
+      .map((n) => n.getAttribute('data-kw'));
   }
   assert.deepStrictEqual(chipsOf(blocks[0]), tutorKws);
   assert.deepStrictEqual(chipsOf(blocks[1]), busKws);
@@ -1157,7 +1194,10 @@ function walkNodes(node, acc) {
       .filter((n) => n.className === 'kw-related-label')
       .map((n) => n.textContent)
       .find((t) => t.indexOf('關鍵字再搜') === 0);
-    assert.strictEqual(researchLabel, '關鍵字再搜（眼鏡・地味）');
+    assert.strictEqual(
+      researchLabel,
+      '關鍵字再搜（' + ['眼鏡', '地味'].map(H.formatKeywordChip).join('・') + '）'
+    );
     const slides = after.filter((n) => n.className === 'kw-research-slide');
     assert.strictEqual(slides.length, 1, 'source work is not repeated in the re-search row');
     const slideHtml = walkNodes(slides[0]).map((n) => n._html || n.textContent || '').join('\n');
@@ -1892,305 +1932,197 @@ function walkNodes(node, acc) {
   assert.strictEqual(H.batchQueryKeepsFrames(5, false, false), false);
   assert.strictEqual(H.batchQueryKeepsFrames(1, true, true), false);
 
-  assert.strictEqual(H.isIdentifyServerFailure('伺服器錯誤'), true);
-  assert.strictEqual(H.isIdentifyServerFailure('伺服器逾時，多圖辨識被中斷'), true);
-  assert.strictEqual(H.isIdentifyServerFailure('未找到番號或片名'), false);
-
-  const fourteen = new Array(14).fill({ name: 'shot.jpg' });
-  const interrupted = H.interruptedBatchPayload(fourteen, [
-    {
-      ok: true,
-      code: 'ABP-123',
-      title: '已完成的一張',
-      from_image_index: 1,
-      timed_out: false,
-    },
-  ]);
-  assert.strictEqual(interrupted.results.length, 14);
-  assert.strictEqual(interrupted.server_interrupted, true);
-  assert.ok(interrupted.message.indexOf('不是查詢不到') !== -1);
-  const gallery = H.galleryFromIdentify(interrupted);
-  assert.strictEqual(gallery.items.length, 14);
-  assert.strictEqual(gallery.items[0].code, 'ABP-123');
-  gallery.items.slice(1).forEach((item) => {
-    assert.strictEqual(item.code, '尚未查完');
-    assert.strictEqual(item.timedOut, true);
-    assert.ok(String(item.message).indexOf('不是查詢不到') !== -1);
-    assert.ok(String(item.message).indexOf('重查') !== -1);
-    assert.notStrictEqual(item.code, '未辨識');
-  });
-
-  assert.strictEqual(H.identifyProgressLabel('running', 0, 14), '還在找');
-  assert.strictEqual(H.identifyProgressLabel('running', 6, 14), '還在找 · 已完成 6／共 14');
-  assert.strictEqual(H.identifyProgressLabel('done', 14, 14), '已完成 14／共 14');
-  assert.strictEqual(H.identifyProgressLabel('done', 6, 14), '已完成 6／共 14 · 其餘可再補');
-  assert.strictEqual(H.identifyProgressLabel('stalled', 6, 14), '卡住或逾時可再補 · 已完成 6／共 14');
-  assert.strictEqual(H.identifyProgressLabel('error', 3, 14), '伺服器錯誤 · 已完成 3／共 14');
-  ['running', 'done', 'stalled', 'error'].forEach((status) => {
-    const label = H.identifyProgressLabel(status, 6, 14);
-    assert.ok(label.indexOf('未找到番號') === -1, label);
-    assert.ok(label.indexOf('查詢不到') === -1, label);
-  });
-
-  const stalledJob = H.resumePayloadFromJob({
-    status: 'stalled',
-    image_count: 14,
-    done_count: 1,
-    slots: [
-      {
-        ok: true,
-        code: 'ABP-123',
-        title: '已完成的一張',
-        from_image_index: 1,
-        timed_out: false,
-      },
-    ],
-  });
-  assert.strictEqual(stalledJob.results.length, 14);
-  assert.strictEqual(stalledJob.results[0].code, 'ABP-123');
-  assert.strictEqual(stalledJob.stalled, true);
-  assert.ok(stalledJob.message.indexOf('卡住或逾時可再補') !== -1);
-  assert.ok(stalledJob.message.indexOf('已完成 1／共 14') !== -1);
-  assert.ok(stalledJob.message.indexOf('未找到番號') === -1);
-  const stalledGallery = H.galleryFromIdentify(stalledJob);
-  assert.strictEqual(stalledGallery.items[0].code, 'ABP-123');
-  stalledGallery.items.slice(1).forEach((item) => {
-    assert.strictEqual(item.code, '尚未查完');
-    assert.strictEqual(item.timedOut, true);
-    assert.ok(String(item.message).indexOf('可再補') !== -1);
-    assert.ok(String(item.message).indexOf('不是查詢不到') !== -1);
-  });
-
-  const errorJob = H.resumePayloadFromJob({
-    status: 'error',
-    image_count: 2,
-    slots: [],
-  });
-  assert.ok(errorJob.message.indexOf('伺服器錯誤') !== -1);
-  assert.ok(errorJob.message.indexOf('未找到番號') === -1);
-  assert.strictEqual(errorJob.results.length, 2);
-
-  // History reopen: identical related does not add a row; a real upgrade does.
+  // Related carousel covers are catalog jackets. The upload preview stays on the main card.
   {
-    function coded(n, line, prefix) {
-      return Array.from({ length: n }, (_, i) => ({
-        code: prefix + '-' + String(i + 1).padStart(3, '0'),
-        title: line + '作品' + (i + 1),
-        title_zh: '中文' + (i + 1),
-        line: line,
-        why: line === 'keyword' ? '關鍵字' : line === 'actress' ? '同女優' : '片名相近',
-        cover: 'https://example.com/' + prefix + i + '.jpg',
-      }));
-    }
-    const nine = coded(9, 'theme', 'THM');
-    assert.strictEqual(nine.length, 9);
-    assert.ok(!H.relatedBucketsNeedFill(nine, { title: '巨乳水泳部員の合宿', actress: '誰か' }));
-
-    function slideCount() {
-      return walkNodes(getEl('history-detail')).filter((n) => n.className === 'work-carousel-slide').length;
-    }
-    function hintText() {
-      const hint = walkNodes(getEl('history-detail')).find((n) => n.className === 'work-carousel-hint');
-      return hint ? String(hint.textContent || '') : '';
-    }
-    function codesOf(rec) {
-      const work = rec && rec.works && rec.works[0];
-      return Array.from((work && work.related) || [], (r) => r.code);
-    }
-
-    function fetchImpl(handler) {
-      context.fetch = (url) => {
-        const u = String(url || '');
-        if (u.indexOf('/api/related-by-title') === -1) {
-          return Promise.resolve({
-            ok: false,
-            arrayBuffer: async () => new ArrayBuffer(0),
-            json: async () => ({}),
-          });
-        }
-        return handler(url);
-      };
-    }
-
-    const sameRecord = {
-      id: 'stable-nine',
-      kind: 'session',
+    const upload = 'data:image/jpeg;base64,UPLOADBYTES';
+    const gallery = H.galleryFromIdentify({
       ok: true,
-      ts: Date.now(),
       code: 'CAMP-100',
-      title: '巨乳水泳部員の合宿',
-      title_zh: '中文主標',
-      cover: 'https://example.com/camp.jpg',
-      theme_keywords: ['合宿', '巨乳'],
+      title: '巨乳水泳部員の媚薬合宿',
+      cover: 'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg',
+      user_preview: upload,
+      related_by_title: [
+        {
+          code: 'BODY-101',
+          title: '巨乳だけの合宿',
+          line: 'keyword',
+          cid: 'body00101',
+          cover: upload,
+          stills: [upload, 'https://pics.dmm.co.jp/digital/video/body101/body101jp-1.jpg'],
+          user_preview: upload,
+        },
+      ],
+    });
+    const main = gallery.items[0];
+    assert.strictEqual(main.cover, 'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg');
+    assert.notStrictEqual(main.cover, upload);
+    assert.ok(main.stills.every((u) => /^https:\/\//.test(u) && u.indexOf('UPLOAD') === -1));
+    const stolen = H.galleryFromIdentify({
+      ok: true,
+      code: 'CAMP-100',
+      title: '巨乳水泳部員の媚薬合宿',
+      cid: 'camp100',
+      cover: upload,
+      stills: [upload],
+      user_preview: upload,
+    });
+    const stolenMain = stolen.items[0];
+    assert.strictEqual(
+      stolenMain.cover,
+      'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg'
+    );
+    assert.notStrictEqual(stolenMain.cover, upload);
+    assert.notStrictEqual(stolenMain.cover, stolenMain.userPreview);
+    assert.ok(stolenMain.stills.length > 0);
+    stolenMain.stills.forEach((u) => {
+      assert.ok(/^https:\/\//.test(u), u);
+      assert.ok(u.indexOf('UPLOAD') === -1, u);
+    });
+    const rel = main.relatedByTitle[0];
+    assert.ok(/^https:\/\//.test(rel.cover), rel.cover);
+    assert.ok(rel.cover.indexOf('body00101') !== -1, rel.cover);
+    assert.strictEqual(rel.userPreview, '');
+    assert.ok(rel.stills.length > 0);
+    rel.stills.forEach((u) => {
+      assert.ok(/^https:\/\//.test(u), u);
+      assert.ok(u.indexOf('UPLOAD') === -1, u);
+    });
+    assert.ok(rel.stills.indexOf('https://pics.dmm.co.jp/digital/video/body101/body101jp-1.jpg') !== -1);
+  }
+
+  // Swim-camp chips render under the main block, not between the title and the cover.
+  {
+    const cover = 'https://pics.dmm.co.jp/digital/video/camp100/camp100pl.jpg';
+    const kws = ['巨乳', '水泳部', '媚薬', '合宿'];
+    H.paintHistoryDetail({
+      id: 'swim-chips',
       works: [
         {
           code: 'CAMP-100',
-          title: '巨乳水泳部員の合宿',
-          title_zh: '中文主標',
-          actress: '誰か',
-          cover: 'https://example.com/camp.jpg',
-          theme_keywords: ['合宿', '巨乳'],
-          related: nine,
+          title: '巨乳水泳部員の媚薬合宿記録',
           line: 'main',
+          cover: cover,
+          theme_keywords: kws,
+          related: [
+            {
+              code: 'BODY-M',
+              title: '巨乳の媚薬',
+              line: 'keyword',
+              why: '關鍵字',
+              cover: cover,
+            },
+          ],
         },
       ],
-    };
-
-    fetchImpl(() =>
-      Promise.resolve({
-        ok: true,
-        json: async () => ({
-          ok: true,
-          related_by_title: nine.map((r) => Object.assign({}, r)),
-        }),
-      })
-    );
-    H.saveHistory([sameRecord]);
-    assert.strictEqual(H.loadHistory().length, 1);
-    assert.strictEqual(H.openHistoryDetail('stable-nine'), true);
-    assert.strictEqual(slideCount(), 10, 'opened row still shows every saved related card');
-    await new Promise((r) => setTimeout(r, 40));
-    assert.strictEqual(H.loadHistory().length, 1, 'unchanged related does not append a row');
-    const savedNine = H.loadHistory().find((r) => r.id === 'stable-nine');
-    assert.deepStrictEqual(codesOf(savedNine), nine.map((r) => r.code));
-    H.openHistoryDetail('stable-nine');
-    await new Promise((r) => setTimeout(r, 40));
-    assert.strictEqual(H.loadHistory().length, 1, 'tapping the same row again still does not append');
-
-    const extra = coded(2, 'keyword', 'KEY');
-    fetchImpl(() =>
-      Promise.resolve({
-        ok: true,
-        json: async () => ({
-          ok: true,
-          related_by_title: extra,
-          theme_keywords: ['巨乳', '合宿', '媚薬漬け'],
-          keyword_queries: ['媚薬漬け', '巨乳', '合宿'],
-        }),
-      })
-    );
-    H.saveHistory([JSON.parse(JSON.stringify(sameRecord))]);
-    assert.strictEqual(H.loadHistory().length, 1);
-    H.openHistoryDetail('stable-nine');
-    await new Promise((r) => setTimeout(r, 40));
-    const afterUpgrade = H.loadHistory();
-    assert.strictEqual(afterUpgrade.length, 2, 'a changed related set adds one new row');
-    const oldRow = afterUpgrade.find((r) => r.id === 'stable-nine');
-    assert.ok(oldRow, 'opened row is still in history');
-    assert.deepStrictEqual(codesOf(oldRow), nine.map((r) => r.code), 'old row membership is untouched');
-    const newRow = afterUpgrade.find((r) => r.id !== 'stable-nine');
-    assert.ok(newRow && newRow.id !== 'stable-nine');
-    const newCodes = codesOf(newRow);
-    nine.forEach((r) => assert.ok(newCodes.indexOf(r.code) !== -1, r.code));
-    extra.forEach((r) => assert.ok(newCodes.indexOf(r.code) !== -1, r.code));
-    assert.ok(newCodes.indexOf('KEY-001') < newCodes.indexOf('THM-001'), newCodes.join(','));
-    H.openHistoryDetail(newRow.id);
-    await new Promise((r) => setTimeout(r, 40));
-    assert.strictEqual(H.loadHistory().length, 2, 'reopening the upgraded row does not duplicate it');
-    H.openHistoryDetail('stable-nine');
-    await new Promise((r) => setTimeout(r, 40));
-    assert.strictEqual(H.loadHistory().length, 2, 'reopening the old row does not append the same upgrade again');
-    assert.deepStrictEqual(
-      codesOf(H.loadHistory().find((r) => r.id === 'stable-nine')),
-      nine.map((r) => r.code)
-    );
-
-    let releaseFetch;
-    const gate = new Promise((resolve) => {
-      releaseFetch = resolve;
     });
-    fetchImpl(() =>
-      gate.then(() => ({
-        ok: true,
-        json: async () => ({
-          ok: true,
-          related_by_title: nine,
-          theme_keywords: ['合宿', '巨乳'],
-          keyword_queries: ['媚薬漬け', '巨乳', '水泳部員', '合宿'],
-        }),
-      }))
-    );
+    const block = walkNodes(getEl('history-detail')).find((n) => n.className === 'work-carousel-block');
+    assert.ok(block);
+    const kids = (block.children || []).map((c) => c.className);
+    assert.ok(kids.indexOf('kw-related-panel') > kids.indexOf('work-main-section'), kids.join('|'));
+    const flat = walkNodes(block);
+    const at = (cls) => flat.findIndex((n) => n.className === cls);
+    assert.ok(at('card-title') < at('cover-wrap'));
+    assert.ok(at('cover-wrap') < at('kw-chip-row'));
+    const chips = flat.filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'));
+    assert.strictEqual(chips.map((c) => c.getAttribute('data-kw')).join('・'), kws.join('・'));
+    assert.ok(chips.every((c) => String(c.textContent).indexOf('（') !== -1), chips.map((c) => c.textContent).join('|'));
+    const card = flat.find((n) => String(n.className || '').indexOf('card') === 0);
+    assert.ok(card);
+    assert.ok(!(card.children || []).some((c) => c.className === 'kw-chip-row'));
+  }
+
+  // Split ノーブラ / 誘惑 chips, catalog title parentheses, actress only with a real CN name.
+  {
+    const cover = 'https://pics.dmm.co.jp/digital/video/mida00616/mida00616pl.jpg';
+    const ja = '彼女の妹のノーブラ誘惑に負け巨乳';
+    const zh = '女友妹妹的誘惑';
+    H.paintHistoryDetail({
+      id: 'nobura-split',
+      works: [
+        {
+          code: 'MIDA-616',
+          title: ja,
+          title_zh: zh,
+          actress: '福田ゆあ',
+          actress_zh: '福田由愛',
+          studio: 'MOODYZ',
+          line: 'main',
+          cover: cover,
+          theme_keywords: ['ノーブラ誘惑', '巨乳'],
+          related: [
+            {
+              code: 'REL-001',
+              title: '巨乳の合宿',
+              title_zh: '巨乳集訓',
+              line: 'keyword',
+              why: '關鍵字',
+              cover: cover,
+              matched_keywords: ['ノーブラ', '誘惑'],
+            },
+          ],
+        },
+      ],
+    });
+    const block = walkNodes(getEl('history-detail')).find((n) => n.className === 'work-carousel-block');
+    const chips = walkNodes(block).filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'));
+    assert.deepStrictEqual(chips.map((c) => c.getAttribute('data-kw')), ['ノーブラ', '誘惑', '巨乳']);
+    assert.strictEqual(chips[0].textContent, 'ノーブラ（無胸罩）');
+    assert.strictEqual(chips[1].textContent, '誘惑（誘惑）');
+    const titles = walkNodes(block).filter((n) => n.className === 'card-title').map((n) => n.textContent);
+    assert.ok(titles[0].indexOf(ja) === 0, titles[0]);
+    assert.ok(titles[0].indexOf('（' + zh + '）') !== -1, titles[0]);
+    assert.ok(titles[1].indexOf('巨乳の合宿（巨乳集訓）') !== -1, titles[1]);
+    const actress = walkNodes(block).find((n) => n.className === 'card-actress');
+    assert.ok(actress && actress.textContent.indexOf('福田ゆあ（福田由愛）') !== -1, actress && actress.textContent);
+    const hits = walkNodes(block).filter((n) => n.className === 'card-hit-kw').map((n) => n.textContent);
+    assert.ok(hits.indexOf('ノーブラ（無胸罩）') !== -1, hits.join('|'));
+    assert.ok(hits.indexOf('誘惑（誘惑）') !== -1, hits.join('|'));
+  }
+
+  // Reopening a saved related list must not refetch it down from 14 to 9.
+  {
+    const fourteen = Array.from({ length: 14 }, (_, i) => ({
+      code: 'KEEP-' + String(i + 1).padStart(3, '0'),
+      title: 'Saved ' + (i + 1),
+      title_zh: '',
+      line: i < 5 ? 'theme' : i < 10 ? 'keyword' : 'actress',
+      why: i < 5 ? '片名相近' : i < 10 ? '關鍵字' : '同女優',
+      cover: 'https://pics.dmm.co.jp/digital/video/keep00' + (i + 1) + '/kpl.jpg',
+    }));
+    assert.ok(!H.relatedBucketsNeedFill(fourteen, { title: '巨乳水泳部員の媚薬合宿', actress: '誰か' }));
     H.saveHistory([
       {
-        id: 'empty-related',
-        kind: 'session',
+        id: 'freeze-14',
         ok: true,
-        code: 'CAMP-200',
-        title: '巨乳水泳部員 媚薬漬け合宿',
-        title_zh: '中文主標',
-        cover: 'https://example.com/camp2.jpg',
+        code: 'CAMP-100',
+        title: '巨乳水泳部員の媚薬合宿記録',
+        title_zh: '合宿',
         works: [
           {
-            code: 'CAMP-200',
-            title: '巨乳水泳部員 媚薬漬け合宿',
-            title_zh: '中文主標',
-            cover: 'https://example.com/camp2.jpg',
-            related: [],
+            code: 'CAMP-100',
+            title: '巨乳水泳部員の媚薬合宿記録',
+            title_zh: '合宿',
+            theme_keywords: ['巨乳', '水泳部', '媚薬', '合宿'],
+            related: fourteen,
             line: 'main',
           },
         ],
       },
     ]);
-    H.openHistoryDetail('empty-related');
-    assert.ok(hintText().indexOf('相關載入中') !== -1, hintText());
-    assert.strictEqual(slideCount(), 1, 'do not paint a partial carousel while loading');
-    releaseFetch();
-    await new Promise((r) => setTimeout(r, 40));
-    const emptyList = H.loadHistory();
-    assert.strictEqual(emptyList.length, 2, 'filling empty related writes a new row');
-    const emptyOld = emptyList.find((r) => r.id === 'empty-related');
-    assert.deepStrictEqual(codesOf(emptyOld), []);
-    const emptyNew = emptyList.find((r) => r.id !== 'empty-related');
-    assert.strictEqual(codesOf(emptyNew).length, 9);
-    assert.strictEqual(slideCount(), 10);
-    assert.ok(hintText().indexOf('相關載入中') === -1);
-    H.openHistoryDetail('empty-related');
-    await new Promise((r) => setTimeout(r, 40));
-    assert.strictEqual(H.loadHistory().length, 2, 'the same fill does not append a second copy');
-    assert.deepStrictEqual(codesOf(H.loadHistory().find((r) => r.id === 'empty-related')), []);
-  }
-
-  {
-    const steps = context.document.getElementById('progress-steps');
-    steps.querySelector = function (sel) {
-      const m = /\[data-step="([^"]+)"\]/.exec(String(sel || ''));
-      if (!m) return null;
-      return (this.children || []).find((c) => c.dataset && c.dataset.step === m[1]) || null;
-    };
-    steps.querySelectorAll = function () {
-      return this.children || [];
-    };
-    H.showProgress([
-      { id: 'vision', label: '看圖辨識（Gemini）' },
-      { id: 'search', label: '搜尋作品資料' },
-      { id: 'done', label: '完成，進入畫廊' },
-    ]);
-    H.applyProgressEvent({
-      step: 'vision',
-      status: 'active',
-      phase: '辨識中',
-      detail: '辨識第 1/4 張…',
+    context.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        related_by_title: related(3, 'keyword').concat(related(2, 'theme'), related(1, 'actress')),
+      }),
     });
-    const vision = steps.children.find((c) => c.dataset.step === 'vision');
-    assert.ok(vision, 'vision step row');
-    assert.strictEqual(vision.dataset.phase, '辨識中');
-    assert.ok(String(vision.textContent).indexOf('辨識中') !== -1, vision.textContent);
-    assert.ok(String(vision.innerHTML).indexOf('看圖辨識') !== -1, vision.innerHTML);
-    const detail = context.document.getElementById('progress-detail');
-    assert.ok(String(detail.textContent).indexOf('辨識第 1/4') !== -1);
-    H.applyProgressEvent({
-      step: 'search',
-      status: 'active',
-      phase: '目錄查詢',
-      detail: '搜尋第 2/4 張…',
-    });
-    const search = steps.children.find((c) => c.dataset.step === 'search');
-    assert.strictEqual(search.dataset.phase, '目錄查詢');
-    assert.ok(!vision.dataset.phase, 'only the active step keeps the sub-progress');
-    H.applyProgressEvent({ step: 'done', status: 'active', phase: '相關作品', detail: '相關作品 1/4…' });
-    const done = steps.children.find((c) => c.dataset.step === 'done');
-    assert.strictEqual(done.dataset.phase, '相關作品');
-    assert.ok(!search.dataset.phase);
+    H.openHistoryDetail('freeze-14');
+    await new Promise((r) => setTimeout(r, 40));
+    const rec = H.loadHistory().find((x) => x.id === 'freeze-14');
+    assert.ok(rec && rec.works && rec.works[0]);
+    assert.strictEqual((rec.works[0].related || []).length, 14, 'saved related count stays 14');
+    assert.strictEqual(rec.works[0].related[0].code, 'KEEP-001');
+    assert.strictEqual(rec.works[0].related[13].code, 'KEEP-014');
   }
 
   console.log('test_history_session.js: ok');

@@ -3,9 +3,6 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-# 240s is the worker wall. Identify itself no longer stops on a shared
-# clock; each upload finishes vision, catalog, and jacket lock, then
-# related runs on its own clock.
-startCommand = "sh -c 'gunicorn -b 0.0.0.0:${PORT:-8080} -w 2 --timeout 240 --graceful-timeout 30 server:app'"
+startCommand = "sh -c 'gunicorn -b 0.0.0.0:${PORT:-8080} -w 2 --timeout 2400 server:app'"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
