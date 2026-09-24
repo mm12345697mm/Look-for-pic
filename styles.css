@@ -522,8 +522,10 @@ label.btn {
   text-overflow: ellipsis;
   max-width: 100%;
 }
-.progress-panel.is-collapsed .progress-summary {
+.progress-panel.is-collapsed .progress-summary,
+.progress-panel.is-live .progress-summary {
   display: block;
+  white-space: normal;
 }
 .progress-panel.is-collapsed .progress-title {
   font-size: 0.82rem;

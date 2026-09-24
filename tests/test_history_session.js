@@ -1915,6 +1915,56 @@ function walkNodes(node, acc) {
     assert.notStrictEqual(item.code, '未辨識');
   });
 
+  assert.strictEqual(H.identifyProgressLabel('running', 0, 14), '還在找');
+  assert.strictEqual(H.identifyProgressLabel('running', 6, 14), '還在找 · 已完成 6／共 14');
+  assert.strictEqual(H.identifyProgressLabel('done', 14, 14), '已完成 14／共 14');
+  assert.strictEqual(H.identifyProgressLabel('done', 6, 14), '已完成 6／共 14 · 其餘可再補');
+  assert.strictEqual(H.identifyProgressLabel('stalled', 6, 14), '卡住或逾時可再補 · 已完成 6／共 14');
+  assert.strictEqual(H.identifyProgressLabel('error', 3, 14), '伺服器錯誤 · 已完成 3／共 14');
+  ['running', 'done', 'stalled', 'error'].forEach((status) => {
+    const label = H.identifyProgressLabel(status, 6, 14);
+    assert.ok(label.indexOf('未找到番號') === -1, label);
+    assert.ok(label.indexOf('查詢不到') === -1, label);
+  });
+
+  const stalledJob = H.resumePayloadFromJob({
+    status: 'stalled',
+    image_count: 14,
+    done_count: 1,
+    slots: [
+      {
+        ok: true,
+        code: 'ABP-123',
+        title: '已完成的一張',
+        from_image_index: 1,
+        timed_out: false,
+      },
+    ],
+  });
+  assert.strictEqual(stalledJob.results.length, 14);
+  assert.strictEqual(stalledJob.results[0].code, 'ABP-123');
+  assert.strictEqual(stalledJob.stalled, true);
+  assert.ok(stalledJob.message.indexOf('卡住或逾時可再補') !== -1);
+  assert.ok(stalledJob.message.indexOf('已完成 1／共 14') !== -1);
+  assert.ok(stalledJob.message.indexOf('未找到番號') === -1);
+  const stalledGallery = H.galleryFromIdentify(stalledJob);
+  assert.strictEqual(stalledGallery.items[0].code, 'ABP-123');
+  stalledGallery.items.slice(1).forEach((item) => {
+    assert.strictEqual(item.code, '尚未查完');
+    assert.strictEqual(item.timedOut, true);
+    assert.ok(String(item.message).indexOf('可再補') !== -1);
+    assert.ok(String(item.message).indexOf('不是查詢不到') !== -1);
+  });
+
+  const errorJob = H.resumePayloadFromJob({
+    status: 'error',
+    image_count: 2,
+    slots: [],
+  });
+  assert.ok(errorJob.message.indexOf('伺服器錯誤') !== -1);
+  assert.ok(errorJob.message.indexOf('未找到番號') === -1);
+  assert.strictEqual(errorJob.results.length, 2);
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

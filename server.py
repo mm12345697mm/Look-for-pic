@@ -556,6 +556,290 @@ def owner_identify_session_detail(session_id: str):
     return jsonify({"ok": True, "session": row})
 
 
+# In-flight identify jobs. The phone WebView often kills the SSE connection
+# when the app is backgrounded; the pipeline keeps running in this process
+# and any worker can read the same file on reconnect.
+IDENTIFY_JOB_MAX = 24
+IDENTIFY_JOB_STALE_S = 90.0
+IDENTIFY_JOB_TTL_S = 7200.0
+_IDENTIFY_JOBS_PATH: Path | None = None
+_IDENTIFY_JOBS_LOCK = threading.Lock()
+
+
+def _identify_jobs_resolve_path() -> Path:
+    global _IDENTIFY_JOBS_PATH
+    if _IDENTIFY_JOBS_PATH is not None:
+        return _IDENTIFY_JOBS_PATH
+    preferred = ROOT / "data" / "identify-jobs.json"
+    fallback = Path("/tmp/lfp-identify-jobs.json")
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        probe = preferred.parent / ".identify-jobs-writetest"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        _IDENTIFY_JOBS_PATH = preferred
+    except Exception:
+        _IDENTIFY_JOBS_PATH = fallback
+    return _IDENTIFY_JOBS_PATH
+
+
+def _identify_jobs_read(path: Path) -> list[dict]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        return []
+    rows = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+
+
+def _identify_jobs_write(path: Path, jobs: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    fresh = []
+    for row in jobs:
+        try:
+            created = float(row.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        if created and (now - created) > IDENTIFY_JOB_TTL_S:
+            continue
+        fresh.append(row)
+    fresh = fresh[:IDENTIFY_JOB_MAX]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps({"jobs": fresh}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def _identify_jobs_mutate(job_id: str, fn) -> dict | None:
+    sid = (job_id or "").strip()
+    if not sid:
+        return None
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                jobs = _identify_jobs_read(path)
+                found = next((row for row in jobs if row.get("id") == sid), None)
+                if found is None:
+                    return None
+                fn(found)
+                _identify_jobs_write(path, jobs)
+                return found
+        except Exception:
+            return None
+
+
+def _job_done_count(slots: list | None) -> int:
+    return sum(1 for slot in (slots or []) if isinstance(slot, dict) and not slot.get("timed_out"))
+
+
+def identify_progress_label(status: str, done: int, total: int) -> str:
+    """Honest Traditional Chinese status. Never a 查詢不到 stand-in."""
+    done_n = max(0, int(done or 0))
+    total_n = max(0, int(total or 0))
+    count = f"已完成 {done_n}／共 {total_n}" if total_n else ""
+    if status == "running":
+        return f"還在找 · {count}" if count and done_n else "還在找"
+    if status == "stalled":
+        return f"卡住或逾時可再補 · {count}" if count else "卡住或逾時可再補"
+    if status == "error":
+        return f"伺服器錯誤 · {count}" if count else "伺服器錯誤"
+    if total_n and done_n < total_n:
+        return f"{count} · 其餘可再補" if count else "其餘可再補"
+    return count or "已完成"
+
+
+def _json_safe(value):
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        return None
+
+
+def identify_job_create(image_count: int) -> str | None:
+    """Record a job before the pipeline starts. Fail-soft if the file cannot be written."""
+    now = time.time()
+    job_id = "job_" + _secrets.token_hex(12)
+    total = max(0, int(image_count or 0))
+    job = {
+        "id": job_id,
+        "status": "running",
+        "image_count": total,
+        "done_count": 0,
+        "created_at": now,
+        "updated_at": now,
+        "progress": {
+            "step": "receive",
+            "status": "active",
+            "detail": "還在找",
+            "progress": 0.02,
+        },
+        "slots": [],
+        "result": None,
+        "http_status": None,
+        "message": identify_progress_label("running", 0, total),
+    }
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                jobs = _identify_jobs_read(path)
+                jobs.insert(0, job)
+                _identify_jobs_write(path, jobs)
+            return job_id
+        except Exception:
+            return None
+
+
+def identify_job_touch(job_id: str) -> None:
+    """Heartbeat so a long vision call is not treated as a dead job."""
+
+    def mutate(job: dict) -> None:
+        if job.get("status") == "running":
+            job["updated_at"] = time.time()
+
+    _identify_jobs_mutate(job_id, mutate)
+
+
+def identify_job_note(job_id: str, evt: dict | None) -> None:
+    """Fold one progress event into the job. Slots stay client-safe (no image bytes)."""
+    evt = evt if isinstance(evt, dict) else {}
+
+    def mutate(job: dict) -> None:
+        if job.get("status") != "running":
+            return
+        job["updated_at"] = time.time()
+        progress = {}
+        for key in ("step", "status", "detail", "progress"):
+            if key in evt:
+                progress[key] = evt.get(key)
+        if progress:
+            job["progress"] = progress
+        slot = evt.get("slot")
+        if isinstance(slot, dict):
+            safe = _client_slot(slot)
+            slots = [row for row in (job.get("slots") or []) if isinstance(row, dict)]
+            idx = safe.get("from_image_index")
+            if idx is None:
+                slots.append(safe)
+            else:
+                replaced = False
+                for i, prev in enumerate(slots):
+                    if prev.get("from_image_index") == idx:
+                        slots[i] = safe
+                        replaced = True
+                        break
+                if not replaced:
+                    slots.append(safe)
+            job["slots"] = slots
+        job["done_count"] = _job_done_count(job.get("slots"))
+        job["message"] = identify_progress_label(
+            "running",
+            job["done_count"],
+            int(job.get("image_count") or 0),
+        )
+
+    _identify_jobs_mutate(job_id, mutate)
+
+
+def identify_job_finish(job_id: str, result: dict | None, http_status: int) -> None:
+    status_code = int(http_status or 200)
+    safe_result = _json_safe(result) if isinstance(result, dict) else None
+    failed = status_code >= 500 or (
+        isinstance(safe_result, dict) and safe_result.get("ok") is False and not safe_result.get("results")
+    )
+
+    def mutate(job: dict) -> None:
+        slots = []
+        if isinstance(safe_result, dict):
+            for row in safe_result.get("results") or []:
+                if isinstance(row, dict):
+                    slots.append(_client_slot(row))
+            if not slots and (safe_result.get("code") or safe_result.get("title")):
+                slots.append(_client_slot(safe_result))
+        if slots:
+            job["slots"] = slots
+        job["done_count"] = _job_done_count(job.get("slots"))
+        job["status"] = "error" if failed else "done"
+        job["http_status"] = status_code
+        job["result"] = safe_result
+        job["updated_at"] = time.time()
+        job["message"] = identify_progress_label(
+            job["status"],
+            int(job.get("done_count") or 0),
+            int(job.get("image_count") or 0),
+        )
+
+    _identify_jobs_mutate(job_id, mutate)
+
+
+def identify_job_public(job_id: str) -> dict | None:
+    sid = (job_id or "").strip()
+    if not sid:
+        return None
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            rows = _identify_jobs_read(path)
+        except Exception:
+            return None
+    job = next((row for row in rows if row.get("id") == sid), None)
+    if not job:
+        return None
+    status = str(job.get("status") or "running")
+    try:
+        updated = float(job.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated = 0.0
+    stale = status == "running" and updated > 0 and (time.time() - updated) > float(IDENTIFY_JOB_STALE_S)
+    view = "stalled" if stale else status
+    done = int(job.get("done_count") or 0)
+    total = int(job.get("image_count") or 0)
+    out = {
+        "id": job.get("id"),
+        "status": view,
+        "stale": bool(stale),
+        "image_count": total,
+        "done_count": done,
+        "message": identify_progress_label(view, done, total),
+        "progress": job.get("progress") if isinstance(job.get("progress"), dict) else {},
+        "slots": [row for row in (job.get("slots") or []) if isinstance(row, dict)],
+        "updated_at": updated,
+    }
+    if view in {"done", "error"}:
+        out["result"] = job.get("result")
+        out["http_status"] = job.get("http_status") or (500 if view == "error" else 200)
+    return out
+
+
+@app.get("/api/identify/jobs/<job_id>")
+def identify_job_status(job_id: str):
+    """Reconnect target after the phone backgrounds and the SSE connection dies."""
+    job = identify_job_public(job_id)
+    if not job:
+        return jsonify({"ok": False, "message": "找不到這次查詢"}), 404
+    return jsonify({"ok": True, "job": job})
+
+
 @app.route("/d/<token>")
 def owner_unlock(token: str):
     """Bookmark this URL on your phone once → later visits skip the share password."""
@@ -12209,6 +12493,7 @@ def identify_stream():
     user_title = (request.form.get("title") or "").strip()
     images = collect_images_from_request()
     n_images = len(images)
+    job_id = identify_job_create(n_images)
 
     def generate():
         import queue
@@ -12217,9 +12502,22 @@ def identify_stream():
         q: queue.Queue = queue.Queue()
 
         def on_progress(evt: dict) -> None:
+            if job_id:
+                try:
+                    identify_job_note(job_id, evt)
+                except Exception:
+                    pass
             q.put(("progress", evt))
 
         def worker() -> None:
+            stop_hb = threading.Event()
+
+            def heartbeat() -> None:
+                while not stop_hb.wait(15):
+                    if job_id:
+                        identify_job_touch(job_id)
+
+            threading.Thread(target=heartbeat, daemon=True).start()
             try:
                 if n_images > 1:
                     result, status = run_multi_identify_pipeline(
@@ -12247,19 +12545,31 @@ def identify_stream():
                     )
                     # related already attached in pipeline
                 result = _ensure_identify_session(result, images)
+                if job_id:
+                    try:
+                        identify_job_finish(job_id, result, status)
+                    except Exception:
+                        pass
                 q.put(("result", {"type": "result", "data": result, "status": status}))
             except Exception as e:
+                err = empty_identify(message=f"伺服器錯誤：{e}")
+                if job_id:
+                    try:
+                        identify_job_finish(job_id, err, 500)
+                    except Exception:
+                        pass
                 q.put(
                     (
                         "result",
                         {
                             "type": "result",
-                            "data": empty_identify(message=f"伺服器錯誤：{e}"),
+                            "data": err,
                             "status": 500,
                         },
                     )
                 )
             finally:
+                stop_hb.set()
                 q.put(("end", None))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -12276,6 +12586,20 @@ def identify_stream():
             ]
         else:
             steps = [{"id": s, "label": l} for s, l in IDENTIFY_STEPS]
+        if job_id:
+            yield (
+                "data: "
+                + json.dumps(
+                    {
+                        "type": "job",
+                        "job_id": job_id,
+                        "image_count": n_images,
+                        "message": "還在找",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
         yield f"data: {json.dumps({'type': 'steps', 'steps': steps}, ensure_ascii=False)}\n\n"
 
         while True:

@@ -8,8 +8,11 @@ stop on its own clock and return the slots it finished.
 from __future__ import annotations
 
 import io
+import json
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from PIL import Image
@@ -222,8 +225,157 @@ class TestStreamKeepsProgress(unittest.TestCase):
         self.assertIn("text/event-stream", (res.content_type or ""))
         self.assertIn(": keepalive", body)
         self.assertIn("搜尋第 1 張", body)
+        self.assertIn('"type": "job"', body)
         self.assertIn('"type": "result"', body)
+        self.assertIn("還在找", body)
         self.assertIn("SER-001", body)
+        job_id = ""
+        for chunk in body.split("\n\n"):
+            line = next((ln[5:].strip() for ln in chunk.split("\n") if ln.startswith("data:")), "")
+            if not line:
+                continue
+            try:
+                evt = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if evt.get("type") == "job":
+                job_id = str(evt.get("job_id") or "")
+        self.assertTrue(job_id.startswith("job_"), body[:400])
+        stored = S.identify_job_public(job_id)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.get("status"), "done")
+        self.assertIn("SER-001", json.dumps(stored.get("result"), ensure_ascii=False))
+        self.assertNotIn("查詢不到", stored.get("message") or "")
+
+
+class TestIdentifyJobResume(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._prev = S._IDENTIFY_JOBS_PATH
+        S._IDENTIFY_JOBS_PATH = Path(self.tmp.name) / "identify-jobs.json"
+
+    def tearDown(self):
+        S._IDENTIFY_JOBS_PATH = self._prev
+        self.tmp.cleanup()
+
+    def test_running_job_reports_progress_without_a_guessed_code(self):
+        job_id = S.identify_job_create(14)
+        self.assertTrue(job_id)
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "done",
+                "detail": "一張完成",
+                "progress": 0.6,
+                "slot": {
+                    "ok": True,
+                    "code": "ABP-123",
+                    "title": "已完成的一張",
+                    "from_image_index": 1,
+                    "timed_out": False,
+                    "image_bytes": b"not-for-the-client",
+                },
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "done",
+                "detail": "時間不夠",
+                "progress": 0.7,
+                "slot": {
+                    "ok": True,
+                    "code": "TITLE-SEARCH",
+                    "title": "（這張尚未查完）",
+                    "from_image_index": 2,
+                    "timed_out": True,
+                    "message": "請再上傳這張重查一次。不是查詢不到。",
+                },
+            },
+        )
+        view = S.identify_job_public(job_id)
+        self.assertEqual(view["status"], "running")
+        self.assertFalse(view["stale"])
+        self.assertEqual(view["done_count"], 1)
+        self.assertEqual(view["image_count"], 14)
+        self.assertIn("還在找", view["message"])
+        self.assertIn("已完成 1／共 14", view["message"])
+        self.assertNotIn("查詢不到", view["message"])
+        self.assertNotIn("未找到番號", view["message"])
+        blob = json.dumps(view, ensure_ascii=False)
+        self.assertNotIn("not-for-the-client", blob)
+        self.assertEqual(view["slots"][0]["code"], "ABP-123")
+        self.assertTrue(view["slots"][1]["timed_out"])
+
+    def test_quiet_job_is_stalled_not_a_miss(self):
+        job_id = S.identify_job_create(8)
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "done",
+                "slot": {
+                    "ok": True,
+                    "code": "SER-004",
+                    "title": "鎖定的一張",
+                    "from_image_index": 4,
+                    "timed_out": False,
+                    "visual_lock": True,
+                },
+            },
+        )
+
+        def age(job):
+            job["updated_at"] = time.time() - (S.IDENTIFY_JOB_STALE_S + 5)
+
+        S._identify_jobs_mutate(job_id, age)
+        view = S.identify_job_public(job_id)
+        self.assertEqual(view["status"], "stalled")
+        self.assertTrue(view["stale"])
+        self.assertIn("卡住或逾時可再補", view["message"])
+        self.assertIn("已完成 1／共 8", view["message"])
+        self.assertEqual(view["slots"][0]["code"], "SER-004")
+        self.assertNotIn("result", view)
+        self.assertNotIn("查詢不到", view["message"])
+
+    def test_finish_keeps_the_pipeline_result(self):
+        job_id = S.identify_job_create(2)
+        S.identify_job_finish(
+            job_id,
+            {
+                "ok": True,
+                "multi": True,
+                "partial": True,
+                "image_count": 2,
+                "results": [
+                    {"ok": True, "code": "SER-004", "title": "鎖定", "from_image_index": 1},
+                    {
+                        "ok": True,
+                        "code": "TITLE-SEARCH",
+                        "title": "（這張尚未查完）",
+                        "from_image_index": 2,
+                        "timed_out": True,
+                    },
+                ],
+                "message": "多圖辨識",
+            },
+            200,
+        )
+        view = S.identify_job_public(job_id)
+        self.assertEqual(view["status"], "done")
+        self.assertEqual(view["done_count"], 1)
+        self.assertIn("其餘可再補", view["message"])
+        self.assertEqual(view["result"]["results"][0]["code"], "SER-004")
+        client = S.app.test_client()
+        res = client.get("/api/identify/jobs/" + job_id)
+        self.assertEqual(res.status_code, 200)
+        body = res.get_json()
+        self.assertTrue(body["ok"])
+        self.assertEqual(body["job"]["id"], job_id)
+        missing = client.get("/api/identify/jobs/job_missing")
+        self.assertEqual(missing.status_code, 404)
 
 
 class TestCoverCache(unittest.TestCase):
