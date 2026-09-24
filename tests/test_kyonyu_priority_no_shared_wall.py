@@ -587,15 +587,25 @@ class TestZhCatalogByCode(unittest.TestCase):
     """品番 pages on MissAV /cn/ and Jable fill 日文（中文）. No invented gloss."""
 
     def test_missav_cn_fills_title_and_actress(self):
+        seen = []
+
         def fake_get(url, timeout=8.0, headers=None, **kwargs):
+            seen.append(url)
             if url == "https://missav.ai/cn/mida-616":
                 return MISSAV_CN_HTML
+            if url == "https://jable.tv/videos/mida-616/":
+                return None
             raise AssertionError(url)
 
         with mock.patch.object(S, "http_get", side_effect=fake_get):
             meta = S.fetch_public_zh_catalog("MIDA-616", actress_ja="福田ゆあ", title_ja=MIDA)
         self.assertEqual(meta["title_zh"], "女友妹妹的無胸罩誘惑")
         self.assertEqual(meta["actress_zh"], "福田由愛")
+        self.assertIsNone(meta["cover"])
+        self.assertEqual(
+            seen,
+            ["https://missav.ai/cn/mida-616", "https://jable.tv/videos/mida-616/"],
+        )
         # The page title is used as-is. A keyword gloss is not substituted.
         self.assertNotEqual(meta["title_zh"], "無胸罩")
 

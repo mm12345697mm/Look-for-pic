@@ -560,6 +560,33 @@ class TestPublicCoverFallback(unittest.TestCase):
         status, detail = S._cover_progress_detail(item)
         self.assertEqual((status, detail), ("done", "封面就緒（Jable）"))
 
+    def test_jable_cover_when_missav_page_has_no_product_image(self):
+        def fake_get(url, timeout=10.0, connect_timeout=3.0, headers=None):
+            if "missav." in str(url):
+                return (
+                    "<html><head>"
+                    '<meta property="og:title" content="ROYD-343 電影院 - MissAV">'
+                    '<meta property="og:image" content="https://missav.ai/logo.png">'
+                    '<meta property="og:image" content="data:image/jpeg;base64,qq">'
+                    "</head><body>"
+                    '<a href="https://missav.ai/cn/actresses/momoe-sarina">百永紗里奈</a>'
+                    "</body></html>"
+                )
+            if "jable.tv" in str(url):
+                return (
+                    "<html><body>"
+                    f'<video poster="{JABLE_COVER}"></video>'
+                    "</body></html>"
+                )
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("ROYD-343")
+        self.assertEqual(meta.get("cover"), JABLE_COVER)
+        self.assertEqual(meta.get("cover_source"), "jable")
+        self.assertTrue(str(meta.get("cover")).startswith("https://"))
+        self.assertFalse(str(meta.get("cover")).startswith(("data:", "blob:")))
+
 
 class TestRelatedPublicCatalog(unittest.TestCase):
     def test_shared_cinema_series_outranks_unrelated_keyword_rows(self):
