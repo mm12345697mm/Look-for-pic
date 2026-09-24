@@ -7551,7 +7551,9 @@ def fetch_public_zh_catalog(
     if page_limit is not None:
         urls = urls[: max(0, int(page_limit))]
     for url in urls:
-        if title_zh and actress_zh:
+        # Title and actress can stop the walk, but an empty jacket still
+        # tries Jable once. A product cover, or a Jable attempt, ends it.
+        if title_zh and actress_zh and (cover or saw_jable):
             break
         if title_zh and saw_cn and saw_jable:
             break
@@ -7589,7 +7591,7 @@ def fetch_public_zh_catalog(
             title_zh = t
         if a and not actress_zh:
             actress_zh = a
-        if title_zh and actress_zh:
+        if title_zh and actress_zh and cover:
             break
         if title_zh and "jable.tv" in url:
             break
