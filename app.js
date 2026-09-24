@@ -955,25 +955,6 @@
     }
   }
 
-  function setStepPhase(li, phase) {
-    if (!li) return;
-    const text = phase ? String(phase) : '';
-    let el = li.querySelector && li.querySelector('.step-phase');
-    if (!el && text && document && document.createElement) {
-      el = document.createElement('span');
-      el.className = 'step-phase';
-      li.appendChild(el);
-    }
-    if (el) {
-      el.hidden = !text;
-      el.textContent = text;
-    }
-    if (li.dataset) {
-      if (text) li.dataset.phase = text;
-      else delete li.dataset.phase;
-    }
-  }
-
   function stepLabel(stepId) {
     return progressLabels[stepId] || (DEFAULT_STEPS.find((s) => s.id === stepId) || {}).label || stepId;
   }
@@ -1001,10 +982,7 @@
       const li = document.createElement('li');
       li.className = 'progress-step is-pending';
       li.dataset.step = s.id;
-      li.innerHTML =
-        '<span class="step-mark" aria-hidden="true"></span>' +
-        '<span class="step-label">' + escapeHtml(s.label) + '</span>' +
-        '<span class="step-phase" hidden></span>';
+      li.innerHTML = '<span class="step-mark" aria-hidden="true"></span><span class="step-label">' + escapeHtml(s.label) + '</span>';
       progressStepsEl.appendChild(li);
     });
     progressDetailEl.textContent = '';
@@ -1024,13 +1002,6 @@
     const li = progressStepsEl.querySelector('[data-step="' + step + '"]');
     if (li) {
       li.className = 'progress-step is-' + status;
-      setStepPhase(li, status === 'active' ? evt.phase : '');
-    }
-    if (status === 'active') {
-      const rows = progressStepsEl.children || [];
-      Array.from(rows).forEach((row) => {
-        if (row !== li) setStepPhase(row, '');
-      });
     }
     if (status === 'active' || status === 'done') {
       const ids = Array.from(progressStepsEl.querySelectorAll('.progress-step')).map((n) => n.dataset.step);
@@ -1039,10 +1010,7 @@
         if (progressState[ids[i]] === 'pending') {
           progressState[ids[i]] = 'done';
           const prev = progressStepsEl.querySelector('[data-step="' + ids[i] + '"]');
-          if (prev) {
-            prev.className = 'progress-step is-done';
-            setStepPhase(prev, '');
-          }
+          if (prev) prev.className = 'progress-step is-done';
         }
       }
     }
@@ -4713,8 +4681,6 @@
       interruptedBatchPayload,
       identifyProgressLabel,
       resumePayloadFromJob,
-      showProgress,
-      applyProgressEvent,
     };
   } catch (_) {}
 

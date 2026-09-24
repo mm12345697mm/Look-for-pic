@@ -140,11 +140,12 @@ class TestMultiPipelineRelated(unittest.TestCase):
         blob = _png()
         return [(blob, f"slot-{i + 1}.png") for i in range(n)]
 
-    def test_short_deadline_still_identifies_every_slot_then_related(self):
-        """Identify is not cut to save related time. Related still runs after."""
+    def test_tight_identify_deadline_still_attaches_related_for_the_hit(self):
+        """Identify may finish with under 1.5s left. Related still runs."""
         calls: list[tuple[str, float]] = []
 
-        def instant(**kwargs):
+        def slow_identify(**kwargs):
+            time.sleep(3.4)
             row = _catalog(kwargs.get("user_code") or "SER-012")
             return row, 200
 
@@ -153,23 +154,33 @@ class TestMultiPipelineRelated(unittest.TestCase):
             result["related_by_title"] = _related_rows()
             return result
 
-        with mock.patch.object(S, "get_gemini_api_key", return_value=""):
-            with mock.patch.object(S, "ocr_image_bytes", side_effect=["SER-012", "SER-013"]):
-                with mock.patch.object(S, "run_identify_pipeline", side_effect=instant):
-                    with mock.patch.object(S, "attach_related_by_title", side_effect=fake_attach):
-                        with mock.patch.object(S, "offline_cache_put"):
-                            payload, status = S.run_multi_identify_pipeline(
-                                self._images(2),
-                                deadline=time.monotonic() - 1,
-                            )
+        # Vision refuses to start under 15s. This test is about the related
+        # skip after a slot has already been identified, so lower only that floor.
+        deadline = time.monotonic() + 4.3
+        with mock.patch.object(S, "MULTI_VISION_START_S", 0.0):
+            with mock.patch.object(S, "get_gemini_api_key", return_value=""):
+                with mock.patch.object(S, "ocr_image_bytes", return_value="SER-012"):
+                    with mock.patch.object(S, "run_identify_pipeline", side_effect=slow_identify):
+                        with mock.patch.object(S, "attach_related_by_title", side_effect=fake_attach):
+                            with mock.patch.object(S, "offline_cache_put"):
+                                payload, status = S.run_multi_identify_pipeline(
+                                    self._images(2),
+                                    deadline=deadline,
+                                )
         self.assertEqual(status, 200)
         results = payload.get("results") or []
         self.assertEqual(len(results), 2)
-        self.assertFalse(any(r.get("timed_out") for r in results), payload.get("message"))
-        self.assertEqual([c[0] for c in calls], ["SER-012", "SER-013"])
-        self.assertTrue(all(c[1] >= S.MULTI_RELATED_SLOT_FLOOR_S for c in calls))
-        for row in results:
-            self.assertGreaterEqual(len(row.get("related_by_title") or []), 2)
+        done = [r for r in results if not r.get("timed_out")]
+        waiting = [r for r in results if r.get("timed_out")]
+        self.assertEqual(len(done), 1, payload.get("message"))
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(calls, [("SER-012", calls[0][1])])
+        self.assertGreaterEqual(calls[0][1], S.MULTI_RELATED_SLOT_FLOOR_S)
+        rel = done[0].get("related_by_title") or []
+        self.assertGreaterEqual(len(rel), 2)
+        self.assertEqual(payload.get("related_by_title"), rel)
+        self.assertFalse(waiting[0].get("related_by_title"))
+        self.assertIn("重查", waiting[0].get("message") or "")
 
     def test_open_deadline_fills_every_finished_slot(self):
         calls: list[str] = []
