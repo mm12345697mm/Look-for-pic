@@ -372,17 +372,21 @@ class TestMultiFrameSlots(unittest.TestCase):
 
 
 class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
-    """The dropped card was the school-swimsuit cover, not the yellow-bikini crop.
+    """Screenshot ground truth, left to right. Do not collapse these three.
 
-    Left: a title-rich 媚薬／水泳部 cover that identifies on its own.
-    Middle: fictional mechanic only. The mocked catalog title contains 「舌技が神」
-    (SHJG-448). That is not the real listing: APGH-012's catalog title does not
-    contain 舌技. See tests/test_apgh012_overlay.py.
-    Right: a still crop that resolves like JUFE-271, and must not absorb the left cover.
+    Left: school-swimsuit / 媚薬合宿 cover. Own slot, its own work. This is the
+    card that used to disappear into the bikini crop.
+    Middle: glasses + tattoo cover. The failed card read only 舌技が神 and
+    柊ゆうき. The catalog title does not contain 舌技. Resolve APGH-012
+    (先生が2人っきりのプライベート補習で全部面倒みてあげる), never a fictional
+    舌技が神 title. SHJG-448 is not this work.
+    Right: yellow-bikini crop. JULX-271 stands in for the JUFE-271 code-on-image
+    path, with that work's title shape. It must stay its own slot.
     """
 
     SWIM_TITLE = "巨乳水泳部員の媚薬合宿記録"
-    SHJG_TITLE = "舌技が神と呼ばれる架空の夜"
+    APGH_CODE = "APGH-012"
+    APGH_TITLE = "先生が2人っきりのプライベート補習で全部面倒みてあげる"
     JULX_TITLE = "地味な眼鏡では隠し切れない美人OLの完全生撮り"
 
     def _payload(self, code, title, actress, cover):
@@ -403,18 +407,34 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
 
     def _search(self, title, actress=None):
         text = str(title or "")
+        compact = "".join(text.split())
         if "媚薬" in text or "水泳部" in text:
             return self._payload("SWIM-804", self.SWIM_TITLE, "架空泳子", "https://example.com/swim804.jpg")
-        if "舌技" in text:
-            return self._payload("SHJG-448", self.SHJG_TITLE, "架空ゆうき", "https://example.com/shjg448.jpg")
+        # 舌技が神 is cover art, not the APGH-012 catalog line. A fragment of
+        # the official title is what title search is allowed to hit.
+        official = "".join(self.APGH_TITLE.split())
+        if "舌技" in compact and "先生" not in compact and "補習" not in compact:
+            return None
+        if len(compact) >= 6 and compact in official:
+            return self._payload(self.APGH_CODE, self.APGH_TITLE, "柊ゆうき", "https://example.com/apgh012.jpg")
         return None
+
+    def _fetch(self, title, actress=None):
+        name = str(actress or title or "")
+        if "柊" not in name:
+            return []
+        return [
+            self._payload("APGH-022", "別作品の職員室で終わらない面談", "柊ゆうき", "https://example.com/apgh022.jpg"),
+            self._payload("APGH-015", "別作品の家庭教師は今日も居残り", "柊ゆうき", "https://example.com/apgh015.jpg"),
+            self._payload(self.APGH_CODE, self.APGH_TITLE, "柊ゆうき", "https://example.com/apgh012.jpg"),
+        ]
 
     def _identify(self, code, ocr_preview=None, vision_meta=None):
         disp = S.format_display_code(str(code))
         if disp == "SWIM-804":
             return self._payload("SWIM-804", self.SWIM_TITLE, "架空泳子", "https://example.com/swim804.jpg")
-        if disp == "SHJG-448":
-            return self._payload("SHJG-448", self.SHJG_TITLE, "架空ゆうき", "https://example.com/shjg448.jpg")
+        if disp == self.APGH_CODE:
+            return self._payload(self.APGH_CODE, self.APGH_TITLE, "柊ゆうき", "https://example.com/apgh012.jpg")
         if disp == "JULX-271":
             return self._payload("JULX-271", self.JULX_TITLE, "架空カレン", "https://example.com/julx271.jpg")
         return {"ok": False, "code": disp, "title": None, "cover": None}
@@ -450,6 +470,7 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
             ocr_image_bytes=mock.Mock(side_effect=ocr),
             search_by_title=mock.Mock(side_effect=self._search),
             identify_code=mock.Mock(side_effect=self._identify),
+            fetch_avbase_title_results=mock.Mock(side_effect=self._fetch),
             rank_candidates_by_visual=mock.Mock(side_effect=rank),
             offline_cache_get=mock.Mock(side_effect=cache),
             offline_cache_put=mock.Mock(return_value=None),
@@ -463,10 +484,11 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         img_swim = b"school-swimsuit-cover"
         img_phrase = b"tongue-title"
         img_crop = b"yellow-bikini-crop"
-        expected = {img_swim: "SWIM-804", img_phrase: "SHJG-448", img_crop: "JULX-271"}
+        expected = {img_swim: "SWIM-804", img_phrase: self.APGH_CODE, img_crop: "JULX-271"}
 
         def vision(image_bytes, mime, api_key):
             if image_bytes == img_phrase:
+                # What the failed card actually stored: slogan + actress, no 品番.
                 return {"title": "舌技が神", "actress": "柊ゆうき"}
             if image_bytes == img_crop:
                 return {"code": "JULX-271"}
@@ -475,6 +497,8 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         def ocr(image_bytes):
             if image_bytes == img_swim:
                 return "巨乳水泳部員の媚薬合宿記録"
+            if image_bytes == img_phrase:
+                return "舌技が神"
             return ""
 
         images = [(img_swim, "swim.jpg"), (img_phrase, "phrase.jpg"), (img_crop, "crop.jpg")]
@@ -497,10 +521,12 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         self.assertEqual(by_index[1].get("code"), "SWIM-804")
         self.assertEqual(by_index[1].get("title"), self.SWIM_TITLE)
         self.assertTrue(by_index[1].get("cover"))
-        self.assertEqual(by_index[2].get("code"), "SHJG-448")
-        self.assertEqual(by_index[2].get("title"), self.SHJG_TITLE)
-        self.assertNotEqual(by_index[2].get("actress"), "柊ゆうき")
+        self.assertEqual(by_index[2].get("code"), self.APGH_CODE)
+        self.assertEqual(by_index[2].get("title"), self.APGH_TITLE)
+        self.assertNotIn("舌技", by_index[2].get("title") or "")
+        self.assertEqual(by_index[2].get("search_mode"), "actress")
         self.assertTrue(by_index[2].get("cover"))
+        self.assertFalse(by_index[2].get("needs_code"))
         self.assertEqual(by_index[3].get("code"), "JULX-271")
         self.assertEqual(by_index[3].get("title"), self.JULX_TITLE)
         note = (payload.get("related_note") or "") + (payload.get("message") or "")
@@ -512,7 +538,7 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         img_swim = b"school-swimsuit-cover"
         img_phrase = b"tongue-title"
         img_crop = b"yellow-bikini-crop"
-        expected = {img_swim: "SWIM-804", img_phrase: "SHJG-448", img_crop: "JULX-271"}
+        expected = {img_swim: "SWIM-804", img_phrase: self.APGH_CODE, img_crop: "JULX-271"}
 
         def vision(image_bytes, mime, api_key):
             if image_bytes == img_swim:
@@ -530,7 +556,8 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         results = payload.get("results") or []
         self.assertEqual(len(results), 3, payload.get("related_note"))
         codes = [row.get("code") for row in results]
-        self.assertEqual(codes, ["SWIM-804", "SHJG-448", "JULX-271"])
+        self.assertEqual(codes, ["SWIM-804", self.APGH_CODE, "JULX-271"])
+        self.assertEqual(results[1].get("title"), self.APGH_TITLE)
         self.assertEqual(results[0].get("title"), self.SWIM_TITLE)
         self.assertNotIn("合併", payload.get("related_note") or "")
 
@@ -539,7 +566,7 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         img_phrase = b"tongue-title"
         img_crop = b"yellow-bikini-crop"
         swim_hash = S.image_content_hash(img_swim)
-        expected = {img_swim: "SWIM-804", img_phrase: "SHJG-448", img_crop: "JULX-271"}
+        expected = {img_swim: "SWIM-804", img_phrase: self.APGH_CODE, img_crop: "JULX-271"}
         cached = self._payload("SWIM-804", self.SWIM_TITLE, "架空泳子", "https://example.com/swim804.jpg")
 
         def vision(image_bytes, mime, api_key):
@@ -566,8 +593,74 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
         self.assertEqual(results[0].get("title"), self.SWIM_TITLE)
         self.assertEqual(results[0].get("from_image_index"), 1)
         self.assertTrue(results[0].get("from_offline_cache"))
+        self.assertEqual(results[1].get("code"), self.APGH_CODE)
+        self.assertEqual(results[1].get("title"), self.APGH_TITLE)
         self.assertEqual(results[2].get("code"), "JULX-271")
         self.assertNotIn("合併", payload.get("related_note") or "")
+
+    def test_cover_full_text_on_tongue_frame_leaves_swimsuit_and_crop(self):
+        """Full-text escalation is only the middle jacket. The other two stay.
+
+        Do not drop this gate: the swimsuit OCR line and the bikini code are
+        not mixed into the cover-text search, and 舌技 alone is not the hit.
+        """
+        img_swim = b"school-swimsuit-cover"
+        img_cover = b"tongue-full-cover"
+        img_crop = b"yellow-bikini-crop"
+        expected = {img_swim: "SWIM-804", img_cover: self.APGH_CODE, img_crop: "JULX-271"}
+        seen: list[str] = []
+
+        def vision(image_bytes, mime, api_key):
+            if image_bytes == img_cover:
+                return {
+                    "shot": "cover",
+                    "title": "舌技が神",
+                    "actress": "柊ゆうき",
+                    "texts": ["舌技が神", "先生が2人っきりの", "プライベート補習"],
+                }
+            if image_bytes == img_crop:
+                return {"code": "JULX-271"}
+            return {}
+
+        def ocr(image_bytes):
+            if image_bytes == img_swim:
+                return "巨乳水泳部員の媚薬合宿記録"
+            if image_bytes == img_cover:
+                return "舌技が神\n先生が2人っきりの\nプライベート補習\nオーロラ"
+            return ""
+
+        def search(title, actress=None):
+            seen.append(str(title or ""))
+            return self._search(title, actress)
+
+        def vision_rank(user, cands, api_key=None, **kwargs):
+            return self._rank_for(expected)(user, cands, api_key=api_key, **kwargs)
+
+        with self._patches(vision, ocr, vision_rank, lambda **kwargs: None):
+            S.search_by_title.side_effect = search
+            payload, status = S.run_multi_identify_pipeline(
+                [(img_swim, "swim.jpg"), (img_cover, "cover.jpg"), (img_crop, "crop.jpg")]
+            )
+
+        self.assertEqual(status, 200)
+        results = payload.get("results") or []
+        self.assertEqual(len(results), 3, payload.get("related_note"))
+        self.assertEqual(
+            [row.get("code") for row in results],
+            ["SWIM-804", self.APGH_CODE, "JULX-271"],
+        )
+        self.assertEqual(results[0].get("title"), self.SWIM_TITLE)
+        self.assertEqual(results[1].get("title"), self.APGH_TITLE)
+        self.assertNotIn("舌技", results[1].get("title") or "")
+        self.assertEqual(results[2].get("title"), self.JULX_TITLE)
+        blob = "\n".join(seen)
+        self.assertIn("媚薬", blob)
+        self.assertTrue(any("先生" in q or "補習" in q for q in seen))
+        self.assertFalse(any(q.strip() == "舌技が神" and "先生" not in q for q in seen))
+        note = (payload.get("related_note") or "") + (payload.get("message") or "")
+        self.assertNotIn("略過", note)
+        self.assertNotIn("去重", note)
+        self.assertNotIn("合併", note)
 
 
 if __name__ == "__main__":

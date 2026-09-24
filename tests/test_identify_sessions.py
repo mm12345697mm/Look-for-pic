@@ -48,13 +48,19 @@ class TestIdentifySessions(unittest.TestCase):
         img_swim = b"school-swimsuit-cover"
         img_phrase = b"tongue-title-frame"
         img_crop = b"yellow-bikini-crop"
-        # SHJG-448 is a fictional stand-in so this session test can show three
-        # different outcomes. It is not the real 「舌技」 work (APGH-012).
-        expected = {img_swim: "SWIM-804", img_phrase: "SHJG-448", img_crop: "JULX-271"}
+        # Middle frame is the real APGH-012 cover, not fictional SHJG-448.
+        # The mocked pipeline hits only when the query is a fragment of the
+        # official title. A bare 舌技が神 must not be stored as a catalog hit.
+        expected = {img_swim: "SWIM-804", img_phrase: "APGH-012", img_crop: "JULX-271"}
 
         def vision(image_bytes, mime, api_key):
             if image_bytes == img_phrase:
-                return {"title": "舌技が神", "actress": "柊ゆうき"}
+                return {
+                    "shot": "cover",
+                    "title": "舌技が神",
+                    "actress": "柊ゆうき",
+                    "texts": ["舌技が神", "先生が2人っきりの"],
+                }
             if image_bytes == img_crop:
                 return {"code": "JULX-271"}
             return {}
@@ -62,6 +68,8 @@ class TestIdentifySessions(unittest.TestCase):
         def ocr(image_bytes):
             if image_bytes == img_swim:
                 return "巨乳水泳部員の媚薬合宿記録"
+            if image_bytes == img_phrase:
+                return "舌技が神\n先生が2人っきりの\nプライベート補習"
             return ""
 
         def pipe(**kwargs):
@@ -69,8 +77,11 @@ class TestIdentifySessions(unittest.TestCase):
             code = str(kwargs.get("user_code") or "")
             if "媚薬" in title:
                 hit = {"code": "SWIM-804", "title": "巨乳水泳部員の媚薬合宿記録"}
-            elif "舌技" in title:
-                hit = {"code": "SHJG-448", "title": "舌技が神と呼ばれる架空の夜"}
+            elif "先生" in title or "補習" in title:
+                hit = {
+                    "code": "APGH-012",
+                    "title": "先生が2人っきりのプライベート補習で全部面倒みてあげる",
+                }
             elif code == "JULX-271":
                 hit = {"code": "JULX-271", "title": "地味な眼鏡では隠し切れない美人OLの完全生撮り"}
             else:
@@ -128,11 +139,12 @@ class TestIdentifySessions(unittest.TestCase):
         frames = session.get("frames") or []
         self.assertEqual([f.get("index") for f in frames], [1, 2, 3])
         codes = [f.get("final_code") for f in frames]
-        self.assertEqual(codes, ["SWIM-804", "SHJG-448", "JULX-271"])
+        self.assertEqual(codes, ["SWIM-804", "APGH-012", "JULX-271"])
         self.assertEqual(len(set(codes)), 3)
         titles = [f.get("final_title") for f in frames]
         self.assertIn("媚薬", titles[0])
-        self.assertIn("舌技が神", titles[1])
+        self.assertIn("先生が2人っきりの", titles[1])
+        self.assertNotIn("舌技", titles[1])
         self.assertTrue(titles[2])
         self.assertTrue(all(f.get("drop_reason") is None for f in frames))
         self.assertEqual(frames[0].get("ocr_title"), "巨乳水泳部員の媚薬合宿記録")
@@ -149,7 +161,7 @@ class TestIdentifySessions(unittest.TestCase):
         self.assertNotIn("略過", banner)
         self.assertNotIn("去重", banner)
         stored = S.identify_session_get(session["id"])
-        self.assertEqual(stored.get("frames")[1].get("final_code"), "SHJG-448")
+        self.assertEqual(stored.get("frames")[1].get("final_code"), "APGH-012")
 
     def test_owner_token_required_for_list_and_detail(self):
         payload = self._run_three()
@@ -184,7 +196,7 @@ class TestIdentifySessions(unittest.TestCase):
         self.assertIn("summary", row)
         self.assertEqual(len(row.get("frames") or []), 3)
         self.assertNotIn("fingerprint", row["frames"][0])
-        self.assertEqual([f.get("final_code") for f in row["frames"]], ["SWIM-804", "SHJG-448", "JULX-271"])
+        self.assertEqual([f.get("final_code") for f in row["frames"]], ["SWIM-804", "APGH-012", "JULX-271"])
 
         detail = client.get(
             "/api/owner/identify-sessions/" + sid,
