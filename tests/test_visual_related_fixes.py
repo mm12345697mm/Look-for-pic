@@ -2652,5 +2652,151 @@ class TestTitleCutAndMultiVisual(unittest.TestCase):
         self.assertTrue(any(c["image"] == img2 and "NHDTC-235" in c["codes"] for c in rank_calls))
 
 
+class TestNarrativeTitleKeywordChips(unittest.TestCase):
+    """Long JP story titles must not collapse to a format tag plus one weak act.
+
+    Ground truth: JUR-881 chips were only BOD・中出し. The catalog title also
+    names the aunt, the stay, the trip, and 連続中出し交尾. Chips stay Japanese.
+    """
+
+    TITLE = (
+        "毎晩旦那とヤリまくる絶倫叔母と一泊二日の搾精旅行 ヌカれまくって性に目覚めた童貞の僕は…"
+        "すべて忘れて連続中出し交尾にハマってしまった。 三比菜々美 (BOD)"
+    )
+    EXPECTED = [
+        "一泊二日",
+        "搾精旅行",
+        "絶倫",
+        "叔母",
+        "童貞",
+        "連続中出し",
+        "交尾",
+        "ヤリまくる",
+        "中出し",
+        "BOD",
+    ]
+    TUTOR = TestKinshipRoleAndEditionMarkers.DANDYA
+
+    def test_jur881_chips_cover_relationship_setting_and_act(self):
+        for actress in ("三比菜々美", "三比菜々美・マドンナ", None):
+            kws = S._extract_title_theme_keywords(self.TITLE, actress=actress)
+            self.assertEqual(kws, self.EXPECTED, (actress, kws))
+        for tok in ("叔母", "一泊二日", "搾精旅行", "連続中出し", "交尾", "中出し", "BOD"):
+            self.assertIn(tok, self.EXPECTED)
+        self.assertLess(self.EXPECTED.index("連続中出し"), self.EXPECTED.index("中出し"))
+        self.assertLess(self.EXPECTED.index("連続中出し"), self.EXPECTED.index("交尾"))
+        self.assertLess(self.EXPECTED.index("搾精旅行"), self.EXPECTED.index("中出し"))
+        self.assertLess(self.EXPECTED.index("叔母"), self.EXPECTED.index("BOD"))
+        for absent in (
+            "僕",
+            "旦那",
+            "三比菜々美",
+            "VOL",
+            "OL",
+            "旅行",
+            "搾精",
+            "ヌカれまくって",
+            "榨精旅行",
+            "連續中出",
+            "阿姨",
+        ):
+            self.assertNotIn(absent, self.EXPECTED, absent)
+        self.assertLessEqual(len(self.EXPECTED), 10)
+        self.assertTrue(S._is_auto_theme_keyword("叔母"))
+        self.assertTrue(S._is_auto_theme_keyword("一泊二日"))
+        self.assertTrue(S._is_auto_theme_keyword("搾精旅行"))
+        self.assertTrue(S._is_auto_theme_keyword("連続中出し"))
+        self.assertTrue(S._is_auto_theme_keyword("交尾"))
+        self.assertTrue(S._is_auto_theme_keyword("絶倫"))
+        self.assertTrue(S._is_auto_theme_keyword("童貞"))
+        for weak in ("中出し", "BOD", "ヤリまくる"):
+            self.assertTrue(S._is_weak_theme_token(weak), weak)
+            self.assertFalse(S._is_auto_theme_keyword(weak), weak)
+        self.assertIn("BOD", S._extract_title_theme_keywords("絶倫叔母と一泊二日の搾精旅行（BOD）"))
+        qs = S._keyword_search_queries(self.TITLE, self.EXPECTED)
+        self.assertEqual(qs[0], "一泊二日", qs)
+        for tok in ("搾精旅行", "叔母", "連続中出し", "交尾"):
+            self.assertIn(tok, qs, qs)
+        for absent in ("BOD", "中出し", "ヤリまくる"):
+            self.assertNotIn(absent, qs, qs)
+        self.assertLessEqual(len(qs), 8)
+        fb = S._keyword_fallback_singles(self.EXPECTED)
+        self.assertLess(fb.index("連続中出し"), fb.index("中出し"), fb)
+        self.assertIn("ヤリまくる", fb)
+        self.assertIn("BOD", fb)
+        selected = S._keyword_search_queries(self.TITLE, ["叔母"], selected_only=True)
+        self.assertIn("叔母", selected)
+        self.assertLessEqual(len(selected), 10)
+        self.assertEqual(S._selected_keyword_min_hits(["叔母", "交尾"]), 2)
+        self.assertEqual(S._selected_keyword_min_hits(["交尾"]), 1)
+
+    def test_tutor_title_chips_stay_compound_first(self):
+        kws = S._extract_title_theme_keywords(self.TUTOR, actress="大浦真奈美")
+        self.assertEqual(
+            kws,
+            ["息子の家庭教師", "家庭教師", "10秒挿入", "肉欲教育", "息子", "ママ"],
+            kws,
+        )
+        for absent in ("VOL", "OL", "叔母", "BOD", "ヤリまくる"):
+            self.assertNotIn(absent, kws, kws)
+
+    def test_setting_and_duration_patterns_are_general(self):
+        onsen = S._extract_title_theme_keywords("温泉旅行の巨乳")
+        self.assertEqual(onsen[0], "温泉旅行", onsen)
+        self.assertLess(onsen.index("温泉旅行"), onsen.index("温泉"))
+        self.assertIn("巨乳", onsen)
+        parted = S._extract_title_theme_keywords("一泊二日の旅行")
+        self.assertEqual(parted, ["一泊二日"], parted)
+        self.assertEqual(S._extract_title_theme_keywords("二泊三日の義母"), ["二泊三日", "義母"])
+        raw = S._extract_title_theme_keywords("生中出し交尾")
+        self.assertIn("生中出し", raw)
+        self.assertIn("中出し", raw)
+        self.assertIn("交尾", raw)
+        self.assertLess(raw.index("生中出し"), raw.index("中出し"))
+
+    def test_recompute_replaces_thin_cached_keywords(self):
+        payload = S._recompute_theme_keywords(
+            {
+                "title": self.TITLE,
+                "actress": "三比菜々美",
+                "theme_keywords": ["BOD", "中出し"],
+                "keyword_queries": ["BOD"],
+            }
+        )
+        self.assertEqual(payload["theme_keywords"], self.EXPECTED)
+        self.assertNotEqual(payload["keyword_queries"][:2], ["BOD", "中出し"])
+        self.assertIn("叔母", payload["keyword_queries"])
+
+    def test_keywords_only_refreshes_chips_without_related_search(self):
+        with mock.patch.object(S, "find_related_by_title") as find_title, mock.patch.object(
+            S, "_find_related_by_keywords"
+        ) as find_kw:
+            client = S.app.test_client()
+            res = client.post(
+                "/api/related-by-title",
+                json={
+                    "title": self.TITLE,
+                    "code": "JUR-881",
+                    "actress": "三比菜々美",
+                    "keywords_only": True,
+                    "seed": [
+                        {
+                            "code": "AAA-001",
+                            "line": "keyword",
+                            "title": "別作品",
+                            "why": "關鍵字",
+                        }
+                    ],
+                },
+            )
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        find_title.assert_not_called()
+        find_kw.assert_not_called()
+        data = res.get_json()
+        self.assertEqual(data.get("theme_keywords"), self.EXPECTED)
+        self.assertIn("叔母", data.get("keyword_queries") or [])
+        self.assertNotIn("BOD", data.get("keyword_queries") or [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

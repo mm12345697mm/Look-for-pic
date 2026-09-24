@@ -4797,6 +4797,9 @@ _WEAK_THEME_TOKENS = frozenset(
         "負ける",
         "負けた",
         "負けちゃう",
+        # ヤリまくる is a real title verb and stays a selectable chip, but it is
+        # generic "do it a lot" and must not outrank relationship / setting nouns.
+        "ヤリまくる",
         "拘束",
         "監禁",
         "調教",
@@ -4850,7 +4853,11 @@ _ROLE_THEME_NOUNS = frozenset(
 # Edition / episode marks. Not theme chips. OL is not in this set: it stays an
 # occupation keyword. These tokens are junk even without a number (VOL, EP);
 # VOL.2 / 第2巻 / 第十二話 are the numbered forms.
+# Parenthetical format tags (BOD) / (DVD) are different from VOL: they may stay
+# selectable chips, but they are weak for automatic related search and must not
+# be the only chip a long story title produces. OL is not a format tag.
 _EDITION_LATIN = frozenset({"vol", "volume", "ep", "episode"})
+_EDITION_FORMAT_TAGS = frozenset({"BOD", "BD", "DVD", "UHD"})
 _EDITION_MARKER_RE = re.compile(
     r"(?i)(?<![A-Za-z])(?:vol(?:ume)?|ep(?:isode)?)(?![A-Za-z])"
     r"(?:\s*[\.．]?\s*[0-9０-９]+)?"
@@ -4925,6 +4932,26 @@ _THEME_KEYWORD_LEXICON = (
     "美人",
     "辦公室",
     "办公室",
+    # Relationship, status, and distinctive-act nouns from narrative titles
+    # (JUR-881 叔母 / 絶倫 / 童貞 / 交尾). Not weak: they may lead related search.
+    # Chips stay in catalog Japanese. Do not mint 阿姨 / 榨精 / 連續中出.
+    "叔母",
+    "伯母",
+    "叔父",
+    "伯父",
+    "義母",
+    "義父",
+    "義姉",
+    "義兄",
+    "義弟",
+    "義娘",
+    "姪っ子",
+    "甥っ子",
+    "絶倫",
+    "童貞",
+    "処女",
+    "交尾",
+    "ヤリまくる",
 )
 
 # Short setting / identity nouns (valid even at 2 chars). Not 地位 — 地味.
@@ -4951,6 +4978,20 @@ _SHORT_THEME_NOUNS = frozenset(
         "爆乳",
         "通勤",
         "ナース",
+        "叔母",
+        "伯母",
+        "叔父",
+        "伯父",
+        "義母",
+        "義父",
+        "義姉",
+        "義兄",
+        "義弟",
+        "義娘",
+        "絶倫",
+        "童貞",
+        "処女",
+        "交尾",
     }
 )
 
@@ -5006,10 +5047,124 @@ def _strip_edition_markers(text: str) -> str:
 
     Removes VOL / Vol / VOL.2 / VOLUME 2 / EP.2 and 第N巻-style counters
     (第2巻, 第２話, 第十二巻, 第2回). Does not touch a real occupation token OL.
+    (BOD) stays in the text so the Latin pass can keep it as a chip.
     """
     if not text:
         return ""
     return _EDITION_MARKER_RE.sub(" ", text)
+
+
+def _is_edition_format_token(tok: str) -> bool:
+    """True for a disc/format tag such as BOD, not for the occupation OL."""
+    t = (tok or "").strip()
+    if not t:
+        return False
+    return t.upper() in _EDITION_FORMAT_TAGS
+
+
+# N泊M日 / 日帰り. The chip is the surface form in the catalog title.
+_DURATION_RE = re.compile(
+    r"(?:[0-9０-９]{1,2}|[一二三四五六七八九十]{1,3})泊"
+    r"(?:[0-9０-９]{1,2}|[一二三四五六七八九十]{1,3})日"
+    r"|日帰り"
+)
+# Glued noun + setting (搾精旅行). A particle (一泊二日の旅行) does not glue.
+_SETTING_TAILS: tuple[str, ...] = ("旅行", "旅館", "合宿")
+# Intensifier glued to an act (連続中出し, 生中出し). The tail stays its own chip.
+_ACT_COMPOUND_PREFIXES: tuple[str, ...] = ("連続", "生")
+_ACT_COMPOUND_TAILS: tuple[str, ...] = (
+    "中出し",
+    "顔射",
+    "射精",
+    "交尾",
+    "挿入",
+    "フェラチオ",
+    "フェラ",
+    "クンニ",
+    "手コキ",
+)
+
+
+def _is_duration_keyword(tok: str) -> bool:
+    return bool(_DURATION_RE.fullmatch(re.sub(r"\s+", "", tok or "")))
+
+
+def _is_setting_compound(tok: str) -> bool:
+    t = re.sub(r"\s+", "", tok or "")
+    return any(t.endswith(tail) and len(t) > len(tail) for tail in _SETTING_TAILS)
+
+
+def _extract_duration_phrases(title: str) -> list[str]:
+    """In-title stay lengths (一泊二日, 二泊三日, 日帰り)."""
+    t = re.sub(r"\s+", "", title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _DURATION_RE.finditer(t):
+        tok = m.group(0)
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _extract_setting_compounds(title: str) -> list[str]:
+    """Glued kanji + 旅行/旅館/合宿 (搾精旅行). Bare 旅行 is not a chip.
+
+    The head is the 2–4 kanji run immediately before the tail, so 一泊二日の搾精旅行
+    yields 搾精旅行 and not a scrape across the particle. A head that is itself
+    a duration (一泊二日旅行) is left to the duration chip.
+    """
+    t = re.sub(r"\s+", "", title or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for tail in _SETTING_TAILS:
+        start = 0
+        while True:
+            i = t.find(tail, start)
+            if i < 0:
+                break
+            start = i + len(tail)
+            m = re.search(r"([\u4e00-\u9fff]{2,4})$", t[:i])
+            if not m:
+                continue
+            head = m.group(1)
+            if _is_duration_keyword(head) or _is_weak_theme_token(head):
+                continue
+            comp = head + tail
+            if comp in seen or not (4 <= len(comp) <= 12):
+                continue
+            seen.add(comp)
+            out.append(comp)
+    return out
+
+
+def _extract_act_compounds(title: str) -> list[tuple[str, str]]:
+    """Intensifier + act as (compound, tail). 連続中出し交尾 → 連続中出し + 中出し.
+
+    交尾 after that compound is a separate lexicon chip, not part of this pair.
+    """
+    t = re.sub(r"\s+", "", title or "")
+    tails = sorted(_ACT_COMPOUND_TAILS, key=len, reverse=True)
+    out: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for pre in _ACT_COMPOUND_PREFIXES:
+        start = 0
+        while True:
+            i = t.find(pre, start)
+            if i < 0:
+                break
+            start = i + len(pre)
+            rest = t[i + len(pre) :]
+            for tail in tails:
+                if not rest.startswith(tail):
+                    continue
+                comp = pre + tail
+                if comp not in seen:
+                    seen.add(comp)
+                    out.append((comp, tail))
+                break
+    return out
 
 
 def _title_sibling_phrases(title: str) -> list[str]:
@@ -5254,6 +5409,10 @@ def _is_weak_theme_token(tok: str) -> bool:
         return True
     if t in _SHORT_THEME_NOUNS or t.upper() in _SHORT_THEME_NOUNS:
         return False
+    # (BOD) stays selectable but must not lead related search or count as the
+    # one "distinctive" token that a long title produced.
+    if _is_edition_format_token(t):
+        return True
     return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
 
 
@@ -5438,7 +5597,8 @@ def _chip_contains_part(compound: str, part: str) -> bool:
 
     の-phrases match a whole side only (息子の家庭教師 covers 家庭教師 and 息子;
     義妹 does not cover 妹). Glued suffix compounds match a prefix
-    (ノーブラ誘惑 covers ノーブラ, 巨乳沼 covers 巨乳).
+    (ノーブラ誘惑 covers ノーブラ, 巨乳沼 covers 巨乳). An intensifier+act
+    compound covers its tail (連続中出し covers 中出し).
     """
     compound = (compound or "").strip()
     part = (part or "").strip()
@@ -5447,7 +5607,14 @@ def _chip_contains_part(compound: str, part: str) -> bool:
     if compound.count("の") == 1:
         left, right = compound.split("の", 1)
         return part == left or part == right
-    return compound.startswith(part)
+    if compound.startswith(part):
+        return True
+    # 連続中出し covers 中出し. 義妹 does not cover 妹 (already returned above
+    # only for の-phrases; a bare suffix match needs a known intensifier).
+    for pre in _ACT_COMPOUND_PREFIXES:
+        if compound.startswith(pre) and compound[len(pre) :] == part:
+            return True
+    return False
 
 
 def _subsumed_keyword_parts(keywords: list[str] | None) -> set[str]:
@@ -5553,6 +5720,10 @@ def _rank_theme_keywords(
     heads = {noun for noun in compound_head.values() if noun}
 
     def _tier(tok: str) -> int:
+        # Stay length and setting compounds lead (一泊二日, 搾精旅行) so a
+        # generic act or a format tag cannot fill the chip bar first.
+        if _is_duration_keyword(tok) or _is_setting_compound(tok):
+            return 0
         head = compound_head.get(tok)
         if head and not _is_weak_theme_token(tok) and not _is_relation_phrase(tok):
             known = (not _is_weak_theme_token(head)) and (
@@ -5638,8 +5809,13 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     Edition / episode junk (VOL, Vol, VOL.2, EP.2, 第2巻, 第十二話) is stripped
     before matching, so it cannot become a chip or a leftover scrap. OL stays
     in the lexicon: it is an occupation chip when the title actually contains
-    that token, and it does not match inside VOL. Leftover {4,6} scraps run
+    that token, and it does not match inside VOL. A parenthetical format tag
+    (BOD) stays a chip but is weak, and it does not block story phrases.
+    Narrative titles also yield stay length (一泊二日), glued settings
+    (搾精旅行), kinship (叔母), and intensifier+act (連続中出し, with 中出し
+    still selectable). Chips stay in catalog Japanese. Leftover {4,6} scraps run
     only when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
+    A format tag alone still counts as an anchor so it does not open that pad.
     """
     raw = (title or "").strip()
     if not raw:
@@ -5681,6 +5857,13 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
         _add(right)
     for canon in _extract_time_action_phrases(t):
         _add(canon)
+    for tok in _extract_duration_phrases(t):
+        _add(tok)
+    for comp in _extract_setting_compounds(t):
+        _add(comp)
+    for comp, tail in _extract_act_compounds(t):
+        _add(comp)
+        _add(tail)
 
     for kw in sorted(_THEME_KEYWORD_LEXICON, key=len, reverse=True):
         if _keyword_index(t_norm, kw) < 0:
@@ -5709,8 +5892,12 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
             _add(noun)
 
     distinctive_lex = [k for k in found if not _is_weak_theme_token(k)]
-    # Leftover {4,6} only when lexicon/latin/compounds produced no distinctive token.
-    if not distinctive_lex:
+    # Leftover {4,6} only when nothing distinctive was found. A format tag such
+    # as (BOD) is weak, so it is not "distinctive", but it still anchors this
+    # gate: BOD alone must not pad arbitrary scraps, and it must not be why a
+    # story title skips the phrases added above.
+    scrap_anchor = distinctive_lex or [k for k in found if _is_edition_format_token(k)]
+    if not scrap_anchor:
         for m in re.finditer(r"[\u4e00-\u9fff\u3040-\u30ff]{4,6}", t_norm):
             chunk = m.group(0)
             if re.fullmatch(r"[\u3040-\u309f]+", chunk):
@@ -6096,8 +6283,9 @@ def _stamp_theme_keywords(payload: dict) -> dict:
 def _recompute_theme_keywords(payload: dict) -> dict:
     """Replace chips from the current extractor whenever a title is present.
 
-    Cached pre-#15 lists (a lone 家庭教師, or VOL/OL junk) must not stick on
-    read. An empty title falls back to _stamp_theme_keywords.
+    Cached pre-#15 lists (a lone 家庭教師, or VOL/OL junk) and thin narrative
+    lists (BOD + 中出し only) must not stick on read. An empty title falls
+    back to _stamp_theme_keywords.
     """
     if not isinstance(payload, dict):
         return payload
@@ -8471,8 +8659,23 @@ def related_by_title_api():
         "ok": True,
         "code": code or None,
         "title": title,
+        "actress": actress,
         "related_by_title": _cap_related_buckets(seed),
     }
+    # History reopen: regenerate chips from the stored title without another
+    # related-catalog search. Identify and cache reads already recompute.
+    if body.get("keywords_only"):
+        _recompute_theme_keywords(wrap)
+        return jsonify(
+            {
+                "ok": True,
+                "related_by_title": wrap.get("related_by_title") or [],
+                "title": title,
+                "exclude": code,
+                "theme_keywords": wrap.get("theme_keywords") or [],
+                "keyword_queries": wrap.get("keyword_queries") or [],
+            }
+        )
     try:
         rel = wrap["related_by_title"]
         t, k, a = _related_bucket_counts(rel)
@@ -8512,7 +8715,7 @@ def related_by_title_api():
             )
         except Exception:
             pass
-        _stamp_theme_keywords(wrap)
+        _recompute_theme_keywords(wrap)
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
     return jsonify({

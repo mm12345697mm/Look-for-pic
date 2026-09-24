@@ -537,7 +537,14 @@
     if (!compound || !part || compound === part || part.length >= compound.length) return false;
     const bits = compound.split('の');
     if (bits.length === 2) return bits[0] === part || bits[1] === part;
-    return compound.indexOf(part) === 0;
+    if (compound.indexOf(part) === 0) return true;
+    // 連続中出し / 生中出し cover 中出し. Keep in step with server.py.
+    const actPrefix = ['連続', '生'];
+    for (let i = 0; i < actPrefix.length; i++) {
+      const pre = actPrefix[i];
+      if (compound.indexOf(pre) === 0 && compound.slice(pre.length) === part) return true;
+    }
+    return false;
   }
 
   /** Put a compound just before its own shorter chips. Leave unrelated order. */
@@ -3255,6 +3262,8 @@
     list[idx].works = works;
     if (workIndex === 0 && patch.related) list[idx].related = patch.related;
     if (patch.title_zh && !list[idx].title_zh) list[idx].title_zh = patch.title_zh;
+    if (workIndex === 0 && patch.theme_keywords) list[idx].theme_keywords = patch.theme_keywords;
+    if (workIndex === 0 && patch.keyword_queries) list[idx].keyword_queries = patch.keyword_queries;
     saveHistory(list);
   }
 
@@ -3343,12 +3352,16 @@
       persistHistoryWork(recId, workIndex, localPatch);
     }
     const related = work.related || [];
-    const need =
+    const gaps =
       relatedNeedsTitleZh(related) ||
       relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
       workNeedsTitleZh(work) ||
       workNeedsThemeKeywords(work);
-    if (!need) return work;
+    // A saved title is reprocessed on open so a thin cached chip list
+    // (BOD・中出し) is replaced from the current extractor. No catalog search
+    // when the related buckets are already filled.
+    const refreshKeywords = !!(work && String(work.title || '').trim());
+    if (!gaps && !refreshKeywords) return work;
     try {
       const res = await fetch('/api/related-by-title', {
         method: 'POST',
@@ -3358,6 +3371,7 @@
           code: work.code || '',
           actress: work.actress || '',
           seed: related,
+          keywords_only: !gaps,
         }),
       });
       const data = await res.json();

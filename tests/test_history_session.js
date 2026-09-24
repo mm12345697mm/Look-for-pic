@@ -620,6 +620,10 @@ function walkNodes(node, acc) {
     '息子の家庭教師・家庭教師・10秒挿入・肉欲教育・息子・ママ'
   );
   assert.strictEqual(H.normalizeKeywordList(['あ', '中']).join('・'), '');
+  assert.strictEqual(
+    H.normalizeKeywordList(['中出し', '連続中出し', '交尾']).join('・'),
+    '連続中出し・中出し・交尾'
+  );
 }
 
 // Keyword chips on a card that already has a 關鍵字 related section
