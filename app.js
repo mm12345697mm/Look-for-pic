@@ -1265,10 +1265,15 @@
     return data;
   }
 
-  async function followIdentifyJob(jobId) {
-    const maxTries = 160;
-    for (let i = 0; i < maxTries; i++) {
-      await sleep(i < 3 ? 400 * (i + 1) : 5000);
+  // Four images × 600s, plus a minute so the last slot can be written.
+  const IDENTIFY_JOB_FOLLOW_MS = 4 * 600 * 1000 + 60 * 1000;
+
+  async function followIdentifyJob(jobId, onProgress) {
+    const deadline = Date.now() + IDENTIFY_JOB_FOLLOW_MS;
+    let wait = 400;
+    while (Date.now() < deadline) {
+      await sleep(wait);
+      wait = Math.min(5000, wait + 400);
       let body = null;
       try {
         const res = await fetch('/api/identify/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
@@ -1282,12 +1287,15 @@
       }
       const job = body && body.job;
       if (!job) continue;
+      if (job.progress && onProgress) onProgress(job.progress);
       const ready = resumePayloadFromJob(job);
       if (ready) return ready;
-      if (job.status === 'stalled') break;
+      // A late heartbeat can look stalled. Keep the real result; do not
+      // paint 時間不夠 / 尚未查完 / 尚未鎖定 while the job can still finish.
     }
     const err = new Error('查詢還在伺服器上，請稍後再開');
     err.jobId = jobId;
+    err.followed = true;
     throw err;
   }
 
@@ -1350,7 +1358,7 @@
     }
     if (!finalData && jobId) {
       try {
-        finalData = await followIdentifyJob(jobId);
+        finalData = await followIdentifyJob(jobId, onProgress);
       } catch (e) {
         if (e && !e.jobId) e.jobId = jobId;
         throw e;
@@ -3948,8 +3956,11 @@
         data = streamed.data;
       } catch (streamErr) {
         if (myRun !== runId) return;
+        if (streamErr && streamErr.followed) {
+          throw streamErr;
+        }
         if (streamErr && streamErr.jobId) {
-          data = await followIdentifyJob(streamErr.jobId);
+          data = await followIdentifyJob(streamErr.jobId, applyProgressEvent);
         } else {
         const abort = { aborted: false };
         const sim = simulateProgress({ images: imgs, code, title }, abort);
@@ -4345,6 +4356,7 @@
       formatKeywordChip,
       formatPersonName,
       resumePayloadFromJob,
+      IDENTIFY_JOB_FOLLOW_MS,
       workNeedsTitleZh,
       workNeedsManualFix,
       batchQueryKeepsFrames,

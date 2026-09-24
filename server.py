@@ -567,21 +567,26 @@ IDENTIFY_JOB_TTL_S = 7200.0
 _IDENTIFY_JOBS_PATH: Path | None = None
 _IDENTIFY_JOBS_LOCK = threading.Lock()
 _GUNICORN_WORKER = None
+_GUNICORN_WORKER_MISSING = False
 
 
 def _notify_gunicorn_worker() -> None:
     """Reset the arbiter silence timer while identify is still running.
 
     Sync workers only notify between requests. SSE keepalive bytes do not.
-    Missing gunicorn (local `python server.py`) is a no-op.
+    Missing gunicorn (local `python server.py`) is a no-op, and the lookup
+    runs once so a long batch does not walk every object every keepalive.
     """
-    global _GUNICORN_WORKER
+    global _GUNICORN_WORKER, _GUNICORN_WORKER_MISSING
+    if _GUNICORN_WORKER_MISSING:
+        return
     worker = _GUNICORN_WORKER
     if worker is None:
         try:
             import gc
             from gunicorn.workers.base import Worker
         except Exception:
+            _GUNICORN_WORKER_MISSING = True
             return
         for obj in gc.get_objects():
             if isinstance(obj, Worker):
@@ -589,11 +594,13 @@ def _notify_gunicorn_worker() -> None:
                 _GUNICORN_WORKER = obj
                 break
         if worker is None:
+            _GUNICORN_WORKER_MISSING = True
             return
     try:
         worker.notify()
     except Exception:
         _GUNICORN_WORKER = None
+        _GUNICORN_WORKER_MISSING = False
 
 
 def _identify_jobs_resolve_path() -> Path:

@@ -663,6 +663,7 @@ function walkNodes(node, acc) {
   assert.strictEqual(H.formatPersonName('福田ゆあ', ''), '福田ゆあ');
   assert.ok(H.formatPersonName('福田ゆあ', '').indexOf('（') === -1);
   assert.strictEqual(H.formatPersonName('福田ゆあ', '福田由愛'), '福田ゆあ（福田由愛）');
+  assert.strictEqual(H.IDENTIFY_JOB_FOLLOW_MS, 4 * 600 * 1000 + 60 * 1000);
   assert.strictEqual(H.resumePayloadFromJob({ status: 'stalled' }), null);
   assert.strictEqual(H.resumePayloadFromJob({ status: 'running', result: { ok: true } }), null);
   const doneJob = H.resumePayloadFromJob({ status: 'done', result: { ok: true, code: 'AAA-001' } });
