@@ -496,6 +496,76 @@ class TestIdentifyStreamSurvivesSilence(unittest.TestCase):
         self.assertEqual((done.get("progress") or {}).get("step"), "done")
         self.assertEqual((done.get("progress") or {}).get("detail"), "完成，列出 4 部")
 
+    def test_job_progress_rejects_smaller_image_denominator(self):
+        job_id = S.identify_job_create(7)
+        self.assertTrue(job_id)
+        live = 0.55 + 0.25 * (1 / 7)
+        stale = 0.55 + 0.25 * (1 / 4)
+        self.assertGreater(stale, live)
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 2/7 張…",
+                "progress": live,
+                "phase": "目錄查詢",
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 2/4 張…",
+                "progress": stale,
+                "phase": "目錄查詢",
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 3/4 張…",
+                "progress": 0.68,
+                "phase": "目錄查詢",
+            },
+        )
+        view = S.identify_job_public(job_id)
+        progress = view.get("progress") or {}
+        self.assertEqual(progress.get("detail"), "搜尋第 2/7 張…")
+        self.assertAlmostEqual(float(progress.get("progress") or 0), live, places=6)
+        self.assertEqual(view.get("image_count"), 7)
+        # Related-work progress counts merged titles, not uploads.
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "done",
+                "status": "active",
+                "detail": "相關作品 1/4…",
+                "progress": 0.95,
+                "phase": "相關作品",
+            },
+        )
+        related = (S.identify_job_public(job_id).get("progress") or {})
+        self.assertEqual(related.get("detail"), "相關作品 1/4…")
+        fresh = S.identify_job_create(4)
+        S.identify_job_note(
+            fresh,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 2/4 張…",
+                "progress": stale,
+                "phase": "目錄查詢",
+            },
+        )
+        self.assertEqual(
+            (S.identify_job_public(fresh).get("progress") or {}).get("detail"),
+            "搜尋第 2/4 張…",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -575,6 +575,102 @@ function related(n, line) {
   assert.strictEqual(getEl('progress-pct').textContent, '55%');
 }
 
+// 7-image run must not adopt a stale 4-image denominator. 搜尋第 2/4 is 61%
+// and 搜尋第 2/7 is 59%, so percent alone would oscillate 7↔4.
+{
+  const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+  const sevenSteps = [
+    { id: 'receive', label: '接收圖片（7 張）' },
+    { id: 'vision', label: '逐張看圖辨識' },
+    { id: 'parse', label: '彙整番號／片名' },
+    { id: 'verify', label: '核對片名與番號' },
+    { id: 'search', label: '搜尋作品資料' },
+    { id: 'cover', label: '抓取封面與劇照' },
+    { id: 'done', label: '完成，進入畫廊' },
+  ];
+  const pct27 = 0.55 + 0.25 * (1 / 7);
+  H.beginIdentifyProgress(7);
+  H.showProgress(sevenSteps, 7);
+  H.bindIdentifyJob('job_seven');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 2/7 張…',
+    progress: pct27,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 2/4 張…',
+    progress: 0.55 + 0.25 * (1 / 4),
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 3/4 張…',
+    progress: 0.68,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 1/7 張…',
+    progress: 0.55,
+    phase: '目錄查詢',
+  });
+  const steps = getEl('progress-steps').children;
+  const receive = steps.find((row) => row.dataset && row.dataset.step === 'receive');
+  assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/7 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, Math.round(pct27 * 100) + '%');
+  assert.ok(getEl('progress-detail').textContent.indexOf('/4') === -1);
+  assert.ok(receive && String(receive.innerHTML).indexOf('7') !== -1);
+  // Merged-work related counts are not the upload denominator.
+  H.applyProgressEvent({
+    step: 'done',
+    status: 'active',
+    detail: '相關作品 1/4…',
+    progress: 0.95,
+    phase: '相關作品',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 4/4 張…',
+    progress: 0.8,
+    phase: '封面鎖定',
+  });
+  assert.strictEqual(getEl('progress-detail').textContent, '相關作品 1/4…');
+  assert.strictEqual(getEl('progress-pct').textContent, '95%');
+  const blob =
+    getEl('progress-detail').textContent +
+    getEl('progress-summary').textContent +
+    getEl('progress-pct').textContent;
+  FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+
+  // A new upload resets. The same panel may then show a real 4-image run.
+  H.beginIdentifyProgress(4);
+  H.showProgress(
+    [
+      { id: 'receive', label: '接收圖片（4 張）' },
+      { id: 'search', label: '搜尋作品資料' },
+      { id: 'done', label: '完成，進入畫廊' },
+    ],
+    4
+  );
+  H.bindIdentifyJob('job_four_new');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 2/4 張…',
+    progress: 0.55 + 0.25 * (1 / 4),
+    phase: '目錄查詢',
+  });
+  assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/4 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, '61%');
+}
+
 // Multi-shot history: persist and render every user upload; legacy single-shot still OK
 {
   function shotsOf(rec) {
@@ -2390,6 +2486,88 @@ function walkNodes(node, acc) {
     assert.ok(String(data.cover).indexOf('https://pics.dmm.co.jp/') === 0);
     assert.ok(String(data.results[0].cover).indexOf('data:') !== 0);
     const blob = JSON.stringify(data) + getEl('progress-detail').textContent + seen.join('');
+    FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+  }
+
+  // A 4-image job poll still in flight must not paint over a new 7-image run.
+  {
+    const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+    H.beginIdentifyProgress(4);
+    H.showProgress(
+      [
+        { id: 'receive', label: '接收圖片（4 張）' },
+        { id: 'search', label: '搜尋作品資料' },
+        { id: 'done', label: '完成，進入畫廊' },
+      ],
+      4
+    );
+    H.bindIdentifyJob('job_old_four');
+    const prevTimeout = context.setTimeout;
+    const prevFetch = context.fetch;
+    let release = null;
+    context.setTimeout = (fn) => {
+      fn();
+      return 0;
+    };
+    context.fetch = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    const applied = [];
+    const pending = H.followIdentifyJob('job_old_four', (evt) => {
+      applied.push(String(evt.detail || ''));
+      H.applyProgressEvent(evt);
+    });
+    pending.catch(() => {});
+    await new Promise((r) => prevTimeout(r, 20));
+    assert.strictEqual(typeof release, 'function');
+    H.beginIdentifyProgress(7);
+    H.showProgress(
+      [
+        { id: 'receive', label: '接收圖片（7 張）' },
+        { id: 'search', label: '搜尋作品資料' },
+        { id: 'done', label: '完成，進入畫廊' },
+      ],
+      7
+    );
+    H.bindIdentifyJob('job_seven_live');
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      detail: '搜尋第 2/7 張…',
+      progress: 0.55 + 0.25 * (1 / 7),
+      phase: '目錄查詢',
+    });
+    release({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        job: {
+          status: 'running',
+          progress: {
+            step: 'search',
+            status: 'active',
+            detail: '搜尋第 2/4 張…',
+            progress: 0.55 + 0.25 * (1 / 4),
+            phase: '目錄查詢',
+          },
+        },
+      }),
+    });
+    let superseded = false;
+    try {
+      await pending;
+    } catch (err) {
+      superseded = !!(err && err.superseded);
+    } finally {
+      context.setTimeout = prevTimeout;
+      context.fetch = prevFetch;
+    }
+    assert.strictEqual(superseded, true);
+    assert.ok(applied.indexOf('搜尋第 2/4 張…') === -1, applied.join('|'));
+    assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/7 張…');
+    assert.strictEqual(getEl('progress-pct').textContent, '59%');
+    const blob = getEl('progress-detail').textContent + getEl('progress-pct').textContent;
     FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
   }
 

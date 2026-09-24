@@ -809,6 +809,30 @@ def _progress_image_slot(detail: str) -> int | None:
     return slot or None
 
 
+def _progress_image_total(detail: str) -> int | None:
+    """Upload denominator in 「搜尋第 i/N」. Related-work counts are not N.
+
+    A 7-image run must not store 搜尋第 2/4. 「相關作品 1/4」 is how many
+    merged works are left, so it is not this denominator.
+    """
+    text = str(detail or "")
+    match = _PROGRESS_SLOT_RE.search(text)
+    if not match:
+        return None
+    if (
+        "相關作品" in text
+        and "搜尋第" not in text
+        and "封面鎖定第" not in text
+        and "辨識第" not in text
+    ):
+        return None
+    try:
+        total = int(match.group(2))
+    except (TypeError, ValueError):
+        return None
+    return total or None
+
+
 def _progress_phase_rank(evt: dict) -> int:
     name = str((evt or {}).get("phase") or "")
     if not name:
@@ -828,13 +852,17 @@ def _progress_snapshot_is_backward(prev: dict, evt: dict) -> bool:
     """True when this note would rewind the same identify run.
 
     A later image may start again at 目錄查詢. The same image must not go
-    back to an earlier phase, and 搜尋第 N/M must not decrease. A brand-new
-    job has no previous note, so its first event is never a rewind.
+    back to an earlier phase, and 搜尋第 i/N must not decrease i or N.
+    A brand-new job has no previous note, so its first event is never a rewind.
     """
     if not isinstance(prev, dict) or not prev:
         return False
     if not isinstance(evt, dict) or not evt:
         return False
+    prev_total = _progress_image_total(str(prev.get("detail") or ""))
+    next_total = _progress_image_total(str(evt.get("detail") or ""))
+    if prev_total is not None and next_total is not None and next_total < prev_total:
+        return True
     prev_step = _progress_step_index(str(prev.get("step") or ""))
     next_step = _progress_step_index(str(evt.get("step") or ""))
     if next_step >= 0 and prev_step >= 0 and next_step < prev_step:
@@ -878,6 +906,13 @@ def identify_job_note(job_id: str, evt: dict | None) -> None:
             return
         current = job.get("progress") if isinstance(job.get("progress"), dict) else {}
         if _progress_snapshot_is_backward(current, progress):
+            return
+        try:
+            floor = int(job.get("image_count") or 0)
+        except (TypeError, ValueError):
+            floor = 0
+        next_total = _progress_image_total(str(progress.get("detail") or ""))
+        if floor > 0 and next_total is not None and next_total < floor:
             return
         job["progress"] = progress
 
@@ -10858,14 +10893,18 @@ def run_multi_identify_pipeline(
     _progress(on_progress, "verify", "active", "逐張對照原圖的人物／衣服／姿勢…", 0.52)
     _progress(on_progress, "verify", "done", "開始逐張搜尋", 0.54)
     results: list[dict] = []
+    # Denominator stays at the upload count when a typed query does not add a
+    # row, and grows only when an extra manual job is appended. It never
+    # shrinks below the photos the user just sent.
+    slot_total = max(len(jobs), int(n or 0), 1)
     for ji, job in enumerate(jobs):
         t_slot = time.monotonic()
         _progress(
             on_progress,
             "search",
             "active",
-            f"搜尋第 {ji + 1}/{len(jobs)} 張…",
-            0.55 + 0.25 * (ji / max(len(jobs), 1)),
+            f"搜尋第 {ji + 1}/{slot_total} 張…",
+            0.55 + 0.25 * (ji / slot_total),
             phase="目錄查詢",
         )
         row = job.get("row") if isinstance(job.get("row"), dict) else None
@@ -11072,8 +11111,8 @@ def run_multi_identify_pipeline(
                 on_progress,
                 "search",
                 "active",
-                f"封面鎖定第 {ji + 1}/{len(jobs)} 張…",
-                0.55 + 0.25 * ((ji + 0.5) / max(len(jobs), 1)),
+                f"封面鎖定第 {ji + 1}/{slot_total} 張…",
+                0.55 + 0.25 * ((ji + 0.5) / slot_total),
                 phase="封面鎖定",
             )
             try:
