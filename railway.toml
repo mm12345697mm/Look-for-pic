@@ -3,6 +3,8 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "sh -c 'gunicorn -b 0.0.0.0:${PORT:-8080} -w 2 --timeout 180 server:app'"
+# 240s is headroom so a batch can flush its partial SSE result. The identify
+# pipeline itself stops around 150s and returns per-slot cards.
+startCommand = "sh -c 'gunicorn -b 0.0.0.0:${PORT:-8080} -w 2 --timeout 240 --graceful-timeout 30 server:app'"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5

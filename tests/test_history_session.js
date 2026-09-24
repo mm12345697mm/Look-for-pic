@@ -1887,6 +1887,33 @@ function walkNodes(node, acc) {
   assert.strictEqual(H.batchQueryKeepsFrames(5, false, false), false);
   assert.strictEqual(H.batchQueryKeepsFrames(1, true, true), false);
 
+  assert.strictEqual(H.isIdentifyServerFailure('伺服器錯誤'), true);
+  assert.strictEqual(H.isIdentifyServerFailure('伺服器逾時，多圖辨識被中斷'), true);
+  assert.strictEqual(H.isIdentifyServerFailure('未找到番號或片名'), false);
+
+  const fourteen = new Array(14).fill({ name: 'shot.jpg' });
+  const interrupted = H.interruptedBatchPayload(fourteen, [
+    {
+      ok: true,
+      code: 'ABP-123',
+      title: '已完成的一張',
+      from_image_index: 1,
+      timed_out: false,
+    },
+  ]);
+  assert.strictEqual(interrupted.results.length, 14);
+  assert.strictEqual(interrupted.server_interrupted, true);
+  assert.ok(interrupted.message.indexOf('不是查詢不到') !== -1);
+  const gallery = H.galleryFromIdentify(interrupted);
+  assert.strictEqual(gallery.items.length, 14);
+  assert.strictEqual(gallery.items[0].code, 'ABP-123');
+  gallery.items.slice(1).forEach((item) => {
+    assert.strictEqual(item.code, '尚未查完');
+    assert.strictEqual(item.timedOut, true);
+    assert.ok(String(item.message).indexOf('不是查詢不到') !== -1);
+    assert.notStrictEqual(item.code, '未辨識');
+  });
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);
