@@ -2571,6 +2571,162 @@ function walkNodes(node, acc) {
     FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
   }
 
+  // Skip a slot, keep the others' related, then fill that same slot.
+  {
+    const relatedA = [
+      {
+        code: 'REL-101',
+        title: 'Alpha sibling',
+        line: 'keyword',
+        why: '關鍵字',
+        cover: 'https://pics.dmm.co.jp/digital/video/rel00101/rel00101pl.jpg',
+      },
+    ];
+    const relatedC = [
+      {
+        code: 'REL-303',
+        title: 'Gamma sibling',
+        line: 'actress',
+        why: '同女優',
+        cover: 'https://pics.dmm.co.jp/digital/video/rel00303/rel00303pl.jpg',
+      },
+    ];
+    const preview = 'data:image/jpeg;base64,abc';
+    const data = {
+      ok: true,
+      code: 'AAA-001',
+      title: 'Alpha',
+      cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+      results: [
+        {
+          ok: true,
+          code: 'AAA-001',
+          title: 'Alpha',
+          cover: 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg',
+          from_image_index: 1,
+          related_by_title: relatedA,
+          line: 'main',
+        },
+        {
+          ok: false,
+          skipped: true,
+          code: null,
+          title: null,
+          cover: null,
+          from_image_index: 2,
+          user_preview: preview,
+          related_by_title: [],
+        },
+        {
+          ok: true,
+          code: 'CCC-003',
+          title: 'Gamma',
+          cover: 'https://pics.dmm.co.jp/digital/video/ccc00003/ccc00003pl.jpg',
+          from_image_index: 3,
+          related_by_title: relatedC,
+          line: 'multi',
+        },
+      ],
+    };
+    const works = H.sessionWorksFromIdentify(data);
+    assert.strictEqual(works.length, 3, 'skipped slot stays in the session');
+    assert.strictEqual(works[1].skipped, true);
+    assert.strictEqual(works[1].code, '');
+    assert.strictEqual(works[1].title, '');
+    assert.strictEqual(works[1].cover, '');
+    assert.strictEqual(works[1].user_preview, preview);
+    assert.strictEqual(works[0].related[0].code, 'REL-101');
+    assert.strictEqual(works[2].related[0].code, 'REL-303');
+    assert.notStrictEqual(works[1].title, 'Alpha', 'skipped slot must not inherit the main title');
+
+    const gallery = H.galleryFromIdentify(data);
+    assert.strictEqual(gallery.items.length, 3);
+    assert.strictEqual(gallery.items[1].skipped, true);
+    assert.strictEqual(gallery.items[1].code, '');
+    assert.strictEqual(gallery.items[1].cover, '');
+    assert.strictEqual(gallery.items[1].userPreview, preview);
+    assert.ok(gallery.items[1].cover !== preview, 'upload preview is not the catalog cover');
+    assert.strictEqual(gallery.items[0].relatedByTitle[0].code, 'REL-101');
+    assert.strictEqual(gallery.items[2].relatedByTitle[0].code, 'REL-303');
+
+    const single = {
+      ok: true,
+      code: 'BBB-002',
+      title: 'Beta',
+      cid: 'bbb00002',
+      cover: 'https://pics.dmm.co.jp/digital/video/bbb00002/bbb00002pl.jpg',
+      related_by_title: [
+        {
+          code: 'REL-202',
+          title: 'Beta sibling',
+          line: 'keyword',
+          why: '關鍵字',
+          cover: 'https://pics.dmm.co.jp/digital/video/rel00202/rel00202pl.jpg',
+        },
+      ],
+    };
+    const merged = H.mergeSlotRetryIntoIdentify(data, 2, single);
+    assert.strictEqual(merged.results[0].related_by_title, relatedA);
+    assert.strictEqual(merged.results[2].related_by_title, relatedC);
+    assert.strictEqual(merged.results[1].code, 'BBB-002');
+    assert.strictEqual(merged.results[1].skipped, false);
+    assert.strictEqual(merged.results[1].from_image_index, 2);
+    assert.ok(String(merged.results[1].cover).indexOf('https://') === 0);
+    assert.notStrictEqual(merged.results[1].cover, preview);
+
+    const filled = H.galleryFromIdentify(merged);
+    assert.strictEqual(filled.items[1].skipped, false);
+    assert.strictEqual(filled.items[1].code, 'BBB-002');
+    assert.ok(filled.items[1].cover.indexOf('https://pics.dmm.co.jp/') === 0);
+    assert.strictEqual(filled.items[0].relatedByTitle[0].code, 'REL-101');
+    assert.strictEqual(filled.items[2].relatedByTitle[0].code, 'REL-303');
+    assert.strictEqual(filled.items[1].relatedByTitle[0].code, 'REL-202');
+
+    const nextWorks = H.sessionWorksFromIdentify(merged);
+    H.saveHistory([{ id: 'h-skip', kind: 'session', works: works, code: 'AAA-001', title: 'Alpha' }]);
+    assert.strictEqual(H.replaceHistorySessionWorks('h-skip', nextWorks), true);
+    const saved = H.loadHistory().find((x) => x.id === 'h-skip');
+    assert.strictEqual(saved.works.length, 3);
+    assert.strictEqual(saved.works[1].code, 'BBB-002');
+    assert.strictEqual(saved.works[1].skipped, false);
+    assert.strictEqual(saved.works[0].related[0].code, 'REL-101');
+    assert.strictEqual(saved.works[2].related[0].code, 'REL-303');
+    assert.strictEqual(saved.works[0].code, 'AAA-001');
+
+    const round = H.galleryFromIdentify(H.identifyPayloadFromHistory(saved));
+    assert.strictEqual(round.items[1].code, 'BBB-002');
+    assert.strictEqual(round.items[1].cover.indexOf('https://') === 0, true);
+
+    const skipOn = H.skipControlState(
+      { step: 'search', status: 'active', detail: '搜尋第 2/7 張…', image_index: 2, image_count: 7 },
+      7,
+      'job_x'
+    );
+    assert.strictEqual(skipOn.visible, true);
+    assert.strictEqual(skipOn.index, 2);
+    assert.strictEqual(skipOn.total, 7);
+    const wrongDenom = H.skipControlState(
+      { step: 'search', status: 'active', detail: '搜尋第 2/5 張…', image_count: 5 },
+      7,
+      'job_x'
+    );
+    assert.strictEqual(wrongDenom.visible, false, 'denominator must stay the original upload count');
+    const falseTimeout = H.skipControlState(
+      { step: 'search', status: 'active', detail: '第 2/7 張時間不夠' },
+      7,
+      'job_x'
+    );
+    assert.strictEqual(falseTimeout.visible, false);
+    const visionOn = H.skipControlState(
+      { step: 'vision', status: 'active', detail: '辨識第 4/7 張…', image_index: 4, image_count: 7 },
+      7,
+      'job_x'
+    );
+    assert.strictEqual(visionOn.visible, true);
+    assert.strictEqual(visionOn.index, 4);
+  }
+
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

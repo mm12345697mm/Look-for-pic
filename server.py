@@ -372,6 +372,7 @@ def _identify_session_public(record: dict, *, full: bool) -> dict:
                 "final_title": f.get("final_title"),
                 "title_only": bool(f.get("title_only")),
                 "unidentified": bool(f.get("unidentified")),
+                "skipped": bool(f.get("skipped")),
                 "drop_reason": f.get("drop_reason"),
                 "visual_lock": bool(f.get("visual_lock")),
             }
@@ -438,6 +439,7 @@ def _frame_trace(row: dict, slot: dict | None, *, slot_pos: int | None, drop_rea
         "unidentified": bool(isinstance(slot, dict) and slot.get("unidentified")),
         "visual_lock": bool(isinstance(slot, dict) and slot.get("visual_lock")),
         "needs_code": bool(isinstance(slot, dict) and slot.get("needs_code")),
+        "skipped": bool(isinstance(slot, dict) and slot.get("skipped")),
     }
 
 
@@ -527,6 +529,63 @@ def _frames_from_single(payload: dict, images: list[tuple[bytes, str | None]]) -
         "parsed_code": payload.get("code"),
     }
     return [_frame_trace(row, payload, slot_pos=1 if payload.get("ok") else None, drop_reason=None)]
+
+
+def identify_session_patch_slot(session_id: str, image_index: int, payload: dict) -> bool:
+    """Replace one upload's trace after 重新辨識. Other frames stay as they are."""
+    sid = (session_id or "").strip()
+    if not sid or not isinstance(payload, dict):
+        return False
+    try:
+        idx = int(image_index)
+    except (TypeError, ValueError):
+        return False
+    path = _identify_sessions_resolve_path()
+    with _IDENTIFY_SESSIONS_LOCK:
+        try:
+            sessions = _identify_sessions_read(path)
+        except Exception:
+            return False
+        record = next((row for row in sessions if row.get("id") == sid), None)
+        if not isinstance(record, dict):
+            return False
+        frames = record.get("frames")
+        if not isinstance(frames, list):
+            return False
+        target = None
+        for frame in frames:
+            if not isinstance(frame, dict):
+                continue
+            try:
+                if int(frame.get("index")) == idx:
+                    target = frame
+                    break
+            except (TypeError, ValueError):
+                continue
+        if target is None:
+            return False
+        raw_code = str(payload.get("code") or "").strip()
+        if raw_code == "TITLE-SEARCH":
+            final_code = "TITLE-SEARCH"
+        elif raw_code and parse_code_parts(raw_code):
+            final_code = format_display_code(raw_code)
+        else:
+            final_code = None
+        title = str(payload.get("title") or "").strip()
+        target["final_code"] = final_code
+        target["final_title"] = title or None
+        target["final_slot"] = target.get("final_slot") or idx
+        target["title_only"] = _trace_title_only(payload)
+        target["unidentified"] = bool(payload.get("unidentified"))
+        target["visual_lock"] = bool(payload.get("visual_lock"))
+        target["needs_code"] = bool(payload.get("needs_code"))
+        target["skipped"] = False
+        target["drop_reason"] = None
+        try:
+            _identify_sessions_write(path, sessions)
+        except Exception:
+            return False
+    return True
 
 
 def _ensure_identify_session(payload: dict, images: list[tuple[bytes, str | None]]) -> dict:
@@ -919,6 +978,100 @@ def identify_job_note(job_id: str, evt: dict | None) -> None:
     _identify_jobs_mutate(job_id, mutate)
 
 
+def _job_skip_indexes(job: dict | None) -> list[int]:
+    raw = (job or {}).get("skip_indexes") or []
+    out: list[int] = []
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        try:
+            n = int(item)
+        except (TypeError, ValueError):
+            continue
+        if n > 0 and n not in out:
+            out.append(n)
+    return out
+
+
+def identify_job_set_active(job_id: str | None, image_index, phase: str | None) -> None:
+    """Remember which upload the multi pipeline is in, so 跳過這張 hits that slot."""
+    if not job_id:
+        return
+    try:
+        idx = int(image_index) if image_index is not None else None
+    except (TypeError, ValueError):
+        idx = None
+
+    def mutate(job: dict) -> None:
+        if job.get("status") != "running":
+            return
+        job["active_index"] = idx if idx and idx > 0 else None
+        job["active_phase"] = phase or None
+        job["updated_at"] = time.time()
+
+    _identify_jobs_mutate(job_id, mutate)
+
+
+def identify_job_clear_active(job_id: str | None) -> None:
+    identify_job_set_active(job_id, None, None)
+
+
+def identify_job_is_skipped(job_id: str | None, image_index) -> bool:
+    if not job_id:
+        return False
+    try:
+        idx = int(image_index)
+    except (TypeError, ValueError):
+        return False
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            rows = _identify_jobs_read(path)
+        except Exception:
+            return False
+    job = next((row for row in rows if row.get("id") == job_id), None)
+    return idx in _job_skip_indexes(job)
+
+
+def identify_job_skip_current(job_id: str) -> dict:
+    """Mark the active vision/search slot skipped. Does not cancel the batch."""
+    outcome: dict = {}
+
+    def mutate(job: dict) -> None:
+        if job.get("status") != "running":
+            outcome["error"] = "這次查詢已經結束"
+            return
+        phase = str(job.get("active_phase") or "")
+        idx = job.get("active_index")
+        try:
+            idx_n = int(idx)
+        except (TypeError, ValueError):
+            idx_n = 0
+        if phase not in {"vision", "search"} or idx_n <= 0:
+            outcome["error"] = "目前沒有可跳過的這張"
+            return
+        skips = _job_skip_indexes(job)
+        if idx_n not in skips:
+            skips.append(idx_n)
+        job["skip_indexes"] = skips
+        job["updated_at"] = time.time()
+        outcome["index"] = idx_n
+        outcome["image_count"] = int(job.get("image_count") or 0)
+        outcome["phase"] = phase
+
+    found = _identify_jobs_mutate(job_id, mutate)
+    if found is None:
+        return {"ok": False, "message": "找不到這次查詢"}
+    if outcome.get("error"):
+        return {"ok": False, "message": outcome["error"]}
+    return {
+        "ok": True,
+        "skipped_index": outcome.get("index"),
+        "image_count": outcome.get("image_count") or 0,
+        "phase": outcome.get("phase") or "",
+    }
+
+
 def identify_job_finish(job_id: str, result: dict | None, http_status: int) -> None:
     status_code = int(http_status or 200)
     safe_result = _json_safe(result) if isinstance(result, dict) else None
@@ -961,6 +1114,9 @@ def identify_job_public(job_id: str) -> dict | None:
         "stale": bool(stale),
         "image_count": int(job.get("image_count") or 0),
         "progress": job.get("progress") if isinstance(job.get("progress"), dict) else {},
+        "active_index": job.get("active_index"),
+        "active_phase": job.get("active_phase"),
+        "skip_indexes": _job_skip_indexes(job),
         "updated_at": updated,
     }
     if view in {"done", "error"}:
@@ -976,6 +1132,16 @@ def identify_job_status(job_id: str):
     if not job:
         return jsonify({"ok": False, "message": "找不到這次查詢"}), 404
     return jsonify({"ok": True, "job": job})
+
+
+@app.post("/api/identify/jobs/<job_id>/skip")
+def identify_job_skip(job_id: str):
+    """Skip the upload currently in vision or catalog search. The batch continues."""
+    out = identify_job_skip_current(job_id)
+    if out.get("ok"):
+        return jsonify(out)
+    missing = "找不到" in str(out.get("message") or "")
+    return jsonify(out), 404 if missing else 409
 
 
 @app.route("/d/<token>")
@@ -10114,6 +10280,54 @@ def _hit_has_catalog_code(hit: dict | None) -> bool:
     return False
 
 
+def _skipped_vision_row(idx: int, fname: str | None, image_bytes: bytes | None) -> dict:
+    """Upload kept in order, with no vision read, because the user skipped it."""
+    return {
+        "index": idx,
+        "filename": fname,
+        "code": None,
+        "title": None,
+        "actress": None,
+        "studio": None,
+        "vision_used": False,
+        "skipped": True,
+        "image_bytes": image_bytes,
+    }
+
+
+def _skipped_slot(row: dict | None, *, image_index) -> dict:
+    """Placeholder gallery card. Layout stays; catalog cover, title, and code stay empty.
+
+    user_preview is the upload thumbnail only. It is not the catalog jacket.
+    """
+    row = row or {}
+    host = image_index if image_index is not None else row.get("index")
+    return {
+        "ok": False,
+        "skipped": True,
+        "code": None,
+        "title": None,
+        "actress": None,
+        "studio": None,
+        "cid": None,
+        "cover": None,
+        "stills": [],
+        "related": [],
+        "related_by_title": [],
+        "candidates": [],
+        "why": "已跳過",
+        "line": "multi",
+        "stub": False,
+        "unidentified": False,
+        "needs_code": False,
+        "message": "已跳過這張，可稍後重新辨識。",
+        "vision_used": False,
+        "search_mode": "skip",
+        "from_image_index": host,
+        "user_preview": _user_frame_preview(row.get("image_bytes")),
+    }
+
+
 def _unidentified_slot(row: dict | None) -> dict:
     """Gallery card for a frame with no code and no title. Never a silent skip."""
     row = row or {}
@@ -10608,12 +10822,60 @@ def _pin_manual_query(rows: list[dict], user_code: str, user_title: str) -> bool
     return False
 
 
+class _SlotSkipped(Exception):
+    """The user asked to leave this upload. The rest of the batch still runs."""
+
+
+def _await_until_skip(job_id: str | None, image_index, fn, poll_s: float = 0.35):
+    """Run fn in a daemon thread. Return (value, skipped).
+
+    A skip for this upload returns immediately. The worker may still finish;
+    its result is discarded so the next slot can start.
+    """
+    if not job_id or not isinstance(image_index, int):
+        return fn(), False
+    if identify_job_is_skipped(job_id, image_index):
+        return None, True
+    box: dict = {}
+    err: dict = {}
+    done = threading.Event()
+
+    def runner() -> None:
+        try:
+            box["value"] = fn()
+        except Exception as exc:
+            err["error"] = exc
+        finally:
+            done.set()
+
+    threading.Thread(target=runner, daemon=True).start()
+    while not done.wait(poll_s):
+        if identify_job_is_skipped(job_id, image_index):
+            return None, True
+    if identify_job_is_skipped(job_id, image_index):
+        return None, True
+    if "error" in err:
+        raise err["error"]
+    return box.get("value"), False
+
+
+def _interruptible_call(job_id: str | None, image_index, fn):
+    """Like a direct call, but a skip for this slot raises _SlotSkipped."""
+    if isinstance(image_index, int) and identify_job_is_skipped(job_id, image_index):
+        raise _SlotSkipped()
+    value, skipped = _await_until_skip(job_id, image_index, fn)
+    if skipped:
+        raise _SlotSkipped()
+    return value
+
+
 def run_multi_identify_pipeline(
     images: list[tuple[bytes, str | None]],
     *,
     user_code: str = "",
     user_title: str = "",
     on_progress=None,
+    job_id: str | None = None,
 ) -> tuple[dict, int]:
     """Vision each image → one gallery slot per upload.
 
@@ -10652,6 +10914,7 @@ def run_multi_identify_pipeline(
     for i, (img_bytes, fname) in enumerate(images):
         idx = i + 1
         t_vision = time.monotonic()
+        identify_job_set_active(job_id, idx, "vision")
         _progress(
             on_progress,
             "vision",
@@ -10659,8 +10922,24 @@ def run_multi_identify_pipeline(
             f"辨識第 {idx}/{n} 張…",
             0.05 + 0.35 * (i / max(n, 1)),
             phase="辨識中",
+            image_index=idx,
+            image_count=n,
         )
-        row: dict = {
+        if identify_job_is_skipped(job_id, idx):
+            vision_rows.append(_skipped_vision_row(idx, fname, img_bytes))
+            _progress(
+                on_progress,
+                "vision",
+                "active",
+                f"已跳過第 {idx}/{n} 張",
+                0.05 + 0.35 * (idx / n),
+                image_index=idx,
+                image_count=n,
+            )
+            identify_job_clear_active(job_id)
+            continue
+        try:
+            row: dict = {
             "index": idx,
             "filename": fname,
             "code": None,
@@ -10670,178 +10949,204 @@ def run_multi_identify_pipeline(
             "vision_used": False,
             "image_bytes": img_bytes,
         }
-        ocr_text = ""
-        mime = detect_image_mime(img_bytes, fname)
-        if api_key:
-            try:
-                vm = call_gemini_vision(img_bytes, mime, api_key)
-                row["vision_used"] = True
-                if vm.get("code"):
-                    row["code"] = str(vm.get("code"))
-                if vm.get("title"):
-                    row["title"] = str(vm.get("title"))
-                if vm.get("actress"):
-                    row["actress"] = str(vm.get("actress"))
-                if vm.get("studio"):
-                    row["studio"] = str(vm.get("studio"))
-                if isinstance(vm.get("texts"), list):
-                    row["vision_texts"] = [str(t).strip() for t in vm["texts"] if str(t or "").strip()]
-                if vm.get("shot"):
-                    row["shot"] = str(vm.get("shot"))
-            except Exception as e:
-                row["vision_error"] = str(e)[:120]
+            ocr_text = ""
+            mime = detect_image_mime(img_bytes, fname)
+            if api_key:
                 try:
-                    ocr_text = ocr_image_bytes(img_bytes)
+                    vm = _interruptible_call(
+                        job_id, idx, lambda: call_gemini_vision(img_bytes, mime, api_key)
+                    )
+                    row["vision_used"] = True
+                    if vm.get("code"):
+                        row["code"] = str(vm.get("code"))
+                    if vm.get("title"):
+                        row["title"] = str(vm.get("title"))
+                    if vm.get("actress"):
+                        row["actress"] = str(vm.get("actress"))
+                    if vm.get("studio"):
+                        row["studio"] = str(vm.get("studio"))
+                    if isinstance(vm.get("texts"), list):
+                        row["vision_texts"] = [str(t).strip() for t in vm["texts"] if str(t or "").strip()]
+                    if vm.get("shot"):
+                        row["shot"] = str(vm.get("shot"))
+                except _SlotSkipped:
+                    raise
+                except Exception as e:
+                    row["vision_error"] = str(e)[:120]
+                    try:
+                        ocr_text = _interruptible_call(
+                            job_id, idx, lambda: ocr_image_bytes(img_bytes)
+                        )
+                        sole, many = _sole_trusted_ocr_code(ocr_text)
+                        if sole:
+                            row["code"] = sole
+                        elif many:
+                            row["ocr_codes"] = many
+                    except _SlotSkipped:
+                        raise
+                    except Exception:
+                        pass
+            else:
+                try:
+                    ocr_text = _interruptible_call(
+                        job_id, idx, lambda: ocr_image_bytes(img_bytes)
+                    )
                     sole, many = _sole_trusted_ocr_code(ocr_text)
                     if sole:
                         row["code"] = sole
                     elif many:
                         row["ocr_codes"] = many
+                except _SlotSkipped:
+                    raise
                 except Exception:
                     pass
-        else:
-            try:
-                ocr_text = ocr_image_bytes(img_bytes)
-                sole, many = _sole_trusted_ocr_code(ocr_text)
+            if row.get("vision_used"):
+                row["vision_code"] = str(row["code"]) if row.get("code") else None
+                row["vision_title"] = str(row["title"]) if row.get("title") else None
+            # A code glued into the title line, or a badge mistaken for a title.
+            embedded, cleaned_title = _split_title_and_code(row.get("title"))
+            _title_codes_sole, title_codes = _sole_product_code(str(row.get("title") or ""))
+            if cleaned_title != row.get("title"):
+                row["title"] = cleaned_title
+            if _is_site_chrome_title(row.get("title")):
+                row["title"] = None
+            if embedded and not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+                row["code"] = embedded
+            elif len(title_codes) >= 2 and not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+                row["ocr_codes"] = title_codes
+            # Vision can return a short cover slogan and still miss the 品番 under the thumb.
+            # OCR runs whenever the code is missing, even if that slogan is a "usable" title.
+            # The frame is still kept if both miss.
+            if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+                # The no-key path already OCR'd this frame. A second pass must not
+                # replace that read: tesseract varies, and a later pass can drop a
+                # short badge or title line the first pass actually saw.
+                if not ocr_text:
+                    try:
+                        ocr_text = _interruptible_call(
+                            job_id, idx, lambda: ocr_image_bytes(img_bytes)
+                        )
+                    except _SlotSkipped:
+                        raise
+                    except Exception:
+                        ocr_text = ""
+                sole, many = _sole_trusted_ocr_code(ocr_text or "")
                 if sole:
                     row["code"] = sole
+                    row["ocr_code"] = sole
                 elif many:
                     row["ocr_codes"] = many
-            except Exception:
-                pass
-        if row.get("vision_used"):
-            row["vision_code"] = str(row["code"]) if row.get("code") else None
-            row["vision_title"] = str(row["title"]) if row.get("title") else None
-        # A code glued into the title line, or a badge mistaken for a title.
-        embedded, cleaned_title = _split_title_and_code(row.get("title"))
-        _title_codes_sole, title_codes = _sole_product_code(str(row.get("title") or ""))
-        if cleaned_title != row.get("title"):
-            row["title"] = cleaned_title
-        if _is_site_chrome_title(row.get("title")):
-            row["title"] = None
-        if embedded and not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-            row["code"] = embedded
-        elif len(title_codes) >= 2 and not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-            row["ocr_codes"] = title_codes
-        # Vision can return a short cover slogan and still miss the 品番 under the thumb.
-        # OCR runs whenever the code is missing, even if that slogan is a "usable" title.
-        # The frame is still kept if both miss.
-        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-            # The no-key path already OCR'd this frame. A second pass must not
-            # replace that read: tesseract varies, and a later pass can drop a
-            # short badge or title line the first pass actually saw.
-            if not ocr_text:
-                try:
-                    ocr_text = ocr_image_bytes(img_bytes)
-                except Exception:
-                    ocr_text = ""
-            sole, many = _sole_trusted_ocr_code(ocr_text or "")
-            if sole:
-                row["code"] = sole
-                row["ocr_code"] = sole
-            elif many:
-                row["ocr_codes"] = many
-            if not is_usable_title(row.get("title")) or _is_site_chrome_title(row.get("title")):
+                if not is_usable_title(row.get("title")) or _is_site_chrome_title(row.get("title")):
+                    ocr_title = _title_from_ocr_text(ocr_text)
+                    if ocr_title:
+                        row["ocr_title"] = ocr_title
+                        row["title"] = ocr_title
+            elif ocr_text and not is_usable_title(row.get("title")):
+                # A weak OCR 品番 (yr 33 → YR-33) must not hide the caption line.
                 ocr_title = _title_from_ocr_text(ocr_text)
                 if ocr_title:
                     row["ocr_title"] = ocr_title
                     row["title"] = ocr_title
-        elif ocr_text and not is_usable_title(row.get("title")):
-            # A weak OCR 品番 (yr 33 → YR-33) must not hide the caption line.
-            ocr_title = _title_from_ocr_text(ocr_text)
-            if ocr_title:
-                row["ocr_title"] = ocr_title
-                row["title"] = ocr_title
-        read_blob = _compose_read_blob(
-            row.get("vision_texts"),
-            row.get("vision_title"),
-            row.get("title"),
-            row.get("actress"),
-            ocr_text,
-        )
-        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-            sole_blob, many_blob = _sole_trusted_ocr_code(read_blob)
-            if sole_blob:
-                row["code"] = sole_blob
-                row["ocr_code"] = sole_blob
-            elif many_blob and not row.get("ocr_codes"):
-                row["ocr_codes"] = many_blob
-        # Full-text search only for one complete cover and no listing row under
-        # the thumb. A grid, multi-row screenshot, or player overlay keeps the
-        # focused 品番 and primary title. Do not drop this gate.
-        if _cover_full_text_allowed(row, read_blob):
-            row["text_queries"] = _full_text_search_queries(read_blob, actress=row.get("actress"))
-        else:
-            row["text_queries"] = []
-        if (
-            row["text_queries"]
-            and not (row.get("code") and parse_code_parts(str(row.get("code") or "")))
-            and (not is_usable_title(row.get("title")) or _is_decorative_overlay(row.get("title")))
-        ):
-            row["ocr_title"] = row.get("ocr_title") or row["text_queries"][0]
-            row["title"] = row["text_queries"][0]
-        if _listing_chrome_in_text(read_blob):
-            repairs = _ocr_title_repairs(str(row.get("title") or ""))
-        else:
-            repairs = _ocr_title_repairs(read_blob)
-        if repairs:
-            current = re.sub(r"\s+", "", str(row.get("title") or ""))
-            merged_q = list(dict.fromkeys(list(repairs) + list(row.get("text_queries") or [])))
-            if current and current not in merged_q and _ocr_line_is_clean(current):
-                merged_q.append(current)
-            row["text_queries"] = merged_q[:6]
-            # A clean caption that already contains the repair stays (JUFE full line).
-            # A noisy line or a different fragment (特別な補習) yields to the repair.
-            if not _ocr_line_is_clean(current) or repairs[0] not in current:
-                row["ocr_title"] = repairs[0]
-                row["title"] = repairs[0]
-        # Prefixes are for a noisy read. A clean vision/OCR title is already
-        # the catalog query; slicing it searches a different work's words.
-        if not _listing_chrome_in_text(read_blob) and not _title_is_search_ready(
-            str(row.get("title") or "")
-        ):
-            prefixes = _ocr_line_prefixes(read_blob)
-            merged_pref = list(row.get("text_queries") or [])
-            for pref in prefixes:
-                if pref not in merged_pref:
-                    merged_pref.append(pref)
-            row["text_queries"] = merged_pref[:8]
-        # This cover may already have succeeded on its own. A multi pass that
-        # reads nothing must reuse that image's cached 番號 and 作品名稱,
-        # instead of leaving the frame to be merged into another upload.
-        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))) and not is_usable_title(
-            row.get("title")
-        ):
-            cached_img = None
-            try:
-                cached_img = offline_cache_get(image_hash=image_content_hash(img_bytes))
-            except Exception:
-                cached_img = None
+            read_blob = _compose_read_blob(
+                row.get("vision_texts"),
+                row.get("vision_title"),
+                row.get("title"),
+                row.get("actress"),
+                ocr_text,
+            )
+            if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+                sole_blob, many_blob = _sole_trusted_ocr_code(read_blob)
+                if sole_blob:
+                    row["code"] = sole_blob
+                    row["ocr_code"] = sole_blob
+                elif many_blob and not row.get("ocr_codes"):
+                    row["ocr_codes"] = many_blob
+            # Full-text search only for one complete cover and no listing row under
+            # the thumb. A grid, multi-row screenshot, or player overlay keeps the
+            # focused 品番 and primary title. Do not drop this gate.
+            if _cover_full_text_allowed(row, read_blob):
+                row["text_queries"] = _full_text_search_queries(read_blob, actress=row.get("actress"))
+            else:
+                row["text_queries"] = []
             if (
-                isinstance(cached_img, dict)
-                and _catalog_code_of(cached_img)
-                and _upload_matches_cached_cover(img_bytes, cached_img)
+                row["text_queries"]
+                and not (row.get("code") and parse_code_parts(str(row.get("code") or "")))
+                and (not is_usable_title(row.get("title")) or _is_decorative_overlay(row.get("title")))
             ):
-                row["code"] = _catalog_code_of(cached_img)
-                if is_usable_title(cached_img.get("title")):
-                    row["title"] = str(cached_img.get("title")).strip()
-                row["image_cache"] = cached_img
+                row["ocr_title"] = row.get("ocr_title") or row["text_queries"][0]
+                row["title"] = row["text_queries"][0]
+            if _listing_chrome_in_text(read_blob):
+                repairs = _ocr_title_repairs(str(row.get("title") or ""))
+            else:
+                repairs = _ocr_title_repairs(read_blob)
+            if repairs:
+                current = re.sub(r"\s+", "", str(row.get("title") or ""))
+                merged_q = list(dict.fromkeys(list(repairs) + list(row.get("text_queries") or [])))
+                if current and current not in merged_q and _ocr_line_is_clean(current):
+                    merged_q.append(current)
+                row["text_queries"] = merged_q[:6]
+                # A clean caption that already contains the repair stays (JUFE full line).
+                # A noisy line or a different fragment (特別な補習) yields to the repair.
+                if not _ocr_line_is_clean(current) or repairs[0] not in current:
+                    row["ocr_title"] = repairs[0]
+                    row["title"] = repairs[0]
+            # Prefixes are for a noisy read. A clean vision/OCR title is already
+            # the catalog query; slicing it searches a different work's words.
+            if not _listing_chrome_in_text(read_blob) and not _title_is_search_ready(
+                str(row.get("title") or "")
+            ):
+                prefixes = _ocr_line_prefixes(read_blob)
+                merged_pref = list(row.get("text_queries") or [])
+                for pref in prefixes:
+                    if pref not in merged_pref:
+                        merged_pref.append(pref)
+                row["text_queries"] = merged_pref[:8]
+            # This cover may already have succeeded on its own. A multi pass that
+            # reads nothing must reuse that image's cached 番號 and 作品名稱,
+            # instead of leaving the frame to be merged into another upload.
+            if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))) and not is_usable_title(
+                row.get("title")
+            ):
+                cached_img = None
+                try:
+                    cached_img = offline_cache_get(image_hash=image_content_hash(img_bytes))
+                except Exception:
+                    cached_img = None
+                if (
+                    isinstance(cached_img, dict)
+                    and _catalog_code_of(cached_img)
+                    and _upload_matches_cached_cover(img_bytes, cached_img)
+                ):
+                    row["code"] = _catalog_code_of(cached_img)
+                    if is_usable_title(cached_img.get("title")):
+                        row["title"] = str(cached_img.get("title")).strip()
+                    row["image_cache"] = cached_img
+        except _SlotSkipped:
+            row = _skipped_vision_row(idx, fname, img_bytes)
+        if not row.get("skipped") and identify_job_is_skipped(job_id, idx):
+            row = _skipped_vision_row(idx, fname, img_bytes)
         vision_rows.append(row)
         slot_used[idx] = slot_used.get(idx, 0.0) + (time.monotonic() - t_vision)
-        detail = f"第 {idx}/{n} 張"
-        if row.get("code"):
-            detail += f"：{format_display_code(str(row['code']))}"
-        elif row.get("title"):
-            detail += "：已讀到片名"
+        if row.get("skipped"):
+            detail = f"已跳過第 {idx}/{n} 張"
         else:
-            detail += "：未讀到，仍保留"
+            detail = f"第 {idx}/{n} 張"
+            if row.get("code"):
+                detail += f"：{format_display_code(str(row['code']))}"
+            elif row.get("title"):
+                detail += "：已讀到片名"
+            else:
+                detail += "：未讀到，仍保留"
         _progress(
             on_progress,
             "vision",
             "done" if idx == n else "active",
             detail,
             0.05 + 0.35 * (idx / n),
+            image_index=idx,
+            image_count=n,
         )
+        identify_job_clear_active(job_id)
 
     _progress(on_progress, "vision", "done", f"已看完 {n} 張", 0.42)
     _progress(on_progress, "parse", "active", "彙整番號／片名…", 0.45)
@@ -10849,6 +11154,9 @@ def run_multi_identify_pipeline(
     # One upload → one job. Duplicate strings are not dropped here.
     jobs: list[dict] = []
     for row in vision_rows:
+        if row.get("skipped"):
+            jobs.append({"kind": "skipped", "code": "", "title": "", "row": row})
+            continue
         code = (row.get("code") or "").strip()
         title = (row.get("title") or "").strip()
         if code and parse_code_parts(code):
@@ -10865,6 +11173,9 @@ def run_multi_identify_pipeline(
     if pinned_manual:
         jobs = []
         for row in vision_rows:
+            if row.get("skipped"):
+                jobs.append({"kind": "skipped", "code": "", "title": "", "row": row})
+                continue
             code = (row.get("code") or "").strip()
             title = (row.get("title") or "").strip()
             if code and parse_code_parts(code):
@@ -10892,6 +11203,7 @@ def run_multi_identify_pipeline(
 
     _progress(on_progress, "verify", "active", "逐張對照原圖的人物／衣服／姿勢…", 0.52)
     _progress(on_progress, "verify", "done", "開始逐張搜尋", 0.54)
+    identify_job_clear_active(job_id)
     results: list[dict] = []
     # Denominator stays at the upload count when a typed query does not add a
     # row, and grows only when an extra manual job is appended. It never
@@ -10899,243 +11211,320 @@ def run_multi_identify_pipeline(
     slot_total = max(len(jobs), int(n or 0), 1)
     for ji, job in enumerate(jobs):
         t_slot = time.monotonic()
-        _progress(
-            on_progress,
-            "search",
-            "active",
-            f"搜尋第 {ji + 1}/{slot_total} 張…",
-            0.55 + 0.25 * (ji / slot_total),
-            phase="目錄查詢",
-        )
         row = job.get("row") if isinstance(job.get("row"), dict) else None
-        vm = None
-        if row:
-            vm = {
-                "title": row.get("title"),
-                "actress": row.get("actress"),
-                "studio": row.get("studio"),
-                "code": row.get("code"),
-            }
-        slot_image = row.get("image_bytes") if row else None
         image_index = row.get("index") if row else None
-        one: dict | None = None
+        slot_pos = ji + 1
         try:
-            cached_frame = row.get("image_cache") if row else None
-            if (
-                job["kind"] == "code"
-                and isinstance(cached_frame, dict)
-                and _catalog_code_of(cached_frame) == job.get("code")
-            ):
-                one = dict(cached_frame)
-                one["ok"] = True
-                one["from_offline_cache"] = True
-                one.setdefault("search_mode", "code")
-            elif job["kind"] == "code":
-                one, _st = run_identify_pipeline(
-                    image_bytes=None,
-                    filename=None,
-                    user_code=job["code"],
-                    user_title="",
-                    on_progress=None,
-                    skip_related=True,
-                )
-            elif job["kind"] == "title":
-                # No 品番: search the title cues, then let the jacket pick the volume.
-                # A shared series template is not accepted until the picture locks.
-                queries = list((row or {}).get("text_queries") or [])
-                if job.get("title") and job["title"] not in queries:
-                    queries.insert(0, job["title"])
-                resolved = None
-                noisy_title = not _title_is_search_ready(str(job.get("title") or ""))
-                if slot_image and noisy_title:
-                    try:
-                        resolved = _resolve_unnumbered_cover(queries, slot_image)
-                    except Exception:
-                        resolved = None
-                if isinstance(resolved, dict) and _catalog_code_of(resolved):
-                    one, _st = run_identify_pipeline(
-                        image_bytes=None,
-                        filename=None,
-                        user_code=_catalog_code_of(resolved),
-                        user_title="",
-                        on_progress=None,
-                        skip_related=True,
-                    )
-                    if isinstance(one, dict):
-                        one["visual_meta"] = resolved.get("visual_meta")
-                        if (resolved.get("visual_meta") or {}).get("visual_lock"):
-                            one["visual_lock"] = True
-                        one["resolve_queries"] = queries[:8]
-                else:
-                    one, _st = run_identify_pipeline(
-                        image_bytes=None,
-                        filename=None,
-                        user_code="",
-                        user_title=job["title"],
-                        on_progress=None,
-                        skip_related=True,
-                    )
-                if (
-                    not (isinstance(resolved, dict) and _catalog_code_of(resolved))
-                    and slot_image
-                    and isinstance(one, dict)
-                    and (one.get("candidates") or one.get("code"))
-                ):
-                    packed = {
-                        "code": one.get("code"),
-                        "title": one.get("title"),
-                        "actress": one.get("actress"),
-                        "studio": one.get("studio"),
-                        "cover": one.get("cover"),
-                        "cid": one.get("cid"),
-                        "source": one.get("source"),
-                        "candidates": list(one.get("candidates") or []),
-                    }
-                    if not packed["candidates"] and packed.get("code"):
-                        packed["candidates"] = [dict(packed)]
-                    try:
-                        packed = apply_visual_rank_to_hit(packed, slot_image, api_key=api_key)
-                    except Exception:
-                        packed = packed
-                    if _hit_visually_locked(packed):
-                        locked_code = _catalog_code_of(packed)
-                        if locked_code and locked_code != _catalog_code_of(one):
-                            try:
-                                refreshed, _rst = run_identify_pipeline(
-                                    image_bytes=None,
-                                    filename=None,
-                                    user_code=locked_code,
-                                    user_title="",
-                                    on_progress=None,
-                                    skip_related=True,
-                                )
-                            except Exception:
-                                refreshed = None
-                            if isinstance(refreshed, dict) and refreshed.get("ok") and _catalog_code_of(refreshed):
-                                one = refreshed
-                        else:
-                            one["code"] = packed.get("code") or one.get("code")
-                            if packed.get("title"):
-                                one["title"] = packed.get("title")
-                            one["visual_lock"] = True
-                    elif packed.get("series_unresolved"):
-                        one = {}
-                if vm and isinstance(one, dict) and one.get("ok"):
-                    one = apply_vision_meta(one, vm)
-        except Exception as e:
-            one = empty_identify(message=f"查詢失敗：{e}")
-
-        if not isinstance(one, dict):
-            one = {}
-        frame_title = (job.get("title") or (vm or {}).get("title") or "").strip()
-        # A code stamped on this frame is not enough when the printed title
-        # belongs to another work. The school-swimsuit cover must not collapse
-        # into a JUFE code that a different upload actually is.
-        title_rejects_code = bool(
-            job["kind"] == "code"
-            and _catalog_code_of(one)
-            and is_usable_title(frame_title)
-            and not _frame_title_supports_code(one.get("title"), frame_title)
+            active_idx = int(image_index) if image_index is not None else 0
+        except (TypeError, ValueError):
+            active_idx = 0
+        user_skipped = job.get("kind") == "skipped" or (
+            active_idx > 0 and identify_job_is_skipped(job_id, active_idx)
         )
-        if job["kind"] == "unknown":
-            one = _unidentified_slot(row)
-        elif not _catalog_code_of(one) or title_rejects_code:
-            escalated = None
-            title_q = frame_title
-            if is_usable_title(title_q) or is_usable_title(
-                _strip_glued_actress(title_q, (vm or {}).get("actress"))
-            ):
-                try:
-                    escalated = _escalate_frame_title(
-                        title_q,
-                        actress=(vm or {}).get("actress") if vm else None,
-                        image_bytes=slot_image,
-                        api_key=api_key,
-                        vision_meta=vm,
-                        image_index=image_index,
-                    )
-                except Exception:
-                    escalated = None
-            if escalated and _catalog_code_of(escalated):
-                one = escalated
-            elif title_rejects_code:
-                pass
-            else:
-                if not _catalog_code_of(one):
-                    for extra_q in (row or {}).get("text_queries") or []:
-                        if not extra_q or extra_q == frame_title:
-                            continue
-                        try:
-                            escalated = _escalate_frame_title(
-                                extra_q,
-                                actress=(vm or {}).get("actress") if vm else None,
-                                image_bytes=slot_image,
-                                api_key=api_key,
-                                vision_meta=vm,
-                                image_index=image_index,
-                            )
-                        except Exception:
-                            escalated = None
-                        if escalated and _catalog_code_of(escalated):
-                            one = escalated
-                            break
-                recovered = None
-                if not _catalog_code_of(one) and slot_image:
-                    try:
-                        recovered = _recover_locked_work(
-                            image_bytes=slot_image,
-                            api_key=api_key,
-                            actress=(vm or {}).get("actress") if vm else None,
-                            codes=(row or {}).get("ocr_codes") if row else None,
-                            vision_meta=vm,
-                            image_index=image_index,
-                        )
-                    except Exception:
-                        recovered = None
-                if recovered and _catalog_code_of(recovered):
-                    one = recovered
-                elif job["kind"] == "title":
-                    one = _unresolved_title_slot(
-                        job,
-                        why="已用片名搜尋，目錄沒有返回番號。可手動輸入番號。",
-                    )
-                elif job["kind"] == "code":
-                    one = build_multi_fail_stub(job, why="番號已查，目錄沒有完整資料")
-                    one["from_image_index"] = image_index
-                    one["needs_code"] = not bool(_catalog_code_of(one))
-                else:
-                    one = _unidentified_slot(row)
-
-        if one.get("ok") and _catalog_code_of(one):
+        if active_idx > 0:
+            identify_job_set_active(job_id, active_idx, "search")
+        if user_skipped:
+            one = _skipped_slot(row, image_index=image_index if image_index is not None else slot_pos)
+            one["line"] = "main" if not results else "multi"
+            one["ok"] = False
+            one["why"] = "已跳過"
+            one["skipped"] = True
+            results.append(one)
             _progress(
                 on_progress,
                 "search",
                 "active",
-                f"封面鎖定第 {ji + 1}/{slot_total} 張…",
-                0.55 + 0.25 * ((ji + 0.5) / slot_total),
-                phase="封面鎖定",
+                f"已跳過第 {slot_pos}/{slot_total} 張",
+                0.55 + 0.25 * (slot_pos / slot_total),
+                image_index=slot_pos,
+                image_count=slot_total,
             )
+            identify_job_clear_active(job_id)
+            continue
+        _progress(
+            on_progress,
+            "search",
+            "active",
+            f"搜尋第 {slot_pos}/{slot_total} 張…",
+            0.55 + 0.25 * (ji / slot_total),
+            phase="目錄查詢",
+            image_index=slot_pos,
+            image_count=slot_total,
+        )
+        def _fill_slot():
+            vm = None
+            if row:
+                vm = {
+                    "title": row.get("title"),
+                    "actress": row.get("actress"),
+                    "studio": row.get("studio"),
+                    "code": row.get("code"),
+                }
+            slot_image = row.get("image_bytes") if row else None
+            image_index = row.get("index") if row else None
+            one: dict | None = None
             try:
-                one = verify_work_against_image(
-                    one,
-                    slot_image,
-                    api_key=api_key,
-                    vision_title=(vm or {}).get("title") if isinstance(vm, dict) else None,
+                cached_frame = row.get("image_cache") if row else None
+                if (
+                    job["kind"] == "code"
+                    and isinstance(cached_frame, dict)
+                    and _catalog_code_of(cached_frame) == job.get("code")
+                ):
+                    one = dict(cached_frame)
+                    one["ok"] = True
+                    one["from_offline_cache"] = True
+                    one.setdefault("search_mode", "code")
+                elif job["kind"] == "code":
+                    one, _st = run_identify_pipeline(
+                        image_bytes=None,
+                        filename=None,
+                        user_code=job["code"],
+                        user_title="",
+                        on_progress=None,
+                        skip_related=True,
+                    )
+                elif job["kind"] == "title":
+                    # No 品番: search the title cues, then let the jacket pick the volume.
+                    # A shared series template is not accepted until the picture locks.
+                    queries = list((row or {}).get("text_queries") or [])
+                    if job.get("title") and job["title"] not in queries:
+                        queries.insert(0, job["title"])
+                    resolved = None
+                    noisy_title = not _title_is_search_ready(str(job.get("title") or ""))
+                    if slot_image and noisy_title:
+                        try:
+                            resolved = _resolve_unnumbered_cover(queries, slot_image)
+                        except Exception:
+                            resolved = None
+                    if isinstance(resolved, dict) and _catalog_code_of(resolved):
+                        one, _st = run_identify_pipeline(
+                            image_bytes=None,
+                            filename=None,
+                            user_code=_catalog_code_of(resolved),
+                            user_title="",
+                            on_progress=None,
+                            skip_related=True,
+                        )
+                        if isinstance(one, dict):
+                            one["visual_meta"] = resolved.get("visual_meta")
+                            if (resolved.get("visual_meta") or {}).get("visual_lock"):
+                                one["visual_lock"] = True
+                            one["resolve_queries"] = queries[:8]
+                    else:
+                        one, _st = run_identify_pipeline(
+                            image_bytes=None,
+                            filename=None,
+                            user_code="",
+                            user_title=job["title"],
+                            on_progress=None,
+                            skip_related=True,
+                        )
+                    if (
+                        not (isinstance(resolved, dict) and _catalog_code_of(resolved))
+                        and slot_image
+                        and isinstance(one, dict)
+                        and (one.get("candidates") or one.get("code"))
+                    ):
+                        packed = {
+                            "code": one.get("code"),
+                            "title": one.get("title"),
+                            "actress": one.get("actress"),
+                            "studio": one.get("studio"),
+                            "cover": one.get("cover"),
+                            "cid": one.get("cid"),
+                            "source": one.get("source"),
+                            "candidates": list(one.get("candidates") or []),
+                        }
+                        if not packed["candidates"] and packed.get("code"):
+                            packed["candidates"] = [dict(packed)]
+                        try:
+                            packed = apply_visual_rank_to_hit(packed, slot_image, api_key=api_key)
+                        except Exception:
+                            packed = packed
+                        if _hit_visually_locked(packed):
+                            locked_code = _catalog_code_of(packed)
+                            if locked_code and locked_code != _catalog_code_of(one):
+                                try:
+                                    refreshed, _rst = run_identify_pipeline(
+                                        image_bytes=None,
+                                        filename=None,
+                                        user_code=locked_code,
+                                        user_title="",
+                                        on_progress=None,
+                                        skip_related=True,
+                                    )
+                                except Exception:
+                                    refreshed = None
+                                if isinstance(refreshed, dict) and refreshed.get("ok") and _catalog_code_of(refreshed):
+                                    one = refreshed
+                            else:
+                                one["code"] = packed.get("code") or one.get("code")
+                                if packed.get("title"):
+                                    one["title"] = packed.get("title")
+                                one["visual_lock"] = True
+                        elif packed.get("series_unresolved"):
+                            one = {}
+                    if vm and isinstance(one, dict) and one.get("ok"):
+                        one = apply_vision_meta(one, vm)
+            except Exception as e:
+                one = empty_identify(message=f"查詢失敗：{e}")
+
+            if active_idx > 0 and identify_job_is_skipped(job_id, active_idx):
+                return _skipped_slot(
+                    row, image_index=image_index if image_index is not None else slot_pos
                 )
-            except Exception:
-                pass
-            disp = _catalog_code_of(one)
-            if disp:
-                one["code"] = disp
-        one.setdefault("related_by_title", [])
-        one["from_image_index"] = image_index if image_index is not None else one.get("from_image_index")
-        one["_frame_title"] = frame_title
-        one["why"] = one.get("why") or "多圖辨識"
-        one["line"] = "main" if not results else "multi"
-        one["ok"] = True
+
+            if not isinstance(one, dict):
+                one = {}
+            frame_title = (job.get("title") or (vm or {}).get("title") or "").strip()
+            # A code stamped on this frame is not enough when the printed title
+            # belongs to another work. The school-swimsuit cover must not collapse
+            # into a JUFE code that a different upload actually is.
+            title_rejects_code = bool(
+                job["kind"] == "code"
+                and _catalog_code_of(one)
+                and is_usable_title(frame_title)
+                and not _frame_title_supports_code(one.get("title"), frame_title)
+            )
+            if job["kind"] == "unknown":
+                one = _unidentified_slot(row)
+            elif not _catalog_code_of(one) or title_rejects_code:
+                escalated = None
+                title_q = frame_title
+                if is_usable_title(title_q) or is_usable_title(
+                    _strip_glued_actress(title_q, (vm or {}).get("actress"))
+                ):
+                    try:
+                        escalated = _escalate_frame_title(
+                            title_q,
+                            actress=(vm or {}).get("actress") if vm else None,
+                            image_bytes=slot_image,
+                            api_key=api_key,
+                            vision_meta=vm,
+                            image_index=image_index,
+                        )
+                    except Exception:
+                        escalated = None
+                if escalated and _catalog_code_of(escalated):
+                    one = escalated
+                elif title_rejects_code:
+                    pass
+                else:
+                    if not _catalog_code_of(one):
+                        for extra_q in (row or {}).get("text_queries") or []:
+                            if not extra_q or extra_q == frame_title:
+                                continue
+                            try:
+                                escalated = _escalate_frame_title(
+                                    extra_q,
+                                    actress=(vm or {}).get("actress") if vm else None,
+                                    image_bytes=slot_image,
+                                    api_key=api_key,
+                                    vision_meta=vm,
+                                    image_index=image_index,
+                                )
+                            except Exception:
+                                escalated = None
+                            if escalated and _catalog_code_of(escalated):
+                                one = escalated
+                                break
+                    recovered = None
+                    if not _catalog_code_of(one) and slot_image:
+                        try:
+                            recovered = _recover_locked_work(
+                                image_bytes=slot_image,
+                                api_key=api_key,
+                                actress=(vm or {}).get("actress") if vm else None,
+                                codes=(row or {}).get("ocr_codes") if row else None,
+                                vision_meta=vm,
+                                image_index=image_index,
+                            )
+                        except Exception:
+                            recovered = None
+                    if recovered and _catalog_code_of(recovered):
+                        one = recovered
+                    elif job["kind"] == "title":
+                        one = _unresolved_title_slot(
+                            job,
+                            why="已用片名搜尋，目錄沒有返回番號。可手動輸入番號。",
+                        )
+                    elif job["kind"] == "code":
+                        one = build_multi_fail_stub(job, why="番號已查，目錄沒有完整資料")
+                        one["from_image_index"] = image_index
+                        one["needs_code"] = not bool(_catalog_code_of(one))
+                    else:
+                        one = _unidentified_slot(row)
+
+            if active_idx > 0 and identify_job_is_skipped(job_id, active_idx):
+                return _skipped_slot(
+                    row, image_index=image_index if image_index is not None else slot_pos
+                )
+            if one.get("ok") and _catalog_code_of(one):
+                _progress(
+                    on_progress,
+                    "search",
+                    "active",
+                    f"封面鎖定第 {slot_pos}/{slot_total} 張…",
+                    0.55 + 0.25 * ((ji + 0.5) / slot_total),
+                    phase="封面鎖定",
+                    image_index=slot_pos,
+                    image_count=slot_total,
+                )
+                try:
+                    one = verify_work_against_image(
+                        one,
+                        slot_image,
+                        api_key=api_key,
+                        vision_title=(vm or {}).get("title") if isinstance(vm, dict) else None,
+                    )
+                except Exception:
+                    pass
+                disp = _catalog_code_of(one)
+                if disp:
+                    one["code"] = disp
+            if active_idx > 0 and identify_job_is_skipped(job_id, active_idx):
+                return _skipped_slot(
+                    row, image_index=image_index if image_index is not None else slot_pos
+                )
+            one["_frame_title"] = frame_title
+            return one
+
+        try:
+            filled, was_skipped = _await_until_skip(
+                job_id, active_idx if active_idx > 0 else None, _fill_slot
+            )
+        except Exception as exc:
+            filled, was_skipped = empty_identify(message=f"查詢失敗：{exc}"), False
+        if was_skipped or (active_idx > 0 and identify_job_is_skipped(job_id, active_idx)) or (
+            isinstance(filled, dict) and filled.get("skipped")
+        ):
+            one = _skipped_slot(
+                row, image_index=image_index if image_index is not None else slot_pos
+            )
+            one["line"] = "main" if not results else "multi"
+            one["ok"] = False
+            one["why"] = "已跳過"
+            one["skipped"] = True
+            _progress(
+                on_progress,
+                "search",
+                "active",
+                f"已跳過第 {slot_pos}/{slot_total} 張",
+                0.55 + 0.25 * (slot_pos / slot_total),
+                image_index=slot_pos,
+                image_count=slot_total,
+            )
+        else:
+            one = filled if isinstance(filled, dict) else {}
+            one.setdefault("related_by_title", [])
+            one["from_image_index"] = image_index if image_index is not None else one.get("from_image_index")
+            one["why"] = one.get("why") or "多圖辨識"
+            one["line"] = "main" if not results else "multi"
+            one["ok"] = True
         results.append(one)
         slot_key = image_index if isinstance(image_index, int) else (ji + 1)
         slot_used[slot_key] = slot_used.get(slot_key, 0.0) + (time.monotonic() - t_slot)
+        identify_job_clear_active(job_id)
 
     # Textless frames may still be a still of a work another frame already found.
     relocked: list[dict] = []
@@ -11164,7 +11553,8 @@ def run_multi_identify_pipeline(
             200,
         )
 
-    n_unknown = sum(1 for r in results if r.get("unidentified"))
+    n_skipped = sum(1 for r in results if isinstance(r, dict) and r.get("skipped"))
+    n_unknown = sum(1 for r in results if r.get("unidentified") and not r.get("skipped"))
     n_title_open = sum(
         1
         for r in results
@@ -11182,6 +11572,10 @@ def run_multi_identify_pipeline(
     if n_code_stub:
         bit = f"其中 {n_code_stub} 部番號已查，目錄沒有完整資料（卡片已保留）"
         note += f"；{bit}"
+    if n_skipped:
+        bit = f"其中 {n_skipped} 張已跳過（可稍後重新辨識）"
+        msg += f"（{bit}）"
+        note += f"；{bit}"
     if n_unknown:
         bit = f"其中 {n_unknown} 部未辨識（已保留該張）"
         note += f"；{bit}"
@@ -11190,6 +11584,7 @@ def run_multi_identify_pipeline(
         msg += f"（{bit}）"
         note += f"；{bit}"
 
+    identify_job_clear_active(job_id)
     _progress(on_progress, "search", "done", f"列出 {len(results)} 部（成功 {ok_count}）", 0.82)
     main = results[0]
     # Other multi hits as related gallery cards (related_by_title filled once below)
@@ -11210,6 +11605,8 @@ def run_multi_identify_pipeline(
                 "stub": bool(r.get("stub")),
                 "unidentified": bool(r.get("unidentified")),
                 "needs_code": bool(r.get("needs_code")),
+                "skipped": bool(r.get("skipped")),
+                "user_preview": r.get("user_preview") if r.get("skipped") else None,
                 "from_image_index": r.get("from_image_index"),
             }
         )
@@ -11322,6 +11719,8 @@ def _progress(
     detail: str = "",
     progress: float | None = None,
     phase: str | None = None,
+    image_index: int | None = None,
+    image_count: int | None = None,
 ) -> None:
     """Safe progress callback. status: pending|active|done|skipped|error.
 
@@ -11353,6 +11752,10 @@ def _progress(
         }
         if phase:
             evt["phase"] = phase
+        if isinstance(image_index, int) and image_index > 0:
+            evt["image_index"] = image_index
+        if isinstance(image_count, int) and image_count > 0:
+            evt["image_count"] = image_count
         cb(evt)
     except Exception:
         pass
@@ -12657,6 +13060,8 @@ def identify_stream():
     """
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
+    session_id = (request.form.get("session_id") or "").strip()
+    slot_index_raw = (request.form.get("slot_index") or "").strip()
     images = collect_images_from_request()
     n_images = len(images)
     job_id = identify_job_create(n_images)
@@ -12693,6 +13098,7 @@ def identify_stream():
                         user_code=user_code,
                         user_title=user_title,
                         on_progress=on_progress,
+                        job_id=job_id,
                     )
                 elif n_images == 1:
                     result, status = run_identify_pipeline(
@@ -12710,6 +13116,20 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
+                if (
+                    n_images == 1
+                    and session_id
+                    and slot_index_raw
+                    and isinstance(result, dict)
+                ):
+                    try:
+                        slot_n = int(slot_index_raw)
+                    except (TypeError, ValueError):
+                        slot_n = 0
+                    if slot_n > 0 and identify_session_patch_slot(session_id, slot_n, result):
+                        result["session_id"] = session_id
+                        result["slot_index"] = slot_n
+                        result["slot_patched"] = True
                 result = _ensure_identify_session(result, images)
                 if job_id:
                     try:

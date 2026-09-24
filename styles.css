@@ -639,6 +639,31 @@ label.btn {
   color: var(--muted);
   line-height: 1.4;
 }
+.progress-skip-row {
+  padding: 0 14px 12px;
+}
+.progress-skip-row[hidden] {
+  display: none !important;
+}
+.btn-skip-slot,
+.btn-reidentify {
+  width: 100%;
+  min-height: 44px;
+  font-size: 1rem;
+  touch-action: manipulation;
+}
+.btn-skip-slot {
+  background: var(--surface2);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.btn-reidentify {
+  margin-top: 8px;
+}
+.card.is-skipped .card-code:empty,
+.card.is-skipped .card-title:empty {
+  display: none;
+}
 .progress-panel.is-complete .progress-summary { color: var(--ok); }
 .progress-panel.is-failed .progress-summary { color: var(--danger); }
 @keyframes spin {
@@ -650,6 +675,23 @@ label.btn {
 .cover-wrap.is-empty {
   min-height: 140px;
   background: #16161e;
+}
+.cover-wrap.is-skipped {
+  position: relative;
+  overflow: hidden;
+}
+.skipped-upload-preview {
+  display: block;
+  width: 100%;
+  max-height: 240px;
+  object-fit: contain;
+  opacity: 0.45;
+  background: #101018;
+}
+.cover-wrap.is-skipped.has-upload-preview .cover-placeholder {
+  position: absolute;
+  inset: 0;
+  background: rgba(12, 12, 18, 0.28);
 }
 .cover-placeholder {
   display: flex;
