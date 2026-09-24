@@ -355,6 +355,66 @@ class TestIdentifyStreamSurvivesSilence(unittest.TestCase):
             self.assertNotIn(phrase, blob)
         self.assertEqual(result.get("code"), "MIDA-616")
 
+    def test_one_known_work_stays_on_the_single_lock_path(self):
+        """MIDA-616 on one image already finishes on production #30.
+
+        The silence fix is only for the 4-image stream. One upload must keep
+        using run_identify_pipeline and return that work's catalog jacket
+        with the visual lock still set. It must not enter 搜尋第 n/4.
+        """
+        jacket = "https://pics.dmm.co.jp/digital/video/mida616/mida616pl.jpg"
+        still = "https://pics.dmm.co.jp/digital/video/mida616/mida616jp-1.jpg"
+        calls = {"single": 0, "multi": 0}
+
+        def fake_single(**kwargs):
+            calls["single"] += 1
+            self.assertEqual(kwargs.get("image_bytes"), b"mida-only")
+            self.assertEqual(kwargs.get("filename"), "mida.jpg")
+            return {
+                "ok": True,
+                "code": "MIDA-616",
+                "title": "彼女の妹のノーブラ誘惑に負け巨乳ナマ乳沼に溺れたサイテーなボク",
+                "cover": jacket,
+                "stills": [still],
+                "visual_lock": True,
+                "related_by_title": [],
+            }, 200
+
+        def fake_multi(*args, **kwargs):
+            calls["multi"] += 1
+            raise AssertionError("one image must not enter the multi-slot catalog loop")
+
+        with mock.patch.object(
+            S, "collect_images_from_request", return_value=[(b"mida-only", "mida.jpg")]
+        ), mock.patch.object(
+            S, "run_identify_pipeline", side_effect=fake_single
+        ), mock.patch.object(
+            S, "run_multi_identify_pipeline", side_effect=fake_multi
+        ):
+            client = S.app.test_client()
+            res = client.post("/api/identify/stream", data={})
+            body = res.get_data(as_text=True)
+
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(calls["single"], 1)
+        self.assertEqual(calls["multi"], 0)
+        self.assertIn("MIDA-616", body)
+        self.assertIn(jacket, body)
+        self.assertNotIn("搜尋第", body)
+        for phrase in FALSE_TIMEOUT:
+            self.assertNotIn(phrase, body)
+        found = re.search(r"job_[0-9a-f]{24}", body)
+        self.assertIsNotNone(found)
+        view = S.identify_job_public(found.group(0))
+        self.assertEqual(view.get("status"), "done")
+        result = view.get("result") or {}
+        self.assertEqual(result.get("code"), "MIDA-616")
+        self.assertTrue(result.get("visual_lock"))
+        self.assertEqual(result.get("cover"), jacket)
+        self.assertEqual(result.get("stills"), [still])
+        self.assertFalse(str(result.get("cover")).startswith("data:"))
+        self.assertNotIn("results", result)
+
 
 if __name__ == "__main__":
     unittest.main()
