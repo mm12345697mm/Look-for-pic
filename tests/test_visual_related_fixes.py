@@ -1190,6 +1190,8 @@ class TestDandyCodeLookupAndVisualLock(unittest.TestCase):
             S, "enrich_title_candidate", side_effect=self._enrich_copy
         ), mock.patch.object(
             S, "attach_chinese_titles", side_effect=lambda payload, **kwargs: payload
+        ), mock.patch.object(
+            S, "fetch_public_zh_catalog", return_value={"genres": [], "series": None, "cover": None}
         ):
             out = S.attach_related_by_title(payload, budget_sec=2, per_item=False)
         self.assertEqual(out.get("theme_keywords"), self.EXPECTED_KEYWORDS)
@@ -1283,6 +1285,11 @@ class TestDandyCodeLookupAndVisualLock(unittest.TestCase):
             mock.patch.object(S, "_find_related_by_keywords", side_effect=fake_keywords),
             mock.patch.object(S, "_find_related_by_actress", side_effect=fake_actress),
             mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich_copy),
+            mock.patch.object(
+                S,
+                "fetch_public_zh_catalog",
+                return_value={"genres": [], "series": None, "cover": None},
+            ),
         ]
         return patches
 
@@ -1918,6 +1925,8 @@ class TestTutorTitleKeywordChips(unittest.TestCase):
             S, "_find_related_by_actress", return_value=[]
         ), mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich_copy), mock.patch.object(
             S, "attach_chinese_titles", side_effect=lambda payload, **kwargs: payload
+        ), mock.patch.object(
+            S, "fetch_public_zh_catalog", return_value={"genres": [], "series": None, "cover": None}
         ):
             out = S.attach_related_by_title(payload, budget_sec=1, per_item=True)
         self.assertEqual(out.get("theme_keywords"), self.EXPECTED_KEYWORDS)
@@ -2237,6 +2246,13 @@ class TestKeywordSingleFallback(unittest.TestCase):
             stack.enter_context(mock.patch.object(S, "search_by_title", return_value=hit))
             stack.enter_context(mock.patch.object(S, "resolve_chinese_title", return_value=None))
             stack.enter_context(mock.patch.object(S, "attach_chinese_titles", side_effect=passthrough))
+            stack.enter_context(
+                mock.patch.object(
+                    S,
+                    "fetch_public_zh_catalog",
+                    return_value={"genres": [], "series": None, "cover": None},
+                )
+            )
             stack.enter_context(
                 mock.patch.object(
                     S,

@@ -310,7 +310,7 @@ class TestMissavTagsAndCinemaSeries(unittest.TestCase):
         self.assertEqual(jable_genres, ["巨乳", "映画館", "淫語"], jable_genres)
 
     def test_fetch_folds_tags_into_the_same_zh_catalog_call(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if url == "https://missav.ai/cn/royd-343":
                 return ROYD_MISSAV_HTML
             return None
@@ -424,6 +424,293 @@ class TestMissavTagsAndCinemaSeries(unittest.TestCase):
         self.assertIn("映画館", seen["missav"], seen["missav"])
         self.assertIn("平日昼間の映画館", seen["missav"], seen["missav"])
         self.assertNotIn("平日昼間の映画館", seen["javbus"])
+
+
+MISSAV_COVER = "https://fourhoi.com/royd-343/cover-n.jpg"
+JABLE_COVER = "https://jable.tv/poster/royd-343.jpg"
+DMM_COVER = "https://pics.dmm.co.jp/digital/video/royd00343/royd00343pl.jpg"
+
+
+def _missav_cover_html() -> str:
+    return ROYD_MISSAV_HTML.replace(
+        "</head>",
+        (
+            f'<meta property="og:image" content="{MISSAV_COVER}">'
+            '<meta property="og:image" content="data:image/jpeg;base64,aaaa">'
+            '<img src="https://missav.ai/assets/logo.png">'
+            "</head>"
+        ),
+        1,
+    )
+
+
+class TestPublicCoverFallback(unittest.TestCase):
+    def test_parser_skips_upload_and_logo(self):
+        html = (
+            "<html><head>"
+            '<meta property="og:image" content="data:image/jpeg;base64,qq">'
+            '<meta property="og:image" content="https://missav.ai/logo.png">'
+            f'<meta property="og:image" content="{MISSAV_COVER}">'
+            "</head></html>"
+        )
+        self.assertEqual(S._parse_public_catalog_cover(html), MISSAV_COVER)
+        self.assertEqual(S._public_product_cover("blob:https://missav.ai/uuid"), "")
+        self.assertEqual(S._public_product_cover("data:image/png;base64,aa"), "")
+
+    def test_upload_never_becomes_the_jacket(self):
+        item = {
+            "code": "ROYD-343",
+            "cover": "data:image/jpeg;base64,qq",
+            "user_preview": "data:image/jpeg;base64,qq",
+        }
+        S._apply_public_cover_fallback(
+            item, {"cover": "blob:https://missav.ai/1", "cover_source": "missav"}
+        )
+        self.assertFalse(str(item.get("cover") or "").startswith(("data:", "blob:")))
+        S._apply_public_cover_fallback(
+            item, {"cover": MISSAV_COVER, "cover_source": "missav"}
+        )
+        self.assertEqual(item.get("cover"), MISSAV_COVER)
+        self.assertEqual(item.get("cover_source"), "missav")
+        self.assertFalse(str(item["cover"]).startswith(("data:", "blob:")))
+
+    def test_dmm_jacket_wins_over_missav(self):
+        item = {"code": "ROYD-343", "cover": DMM_COVER}
+        S._apply_public_cover_fallback(
+            item, {"cover": MISSAV_COVER, "cover_source": "missav"}
+        )
+        self.assertEqual(item.get("cover"), DMM_COVER)
+        self.assertNotEqual(item.get("cover_source"), "missav")
+
+    def test_progress_names_the_fallback_source(self):
+        status, detail = S._cover_progress_detail(
+            {"cover": MISSAV_COVER, "cover_source": "missav"}
+        )
+        self.assertEqual(status, "done")
+        self.assertEqual(detail, "封面就緒（MissAV）")
+        self.assertNotIn("無封面 URL", detail)
+        skipped, empty = S._cover_progress_detail({"cover": None})
+        self.assertEqual(skipped, "skipped")
+        self.assertEqual(empty, "無封面 URL")
+
+    def test_pipeline_uses_missav_cover_when_dmm_is_empty(self):
+        events = []
+
+        def on_progress(evt):
+            events.append(dict(evt))
+
+        def fake_get(url, timeout=10.0, connect_timeout=3.0, headers=None):
+            if "missav." in str(url):
+                return _missav_cover_html()
+            return None
+
+        with mock.patch.object(S, "offline_cache_get", return_value=None), mock.patch.object(
+            S,
+            "fetch_avbase_by_code",
+            return_value={
+                "title": ROYD_TITLE,
+                "actress": "百永さりな",
+                "genres": list(ROYD_CATALOG_GENRES),
+                "source": "avbase",
+            },
+        ), mock.patch.object(
+            S, "sanitize_cover_fields", return_value=(None, None, [])
+        ), mock.patch.object(S, "http_get", side_effect=fake_get), mock.patch.object(
+            S, "find_related_by_title", return_value=[]
+        ), mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ):
+            payload, status = S.run_identify_pipeline(
+                user_code="ROYD-343", on_progress=on_progress
+            )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("search_mode"), "manual")
+        self.assertEqual(payload.get("cover"), MISSAV_COVER)
+        self.assertTrue(str(payload.get("cover")).startswith("https://"))
+        self.assertEqual(payload.get("cover_source"), "missav")
+        self.assertNotEqual(payload.get("cover"), "data:image/jpeg;base64,aaaa")
+        cover_steps = [ev for ev in events if ev.get("step") == "cover" and ev.get("status") != "active"]
+        self.assertTrue(cover_steps, events)
+        self.assertEqual(cover_steps[-1].get("status"), "done")
+        self.assertNotIn("無封面 URL", str(cover_steps[-1].get("detail")))
+        self.assertIn("封面就緒（MissAV）", str(cover_steps[-1].get("detail")))
+        self.assertIn("映画館", payload.get("theme_keywords") or [])
+
+    def test_jable_poster_when_missav_page_is_missing(self):
+        def fake_get(url, timeout=10.0, connect_timeout=3.0, headers=None):
+            if "jable.tv" in str(url):
+                return (
+                    "<html><head>"
+                    '<meta property="og:title" content="ROYD-343 電影院 - Jable">'
+                    "</head><body>"
+                    f'<video poster="{JABLE_COVER}"></video>'
+                    '<a href="https://jable.tv/models/momoe-sarina/">百永紗里奈</a>'
+                    "</body></html>"
+                )
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("ROYD-343")
+        self.assertEqual(meta.get("cover"), JABLE_COVER)
+        self.assertEqual(meta.get("cover_source"), "jable")
+        item = {"code": "ROYD-343", "cover": None}
+        S._apply_public_cover_fallback(item, meta)
+        self.assertEqual(item.get("cover"), JABLE_COVER)
+        self.assertEqual(item.get("cover_source"), "jable")
+        status, detail = S._cover_progress_detail(item)
+        self.assertEqual((status, detail), ("done", "封面就緒（Jable）"))
+
+
+class TestRelatedPublicCatalog(unittest.TestCase):
+    def test_shared_cinema_series_outranks_unrelated_keyword_rows(self):
+        main = {
+            "code": "ROYD-343",
+            "title": ROYD_TITLE,
+            "series": ROYD_SERIES,
+            "genres": ["巨乳", "映画館", "淫語"],
+            "theme_keywords": list(ROYD_WITH_MISSAV),
+        }
+        rows = []
+        for i in range(5):
+            rows.append(
+                {
+                    "code": f"BODY-{i+1:03d}",
+                    "title": "巨乳な彼女との日常",
+                    "line": "keyword",
+                    "why": "名稱關鍵字",
+                    "keyword_hits": 3,
+                    "matched_keywords": ["巨乳"],
+                    "cover": f"https://pics.dmm.co.jp/digital/video/body{i}/pl.jpg",
+                    "series": "別シリーズ",
+                }
+            )
+        for code in ("ROYD-100", "ROYD-200", "ROYD-300"):
+            rows.append(
+                {
+                    "code": code,
+                    "title": "短い作品",
+                    "line": "keyword",
+                    "why": "名稱關鍵字",
+                    "keyword_hits": 1,
+                    "matched_keywords": ["巨乳"],
+                    "cover": f"https://pics.dmm.co.jp/digital/video/{code.lower()}/pl.jpg",
+                    "series": ROYD_SERIES,
+                }
+            )
+        plain = [r["code"] for r in S._cap_related_buckets(rows)]
+        self.assertEqual(plain, [f"BODY-{i+1:03d}" for i in range(5)], plain)
+        ranked = S._cap_related_buckets(list(rows), main=main)
+        ranked_codes = [r["code"] for r in ranked]
+        cinema = [c for c in ranked_codes if c.startswith("ROYD")]
+        self.assertGreaterEqual(len(cinema), 2, ranked_codes)
+        self.assertGreater(len(cinema), len([c for c in plain if c.startswith("ROYD")]))
+        t, k, a = S._related_bucket_counts(ranked)
+        self.assertLessEqual((t, k, a), (5, 5, 3))
+        self.assertLessEqual(len(ranked), 5)
+
+    def test_enrich_fills_related_tags_and_cover_and_keeps_dmm(self):
+        def fake_fetch(code, **kwargs):
+            text = str(code)
+            if text.startswith("ROYD"):
+                return {
+                    "title_zh": "電影院中文",
+                    "actress_zh": "百永紗里奈",
+                    "genres": ["巨乳", "電影院", "淫語", "高清"],
+                    "series": ROYD_SERIES,
+                    "cover": MISSAV_COVER,
+                    "cover_source": "missav",
+                }
+            return {
+                "title_zh": "其他中文",
+                "genres": ["巨乳"],
+                "series": "別シリーズ",
+                "cover": "https://fourhoi.com/body/cover-n.jpg",
+                "cover_source": "missav",
+            }
+
+        related = []
+        for i in range(5):
+            related.append(
+                {
+                    "code": f"BODY-{i+1:03d}",
+                    "title": "巨乳な彼女との日常",
+                    "line": "keyword",
+                    "why": "名稱關鍵字",
+                    "keyword_hits": 3,
+                    "matched_keywords": ["巨乳"],
+                    "cover": f"https://pics.dmm.co.jp/digital/video/body{i}/pl.jpg",
+                }
+            )
+        related.append(
+            {
+                "code": "ROYD-100",
+                "title": "短い作品",
+                "line": "keyword",
+                "why": "名稱關鍵字",
+                "keyword_hits": 1,
+                "matched_keywords": ["巨乳"],
+                "cover": None,
+            }
+        )
+        related.append(
+            {
+                "code": "ROYD-200",
+                "title": "もう一本",
+                "line": "keyword",
+                "why": "名稱關鍵字",
+                "keyword_hits": 1,
+                "matched_keywords": ["巨乳"],
+                "cover": "",
+            }
+        )
+        dmm_related = "https://pics.dmm.co.jp/digital/video/royd00300/royd00300pl.jpg"
+        related.append(
+            {
+                "code": "ROYD-300",
+                "title": "封面在的作品",
+                "line": "keyword",
+                "why": "名稱關鍵字",
+                "keyword_hits": 1,
+                "matched_keywords": ["巨乳"],
+                "cover": dmm_related,
+            }
+        )
+        payload = {
+            "ok": True,
+            "code": "ROYD-343",
+            "title": ROYD_TITLE,
+            "title_zh": "已有中文",
+            "actress": "百永さりな",
+            "series": ROYD_SERIES,
+            "genres": list(ROYD_CATALOG_GENRES),
+            "cover": DMM_COVER,
+            "public_catalog_fetched": True,
+            "related_by_title": related,
+        }
+        with mock.patch.object(S, "fetch_public_zh_catalog", side_effect=fake_fetch):
+            S.enrich_related_public_catalog(payload)
+        self.assertEqual(payload.get("cover"), DMM_COVER)
+        self.assertEqual(payload.get("title_zh"), "已有中文")
+        self.assertNotEqual(payload.get("cover_source"), "missav")
+        by_code = {r["code"]: r for r in payload["related_by_title"]}
+        self.assertEqual(by_code["ROYD-100"].get("cover"), MISSAV_COVER)
+        self.assertEqual(by_code["ROYD-100"].get("cover_source"), "missav")
+        self.assertTrue(str(by_code["ROYD-100"]["cover"]).startswith("https://"))
+        self.assertEqual(by_code["ROYD-100"].get("title_zh"), "電影院中文")
+        self.assertEqual(by_code["ROYD-100"].get("actress_zh"), "百永紗里奈")
+        chips = by_code["ROYD-100"].get("theme_keywords") or []
+        self.assertIn("映画館", chips)
+        self.assertIn("淫語", chips)
+        self.assertNotIn("高清", chips)
+        self.assertNotIn("ROYAL", chips)
+        self.assertEqual(by_code["ROYD-300"].get("cover"), dmm_related)
+        self.assertNotEqual(by_code["ROYD-300"].get("cover_source"), "missav")
+        codes = [r["code"] for r in payload["related_by_title"]]
+        cinema = [c for c in codes if c.startswith("ROYD")]
+        self.assertGreaterEqual(len(cinema), 2, codes)
+        t, k, a = S._related_bucket_counts(payload["related_by_title"])
+        self.assertLessEqual((t, k, a), (5, 5, 3))
+        self.assertLessEqual(len(payload["related_by_title"]), 13)
 
 
 if __name__ == "__main__":

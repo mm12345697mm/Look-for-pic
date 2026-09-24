@@ -5125,6 +5125,7 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "actress": it.get("actress"),
                 "actress_zh": it.get("actress_zh"),
                 "cover": it.get("cover"),
+                "cover_source": it.get("cover_source"),
                 "cid": it.get("cid"),
                 "line": it.get("line"),
                 "why": it.get("why"),
@@ -5395,8 +5396,53 @@ def _related_cover_is_usable_https(row: dict | None) -> bool:
     return cover.startswith("https://")
 
 
-def _cap_related_buckets(items) -> list[dict]:
-    """Keep existing order within each bucket; enforce 5+5+3 maxima; no padding."""
+def _public_theme_affinity(main: dict | None, row: dict | None) -> tuple[int, int]:
+    """(same series, shared setting). Generic chips such as 巨乳 do not count."""
+    if not isinstance(main, dict) or not isinstance(row, dict):
+        return (0, 0)
+    left = _series_plain_text(main.get("series"))
+    right = _series_plain_text(row.get("series"))
+    same = 1 if left and right and (left == right or left in right or right in left) else 0
+
+    def _settings(item: dict) -> set[str]:
+        found: set[str] = set()
+        blobs = [str(item.get("series") or "")]
+        for key in ("theme_keywords", "genres", "matched_keywords", "hit_keywords"):
+            raw = item.get(key)
+            if isinstance(raw, list):
+                blobs.extend(str(tok or "") for tok in raw)
+        for blob in blobs:
+            if _is_setting_theme_token(blob):
+                found.add(blob)
+            for tok in _series_theme_tokens(blob):
+                if _is_setting_theme_token(tok):
+                    found.add(tok)
+        return found
+
+    shared = 1 if _settings(main) & _settings(row) else 0
+    return (same, shared)
+
+
+def _prefer_public_catalog_order(items, main: dict | None) -> list[dict]:
+    """Stable: same series, then a shared setting token, then the original order."""
+    rows = [x for x in (items or []) if isinstance(x, dict)]
+    if not rows or not any(str(x.get("series") or "").strip() for x in rows):
+        return rows
+    indexed = list(enumerate(rows))
+    indexed.sort(
+        key=lambda pair: (_public_theme_affinity(main, pair[1]), -pair[0]),
+        reverse=True,
+    )
+    return [it for _, it in indexed]
+
+
+def _cap_related_buckets(items, *, main: dict | None = None) -> list[dict]:
+    """Keep existing order within each bucket; enforce 5+5+3 maxima; no padding.
+
+    When a row carries a MissAV/Jable series, same-series and shared-setting
+    cards move ahead inside that bucket before the cap. No series means the
+    previous order.
+    """
     theme: list[dict] = []
     keyword_pool: list[dict] = []
     actress: list[dict] = []
@@ -5416,14 +5462,25 @@ def _cap_related_buckets(items) -> list[dict]:
         item["code"] = rc
         item["line"] = _related_line_of(item)
         ln = item["line"]
-        if ln == "theme" and len(theme) < RELATED_THEME_CAP:
+        if ln == "theme":
             theme.append(item)
         elif ln == "keyword":
             keyword_pool.append(item)
-        elif ln == "actress" and len(actress) < RELATED_ACTRESS_CAP:
+        elif ln == "actress":
             actress.append(item)
-    keyword = _finalize_keyword_bucket(keyword_pool, None, RELATED_KEYWORD_CAP)
-    return theme + keyword + actress
+    prefer = main is not None and any(
+        str(it.get("series") or "").strip() for it in theme + keyword_pool + actress
+    )
+    if prefer:
+        theme = _prefer_public_catalog_order(theme, main)
+        actress = _prefer_public_catalog_order(actress, main)
+    keyword = _finalize_keyword_bucket(
+        keyword_pool,
+        None,
+        RELATED_KEYWORD_CAP,
+        main=main if prefer else None,
+    )
+    return theme[:RELATED_THEME_CAP] + keyword + actress[:RELATED_ACTRESS_CAP]
 
 
 def _keyword_related_sort_key(item: dict | None) -> tuple:
@@ -5662,6 +5719,10 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     _recompute_theme_keywords(payload)
     if not _payload_needs_enrichment(payload):
         try:
+            enrich_related_public_catalog(payload)
+        except Exception:
+            pass
+        try:
             if _payload_enrichment_fingerprint(payload) != before_identity:
                 offline_cache_put(payload, image_hash=image_hash)
         except Exception:
@@ -5711,6 +5772,10 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
                 related_network=True,
                 related_budget_sec=OFFLINE_CACHE_TITLE_ZH_BUDGET,
             )
+    except Exception:
+        pass
+    try:
+        enrich_related_public_catalog(payload)
     except Exception:
         pass
     # Attempt markers for this request only — next open still checks gaps.
@@ -5766,6 +5831,11 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "studio": payload.get("studio"),
         "cid": payload.get("cid"),
         "cover": payload.get("cover") if usable_cover_url(payload.get("cover")) else None,
+        "cover_source": (
+            payload.get("cover_source")
+            if usable_cover_url(payload.get("cover"))
+            else None
+        ),
         "stills": list(stills)[:20],
         "related_by_title": _slim_related_for_cache(
             payload.get("related_by_title") or payload.get("related")
@@ -5951,6 +6021,15 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                             value[field] = prev[field]
                     if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
                         value["cover"] = prev.get("cover")
+                        if prev.get("cover_source"):
+                            value["cover_source"] = prev.get("cover_source")
+                    elif (
+                        value.get("cover")
+                        and value.get("cover") == prev.get("cover")
+                        and not value.get("cover_source")
+                        and prev.get("cover_source")
+                    ):
+                        value["cover_source"] = prev.get("cover_source")
                     value["stills"] = _merge_unique_urls(prev.get("stills"), value.get("stills"), cap=20)
                     value["related_by_title"] = _merge_related_for_cache(
                         prev.get("related_by_title"),
@@ -6283,6 +6362,7 @@ def identify_code(
         "genres": list(meta.get("genres") or []) if isinstance(meta, dict) else [],
     }
     _merge_public_catalog_theme(out, catalog_zh)
+    _apply_public_cover_fallback(out, catalog_zh)
     try:
         _backfill_catalog_identity(out)
     except Exception:
@@ -7003,13 +7083,25 @@ def health():
 
 
 
-def http_get(url: str, *, timeout: float = 10.0, headers: dict | None = None) -> str | None:
+def http_get(
+    url: str,
+    *,
+    timeout: float = 10.0,
+    connect_timeout: float = 3.0,
+    headers: dict | None = None,
+) -> str | None:
     """Lightweight GET returning text, or None on failure (for catalog scrapes)."""
     try:
         h = {"User-Agent": UA, "Accept-Language": "zh-TW,zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.5"}
         if headers:
             h.update(headers)
-        r = requests.get(url, headers=h, timeout=(3, timeout), verify=False, allow_redirects=True)
+        r = requests.get(
+            url,
+            headers=h,
+            timeout=(connect_timeout, timeout),
+            verify=False,
+            allow_redirects=True,
+        )
         if r.status_code >= 400 or not r.text:
             return None
         if "Just a moment" in r.text[:800]:
@@ -7253,6 +7345,60 @@ def _anchor_label(inner: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+_PUBLIC_COVER_SKIP_RE = re.compile(
+    r"logo|icon|avatar|favicon|sprite|blank\.gif|placeholder|now_printing|noimage",
+    re.I,
+)
+
+
+def _public_page_source(url: str) -> str:
+    host = (url or "").lower()
+    if "jable.tv" in host:
+        return "jable"
+    if "missav." in host:
+        return "missav"
+    return ""
+
+
+def _public_product_cover(url: str | None) -> str:
+    """https product image. Upload data/blob URLs and site chrome are not covers."""
+    raw = unescape(str(url or "")).strip()
+    if raw.lower().startswith("data:") or raw.lower().startswith("blob:"):
+        return ""
+    cleaned = _catalog_jacket_url(raw)
+    if not cleaned or _PUBLIC_COVER_SKIP_RE.search(cleaned):
+        return ""
+    return cleaned
+
+
+def _parse_public_catalog_cover(html: str | None) -> str | None:
+    """Product jacket on a MissAV or Jable page. og:image, then video poster.
+
+    A logo, favicon, or data/blob image is not a jacket.
+    """
+    page = html or ""
+    patterns = (
+        r'property=["\']og:image["\'][^>]*content=["\']([^"\']+)',
+        r'content=["\']([^"\']+)["\'][^>]*property=["\']og:image["\']',
+        r'<video[^>]*\bposter=["\']([^"\']+)',
+        r'\bposter=["\']([^"\']+)["\']',
+    )
+    for pat in patterns:
+        for match in re.finditer(pat, page, flags=re.I):
+            cover = _public_product_cover(match.group(1))
+            if cover:
+                return cover
+    for match in re.finditer(r'<img\b[^>]*\bsrc=["\']([^"\']+)', page, flags=re.I):
+        src = match.group(1)
+        low = src.lower()
+        if not any(tok in low for tok in ("cover", "poster", "pl.jpg", "jacket")):
+            continue
+        cover = _public_product_cover(src)
+        if cover:
+            return cover
+    return None
+
+
 def _parse_public_catalog_tags(html: str | None) -> tuple[list[str], str | None]:
     """Genre chips and series name from a MissAV or Jable work page.
 
@@ -7369,15 +7515,25 @@ def fetch_public_zh_catalog(
     *,
     actress_ja: str | None = None,
     title_ja: str | None = None,
+    page_limit: int | None = None,
+    timeout: float = 8.0,
 ) -> dict:
-    """品番 lookup for a Chinese title, actress name, genre tags, and series.
+    """品番 lookup for a Chinese title, actress name, genre tags, series, and cover.
 
     MissAV /cn/ and Jable supply 品番 + 中文標題 (and a Chinese billing when the
-    page has one). The same HTML's genre/tag chips and series name are parsed
-    for theme keywords. JAVLibrary CN is the fallback already used for titles.
-    Missing fields stay empty — nothing is translated or invented.
+    page has one). The same HTML's genre/tag chips, series name, and product
+    cover are parsed. MissAV is tried before Jable. JAVLibrary CN is the
+    fallback already used for titles. Missing fields stay empty — nothing is
+    translated or invented. A data/blob image is never a cover.
     """
-    empty = {"title_zh": None, "actress_zh": None, "genres": [], "series": None}
+    empty = {
+        "title_zh": None,
+        "actress_zh": None,
+        "genres": [],
+        "series": None,
+        "cover": None,
+        "cover_source": None,
+    }
     if not code or not parse_code_parts(str(code)):
         return empty
     disp = format_display_code(str(code))
@@ -7386,10 +7542,15 @@ def fetch_public_zh_catalog(
     genres: list[str] = []
     genre_seen: set[str] = set()
     series = None
+    cover = None
+    cover_source = None
     saw_cn = False
     saw_jable = False
     fetches = 0
-    for url in _zh_catalog_page_urls(disp):
+    urls = _zh_catalog_page_urls(disp)
+    if page_limit is not None:
+        urls = urls[: max(0, int(page_limit))]
+    for url in urls:
         if title_zh and actress_zh:
             break
         if title_zh and saw_cn and saw_jable:
@@ -7402,7 +7563,7 @@ def fetch_public_zh_catalog(
         if "jable.tv" in url:
             saw_jable = True
         try:
-            html = http_get(url, timeout=8.0)
+            html = http_get(url, timeout=timeout, connect_timeout=min(2.0, timeout))
         except Exception:
             html = None
         if not html:
@@ -7411,6 +7572,11 @@ def fetch_public_zh_catalog(
             html, code=disp, actress_ja=actress_ja, title_ja=title_ja
         )
         page_genres, page_series = _parse_public_catalog_tags(html)
+        if not cover:
+            page_cover = _parse_public_catalog_cover(html)
+            if page_cover:
+                cover = page_cover
+                cover_source = _public_page_source(url) or None
         for tok in page_genres:
             key = tok.casefold()
             if key in genre_seen:
@@ -7442,6 +7608,8 @@ def fetch_public_zh_catalog(
         "actress_zh": actress_zh,
         "genres": genres,
         "series": series,
+        "cover": cover,
+        "cover_source": cover_source,
     }
 
 
@@ -7460,6 +7628,10 @@ def _copy_public_catalog_meta(catalog_out: dict | None, meta: dict | None) -> No
     catalog_out["genres"] = list(meta.get("genres") or [])
     if meta.get("series"):
         catalog_out["series"] = meta.get("series")
+    if meta.get("cover"):
+        catalog_out["cover"] = meta.get("cover")
+    if meta.get("cover_source"):
+        catalog_out["cover_source"] = meta.get("cover_source")
 
 
 def _merge_public_catalog_theme(item: dict | None, meta: dict | None) -> None:
@@ -7495,6 +7667,162 @@ def _merge_public_catalog_theme(item: dict | None, meta: dict | None) -> None:
         item["genres"] = merged
     if meta.get("series") and not str(item.get("series") or "").strip():
         item["series"] = meta.get("series")
+    if meta.get("public_catalog_fetched"):
+        item["public_catalog_fetched"] = True
+
+
+def _apply_public_cover_fallback(item: dict | None, meta: dict | None) -> None:
+    """Use a MissAV/Jable product cover only when the catalog jacket is empty.
+
+    A working DMM / catalog https jacket stays. data: and blob: uploads are
+    never written as the cover, and they do not block the public fallback.
+    """
+    if not isinstance(item, dict) or not isinstance(meta, dict):
+        return
+    preview = str(item.get("user_preview") or item.get("userPreview") or "").strip()
+    raw_existing = str(item.get("cover") or item.get("cover_url") or "").strip()
+    upload = _is_upload_media_url(raw_existing, preview)
+    existing = "" if upload else raw_existing
+    if _catalog_jacket_url(existing):
+        return
+    cover = _public_product_cover(meta.get("cover"))
+    if not cover or _is_upload_media_url(cover, preview):
+        if upload:
+            item["cover"] = None
+            if "cover_url" in item:
+                item["cover_url"] = None
+        return
+    item["cover"] = cover
+    if "cover_url" in item:
+        item["cover_url"] = cover
+    source = str(meta.get("cover_source") or "").lower()
+    if source in ("missav", "jable"):
+        item["cover_source"] = source
+
+
+def _cover_progress_detail(payload: dict | None) -> tuple[str, str]:
+    """Progress step for the jacket. Public fallback names its source.
+
+    ``無封面 URL`` is only for a known work whose DMM, MissAV, and Jable
+    pages all lacked a usable product cover.
+    """
+    if not isinstance(payload, dict) or not usable_cover_url(payload.get("cover")):
+        return "skipped", "無封面 URL"
+    source = str(payload.get("cover_source") or "").lower()
+    if source == "missav":
+        return "done", "封面就緒（MissAV）"
+    if source == "jable":
+        return "done", "封面就緒（Jable）"
+    n_stills = len(payload.get("stills") or []) if isinstance(payload.get("stills"), list) else 0
+    extra = f"＋劇照 {n_stills} 張" if n_stills else ""
+    return "done", f"封面就緒{extra}"
+
+
+def _needs_public_catalog_fetch(item: dict | None) -> bool:
+    """True when a coded row is still missing series, Chinese title, or a jacket."""
+    if not isinstance(item, dict) or item.get("public_catalog_fetched"):
+        return False
+    code = str(item.get("code") or "").strip()
+    if not code or code == "TITLE-SEARCH" or not parse_code_parts(code):
+        return False
+    if not str(item.get("series") or "").strip():
+        return True
+    if not str(item.get("title_zh") or "").strip():
+        return True
+    preview = str(item.get("user_preview") or "").strip()
+    cover = str(item.get("cover") or item.get("cover_url") or "").strip()
+    if _is_upload_media_url(cover, preview) or not _catalog_jacket_url(cover):
+        return True
+    return False
+
+
+def enrich_coded_work_from_public_catalog(item: dict | None, *, page_limit: int = 2) -> bool:
+    """Fill one coded work from MissAV/Jable: zh, tags, series, and cover.
+
+    Does not replace a Chinese title or a catalog jacket already on the row.
+    Returns True when a fetch was attempted.
+    """
+    if not _needs_public_catalog_fetch(item) or not isinstance(item, dict):
+        return False
+    try:
+        meta = fetch_public_zh_catalog(
+            str(item.get("code")),
+            actress_ja=item.get("actress"),
+            title_ja=item.get("title"),
+            page_limit=page_limit,
+            timeout=2.0,
+        )
+    except Exception:
+        meta = {}
+    item["public_catalog_fetched"] = True
+    if not str(item.get("title_zh") or "").strip() and meta.get("title_zh"):
+        item["title_zh"] = meta.get("title_zh")
+    _apply_catalog_actress(item, meta)
+    _merge_public_catalog_theme(item, meta)
+    _apply_public_cover_fallback(item, meta)
+    if str(item.get("title") or "").strip():
+        _recompute_theme_keywords(item)
+    return True
+
+
+def _order_related_by_public_catalog(items, main: dict | None) -> list[dict]:
+    """Re-cap related rows, preferring a shared MissAV/Jable series or setting."""
+    return _cap_related_buckets(items, main=main if isinstance(main, dict) else None)
+
+
+def enrich_related_public_catalog(
+    payload: dict | None,
+    *,
+    budget_sec: float = 4.0,
+    max_fetches: int = 8,
+    bucket_cap: bool = True,
+) -> dict | None:
+    """Enrich related rows (and the main work if needed) from MissAV/Jable.
+
+    Shared series / setting tags are preferred inside the existing 5/5/3 caps.
+    Keyword re-search passes bucket_cap=False so its cap of 10 stays.
+    """
+    import time as _time
+
+    if not isinstance(payload, dict):
+        return payload
+    t0 = _time.monotonic()
+    fetches = 0
+    rows: list[dict] = [payload]
+    for key in ("related_by_title", "related"):
+        for item in payload.get(key) or []:
+            if isinstance(item, dict):
+                rows.append(item)
+    for item in payload.get("results") or []:
+        if not isinstance(item, dict):
+            continue
+        rows.append(item)
+        for rel in item.get("related_by_title") or []:
+            if isinstance(rel, dict):
+                rows.append(rel)
+    seen: set[str] = set()
+    for item in rows:
+        if fetches >= max_fetches:
+            break
+        if budget_sec and (_time.monotonic() - t0) > float(budget_sec):
+            break
+        code = str(item.get("code") or "").strip()
+        if code and parse_code_parts(code):
+            disp = format_display_code(code)
+            if disp in seen:
+                continue
+        if not enrich_coded_work_from_public_catalog(item):
+            continue
+        if code and parse_code_parts(code):
+            seen.add(format_display_code(code))
+        fetches += 1
+    rows = payload.get("related_by_title")
+    if isinstance(rows, list):
+        if bucket_cap:
+            payload["related_by_title"] = _order_related_by_public_catalog(rows, payload)
+        elif any(str((x or {}).get("series") or "").strip() for x in rows if isinstance(x, dict)):
+            payload["related_by_title"] = _prefer_public_catalog_order(rows, payload)
+    return payload
 
 
 def resolve_chinese_title(
@@ -7519,6 +7847,8 @@ def resolve_chinese_title(
         catalog_out.pop("actress_zh", None)
         catalog_out.pop("genres", None)
         catalog_out.pop("series", None)
+        catalog_out.pop("cover", None)
+        catalog_out.pop("cover_source", None)
         catalog_out.pop("public_catalog_fetched", None)
     zh = _clean_title_zh(existing_zh, title_ja=title_ja, code=code)
     if zh:
@@ -7599,6 +7929,7 @@ def attach_chinese_titles(
             payload["title_zh"] = zh
         _apply_catalog_actress(payload, catalog_out)
         _merge_public_catalog_theme(payload, catalog_out)
+        _apply_public_cover_fallback(payload, catalog_out)
     t_rel0 = _time.monotonic()
     for key in ("related_by_title", "related"):
         items = payload.get(key)
@@ -7638,6 +7969,7 @@ def attach_chinese_titles(
                 item["title_zh"] = zh
             _apply_catalog_actress(item, catalog_out)
             _merge_public_catalog_theme(item, catalog_out)
+            _apply_public_cover_fallback(item, catalog_out)
     return payload
 
 
@@ -10192,12 +10524,15 @@ def _finalize_keyword_bucket(
     items: list | None,
     keywords: list[str] | None,
     cap: int,
+    *,
+    main: dict | None = None,
 ) -> list[dict]:
     """Cap the keyword bucket.
 
     Swim-camp titles only keep rows with an https jacket, then mix
     巨乳+媚薬 with 巨乳+合宿/水泳部. Other titles keep the #25 cut: body-size
     hits are ranked before the cap; everyone else keeps the first five.
+    A MissAV/Jable series on the pool pulls same-series rows ahead of that cut.
     """
     rows = [it for it in (items or []) if isinstance(it, dict)]
     if cap <= 0:
@@ -10205,6 +10540,17 @@ def _finalize_keyword_bucket(
     if _keyword_pool_is_swim_camp(keywords, rows):
         covered = [it for it in rows if _related_cover_is_usable_https(it)]
         return _diversify_body_keyword_rows(covered, keywords, cap)
+    if main is not None and any(str(it.get("series") or "").strip() for it in rows):
+        indexed = list(enumerate(rows))
+        indexed.sort(
+            key=lambda pair: (
+                _public_theme_affinity(main, pair[1]),
+                _keyword_related_sort_key(pair[1]),
+                -pair[0],
+            ),
+            reverse=True,
+        )
+        return [it for _, it in indexed][:cap]
     if any(_row_matches_body_generic(it) for it in rows):
         rows.sort(key=_keyword_related_sort_key, reverse=True)
         return rows[:cap]
@@ -10796,6 +11142,10 @@ def attach_related_by_title(
         )
     except Exception:
         pass
+    try:
+        enrich_related_public_catalog(result)
+    except Exception:
+        pass
 
     _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
@@ -10844,6 +11194,11 @@ def attach_related_by_title(
         except Exception:
             item["related_by_title"] = []
         _stamp_listed_work_keywords(item)
+    try:
+        enrich_related_public_catalog(result)
+    except Exception:
+        pass
+    _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
     return result
 
@@ -12704,13 +13059,11 @@ def run_multi_identify_pipeline(
         "dropped": [],
         "ocr_text_preview": None,
     }
-    _progress(
-        on_progress,
-        "cover",
-        "done" if payload.get("cover") else "skipped",
-        "封面就緒" if payload.get("cover") else "部分無封面",
-        0.92,
-    )
+    if usable_cover_url(payload.get("cover")):
+        cover_status, cover_detail = _cover_progress_detail(payload)
+    else:
+        cover_status, cover_detail = "skipped", "部分無封面"
+    _progress(on_progress, "cover", cover_status, cover_detail, 0.92)
     # Related for EVERY main hit (each screenshot row gets its own carousel siblings).
     _progress(on_progress, "done", "active", "為每部作品補齊相關…", 0.94, phase="相關作品")
     total_rel = 0
@@ -13583,7 +13936,8 @@ def run_identify_pipeline(
             if recovered and _catalog_code_of(recovered):
                 _progress(on_progress, "search", "done", str(recovered.get("message") or "已對上原圖")[:100], 4 / 6)
                 payload = _finish(recovered)
-                _progress(on_progress, "cover", "done" if payload.get("cover") else "skipped", "封面就緒" if payload.get("cover") else "無封面", 5 / 6)
+                cover_status, cover_detail = _cover_progress_detail(payload)
+                _progress(on_progress, "cover", cover_status, cover_detail, 5 / 6)
                 _progress(on_progress, "done", "done", "完成", 1.0)
                 return payload, 200
             early_payload = _finish(
@@ -13808,13 +14162,12 @@ def run_identify_pipeline(
     else:
         _progress(on_progress, "search", "done", (src[:80] or "已查詢（可能無標題）"), 4 / 6)
 
-    # Step 5: cover/stills (URLs already built in identify_code)
+    # Step 5: cover/stills (URLs already built in identify_code).
+    # A MissAV/Jable product cover counts as ready. 無封面 URL only when
+    # DMM, MissAV, and Jable all lacked a usable jacket.
     _progress(on_progress, "cover", "active", "CDN 封面載入中…", 4 / 6)
-    if result.get("cover"):
-        n_stills = len(result.get("stills") or [])
-        _progress(on_progress, "cover", "done", f"封面就緒" + (f"＋劇照 {n_stills} 張" if n_stills else ""), 5 / 6)
-    else:
-        _progress(on_progress, "cover", "skipped", "無封面 URL", 5 / 6)
+    cover_status, cover_detail = _cover_progress_detail(result)
+    _progress(on_progress, "cover", cover_status, cover_detail, 5 / 6)
 
     # Attach other title-search codes as gallery cards when applicable
     if title_search_hit:
@@ -14048,7 +14401,11 @@ def related_by_title_api():
             )
         except Exception:
             pass
-        _stamp_theme_keywords(wrap)
+        try:
+            enrich_related_public_catalog(wrap)
+        except Exception:
+            pass
+        _stamp_listed_work_keywords(wrap)
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
     return jsonify({
@@ -14109,6 +14466,13 @@ def related_by_keywords_api():
         )
     except Exception:
         pass
+    try:
+        enrich_related_public_catalog(wrap, budget_sec=3.0, max_fetches=8, bucket_cap=False)
+    except Exception:
+        pass
+    for item in wrap.get("related_by_title") or []:
+        if isinstance(item, dict) and str(item.get("title") or "").strip():
+            _recompute_theme_keywords(item)
     related = list(wrap.get("related_by_title") or [])[:RELATED_KEYWORD_RESEARCH_CAP]
     return jsonify({
         "ok": True,
