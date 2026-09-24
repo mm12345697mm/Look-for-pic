@@ -68,8 +68,12 @@ SLOT_WORK_BUDGET_S = 600.0
 # railway.toml). 2400 = 4 × SLOT_WORK_BUDGET_S so a sync stream of four
 # images can finish. The identify job calls Worker.notify() while it runs,
 # so this is the silence backstop for a stuck worker, not a shared wall.
+# A Railway service start command overrides those files. Production was
+# still `gunicorn --timeout 180` after the 2400 edit, so the heartbeat below
+# has to land on this process's worker well inside that shorter window.
 GUNICORN_WORKER_TIMEOUT_S = 2400
 STREAM_KEEPALIVE_S = 5.0
+GUNICORN_HEARTBEAT_S = 5.0
 GEMINI_MODELS = (
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
@@ -568,39 +572,98 @@ _IDENTIFY_JOBS_PATH: Path | None = None
 _IDENTIFY_JOBS_LOCK = threading.Lock()
 _GUNICORN_WORKER = None
 _GUNICORN_WORKER_MISSING = False
+_GUNICORN_NOTIFY_LOCK = threading.Lock()
+
+
+def _gunicorn_worker_is_live(worker, pid: int) -> bool:
+    """True for this process's worker whose heartbeat file is still open.
+
+    ``gunicorn -w 2`` forks siblings into the child and then closes their
+    temp fds. Those dead Worker objects stay reachable from gc. Notifying
+    the first one raises and does not utime the live WorkerTmp, so the
+    arbiter's silence timer (180s on the current Railway start command)
+    still murders the stream inside ``queue.Queue.get``.
+    """
+    if worker is None or getattr(worker, "pid", None) != pid:
+        return False
+    tmp = getattr(worker, "tmp", None)
+    if tmp is None:
+        return False
+    try:
+        fd = tmp.fileno()
+    except Exception:
+        return False
+    return isinstance(fd, int) and fd >= 0
+
+
+def _iter_gunicorn_workers():
+    global _GUNICORN_WORKER_MISSING
+    if _GUNICORN_WORKER_MISSING:
+        return []
+    try:
+        import gc
+        from gunicorn.workers.base import Worker
+    except Exception:
+        _GUNICORN_WORKER_MISSING = True
+        return []
+    found = []
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, Worker):
+                found.append(obj)
+        except Exception:
+            continue
+    return found
+
+
+def _select_live_gunicorn_worker(candidates, pid: int | None = None):
+    want = os.getpid() if pid is None else int(pid)
+    for obj in candidates or []:
+        if _gunicorn_worker_is_live(obj, want):
+            return obj
+    return None
+
+
+def _gunicorn_silence_age(worker) -> float | None:
+    """Seconds since this worker's heartbeat, using the arbiter's clock.
+
+    Gunicorn 26 stores ``time.monotonic()`` via ``os.utime`` and the master
+    murders when ``time.monotonic() - last_update() > timeout``. A fresh
+    temp file still has a wall-clock mtime, which looks negative (not
+    expired) until the first real ``notify()``.
+    """
+    tmp = getattr(worker, "tmp", None)
+    if tmp is None:
+        return None
+    try:
+        updated = float(tmp.last_update())
+    except (OSError, ValueError, TypeError):
+        return None
+    return time.monotonic() - updated
 
 
 def _notify_gunicorn_worker() -> None:
     """Reset the arbiter silence timer while identify is still running.
 
     Sync workers only notify between requests. SSE keepalive bytes do not.
-    Missing gunicorn (local `python server.py`) is a no-op, and the lookup
-    runs once so a long batch does not walk every object every keepalive.
+    Missing gunicorn (local ``python server.py``) is a no-op. The cached
+    worker is this process only; a closed sibling is never reused.
     """
-    global _GUNICORN_WORKER, _GUNICORN_WORKER_MISSING
+    global _GUNICORN_WORKER
     if _GUNICORN_WORKER_MISSING:
         return
-    worker = _GUNICORN_WORKER
-    if worker is None:
-        try:
-            import gc
-            from gunicorn.workers.base import Worker
-        except Exception:
-            _GUNICORN_WORKER_MISSING = True
-            return
-        for obj in gc.get_objects():
-            if isinstance(obj, Worker):
-                worker = obj
-                _GUNICORN_WORKER = obj
-                break
+    pid = os.getpid()
+    with _GUNICORN_NOTIFY_LOCK:
+        worker = _GUNICORN_WORKER
+        if not _gunicorn_worker_is_live(worker, pid):
+            worker = _select_live_gunicorn_worker(_iter_gunicorn_workers(), pid)
+            _GUNICORN_WORKER = worker
         if worker is None:
-            _GUNICORN_WORKER_MISSING = True
             return
-    try:
-        worker.notify()
-    except Exception:
-        _GUNICORN_WORKER = None
-        _GUNICORN_WORKER_MISSING = False
+        try:
+            worker.notify()
+        except Exception:
+            _GUNICORN_WORKER = None
 
 
 def _identify_jobs_resolve_path() -> Path:
@@ -12495,7 +12558,7 @@ def identify_stream():
             stop_hb = threading.Event()
 
             def heartbeat() -> None:
-                while not stop_hb.wait(15):
+                while not stop_hb.wait(float(GUNICORN_HEARTBEAT_S)):
                     if job_id:
                         identify_job_touch(job_id)
                     else:
@@ -12570,6 +12633,7 @@ def identify_stream():
             )
         yield f"data: {json.dumps({'type': 'steps', 'steps': steps}, ensure_ascii=False)}\n\n"
 
+        _notify_gunicorn_worker()
         while True:
             try:
                 kind, payload = q.get(timeout=float(STREAM_KEEPALIVE_S))

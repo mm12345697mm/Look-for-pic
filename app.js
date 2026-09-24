@@ -4356,6 +4356,7 @@
       formatKeywordChip,
       formatPersonName,
       resumePayloadFromJob,
+      followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
       workNeedsTitleZh,
       workNeedsManualFix,

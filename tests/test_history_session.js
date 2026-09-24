@@ -2125,6 +2125,108 @@ function walkNodes(node, acc) {
     assert.strictEqual(rec.works[0].related[13].code, 'KEEP-014');
   }
 
+  // SSE died on 目錄查詢 3/4. Polling the job must walk later slots and finish.
+  {
+    const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+    const shots = [
+      {
+        status: 'running',
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 3/4 張…',
+          progress: 0.68,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'stalled',
+        stale: true,
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 3/4 張…',
+          progress: 0.68,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'running',
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 4/4 張…',
+          progress: 0.74,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'running',
+        progress: {
+          step: 'cover',
+          status: 'active',
+          detail: '抓取封面與劇照',
+          progress: 0.88,
+          phase: '封面鎖定',
+        },
+      },
+      {
+        status: 'done',
+        progress: {
+          step: 'done',
+          status: 'done',
+          detail: '完成，列出 4 部',
+          progress: 1,
+        },
+        result: {
+          ok: true,
+          code: 'MIDA-616',
+          title: '作品1',
+          results: ['MIDA-616', 'APGH-012', 'JUFE-271', 'SSIS-001'].map((code) => {
+            const cid = code.toLowerCase().replace('-', '');
+            return {
+              ok: true,
+              code,
+              title: code,
+              cover: 'https://pics.dmm.co.jp/digital/video/' + cid + '/' + cid + 'pl.jpg',
+            };
+          }),
+        },
+      },
+    ];
+    let n = 0;
+    context.fetch = async (url) => {
+      assert.ok(String(url).indexOf('/api/identify/jobs/job_batch') !== -1);
+      const job = shots[Math.min(n, shots.length - 1)];
+      n += 1;
+      return { ok: true, json: async () => ({ ok: true, job }) };
+    };
+    H.showProgress();
+    const seen = [];
+    const data = await H.followIdentifyJob('job_batch', (evt) => {
+      seen.push(String(evt.detail || ''));
+      H.applyProgressEvent(evt);
+    });
+    assert.ok(seen.indexOf('搜尋第 3/4 張…') !== -1, seen.join('|'));
+    assert.ok(seen.indexOf('搜尋第 4/4 張…') !== -1, seen.join('|'));
+    assert.ok(seen.indexOf('搜尋第 3/4 張…') < seen.indexOf('搜尋第 4/4 張…'));
+    assert.ok(seen.indexOf('抓取封面與劇照') > seen.indexOf('搜尋第 4/4 張…'));
+    const steps = getEl('progress-steps').children;
+    const search = steps.find((row) => row.dataset && row.dataset.step === 'search');
+    const cover = steps.find((row) => row.dataset && row.dataset.step === 'cover');
+    assert.ok(search && !search.dataset.phase, '目錄查詢 clears once the batch moves on');
+    assert.ok(cover && cover.dataset.phase === '封面鎖定');
+    assert.strictEqual(getEl('progress-detail').textContent, '完成，列出 4 部');
+    assert.strictEqual(data.results.length, 4);
+    data.results.forEach((row) => {
+      assert.ok(String(row.cover).indexOf('https://pics.dmm.co.jp/') === 0);
+      assert.ok(String(row.cover).indexOf('data:') !== 0);
+    });
+    const blob = JSON.stringify(data) + seen.join('');
+    FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+    assert.strictEqual(H.resumePayloadFromJob({ status: 'stalled', progress: shots[0].progress }), null);
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);
