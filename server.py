@@ -63,6 +63,8 @@ VISION_TIMEOUT = 45
 MULTI_IDENTIFY_BUDGET_S = 150.0
 # Do not start another slot when less than this remains — flush the response.
 MULTI_SLOT_RESERVE_S = 4.0
+# Do not start a shortened vision call. Below this, the frame is retryable.
+MULTI_VISION_START_S = 15.0
 # Related carousels for a large batch share this wall, not 8s × N.
 MULTI_RELATED_BUDGET_S = 20.0
 STREAM_KEEPALIVE_S = 5.0
@@ -1874,10 +1876,8 @@ def call_gemini_vision(
     max_models: int | None = None,
 ) -> dict[str, Any]:
     image_bytes, mime_type = maybe_downscale_for_vision(image_bytes, mime_type)
-    if timeout is None and getattr(_BATCH, "active", False):
-        timeout = getattr(_BATCH, "vision_timeout", None)
-    if max_models is None and getattr(_BATCH, "active", False):
-        max_models = getattr(_BATCH, "vision_models", None)
+    # A batch deadline must not shrink this call. A short read can invent a
+    # volume; the multi pipeline skips the frame instead.
     limit = float(VISION_TIMEOUT if timeout is None else timeout)
     if limit < 2.0:
         raise RuntimeError("vision budget too small")
@@ -5634,13 +5634,11 @@ _BATCH = threading.local()
 def _enter_batch_ctx(deadline: float) -> None:
     _BATCH.active = True
     _BATCH.deadline = deadline
-    _BATCH.vision_timeout = None
-    _BATCH.vision_models = None
-    _BATCH.visual_budget = None
+    _BATCH.jacket_incomplete = False
 
 
 def _leave_batch_ctx() -> None:
-    for name in ("active", "deadline", "vision_timeout", "vision_models", "visual_budget"):
+    for name in ("active", "deadline", "jacket_incomplete"):
         if hasattr(_BATCH, name):
             delattr(_BATCH, name)
 
@@ -5709,27 +5707,29 @@ def _jacket_similarity(user: Image.Image, cover: Image.Image) -> float:
     return frame
 
 
-def _fetch_jacket_blob(cand: dict, deadline: float | None) -> tuple[dict, bytes | None]:
-    """Download one candidate jacket. Stops early when the batch deadline is close."""
-    if _seconds_left(deadline) < 1.2:
-        return cand, None
+def _fetch_jacket_blob(cand: dict, deadline: float | None) -> tuple[dict, bytes | None, bool]:
+    """Download one candidate jacket at the full cover timeout.
+
+    The third value is True when the deadline stopped us before this cover
+    was fetched. That is not a 404: the lock must not keep the other volumes.
+    """
+    need = float(COVER_DOWNLOAD_TIMEOUT) + 0.4
+    if _seconds_left(deadline) < need:
+        return cand, None, True
     try:
         disp = format_display_code(str(cand.get("code")))
         cid = str(cand.get("cid") or "") or (code_to_cid(disp) or "")
         url = str(cand.get("cover") or "") or (cover_url(cid) if cid else "")
-        remain = _seconds_left(deadline)
-        timeout = min(float(COVER_DOWNLOAD_TIMEOUT), max(1.2, remain - 0.6))
-        blob = download_cover_bytes(url, timeout=timeout) if url else None
-        if not blob and cid and _seconds_left(deadline) >= 1.2:
+        blob = download_cover_bytes(url, timeout=COVER_DOWNLOAD_TIMEOUT) if url else None
+        if not blob and cid:
+            if _seconds_left(deadline) < need:
+                return cand, None, True
             alt = cover_url(cid)
             if alt and alt != url:
-                blob = download_cover_bytes(
-                    alt,
-                    timeout=min(2.0, max(1.0, _seconds_left(deadline) - 0.4)),
-                )
-        return cand, blob
+                blob = download_cover_bytes(alt, timeout=COVER_DOWNLOAD_TIMEOUT)
+        return cand, blob, False
     except Exception:
-        return cand, None
+        return cand, None, False
 
 
 def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None) -> dict | None:
@@ -5738,6 +5738,8 @@ def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None)
     A series template (six APGH volumes, one title) must not keep whichever
     row the catalog listed first. Lock only on a clear margin.
     """
+    if getattr(_BATCH, "active", False):
+        _BATCH.jacket_incomplete = False
     if not user_image_bytes:
         return None
     coded = [c for c in (candidates or []) if isinstance(c, dict) and c.get("code") and parse_code_parts(str(c.get("code")))]
@@ -5752,7 +5754,7 @@ def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None)
         return None
     deadline = _batch_deadline()
     pool = coded[:12]
-    fetched: list[tuple[dict, bytes | None]]
+    fetched: list[tuple[dict, bytes | None, bool]]
     if len(pool) >= 3:
         workers = min(4, len(pool))
         with ThreadPoolExecutor(max_workers=workers) as pool_ex:
@@ -5760,8 +5762,13 @@ def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None)
     else:
         fetched = [_fetch_jacket_blob(cand, deadline) for cand in pool]
     scored: list[tuple[float, float, dict]] = []
+    aborted = False
     incomplete = False
-    for cand, blob in fetched:
+    for cand, blob, was_aborted in fetched:
+        if was_aborted:
+            # A cover we never fetched is not a miss. Do not lock on the rest.
+            aborted = True
+            break
         if not blob:
             continue
         if _seconds_left(deadline) < 0.35:
@@ -5775,7 +5782,11 @@ def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None)
             continue
         frame, figure = _aligned_jacket_scores(user, cover)
         scored.append((frame, figure, cand))
-    if incomplete or not scored:
+    if aborted or incomplete:
+        if getattr(_BATCH, "active", False):
+            _BATCH.jacket_incomplete = True
+        return None
+    if not scored:
         return None
     scored.sort(key=lambda pair: (pair[0], pair[1]), reverse=True)
     best_s, best_fig, best = scored[0]
@@ -5949,6 +5960,9 @@ def _resolve_unnumbered_cover(queries: list[str] | None, image_bytes: bytes | No
                 "note": "封面與原圖鎖定",
             }
             return hit
+        # The jacket compare was cut off. A short phrase must not pick the volume.
+        if getattr(_BATCH, "jacket_incomplete", False):
+            return None
     if specific:
         specific.sort(key=lambda item: (item[0], item[1]), reverse=True)
         return specific[0][2]
@@ -5965,19 +5979,20 @@ def _hit_visually_locked(hit: dict | None) -> bool:
     return bool(isinstance(vm, dict) and vm.get("same_work") and vm.get("match_clothes"))
 
 
-def _skip_cloud_visual(hit: dict, coded: list) -> dict:
-    """Jacket did not lock and this batch has no time left for Gemini compare."""
+def _mark_lock_incomplete(hit: dict, coded: list) -> dict:
+    """A multi-candidate compare was cut off. Do not keep or invent a volume."""
     out = dict(hit)
-    if len(coded) >= 2 and _candidate_titles_collide(coded):
-        out["series_unresolved"] = True
-        out["visual_confident"] = False
-        out["visual_meta"] = {
-            "visual_ranked": False,
-            "visual_lock": False,
-            "compared": 0,
-            "note": "同系列未鎖定（這批時間不夠做雲端比對）",
-            "mode": "jacket",
-        }
+    out["lock_incomplete"] = True
+    out["visual_confident"] = False
+    out["visual_lock"] = False
+    out["series_unresolved"] = len(coded) >= 2
+    out["visual_meta"] = {
+        "visual_ranked": False,
+        "visual_lock": False,
+        "compared": 0,
+        "note": "同系列還沒比完，不鎖定番號",
+        "mode": "incomplete",
+    }
     return out
 
 
@@ -5994,6 +6009,9 @@ def apply_visual_rank_to_hit(
     Locks 番號/片名 onto the visual winner only when same_work + clothes/person
     gates pass (visual_confident). Otherwise still reorders by visual score but
     marks visual_confident=False so UI/message can show 未鎖定.
+
+    visual_budget is ignored. A short budget must not run a partial rank:
+    the batch marks that slot retryable instead.
     """
     if not hit or not user_image_bytes:
         return hit
@@ -6051,21 +6069,21 @@ def apply_visual_rank_to_hit(
             "mode": "jacket",
         }
         return out
-    if visual_budget is None and getattr(_BATCH, "active", False):
-        visual_budget = getattr(_BATCH, "visual_budget", None)
     if deadline is None:
         deadline = _batch_deadline()
-    cloud_budget = None if visual_budget is None else float(visual_budget)
-    if deadline is not None:
-        remain = max(0.0, _seconds_left(deadline) - 1.0)
-        cloud_budget = remain if cloud_budget is None else min(cloud_budget, remain)
-    if cloud_budget is not None and cloud_budget < 4.0:
-        return _skip_cloud_visual(hit, coded)
+    jacket_cut = bool(getattr(_BATCH, "jacket_incomplete", False))
+    remain = _seconds_left(deadline)
+    # A short tournament plus the unlocked promotion can copy the wrong volume.
+    # Run the full compare, or mark the slot retryable.
+    if jacket_cut or remain < float(VISUAL_COMPARE_BUDGET):
+        if len(coded) >= 2:
+            return _mark_lock_incomplete(hit, coded)
+        return hit
     ranked, meta = rank_candidates_by_visual(
         user_image_bytes,
         coded,
         api_key=api_key,
-        budget_s=VISUAL_COMPARE_BUDGET if cloud_budget is None else cloud_budget,
+        budget_s=VISUAL_COMPARE_BUDGET,
     )
     if not meta.get("visual_ranked"):
         hit = dict(hit)
@@ -9158,14 +9176,25 @@ def verify_work_against_image(
         return result
     out = dict(result)
     key = (api_key or get_gemini_api_key() or "").strip()
+    if getattr(_BATCH, "active", False):
+        remain = _seconds_left(_batch_deadline())
+        jacket_cut = bool(getattr(_BATCH, "jacket_incomplete", False))
+        already_locked = bool(out.get("visual_lock")) or _hit_visually_locked(out)
+        # A finished jacket lock stays. Do not spend a second pass undoing it.
+        if already_locked and (jacket_cut or remain < float(VISUAL_COMPARE_BUDGET)):
+            return out
+        if jacket_cut or remain < float(VISUAL_COMPARE_BUDGET):
+            pool = _collect_visual_pool([out], out.get("candidates"))
+            # One printed code is not a volume choice. Two or more is.
+            if len(pool) >= 2 and not already_locked:
+                return _mark_lock_incomplete(out, pool)
+            out["visual_lock"] = False
+            return out
     if not image_bytes or not key:
         out["visual_lock"] = False
         return out
-    if budget_s is None and getattr(_BATCH, "active", False):
-        budget_s = getattr(_BATCH, "visual_budget", None)
-    if budget_s is not None and float(budget_s) < 4.0:
-        out["visual_lock"] = False
-        return out
+    # budget_s must not shrink the compare. Callers that are out of time
+    # already returned a retryable slot above.
     pool = _collect_visual_pool([out], out.get("candidates"))
     if not pool:
         _mark_visual_mismatch(out, "未核對圖片（沒有可比較的封面或劇照）")
@@ -9175,7 +9204,7 @@ def verify_work_against_image(
         image_bytes,
         pool,
         api_key=key,
-        budget_s=VISUAL_COMPARE_BUDGET if budget_s is None else float(budget_s),
+        budget_s=VISUAL_COMPARE_BUDGET,
     )
     locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not locked:
@@ -9196,7 +9225,7 @@ def verify_work_against_image(
                 image_bytes,
                 wider,
                 api_key=key,
-                budget_s=VISUAL_COMPARE_BUDGET if budget_s is None else float(budget_s),
+                budget_s=VISUAL_COMPARE_BUDGET,
             )
             locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not (meta or {}).get("visual_ranked"):
@@ -9599,6 +9628,8 @@ def _adopt_title_catalog_hit(
             hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
         except Exception:
             pass
+    if isinstance(hit, dict) and hit.get("lock_incomplete") and not _hit_visually_locked(hit):
+        return _time_budget_slot({"index": image_index, "image_bytes": image_bytes})
     if isinstance(hit, dict) and hit.get("series_unresolved") and not _hit_visually_locked(hit):
         return None
     if not _hit_has_catalog_code(hit):
@@ -9717,6 +9748,10 @@ def _visual_lock_winner(
     coded = [c for c in candidates or [] if isinstance(c, dict) and _catalog_code_of(c)]
     if not image_bytes or not coded or not (api_key or "").strip():
         return None
+    if getattr(_BATCH, "active", False):
+        remain = _seconds_left(_batch_deadline())
+        if getattr(_BATCH, "jacket_incomplete", False) or remain < float(VISUAL_COMPARE_BUDGET):
+            return None
     try:
         ranked, meta = rank_candidates_by_visual(image_bytes, coded[:8], api_key=api_key)
     except Exception:
@@ -9874,6 +9909,8 @@ def _lock_unknown_onto_sibling(
     may merge only when both frames locked the same code.
     """
     if not image_bytes or not slot.get("unidentified") or not (api_key or "").strip():
+        return slot
+    if getattr(_BATCH, "active", False) and _seconds_left(_batch_deadline()) < float(VISUAL_COMPARE_BUDGET):
         return slot
     pool: list[dict] = []
     seen: set[str] = set()
@@ -10081,7 +10118,7 @@ def _time_budget_slot(row: dict | None) -> dict:
         "unidentified": False,
         "timed_out": True,
         "needs_code": True,
-        "message": "伺服器時間上限，這張還沒查完。不是查詢不到，可再試一次。",
+        "message": "這張時間不夠，還沒鎖定。請再上傳這張重查一次。不是查詢不到。",
         "vision_used": bool(row.get("vision_used")),
         "search_mode": "title",
         "from_image_index": row.get("index"),
@@ -10148,7 +10185,7 @@ def run_multi_identify_pipeline(
         vision_rows: list[dict] = []
         for i, (img_bytes, fname) in enumerate(images):
             idx = i + 1
-            if _seconds_left(deadline) < 8.0:
+            if _seconds_left(deadline) < MULTI_VISION_START_S:
                 vision_rows.append(
                     {
                         "index": idx,
@@ -10166,7 +10203,7 @@ def run_multi_identify_pipeline(
                     on_progress,
                     "vision",
                     "active",
-                    f"第 {idx}/{n} 張：時間不夠，標成尚未查完",
+                    f"第 {idx}/{n} 張：時間不夠，請再上傳這張重查",
                     0.05 + 0.35 * (idx / max(n, 1)),
                 )
                 continue
@@ -10191,10 +10228,6 @@ def run_multi_identify_pipeline(
             mime = detect_image_mime(img_bytes, fname)
             if api_key:
                 try:
-                    left_now = _seconds_left(deadline)
-                    per_try = 12.0 if n >= 6 else 18.0
-                    _BATCH.vision_timeout = min(per_try, max(4.0, left_now - 6.0))
-                    _BATCH.vision_models = 2 if n >= 6 else 3
                     vm = call_gemini_vision(img_bytes, mime, api_key)
                     row["vision_used"] = True
                     if vm.get("code"):
@@ -10411,16 +10444,9 @@ def run_multi_identify_pipeline(
             except Exception:
                 pass
 
-        def _slot_visual_budget(index: int) -> float:
-            left = _seconds_left(deadline)
-            later = max(0, len(jobs) - index - 1)
-            reserve = later * 3.0 + MULTI_SLOT_RESERVE_S
-            grant = min(8.0, max(0.0, left - reserve))
-            if grant < 4.0:
-                return 0.0
-            return grant
-
         for ji, job in enumerate(jobs):
+            if getattr(_BATCH, "active", False):
+                _BATCH.jacket_incomplete = False
             if job.get("kind") == "timeout" or _seconds_left(deadline) < MULTI_SLOT_RESERVE_S:
                 for rest in jobs[ji:]:
                     rest_row = rest.get("row") if isinstance(rest.get("row"), dict) else None
@@ -10433,7 +10459,7 @@ def run_multi_identify_pipeline(
                     on_progress,
                     "search",
                     "active",
-                    f"時間上限，其餘 {len(jobs) - ji} 張標成尚未查完",
+                    f"時間上限，其餘 {len(jobs) - ji} 張請再上傳重查",
                     0.8,
                 )
                 break
@@ -10531,7 +10557,6 @@ def run_multi_identify_pipeline(
                         if not packed["candidates"] and packed.get("code"):
                             packed["candidates"] = [dict(packed)]
                         try:
-                            _BATCH.visual_budget = _slot_visual_budget(ji)
                             packed = apply_visual_rank_to_hit(packed, slot_image, api_key=api_key)
                         except Exception:
                             packed = packed
@@ -10556,9 +10581,11 @@ def run_multi_identify_pipeline(
                                 if packed.get("title"):
                                     one["title"] = packed.get("title")
                                 one["visual_lock"] = True
+                        elif packed.get("lock_incomplete"):
+                            one = _time_budget_slot(row)
                         elif packed.get("series_unresolved"):
                             one = {}
-                    if vm and isinstance(one, dict) and one.get("ok"):
+                    if vm and isinstance(one, dict) and one.get("ok") and not one.get("timed_out"):
                         one = apply_vision_meta(one, vm)
             except Exception as e:
                 one = empty_identify(message=f"查詢失敗：{e}")
@@ -10575,7 +10602,10 @@ def run_multi_identify_pipeline(
                 and is_usable_title(frame_title)
                 and not _frame_title_supports_code(one.get("title"), frame_title)
             )
-            if job["kind"] == "unknown":
+            if one.get("timed_out"):
+                # Retry card. Do not escalate into a guessed volume.
+                pass
+            elif job["kind"] == "unknown":
                 one = _unidentified_slot(row)
             elif not _catalog_code_of(one) or title_rejects_code:
                 escalated = None
@@ -10594,7 +10624,9 @@ def run_multi_identify_pipeline(
                         )
                     except Exception:
                         escalated = None
-                if escalated and _catalog_code_of(escalated):
+                if escalated and escalated.get("timed_out"):
+                    one = escalated
+                elif escalated and _catalog_code_of(escalated):
                     one = escalated
                 elif title_rejects_code:
                     pass
@@ -10614,11 +10646,14 @@ def run_multi_identify_pipeline(
                                 )
                             except Exception:
                                 escalated = None
+                            if escalated and escalated.get("timed_out"):
+                                one = escalated
+                                break
                             if escalated and _catalog_code_of(escalated):
                                 one = escalated
                                 break
                     recovered = None
-                    if not _catalog_code_of(one) and slot_image:
+                    if not one.get("timed_out") and not _catalog_code_of(one) and slot_image:
                         try:
                             recovered = _recover_locked_work(
                                 image_bytes=slot_image,
@@ -10630,8 +10665,12 @@ def run_multi_identify_pipeline(
                             )
                         except Exception:
                             recovered = None
-                    if recovered and _catalog_code_of(recovered):
+                    if recovered and recovered.get("timed_out"):
                         one = recovered
+                    elif recovered and _catalog_code_of(recovered):
+                        one = recovered
+                    elif one.get("timed_out"):
+                        pass
                     elif job["kind"] == "title":
                         one = _unresolved_title_slot(
                             job,
@@ -10644,9 +10683,8 @@ def run_multi_identify_pipeline(
                     else:
                         one = _unidentified_slot(row)
 
-            if one.get("ok") and _catalog_code_of(one):
+            if one.get("ok") and _catalog_code_of(one) and not one.get("timed_out"):
                 try:
-                    _BATCH.visual_budget = _slot_visual_budget(ji)
                     one = verify_work_against_image(
                         one,
                         slot_image,
@@ -10655,9 +10693,17 @@ def run_multi_identify_pipeline(
                     )
                 except Exception:
                     pass
-                disp = _catalog_code_of(one)
-                if disp:
-                    one["code"] = disp
+                if one.get("lock_incomplete") and not _hit_visually_locked(one):
+                    one = _time_budget_slot(row)
+                elif (
+                    getattr(_BATCH, "jacket_incomplete", False)
+                    and not _hit_visually_locked(one)
+                ):
+                    one = _time_budget_slot(row)
+                else:
+                    disp = _catalog_code_of(one)
+                    if disp:
+                        one["code"] = disp
             one.setdefault("related_by_title", [])
             one["from_image_index"] = image_index if image_index is not None else one.get("from_image_index")
             one["_frame_title"] = frame_title
@@ -10720,7 +10766,7 @@ def run_multi_identify_pipeline(
             bit = f"其中 {n_unknown} 部未辨識（已保留該張）"
             note += f"；{bit}"
         if n_budget:
-            bit = f"其中 {n_budget} 張因時間上限未查完（不是查詢不到）"
+            bit = f"其中 {n_budget} 張時間不夠未鎖定（請再上傳那幾張重查，不是查詢不到）"
             msg += f"（{bit}）"
             note += f"；{bit}"
         if n_merged:

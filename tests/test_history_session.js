@@ -1911,6 +1911,7 @@ function walkNodes(node, acc) {
     assert.strictEqual(item.code, '尚未查完');
     assert.strictEqual(item.timedOut, true);
     assert.ok(String(item.message).indexOf('不是查詢不到') !== -1);
+    assert.ok(String(item.message).indexOf('重查') !== -1);
     assert.notStrictEqual(item.code, '未辨識');
   });
 

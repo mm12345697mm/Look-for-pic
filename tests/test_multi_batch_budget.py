@@ -118,15 +118,16 @@ class TestMultiBatchDeadline(unittest.TestCase):
         images = self._images(8)
 
         def slow_identify(**kwargs):
-            time.sleep(0.7)
+            time.sleep(2.0)
             return {
                 "ok": True,
                 "code": kwargs.get("user_code") or "ABP-123",
                 "title": "架空題名のテスト",
             }, 200
 
-        # Above the 8s vision gate, but not long enough to search every slot.
-        deadline = time.monotonic() + 8.2
+        # Above the vision-start floor, but not long enough to search every slot.
+        # OCR is instant, so every frame is read; search stops at the reserve.
+        deadline = time.monotonic() + 16.0
         with mock.patch.object(S, "get_gemini_api_key", return_value=""):
             with mock.patch.object(S, "ocr_image_bytes", return_value="ABP-123"):
                 with mock.patch.object(S, "run_identify_pipeline", side_effect=slow_identify):
@@ -148,8 +149,15 @@ class TestMultiBatchDeadline(unittest.TestCase):
         self.assertGreaterEqual(len(waiting), 1, payload.get("message"))
         self.assertTrue(payload.get("partial"))
         self.assertIn("不是查詢不到", payload.get("message") or "")
-        # Must return because of the deadline, not run all 8 × 0.45s plus margin.
-        self.assertLess(elapsed, 8.0, elapsed)
+        self.assertIn("重查", payload.get("message") or "")
+        for row in done:
+            self.assertEqual(row.get("code"), "ABP-123")
+            self.assertFalse(row.get("timed_out"))
+        for row in waiting:
+            self.assertNotEqual(row.get("code"), "ABP-123")
+            self.assertIn("重查", row.get("message") or "")
+        # Must return because of the deadline, not run all 8 × 2s.
+        self.assertLess(elapsed, 15.0, elapsed)
         print(
             f"partial batch: {len(done)} finished, {len(waiting)} 尚未查完, {elapsed:.2f}s"
         )
@@ -244,6 +252,128 @@ class TestCoverCache(unittest.TestCase):
         self.assertEqual(first, blob)
         self.assertEqual(second, blob)
         self.assertEqual(calls["n"], 1)
+
+
+class TestDeadlineDoesNotInventAVolume(unittest.TestCase):
+    def _series(self, seeds):
+        shared = "架空系列の同じ題名で巻だけ違う"
+        blobs = {}
+        cands = []
+        for i, seed in enumerate(seeds, start=1):
+            code = f"SER-{i:03d}"
+            wide = Image.new("RGB", (400, 160), (20, 20, 20))
+            wide.paste(_pattern(120, 160, seed), (280, 0))
+            blobs[code] = _png(wide)
+            cands.append(
+                {
+                    "code": code,
+                    "title": shared,
+                    "cover": f"https://pics.dmm.co.jp/digital/video/{code}/{code}pl.jpg",
+                }
+            )
+        front = _png(_pattern(120, 160, 7))
+        return shared, blobs, cands, front
+
+    def test_aborted_cover_does_not_lock_the_other_volumes(self):
+        """The true jacket was not fetched. Do not lock on the covers that were."""
+        _shared, blobs, cands, front = self._series((3, 4, 5, 7, 8, 9))
+
+        def fetch(cand, deadline):
+            code = cand["code"]
+            if code == "SER-004":
+                return cand, None, True
+            return cand, blobs[code], False
+
+        S._enter_batch_ctx(time.monotonic() + 60)
+        try:
+            with mock.patch.object(S, "_fetch_jacket_blob", side_effect=fetch):
+                winner = S._jacket_lock_winner(front, cands)
+            self.assertIsNone(winner)
+            self.assertTrue(getattr(S._BATCH, "jacket_incomplete", False))
+        finally:
+            S._leave_batch_ctx()
+
+    def test_past_deadline_does_not_lock_even_if_the_cover_matches(self):
+        _shared, blobs, cands, front = self._series((3, 4, 5, 7, 8, 9))
+
+        def fake_dl(url, timeout=None):
+            self.fail(f"download started after the deadline: {url}")
+
+        S._enter_batch_ctx(time.monotonic() - 1)
+        try:
+            with mock.patch.object(S, "download_cover_bytes", side_effect=fake_dl):
+                winner = S._jacket_lock_winner(front, cands)
+            self.assertIsNone(winner)
+            self.assertTrue(getattr(S._BATCH, "jacket_incomplete", False))
+        finally:
+            S._leave_batch_ctx()
+
+    def test_full_time_still_locks_same_work_and_clothes(self):
+        """Thresholds stay 0.70 / 0.12 / 0.58 when the batch still has time."""
+        _shared, blobs, cands, front = self._series((3, 4, 5, 7, 8, 9))
+
+        def fake_dl(url, timeout=None):
+            self.assertGreaterEqual(timeout or 0, S.COVER_DOWNLOAD_TIMEOUT)
+            for code, blob in blobs.items():
+                if code in url:
+                    return blob
+            return None
+
+        S._enter_batch_ctx(time.monotonic() + 120)
+        try:
+            with mock.patch.object(S, "download_cover_bytes", side_effect=fake_dl):
+                winner = S._jacket_lock_winner(front, cands)
+            self.assertIsNotNone(winner)
+            self.assertEqual(winner["code"], "SER-004")
+            self.assertGreaterEqual(winner["jacket_score"], 0.70)
+            self.assertGreaterEqual(winner["jacket_figure"], 0.58)
+            self.assertFalse(getattr(S._BATCH, "jacket_incomplete", False))
+        finally:
+            S._leave_batch_ctx()
+
+    def test_cut_short_series_is_retryable_not_the_catalog_first_row(self):
+        shared, _blobs, cands, front = self._series((3, 4, 5, 7, 8, 9))
+        other = _png(Image.new("RGB", (90, 90), (9, 9, 9)))
+
+        def fake_lock(image, candidates):
+            if getattr(S._BATCH, "active", False):
+                S._BATCH.jacket_incomplete = True
+            return None
+
+        def fake_rank(*args, **kwargs):
+            raise AssertionError("short visual rank must not run")
+
+        def fake_identify(**kwargs):
+            code = kwargs.get("user_code") or "SER-001"
+            return {
+                "ok": True,
+                "code": code,
+                "title": shared,
+                "candidates": cands,
+            }, 200
+
+        with mock.patch.object(S, "get_gemini_api_key", return_value=""):
+            with mock.patch.object(S, "ocr_image_bytes", return_value=shared):
+                with mock.patch.object(S, "_jacket_lock_winner", side_effect=fake_lock):
+                    with mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank):
+                        with mock.patch.object(S, "run_identify_pipeline", side_effect=fake_identify):
+                            with mock.patch.object(
+                                S, "attach_related_by_title", side_effect=lambda result, **kwargs: result
+                            ):
+                                payload, status = S.run_multi_identify_pipeline(
+                                    [(front, "a.png"), (other, "b.png")],
+                                    deadline=time.monotonic() + 80,
+                                )
+        self.assertEqual(status, 200)
+        self.assertTrue(payload.get("partial"))
+        results = payload.get("results") or []
+        self.assertGreaterEqual(len(results), 1)
+        self.assertTrue(all(row.get("timed_out") for row in results), results)
+        for row in results:
+            self.assertNotEqual(row.get("code"), "SER-001")
+            self.assertNotEqual(row.get("code"), "SER-004")
+            self.assertIn("重查", row.get("message") or "")
+            self.assertIn("不是查詢不到", row.get("message") or "")
 
 
 if __name__ == "__main__":

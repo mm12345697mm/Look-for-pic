@@ -1070,7 +1070,7 @@
         code: 'TITLE-SEARCH',
         title: '（這張尚未查完）',
         from_image_index: i,
-        message: '伺服器逾時，這張辨識被中斷。不是查詢不到。',
+        message: '伺服器逾時，這張被中斷。請再上傳這張重查一次。不是查詢不到。',
         why: '伺服器逾時',
         line: 'multi',
         needs_code: true,
@@ -1087,8 +1087,8 @@
       image_count: n,
       result_count: slots.length,
       results: slots,
-      message: '伺服器逾時，多圖辨識被中斷。已完成的會保留；其餘不是查詢不到。',
-      related_note: '伺服器逾時，未完成的不是查詢不到',
+      message: '伺服器逾時，多圖辨識被中斷。已完成的會保留。未完成的請再上傳重查，不是查詢不到。',
+      related_note: '未完成的請再上傳這張重查，不是查詢不到',
     };
   }
 
@@ -1418,7 +1418,7 @@
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
       ph.innerHTML = w.timedOut
-        ? '<strong>尚未查完</strong><span>伺服器時間上限，不是查詢不到</span>'
+        ? '<strong>尚未查完</strong><span>請再上傳這張重查一次，不是查詢不到</span>'
         : w.unidentified
           ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
           : w.titleOnly
@@ -1525,7 +1525,7 @@
     if (w.timedOut) {
       const noteEl = document.createElement('p');
       noteEl.className = 'card-visual-note';
-      noteEl.textContent = w.message || '伺服器時間上限，這張還沒查完。不是查詢不到。';
+      noteEl.textContent = w.message || '這張時間不夠，還沒鎖定。請再上傳這張重查一次。不是查詢不到。';
       meta.appendChild(noteEl);
     }
     if (w.visualMismatch) {
