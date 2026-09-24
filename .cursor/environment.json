@@ -1,0 +1,17 @@
+{
+  "name": "Look-for-pic Web",
+  "install": "bash .cursor/install.sh",
+  "terminals": [
+    {
+      "name": "flask-server",
+      "command": "ALLOW_PUBLIC=1 bash -lc 'source .venv/bin/activate && exec python -u server.py'",
+      "description": "Look-for-pic Web Flask server (identify API + static PWA) on http://0.0.0.0:8787/"
+    }
+  ],
+  "ports": [
+    {
+      "name": "flask-server",
+      "port": 8787
+    }
+  ]
+}
