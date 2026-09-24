@@ -190,6 +190,14 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertFalse(any("だけ" in c for c in chips), blob)
         self.assertTrue(any(c in ("溢れる欲望", "狭い部屋", "食堂", "同僚") for c in chips), blob)
 
+    def test_alias_labels_and_comparisons_are_not_chips(self):
+        title = "架空題は溢れる欲望と自分以上に勢いが凄い！！ (仮名)アキさん"
+        chips = S._extract_title_theme_keywords(title)
+        blob = " ".join(chips)
+        self.assertNotIn("自分以上", chips, blob)
+        self.assertFalse(any("仮名" in c for c in chips), blob)
+        self.assertIn("溢れる欲望", chips, blob)
+
     def test_manual_code_pins_slogan_frame_not_a_resolved_neighbor(self):
         rows = [
             {"code": "JUFE-271", "title": "地味な眼鏡では隠し切れない美人OL"},

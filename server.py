@@ -7514,6 +7514,12 @@ def _bounded_title_compounds(text: str) -> list[str]:
             continue
         if _CLAUSE_JOIN_RE.search(part):
             continue
+        # (仮名)アキさん is an alias label, not a theme. 自分以上 is a
+        # comparison ("more than me"), not a compound.
+        if "仮名" in part:
+            continue
+        if re.fullmatch(r"(自分|それ|これ|あれ|彼女|彼氏)以上", part):
+            continue
         if not re.search(r"[\u4e00-\u9fff\u30a0-\u30ff0-9]", part):
             continue
         if part in _COMPOUND_SUFFIXES or any(part.startswith(suf) for suf in _COMPOUND_SUFFIXES):
