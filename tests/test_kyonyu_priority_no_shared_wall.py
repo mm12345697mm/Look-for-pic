@@ -558,5 +558,154 @@ class TestKyonyuKeywordPriority(unittest.TestCase):
         self.assertEqual(view["result"]["code"], "AAA-001")
 
 
+MISSAV_CN_HTML = """
+<html><head>
+<meta property="og:title" content="MIDA-616 女友妹妹的無胸罩誘惑 - MissAV">
+</head><body>
+<a href="https://missav.ai/cn/actresses/fukuda-yua">福田由愛</a>
+</body></html>
+"""
+
+JABLE_HTML = """
+<html><head>
+<meta property="og:title" content="MIDA-100 巨乳泳社的集訓 - Jable.TV">
+</head><body>
+<a href="https://jable.tv/models/fukuda-yua/"><img alt="avatar"><span>福田由愛</span></a>
+</body></html>
+"""
+
+MISSAV_JA_HTML = """
+<html><head>
+<meta property="og:title" content="MIDA-616 彼女の妹のノーブラ誘惑 - MissAV">
+</head><body>
+<a href="https://missav.ai/cn/actresses/fukuda-yua">福田ゆあ</a>
+</body></html>
+"""
+
+
+class TestZhCatalogByCode(unittest.TestCase):
+    """品番 pages on MissAV /cn/ and Jable fill 日文（中文）. No invented gloss."""
+
+    def test_missav_cn_fills_title_and_actress(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            if url == "https://missav.ai/cn/mida-616":
+                return MISSAV_CN_HTML
+            raise AssertionError(url)
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("MIDA-616", actress_ja="福田ゆあ", title_ja=MIDA)
+        self.assertEqual(meta["title_zh"], "女友妹妹的無胸罩誘惑")
+        self.assertEqual(meta["actress_zh"], "福田由愛")
+        # The page title is used as-is. A keyword gloss is not substituted.
+        self.assertNotEqual(meta["title_zh"], "無胸罩")
+
+    def test_japanese_page_omits_parentheses_sources(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            if "javlibrary" in url:
+                return None
+            if "mida-616" in url and "missav.ai/cn/" in url:
+                return MISSAV_JA_HTML
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("mida-616", actress_ja="福田ゆあ")
+        self.assertIsNone(meta["title_zh"])
+        self.assertIsNone(meta["actress_zh"])
+
+    def test_jable_when_missav_misses(self):
+        seen = []
+
+        def fake_get(url, timeout=8.0, headers=None):
+            seen.append(url)
+            if url == "https://jable.tv/videos/mida-100/":
+                return JABLE_HTML
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("MIDA-100", actress_ja="福田ゆあ")
+        self.assertEqual(meta["title_zh"], "巨乳泳社的集訓")
+        self.assertEqual(meta["actress_zh"], "福田由愛")
+        self.assertTrue(any("jable.tv" in u for u in seen))
+        self.assertFalse(any("javlibrary" in u for u in seen))
+
+    def test_same_han_name_is_not_a_second_billing(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            if "missav.ai/cn/" in url:
+                return MISSAV_CN_HTML
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("MIDA-616", actress_ja="福田由愛")
+        self.assertEqual(meta["title_zh"], "女友妹妹的無胸罩誘惑")
+        self.assertIsNone(meta["actress_zh"])
+
+    def test_attach_fills_main_and_related_without_inventing(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            if url == "https://missav.ai/cn/mida-616":
+                return MISSAV_CN_HTML
+            if url == "https://jable.tv/videos/mida-100/":
+                return JABLE_HTML
+            if "missav.ai/cn/mida-100" in url:
+                return None
+            return None
+
+        payload = {
+            "code": "MIDA-616",
+            "title": MIDA,
+            "actress": "福田ゆあ",
+            "related_by_title": [
+                {
+                    "code": "MIDA-100",
+                    "title": "巨乳の合宿",
+                    "actress": "福田ゆあ",
+                }
+            ],
+        }
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            out = S.attach_chinese_titles(payload, related_budget_sec=30)
+        self.assertEqual(out["title_zh"], "女友妹妹的無胸罩誘惑")
+        self.assertEqual(out["actress_zh"], "福田由愛")
+        rel = out["related_by_title"][0]
+        self.assertEqual(rel["title_zh"], "巨乳泳社的集訓")
+        self.assertEqual(rel["actress_zh"], "福田由愛")
+
+    def test_existing_chinese_title_is_not_replaced(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            raise AssertionError(url)
+
+        payload = {
+            "code": "MIDA-616",
+            "title": MIDA,
+            "title_zh": "既有中文",
+            "actress": "福田ゆあ",
+            "related_by_title": [
+                {"code": "MIDA-100", "title": "巨乳の合宿", "title_zh": "已有相關"}
+            ],
+        }
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            out = S.attach_chinese_titles(payload, related_budget_sec=30)
+        self.assertEqual(out["title_zh"], "既有中文")
+        self.assertFalse(out.get("actress_zh"))
+        self.assertEqual(out["related_by_title"][0]["title_zh"], "已有相關")
+        self.assertFalse(out["related_by_title"][0].get("actress_zh"))
+
+    def test_resolve_returns_title_and_reports_actress(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            if "missav.ai/cn/mida-616" in url:
+                return MISSAV_CN_HTML
+            return None
+
+        found: dict = {}
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            zh = S.resolve_chinese_title(
+                "MIDA-616",
+                title_ja=MIDA,
+                actress_ja="福田ゆあ",
+                catalog_out=found,
+            )
+        self.assertEqual(zh, "女友妹妹的無胸罩誘惑")
+        self.assertEqual(found.get("actress_zh"), "福田由愛")
+
+
 if __name__ == "__main__":
     unittest.main()
