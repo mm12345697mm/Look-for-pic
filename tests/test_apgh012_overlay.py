@@ -13,6 +13,7 @@ SHJG-448 in other tests is a fictional phrase-in-title mechanic, not this work.
 """
 from __future__ import annotations
 
+import re
 import unittest
 from unittest import mock
 
@@ -123,6 +124,8 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertIn("舌技", prompt)
         self.assertIn("無碼影片", prompt)
         self.assertIn("ApGH-012", prompt)
+        self.assertIn("texts", prompt)
+        self.assertIn("全部", prompt)
 
     def test_code_shapes_and_chrome_are_not_titles(self):
         for raw in ("APGH-012", "ApGH-012", "APGH 012", "APGH012"):
@@ -142,6 +145,12 @@ class TestApgh012Overlay(unittest.TestCase):
         sole, many = S._sole_product_code("APGH-025\nAPGH-012\nAPGH-015")
         self.assertIsNone(sole)
         self.assertEqual(many, ["APGH-025", "APGH-012", "APGH-015"])
+        parsed = S.parse_vision_json(
+            '{"title":"舌技が神","texts":["舌技が神","先生が2人っきりの","APGH-012","オーロラ"],"actress":"柊ゆうき"}'
+        )
+        self.assertEqual(parsed.get("code"), "APGH-012")
+        self.assertIn("先生が2人っきりの", parsed.get("texts") or [])
+        self.assertIn("舌技が神", parsed.get("texts") or [])
 
     def test_listing_caption_code_beats_slogan(self):
         img = b"missav-apgh-012-card"
@@ -213,6 +222,91 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertEqual(payload.get("title"), APGH_TITLE)
         self.assertNotEqual(payload.get("code"), "APGH-025")
         self.assertEqual(payload.get("search_mode"), "code")
+
+    def test_cover_only_corner_code_is_not_a_listing_row(self):
+        """品番 is small print on the art itself, not a missav caption under the thumb."""
+        img = b"cover-art-with-corner-code"
+
+        def vision(image_bytes, mime, api_key):
+            return {"title": "舌技が神", "actress": ACTRESS, "texts": ["舌技が神"]}
+
+        def ocr(image_bytes):
+            return "舌技が神\nオーロラ\nAPGH-012"
+
+        searches: list[str] = []
+
+        def search(title, actress=None):
+            searches.append(str(title or ""))
+            return None
+
+        with mock.patch.multiple(
+            S,
+            get_gemini_api_key=mock.Mock(return_value="test-key"),
+            call_gemini_vision=mock.Mock(side_effect=vision),
+            ocr_image_bytes=mock.Mock(side_effect=ocr),
+            search_by_title=mock.Mock(side_effect=search),
+            identify_code=mock.Mock(side_effect=self._identify),
+            fetch_avbase_title_results=mock.Mock(return_value=[]),
+            rank_candidates_by_visual=mock.Mock(side_effect=self._rank(None)),
+            offline_cache_get=mock.Mock(return_value=None),
+            offline_cache_put=mock.Mock(return_value=None),
+            probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_chinese_title=mock.Mock(return_value=None),
+            find_related_by_title=mock.Mock(return_value=[]),
+            attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
+        ):
+            payload, status = S.run_identify_pipeline(image_bytes=img, filename="cover.jpg")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("code"), APGH_CODE)
+        self.assertEqual(payload.get("title"), APGH_TITLE)
+        self.assertEqual(searches, [])
+
+    def test_cover_only_full_text_beats_the_slogan(self):
+        """No 品番 on the art. The catalog line is smaller print than 舌技が神."""
+        img = b"cover-art-title-fragments"
+        seen: list[str] = []
+
+        def vision(image_bytes, mime, api_key):
+            return {"title": "舌技が神", "actress": ACTRESS, "texts": ["舌技が神"]}
+
+        def ocr(image_bytes):
+            return "舌技が神\n先生が2人っきりの\nプライベート補習\nオーロラ"
+
+        def search(title, actress=None):
+            q = re.sub(r"\s+", "", str(title or ""))
+            seen.append(q)
+            official = re.sub(r"\s+", "", APGH_TITLE)
+            if "舌技" in q and "先生" not in q and "補習" not in q:
+                return None
+            if len(q) >= 6 and q in official:
+                return _work(APGH_CODE, APGH_TITLE)
+            return None
+
+        with mock.patch.multiple(
+            S,
+            get_gemini_api_key=mock.Mock(return_value="test-key"),
+            call_gemini_vision=mock.Mock(side_effect=vision),
+            ocr_image_bytes=mock.Mock(side_effect=ocr),
+            search_by_title=mock.Mock(side_effect=search),
+            identify_code=mock.Mock(side_effect=self._identify),
+            fetch_avbase_title_results=mock.Mock(return_value=[]),
+            rank_candidates_by_visual=mock.Mock(side_effect=self._rank(None)),
+            offline_cache_get=mock.Mock(return_value=None),
+            offline_cache_put=mock.Mock(return_value=None),
+            probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_chinese_title=mock.Mock(return_value=None),
+            find_related_by_title=mock.Mock(return_value=[]),
+            attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
+        ):
+            payload, status = S.run_identify_pipeline(image_bytes=img, filename="cover.jpg")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(payload.get("code"), APGH_CODE)
+        self.assertEqual(payload.get("title"), APGH_TITLE)
+        self.assertTrue(any("先生" in q or "補習" in q for q in seen))
+        self.assertNotEqual(seen[:1], ["舌技が神"])
+        self.assertNotIn("Yuuki", "\n".join(seen))
 
     def test_no_visual_lock_stays_title_only(self):
         img = b"cover-only-no-lock"

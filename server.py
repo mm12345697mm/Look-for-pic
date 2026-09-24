@@ -71,18 +71,19 @@ GEMINI_TEXT_MODELS = (
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
 )
-VISION_PROMPT = """你是 AV／JAV 列表截圖辨識助手。圖片可能是單張封面、封面裁切，或 missav／JAVDB 列表：縮圖下方或旁邊印著番號與女優名。
+VISION_PROMPT = """你是 AV／JAV 封面與列表截圖辨識助手。圖片可能是整張封面（沒有網站列），或 missav／JAVDB 列表。
 
-請只讀取畫面中「主作品／焦點那一筆」的資訊，回傳 JSON（不要 markdown、不要程式碼圍欄、不要多餘說明）：
-{"code":"APGH-012","title":"日本語タイトル","actress":"...","studio":"...","confidence":0.0,"notes":""}
+請讀取畫面上「全部」看得到的字，不要只挑最大的那句。回傳 JSON（不要 markdown、不要程式碼圍欄、不要多餘說明）：
+{"code":"APGH-012","title":"日本語タイトル","actress":"...","studio":"...","texts":["APGH-012","日本語タイトル","女優名","メーカー","角落小字"],"confidence":0.0,"notes":""}
 
 規則：
-1. 番號（品番）優先於封面上的裝飾字。縮圖下方、標題列、封面旁的番號都要讀，例如 APGH-012、ApGH-012、APGH 012。讀到就填 code，並寫成「英數-數字」。
-2. 封面上的短直排或宣傳句（例如「舌技」「舌技が神」）不是目錄片名。若同時看得到番號，code 必填；title 只填畫面上真正的作品標題那一行。沒有標題行就讓 title 為 null，不要用短標語充當片名。
-3. 不要把網站介面當成片名：時長（2:25:56）、無碼影片、有碼、中文字幕、LIVE、網站名。這些不是 title。
-4. 看不清楚的欄位填 null。不要翻譯、不要發明、不要補全看不到的字。confidence 為 0.0～1.0。
-5. actress 用畫面上的人名。列表若是羅馬字（Yuuki Hiiragi）而封面有日文名，優先日文名。studio 沒有就 null。
-6. 只輸出一行合法 JSON。
+1. texts 列出每一段讀得到的字：番號、標題各行、女優、片商、角落印章、小字。短宣傳句也要留下。不要因為有一句很大的標語就漏掉其餘的字。
+2. 番號優先於裝飾字。APGH-012、ApGH-012、APGH 012 這類都要寫進 code，並出現在 texts。寫成「英數-數字」。封面本體上的番號與列表縮圖下方的番號同樣要讀。
+3. 短直排或宣傳句（例如「舌技」「舌技が神」）不是目錄片名。title 只填真正的作品標題那一行；沒有就 null。短標語仍放在 texts，不要拿它冒充 title。
+4. 不要把網站介面當成 title：時長（2:25:56）、無碼影片、有碼、中文字幕、LIVE、網站名。
+5. 看不清楚的欄位填 null。不要翻譯、不要發明、不要補全看不到的字。confidence 為 0.0～1.0。
+6. actress 用畫面上的人名。列表若是羅馬字（Yuuki Hiiragi）而封面有日文名，優先日文名。studio 沒有就 null。
+7. 只輸出一行合法 JSON。
 """
 
 VISUAL_MATCH_PROMPT = """你是 AV／JAV 視覺核對助手。Image A 是使用者上傳的「原始截圖／劇照／封面裁切」；Image B 是候選作品的封面或劇照。
@@ -1320,6 +1321,39 @@ def parse_vision_json(text: str) -> dict[str, Any]:
         codes = extract_codes(code)
         code = format_display_code(codes[0]) if codes else format_display_code(code)
 
+    def _text_items(value: Any) -> list[str]:
+        if isinstance(value, list):
+            raw_items = value
+        elif isinstance(value, str):
+            raw_items = re.split(r"[\r\n]+", value)
+        else:
+            raw_items = []
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_items:
+            item = clean_str(raw)
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+        return out
+
+    texts = _text_items(data.get("texts"))
+    for extra in (
+        clean_str(data.get("title")),
+        clean_str(data.get("actress")),
+        clean_str(data.get("studio")),
+        clean_str(data.get("notes")),
+        code,
+    ):
+        if extra and extra not in texts:
+            texts.append(extra)
+    # A corner stamp may be only in texts, while title was filled with a slogan.
+    if not code:
+        sole, _many = _sole_product_code("\n".join(texts))
+        if sole:
+            code = sole
+
     conf = data.get("confidence")
     try:
         confidence = float(conf) if conf is not None else None
@@ -1331,6 +1365,7 @@ def parse_vision_json(text: str) -> dict[str, Any]:
         "title": clean_str(data.get("title")),
         "actress": clean_str(data.get("actress")),
         "studio": clean_str(data.get("studio")),
+        "texts": texts[:24],
         "confidence": confidence,
         "notes": clean_str(data.get("notes")) or "",
     }
@@ -7884,6 +7919,105 @@ def _actress_query_name(name: str | None) -> str | None:
     return shown
 
 
+def _compose_read_blob(*parts: Any) -> str:
+    """Every readable string, in order, without duplicate lines."""
+    lines: list[str] = []
+    seen: set[str] = set()
+    for part in parts:
+        if isinstance(part, list):
+            chunks = part
+        else:
+            chunks = re.split(r"[\r\n]+", str(part or ""))
+        for chunk in chunks:
+            s = str(chunk or "").strip()
+            if not s or s in seen or s.startswith("[tesseract"):
+                continue
+            seen.add(s)
+            lines.append(s)
+    return "\n".join(lines)
+
+
+def _full_text_search_queries(blob: str | None, *, actress: str | None = None) -> list[str]:
+    """Distinctive lines from the whole read, slogan last is omitted when real lines exist.
+
+    Manual lookup pastes every OCR string, not only the biggest phrase. A short
+    cover slogan such as 舌技が神 is not a catalog query when the art also
+    printed a longer title fragment, a maker mark line, or a corner 品番.
+    """
+    raw = (blob or "").strip()
+    if not raw or raw.startswith("[tesseract"):
+        return []
+    pieces = [p.strip() for p in re.split(r"[\r\n]+", raw) if p.strip()]
+    pieces.extend(re.findall(r"[\u3040-\u30ff\u4e00-\u9fff々ー]{4,40}", raw))
+    actress_c = re.sub(r"[\s　]+", "", actress or "")
+    ranked: list[str] = []
+    seen: set[str] = set()
+
+    def _consider(piece: str) -> None:
+        piece = normalize_ocr_title(piece) or str(piece or "").strip()
+        piece = re.sub(r"\s+", " ", piece).strip()
+        _sole, cleaned = _split_title_and_code(piece)
+        piece = cleaned or ""
+        if not piece or piece in seen or _is_site_chrome_title(piece) or not is_usable_title(piece):
+            return
+        if _is_decorative_overlay(piece):
+            return
+        compact = re.sub(r"[\s　]+", "", piece)
+        if actress_c and compact == actress_c:
+            return
+        seen.add(piece)
+        ranked.append(piece)
+
+    for piece in pieces:
+        _consider(piece)
+    ranked.sort(key=lambda s: _cjk_count(s), reverse=True)
+    queries: list[str] = []
+
+    def add(q: str) -> None:
+        q = re.sub(r"\s+", " ", (q or "").strip())
+        if len(q) < 4 or q in queries or _is_decorative_overlay(q) or not is_usable_title(q):
+            return
+        queries.append(q)
+
+    for line in ranked:
+        add(line)
+        compact = re.sub(r"\s+", "", line)
+        if _cjk_count(compact) >= 10:
+            for n in (8, 6):
+                if len(compact) < n:
+                    continue
+                add(compact[:n])
+                mid = max(0, (len(compact) - n) // 2)
+                add(compact[mid : mid + n])
+        if len(queries) >= 6:
+            break
+    return queries[:6]
+
+
+def _ordered_title_queries(primary: str | None, extras: list[str] | None) -> list[str]:
+    """Search real title fragments before a short decorative slogan."""
+    ordered: list[str] = []
+    decorative: list[str] = []
+
+    def push(q: str | None) -> None:
+        q = re.sub(r"\s+", " ", str(q or "").strip())
+        if not q or q in ordered or q in decorative:
+            return
+        if not is_usable_title(q):
+            return
+        if _is_decorative_overlay(q):
+            decorative.append(q)
+        else:
+            ordered.append(q)
+
+    for q in extras or []:
+        push(q)
+    push(primary)
+    if ordered:
+        return (ordered + decorative)[:8]
+    return decorative[:4]
+
+
 def _title_from_ocr_text(text: str | None) -> str | None:
     """Best usable title line in an OCR dump. Ignores tesseract stubs and site chrome."""
     raw = (text or "").strip()
@@ -8433,6 +8567,7 @@ def run_multi_identify_pipeline(
             "vision_used": False,
             "image_bytes": img_bytes,
         }
+        ocr_text = ""
         mime = detect_image_mime(img_bytes, fname)
         if api_key:
             try:
@@ -8446,6 +8581,8 @@ def run_multi_identify_pipeline(
                     row["actress"] = str(vm.get("actress"))
                 if vm.get("studio"):
                     row["studio"] = str(vm.get("studio"))
+                if isinstance(vm.get("texts"), list):
+                    row["vision_texts"] = [str(t).strip() for t in vm["texts"] if str(t or "").strip()]
             except Exception as e:
                 row["vision_error"] = str(e)[:120]
                 try:
@@ -8500,6 +8637,28 @@ def run_multi_identify_pipeline(
                 if ocr_title:
                     row["ocr_title"] = ocr_title
                     row["title"] = ocr_title
+        read_blob = _compose_read_blob(
+            row.get("vision_texts"),
+            row.get("vision_title"),
+            row.get("title"),
+            row.get("actress"),
+            ocr_text,
+        )
+        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+            sole_blob, many_blob = _sole_product_code(read_blob)
+            if sole_blob:
+                row["code"] = sole_blob
+                row["ocr_code"] = sole_blob
+            elif many_blob and not row.get("ocr_codes"):
+                row["ocr_codes"] = many_blob
+        row["text_queries"] = _full_text_search_queries(read_blob, actress=row.get("actress"))
+        if (
+            row["text_queries"]
+            and not (row.get("code") and parse_code_parts(str(row.get("code") or "")))
+            and (not is_usable_title(row.get("title")) or _is_decorative_overlay(row.get("title")))
+        ):
+            row["ocr_title"] = row.get("ocr_title") or row["text_queries"][0]
+            row["title"] = row["text_queries"][0]
         # This cover may already have succeeded on its own. A multi pass that
         # reads nothing must reuse that image's cached 番號 and 作品名稱,
         # instead of leaving the frame to be merged into another upload.
@@ -8666,6 +8825,24 @@ def run_multi_identify_pipeline(
             elif title_rejects_code:
                 pass
             else:
+                if not _catalog_code_of(one):
+                    for extra_q in (row or {}).get("text_queries") or []:
+                        if not extra_q or extra_q == frame_title:
+                            continue
+                        try:
+                            escalated = _escalate_frame_title(
+                                extra_q,
+                                actress=(vm or {}).get("actress") if vm else None,
+                                image_bytes=slot_image,
+                                api_key=api_key,
+                                vision_meta=vm,
+                                image_index=image_index,
+                            )
+                        except Exception:
+                            escalated = None
+                        if escalated and _catalog_code_of(escalated):
+                            one = escalated
+                            break
                 recovered = None
                 if not _catalog_code_of(one) and slot_image:
                     try:
@@ -9128,6 +9305,7 @@ def run_identify_pipeline(
     vision_meta: dict | None = None
     extra_msg: str | None = None
     ambiguous_codes: list[str] = []
+    text_queries: list[str] = []
     code = (user_code or "").strip()
     user_title = (user_title or "").strip()
     search_mode = "manual" if code else ("title" if user_title else "code")
@@ -9339,6 +9517,38 @@ def run_identify_pipeline(
             vision_meta["title"] = ocr_title
             extra_msg = (extra_msg + " " if extra_msg else "") + "看圖未讀到片名，已用 OCR 補片名。"
 
+    # Cover-only art: the biggest phrase can be a slogan while the 品番 or the
+    # real title fragment is smaller print. Search the whole read, not one line.
+    if image_bytes is not None:
+        read_blob = _compose_read_blob(
+            (vision_meta or {}).get("texts") if vision_meta else None,
+            (vision_meta or {}).get("title") if vision_meta else None,
+            (vision_meta or {}).get("actress") if vision_meta else None,
+            (vision_meta or {}).get("studio") if vision_meta else None,
+            ocr_preview,
+        )
+        if not code:
+            sole_blob, many_blob = _sole_product_code(read_blob)
+            if sole_blob:
+                code = sole_blob
+                search_mode = "code"
+                extra_msg = (extra_msg + " " if extra_msg else "") + "已從整段文字讀出番號。"
+            elif many_blob:
+                ambiguous_codes = many_blob
+        text_queries = _full_text_search_queries(
+            read_blob,
+            actress=(vision_meta or {}).get("actress") if vision_meta else None,
+        )
+        current_title = str((vision_meta or {}).get("title") or "") if vision_meta else ""
+        if (
+            not code
+            and text_queries
+            and (not is_usable_title(current_title) or _is_decorative_overlay(current_title))
+        ):
+            vision_meta = dict(vision_meta or {})
+            vision_meta["title"] = text_queries[0]
+            extra_msg = (extra_msg + " " if extra_msg else "") + "已改搜封面上其餘文字。"
+
     # Step 3: parse code/title
     _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
 
@@ -9430,10 +9640,16 @@ def run_identify_pipeline(
         _progress(on_progress, "parse", "done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
         _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
         hit = None
-        try:
-            hit = search_by_title(vtitle, actress=vactress)
-        except Exception as se:
-            extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+        for q in _ordered_title_queries(vtitle, text_queries):
+            try:
+                found = search_by_title(q, actress=vactress)
+            except Exception as se:
+                extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+                found = None
+            if _hit_has_catalog_code(found):
+                hit = found
+                vtitle = q
+                break
 
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
             # Visual rank when multiple same-series candidates
