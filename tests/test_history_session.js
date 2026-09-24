@@ -634,7 +634,7 @@ function walkNodes(node, acc) {
 {
   assert.strictEqual(
     H.normalizeKeywordList(['ノーブラ誘惑', '巨乳', '彼女の妹', '彼女', '妹', '誘']).join('・'),
-    'ノーブラ誘惑・巨乳・彼女の妹・彼女・妹'
+    'ノーブラ・誘惑・巨乳・彼女の妹・彼女・妹'
   );
   assert.strictEqual(
     H.normalizeKeywordList(['巨乳', '電車', '彼女', '妹', '彼女の妹']).join('・'),
@@ -652,19 +652,32 @@ function walkNodes(node, acc) {
   );
   assert.strictEqual(
     H.formatKeywordListLabel('關鍵字相關', ['BOD', '中出し']),
-    '關鍵字相關（中出し）'
+    '關鍵字相關（' + H.formatKeywordChip('中出し') + '）'
   );
+  assert.strictEqual(H.formatKeywordChip('ノーブラ'), 'ノーブラ（無胸罩）');
+  assert.strictEqual(H.formatKeywordChip('誘惑'), '誘惑（誘惑）');
+  assert.strictEqual(H.formatKeywordChip('水泳部'), '水泳部（游泳社）');
+  assert.strictEqual(H.formatKeywordChip('合宿'), '合宿（集訓）');
+  assert.strictEqual(H.formatKeywordChip('媚薬'), '媚薬（媚藥）');
+  assert.strictEqual(H.formatKeywordChip('巨乳'), '巨乳（巨乳）');
+  assert.strictEqual(H.formatPersonName('福田ゆあ', ''), '福田ゆあ');
+  assert.ok(H.formatPersonName('福田ゆあ', '').indexOf('（') === -1);
+  assert.strictEqual(H.formatPersonName('福田ゆあ', '福田由愛'), '福田ゆあ（福田由愛）');
+  assert.strictEqual(H.resumePayloadFromJob({ status: 'stalled' }), null);
+  assert.strictEqual(H.resumePayloadFromJob({ status: 'running', result: { ok: true } }), null);
+  const doneJob = H.resumePayloadFromJob({ status: 'done', result: { ok: true, code: 'AAA-001' } });
+  assert.strictEqual(doneJob.code, 'AAA-001');
 }
 
 // Keyword chips on a card that already has a 關鍵字 related section
 {
   assert.strictEqual(
     H.formatKeywordListLabel('關鍵字相關', ['眼鏡', '地味', 'OL']),
-    '關鍵字相關（眼鏡・地味・OL）'
+    '關鍵字相關（' + ['眼鏡', '地味', 'OL'].map(H.formatKeywordChip).join('・') + '）'
   );
   assert.strictEqual(
     H.formatKeywordListLabel('關鍵字再搜', ['眼鏡', '地味']),
-    '關鍵字再搜（眼鏡・地味）'
+    '關鍵字再搜（' + ['眼鏡', '地味'].map(H.formatKeywordChip).join('・') + '）'
   );
   const data = {
     ok: true,
@@ -701,12 +714,14 @@ function walkNodes(node, acc) {
   const labels = nodes
     .filter((n) => n.className === 'kw-related-label')
     .map((n) => n.textContent);
-  assert.ok(labels.indexOf('關鍵字相關（眼鏡・地味・OL）') !== -1, labels.join('|'));
+  const glossed = '關鍵字相關（' + ['眼鏡', '地味', 'OL'].map(H.formatKeywordChip).join('・') + '）';
+  assert.ok(labels.indexOf(glossed) !== -1, labels.join('|'));
   const chips = nodes.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
-  assert.strictEqual(chips.map((c) => c.textContent).join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(chips.map((c) => c.getAttribute('data-kw')).join('・'), '眼鏡・地味・OL');
+  assert.strictEqual(chips.map((c) => c.textContent).join('・'), ['眼鏡', '地味', 'OL'].map(H.formatKeywordChip).join('・'));
   const hint = nodes.find((n) => n.className === 'work-carousel-hint');
   assert.ok(
-    hint && hint.textContent.indexOf('關鍵字相關（眼鏡・地味・OL）') !== -1,
+    hint && hint.textContent.indexOf(glossed) !== -1,
     hint && hint.textContent
   );
   const search = nodes.find((n) => String(n.className || '').indexOf('kw-search') !== -1);
@@ -888,7 +903,8 @@ function walkNodes(node, acc) {
   assert.ok(mainCardClasses.indexOf('work-actions') >= 0);
   assert.ok(mainCardClasses.indexOf('cover-wrap') > mainCardClasses.indexOf('work-actions'));
   const mainChips = walkNodes(blocks[0]).filter((n) => n.getAttribute && n.getAttribute('data-kw') && n.className === 'kw-chip');
-  assert.strictEqual(mainChips.map((c) => c.textContent).join('・'), kws.join('・'));
+  assert.strictEqual(mainChips.map((c) => c.getAttribute('data-kw')).join('・'), kws.join('・'));
+  assert.ok(mainChips.every((c) => c.textContent.indexOf('（') !== -1));
   const mainSlides = walkNodes(blocks[0]).filter((n) => n.className === 'work-carousel-slide');
   mainSlides.slice(1).forEach((slide, i) => {
     const inside = walkNodes(slide).filter((n) => n.getAttribute && n.getAttribute('data-kw'));
@@ -923,7 +939,7 @@ function walkNodes(node, acc) {
   assert.ok(hint && hint.textContent.indexOf('同演員') !== -1, hint && hint.textContent);
   assert.ok(hint && hint.textContent.indexOf('關鍵字') === -1, hint && hint.textContent);
   const stillChips = only.filter((n) => n.getAttribute && n.getAttribute('data-kw'));
-  assert.strictEqual(stillChips.map((c) => c.textContent).join('・'), kws.join('・'));
+  assert.strictEqual(stillChips.map((c) => c.getAttribute('data-kw')).join('・'), kws.join('・'));
 }
 
 // Title display keeps the full Japanese string, including an official internal
@@ -1006,7 +1022,7 @@ function walkNodes(node, acc) {
   function chipsOf(block) {
     return walkNodes(block)
       .filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'))
-      .map((n) => n.textContent);
+      .map((n) => n.getAttribute('data-kw'));
   }
   assert.deepStrictEqual(chipsOf(blocks[0]), tutorKws);
   assert.deepStrictEqual(chipsOf(blocks[1]), busKws);
@@ -1177,7 +1193,10 @@ function walkNodes(node, acc) {
       .filter((n) => n.className === 'kw-related-label')
       .map((n) => n.textContent)
       .find((t) => t.indexOf('關鍵字再搜') === 0);
-    assert.strictEqual(researchLabel, '關鍵字再搜（眼鏡・地味）');
+    assert.strictEqual(
+      researchLabel,
+      '關鍵字再搜（' + ['眼鏡', '地味'].map(H.formatKeywordChip).join('・') + '）'
+    );
     const slides = after.filter((n) => n.className === 'kw-research-slide');
     assert.strictEqual(slides.length, 1, 'source work is not repeated in the re-search row');
     const slideHtml = walkNodes(slides[0]).map((n) => n._html || n.textContent || '').join('\n');
@@ -2004,10 +2023,59 @@ function walkNodes(node, acc) {
     assert.ok(at('card-title') < at('cover-wrap'));
     assert.ok(at('cover-wrap') < at('kw-chip-row'));
     const chips = flat.filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'));
-    assert.strictEqual(chips.map((c) => c.textContent).join('・'), kws.join('・'));
+    assert.strictEqual(chips.map((c) => c.getAttribute('data-kw')).join('・'), kws.join('・'));
+    assert.ok(chips.every((c) => String(c.textContent).indexOf('（') !== -1), chips.map((c) => c.textContent).join('|'));
     const card = flat.find((n) => String(n.className || '').indexOf('card') === 0);
     assert.ok(card);
     assert.ok(!(card.children || []).some((c) => c.className === 'kw-chip-row'));
+  }
+
+  // Split ノーブラ / 誘惑 chips, catalog title parentheses, actress only with a real CN name.
+  {
+    const cover = 'https://pics.dmm.co.jp/digital/video/mida00616/mida00616pl.jpg';
+    const ja = '彼女の妹のノーブラ誘惑に負け巨乳';
+    const zh = '女友妹妹的誘惑';
+    H.paintHistoryDetail({
+      id: 'nobura-split',
+      works: [
+        {
+          code: 'MIDA-616',
+          title: ja,
+          title_zh: zh,
+          actress: '福田ゆあ',
+          actress_zh: '福田由愛',
+          studio: 'MOODYZ',
+          line: 'main',
+          cover: cover,
+          theme_keywords: ['ノーブラ誘惑', '巨乳'],
+          related: [
+            {
+              code: 'REL-001',
+              title: '巨乳の合宿',
+              title_zh: '巨乳集訓',
+              line: 'keyword',
+              why: '關鍵字',
+              cover: cover,
+              matched_keywords: ['ノーブラ', '誘惑'],
+            },
+          ],
+        },
+      ],
+    });
+    const block = walkNodes(getEl('history-detail')).find((n) => n.className === 'work-carousel-block');
+    const chips = walkNodes(block).filter((n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw'));
+    assert.deepStrictEqual(chips.map((c) => c.getAttribute('data-kw')), ['ノーブラ', '誘惑', '巨乳']);
+    assert.strictEqual(chips[0].textContent, 'ノーブラ（無胸罩）');
+    assert.strictEqual(chips[1].textContent, '誘惑（誘惑）');
+    const titles = walkNodes(block).filter((n) => n.className === 'card-title').map((n) => n.textContent);
+    assert.ok(titles[0].indexOf(ja) === 0, titles[0]);
+    assert.ok(titles[0].indexOf('（' + zh + '）') !== -1, titles[0]);
+    assert.ok(titles[1].indexOf('巨乳の合宿（巨乳集訓）') !== -1, titles[1]);
+    const actress = walkNodes(block).find((n) => n.className === 'card-actress');
+    assert.ok(actress && actress.textContent.indexOf('福田ゆあ（福田由愛）') !== -1, actress && actress.textContent);
+    const hits = walkNodes(block).filter((n) => n.className === 'card-hit-kw').map((n) => n.textContent);
+    assert.ok(hits.indexOf('ノーブラ（無胸罩）') !== -1, hits.join('|'));
+    assert.ok(hits.indexOf('誘惑（誘惑）') !== -1, hits.join('|'));
   }
 
   // Reopening a saved related list must not refetch it down from 14 to 9.

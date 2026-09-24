@@ -59,6 +59,17 @@ TEXT_TIMEOUT = 20
 VISION_TIMEOUT = 45
 # Soft deadline for online code→title attempts in identify_code
 IDENTIFY_ONLINE_BUDGET = 20
+# One image's own clock: main identify + jacket lock + related buckets
+# (title/series ≤5, keyword ≤5, same-actress ≤3). Not a shared batch wall.
+# Four images may use about 4× this. A short clock never becomes
+# 時間不夠 / 尚未查完 / 尚未鎖定; the slot still finishes what it can.
+SLOT_WORK_BUDGET_S = 600.0
+# Gunicorn --timeout is one process-wide integer (Dockerfile, Procfile,
+# railway.toml). 2400 = 4 × SLOT_WORK_BUDGET_S so a sync stream of four
+# images can finish. The identify job calls Worker.notify() while it runs,
+# so this is the silence backstop for a stuck worker, not a shared wall.
+GUNICORN_WORKER_TIMEOUT_S = 2400
+STREAM_KEEPALIVE_S = 5.0
 GEMINI_MODELS = (
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
@@ -543,6 +554,241 @@ def owner_identify_session_detail(session_id: str):
     if not row:
         return jsonify({"ok": False, "message": "找不到這筆辨識紀錄"}), 404
     return jsonify({"ok": True, "session": row})
+
+
+# In-flight identify jobs. The SSE connection can die (phone background,
+# proxy) while this process keeps working. Any worker can read the same file.
+# A running job heartbeats Worker.notify() so gunicorn's silence timer does
+# not SIGKILL the batch. The client resumes from GET /api/identify/jobs/<id>
+# and must not invent 時間不夠 / 尚未查完 / 尚未鎖定 cards.
+IDENTIFY_JOB_MAX = 24
+IDENTIFY_JOB_STALE_S = 90.0
+IDENTIFY_JOB_TTL_S = 7200.0
+_IDENTIFY_JOBS_PATH: Path | None = None
+_IDENTIFY_JOBS_LOCK = threading.Lock()
+_GUNICORN_WORKER = None
+
+
+def _notify_gunicorn_worker() -> None:
+    """Reset the arbiter silence timer while identify is still running.
+
+    Sync workers only notify between requests. SSE keepalive bytes do not.
+    Missing gunicorn (local `python server.py`) is a no-op.
+    """
+    global _GUNICORN_WORKER
+    worker = _GUNICORN_WORKER
+    if worker is None:
+        try:
+            import gc
+            from gunicorn.workers.base import Worker
+        except Exception:
+            return
+        for obj in gc.get_objects():
+            if isinstance(obj, Worker):
+                worker = obj
+                _GUNICORN_WORKER = obj
+                break
+        if worker is None:
+            return
+    try:
+        worker.notify()
+    except Exception:
+        _GUNICORN_WORKER = None
+
+
+def _identify_jobs_resolve_path() -> Path:
+    global _IDENTIFY_JOBS_PATH
+    if _IDENTIFY_JOBS_PATH is not None:
+        return _IDENTIFY_JOBS_PATH
+    preferred = ROOT / "data" / "identify-jobs.json"
+    fallback = Path("/tmp/lfp-identify-jobs.json")
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        probe = preferred.parent / ".identify-jobs-writetest"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        _IDENTIFY_JOBS_PATH = preferred
+    except Exception:
+        _IDENTIFY_JOBS_PATH = fallback
+    return _IDENTIFY_JOBS_PATH
+
+
+def _identify_jobs_read(path: Path) -> list[dict]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except Exception:
+        return []
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        return []
+    rows = data.get("jobs") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+
+
+def _identify_jobs_write(path: Path, jobs: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    fresh = []
+    for row in jobs:
+        try:
+            created = float(row.get("created_at") or 0)
+        except (TypeError, ValueError):
+            created = 0
+        if created and (now - created) > IDENTIFY_JOB_TTL_S:
+            continue
+        fresh.append(row)
+    fresh = fresh[:IDENTIFY_JOB_MAX]
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps({"jobs": fresh}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _identify_jobs_mutate(job_id: str, fn) -> dict | None:
+    sid = (job_id or "").strip()
+    if not sid:
+        return None
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                jobs = _identify_jobs_read(path)
+                found = next((row for row in jobs if row.get("id") == sid), None)
+                if found is None:
+                    return None
+                fn(found)
+                _identify_jobs_write(path, jobs)
+                return found
+        except Exception:
+            return None
+
+
+def _json_safe(value):
+    try:
+        return json.loads(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        return None
+
+
+def identify_job_create(image_count: int) -> str | None:
+    now = time.time()
+    job_id = "job_" + _secrets.token_hex(12)
+    total = max(0, int(image_count or 0))
+    job = {
+        "id": job_id,
+        "status": "running",
+        "image_count": total,
+        "created_at": now,
+        "updated_at": now,
+        "progress": {"step": "receive", "status": "active", "detail": "還在找", "progress": 0.02},
+        "result": None,
+        "http_status": None,
+    }
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                jobs = _identify_jobs_read(path)
+                jobs.insert(0, job)
+                _identify_jobs_write(path, jobs)
+            return job_id
+        except Exception:
+            return None
+
+
+def identify_job_touch(job_id: str) -> None:
+    def mutate(job: dict) -> None:
+        if job.get("status") == "running":
+            job["updated_at"] = time.time()
+
+    _identify_jobs_mutate(job_id, mutate)
+    _notify_gunicorn_worker()
+
+
+def identify_job_note(job_id: str, evt: dict | None) -> None:
+    evt = evt if isinstance(evt, dict) else {}
+
+    def mutate(job: dict) -> None:
+        if job.get("status") != "running":
+            return
+        job["updated_at"] = time.time()
+        progress = {}
+        for key in ("step", "status", "detail", "progress", "phase"):
+            if key in evt:
+                progress[key] = evt.get(key)
+        if progress:
+            job["progress"] = progress
+
+    _identify_jobs_mutate(job_id, mutate)
+
+
+def identify_job_finish(job_id: str, result: dict | None, http_status: int) -> None:
+    status_code = int(http_status or 200)
+    safe_result = _json_safe(result) if isinstance(result, dict) else None
+    failed = status_code >= 500 or (
+        isinstance(safe_result, dict) and safe_result.get("ok") is False and not safe_result.get("results")
+    )
+
+    def mutate(job: dict) -> None:
+        job["status"] = "error" if failed else "done"
+        job["http_status"] = status_code
+        job["result"] = safe_result
+        job["updated_at"] = time.time()
+
+    _identify_jobs_mutate(job_id, mutate)
+
+
+def identify_job_public(job_id: str) -> dict | None:
+    sid = (job_id or "").strip()
+    if not sid:
+        return None
+    path = _identify_jobs_resolve_path()
+    with _IDENTIFY_JOBS_LOCK:
+        try:
+            rows = _identify_jobs_read(path)
+        except Exception:
+            return None
+    job = next((row for row in rows if row.get("id") == sid), None)
+    if not job:
+        return None
+    status = str(job.get("status") or "running")
+    try:
+        updated = float(job.get("updated_at") or 0)
+    except (TypeError, ValueError):
+        updated = 0.0
+    stale = status == "running" and updated > 0 and (time.time() - updated) > float(IDENTIFY_JOB_STALE_S)
+    view = "stalled" if stale else status
+    out = {
+        "id": job.get("id"),
+        "status": view,
+        "stale": bool(stale),
+        "image_count": int(job.get("image_count") or 0),
+        "progress": job.get("progress") if isinstance(job.get("progress"), dict) else {},
+        "updated_at": updated,
+    }
+    if view in {"done", "error"}:
+        out["result"] = job.get("result")
+        out["http_status"] = job.get("http_status") or (500 if view == "error" else 200)
+    return out
+
+
+@app.get("/api/identify/jobs/<job_id>")
+def identify_job_status(job_id: str):
+    """Resume target after the SSE connection drops. The pipeline keeps writing."""
+    job = identify_job_public(job_id)
+    if not job:
+        return jsonify({"ok": False, "message": "找不到這次查詢"}), 404
+    return jsonify({"ok": True, "job": job})
 
 
 @app.route("/d/<token>")
@@ -6521,7 +6767,9 @@ def _title_related_keyword_queries(title: str) -> list[str]:
 # Relationship / pronoun fluff and bare action tokens.
 # They may sit in the lexicon (彼女, 息子, ママ) but must not outrank theme nouns,
 # and must not be primary keyword-search drivers when a stronger term exists.
-# Bare 誘惑 is not a theme noun; it is kept only inside a compound (ノーブラ誘惑).
+# Bare 誘惑 is not a theme noun. The glued pair ノーブラ誘惑 is the exception:
+# it is two chips (ノーブラ and 誘惑), not one compound. Other noun+suffix
+# compounds (巨乳沼, 羞恥教育) stay one chip.
 # 彼女 / 妹 stay weak for automatic search priority, but a title pattern like
 # 彼女の妹 still exposes 彼女, 妹, and 彼女の妹 as selectable chips.
 # 息子 / ママ are the same class: selectable kinship-role chips, weak for auto.
@@ -6569,8 +6817,9 @@ _WEAK_THEME_TOKENS = frozenset(
 )
 
 # Productive title suffixes. Noun + suffix is one theme when the noun is glued
-# on (ノーブラ誘惑, 巨乳沼, 肉欲教育, 羞恥教育, 搾精旅行). Bare 誘惑 / 沼 / 教育
-# / 旅行 are not chips. The noun window is the same 2–8 kanji/katakana run
+# on (巨乳沼, 肉欲教育, 羞恥教育, 搾精旅行). ノーブラ誘惑 is not in that set:
+# it splits into ノーブラ and 誘惑. Bare 沼 / 教育 / 旅行 are not chips.
+# The noun window is the same 2–8 kanji/katakana run
 # (性教育 is one kanji short of that window, so it is not minted from a single 性).
 _COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼", "教育", "旅行")
 
@@ -7389,8 +7638,9 @@ def _compound_noun_heads() -> list[str]:
 def _extract_title_compounds(title: str) -> list[tuple[str, str]]:
     """In-title compounds as (compound, noun_half).
 
-    Prefer a known theme noun glued to 誘惑/沼/教育 (ノーブラ誘惑, 巨乳沼,
-    羞恥教育). Otherwise keep a short kanji/katakana noun glued to the same
+    Prefer a known theme noun glued to 沼/教育 (巨乳沼, 羞恥教育).
+    ノーブラ誘惑 is not minted; the extractor emits ノーブラ and 誘惑 instead.
+    Otherwise keep a short kanji/katakana noun glued to the same
     suffix (ナマ乳沼, 肉欲教育) without minting that noun as its own chip.
     Weak heads (彼女) do not form a compound. A particle between the noun
     and the suffix (ノーブラの誘惑, 肉欲の教育) does not either. Bare 教育
@@ -7406,6 +7656,9 @@ def _extract_title_compounds(title: str) -> list[tuple[str, str]]:
     def _push(noun: str, suf: str) -> None:
         noun = (noun or "").strip()
         if len(noun) < 2 or _is_weak_theme_token(noun) or noun in _COMPOUND_SUFFIXES:
+            return
+        # ノーブラ誘惑 is two keywords, not one leading compound.
+        if noun == "ノーブラ" and suf == "誘惑":
             return
         compound = noun + suf
         if compound in seen or compound not in t:
@@ -7635,23 +7888,26 @@ def _normalize_keyword_list(raw, *, limit: int = 10) -> list[str]:
         return []
     for item in raw:
         tok = str(item or "").strip()
-        if not _keyword_token_ok(tok):
-            continue
-        key = tok.casefold()
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(tok)
-        if len(out) >= limit:
-            break
+        pieces = ["ノーブラ", "誘惑"] if tok == "ノーブラ誘惑" else [tok]
+        for piece in pieces:
+            if not _keyword_token_ok(piece):
+                continue
+            key = piece.casefold()
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(piece)
+            if len(out) >= limit:
+                return out
     return out
 
 
 def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
     """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
 
-    Prefer lexicon + Latin tokens and in-title compounds (ノーブラ誘惑, 巨乳沼,
-    肉欲教育). Keep the distinctive noun half of a lexicon compound (ノーブラ),
+    Prefer lexicon + Latin tokens and in-title compounds (巨乳沼, 肉欲教育).
+    ノーブラ誘惑 is split into ノーブラ and 誘惑. Keep the distinctive noun half
+    of a lexicon compound (巨乳 under 巨乳沼),
     and keep high-signal 2-char look tokens (眼鏡/地味/美人).
 
     Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
@@ -7705,6 +7961,10 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     for comp, _noun in compounds:
         _add(comp)
+    # Glued ノーブラ誘惑 → two chips. ノーブラの誘惑 does not contain that span.
+    if "ノーブラ誘惑" in re.sub(r"\s+", "", t):
+        _add("ノーブラ")
+        _add("誘惑")
     for phrase, left, right in relations:
         _add(phrase)
         _add(left)
@@ -8029,6 +8289,8 @@ def _keyword_search_queries(
 
     def _add_q(q: str) -> None:
         q = (q or "").strip()
+        if q == "ノーブラ誘惑":
+            return
         if _keyword_token_ok(q) and q not in queries:
             queries.append(q)
 
@@ -8053,7 +8315,9 @@ def _keyword_search_queries(
             a, b = ordered[i], ordered[i + 1]
             if not a or not b or a.casefold() == b.casefold():
                 continue
-            # ノーブラ is already inside ノーブラ誘惑; don't invent a doubled query.
+            # ノーブラ + 誘惑 stay two queries. Do not glue them back together.
+            if {a, b} == {"ノーブラ", "誘惑"}:
+                continue
             if a in b or b in a:
                 continue
             _add_q(a + b)
@@ -8107,6 +8371,10 @@ def _keyword_search_queries(
         _add_pairs()
     if late:
         _add_singles(late, include_weak=True)
+    # Split ノーブラ誘惑 is a real search token even though bare 誘惑 is weak.
+    if any(k == "ノーブラ" for k in keywords) and any(k == "誘惑" for k in keywords):
+        _add_q("ノーブラ")
+        _add_q("誘惑")
     if distinctive:
         for p in _title_sibling_phrases(title):
             if len(queries) >= 8:
@@ -10181,17 +10449,22 @@ def run_multi_identify_pipeline(
             user_title=user_title,
             on_progress=on_progress,
         )
-        result = attach_related_by_title(result, budget_sec=14.0)
+        result = attach_related_by_title(result, budget_sec=SLOT_WORK_BUDGET_S)
         return _lock_identify_payload_media(result), status
 
     n = len(images)
     api_key = get_gemini_api_key()
+    # Active seconds spent on each image (vision + catalog + jacket lock).
+    # Other images do not spend this clock. Related uses the remainder of
+    # SLOT_WORK_BUDGET_S for that image only.
+    slot_used: dict[int, float] = {}
     _progress(on_progress, "receive", "active", f"正在接收 {n} 張圖片…", 0.02)
     _progress(on_progress, "receive", "done", f"已接收 {n} 張圖片", 1 / 7)
 
     vision_rows: list[dict] = []
     for i, (img_bytes, fname) in enumerate(images):
         idx = i + 1
+        t_vision = time.monotonic()
         _progress(
             on_progress,
             "vision",
@@ -10367,6 +10640,7 @@ def run_multi_identify_pipeline(
                     row["title"] = str(cached_img.get("title")).strip()
                 row["image_cache"] = cached_img
         vision_rows.append(row)
+        slot_used[idx] = slot_used.get(idx, 0.0) + (time.monotonic() - t_vision)
         detail = f"第 {idx}/{n} 張"
         if row.get("code"):
             detail += f"：{format_display_code(str(row['code']))}"
@@ -10433,6 +10707,7 @@ def run_multi_identify_pipeline(
     _progress(on_progress, "verify", "done", "開始逐張搜尋", 0.54)
     results: list[dict] = []
     for ji, job in enumerate(jobs):
+        t_slot = time.monotonic()
         _progress(
             on_progress,
             "search",
@@ -10668,6 +10943,8 @@ def run_multi_identify_pipeline(
         one["line"] = "main" if not results else "multi"
         one["ok"] = True
         results.append(one)
+        slot_key = image_index if isinstance(image_index, int) else (ji + 1)
+        slot_used[slot_key] = slot_used.get(slot_key, 0.0) + (time.monotonic() - t_slot)
 
     # Textless frames may still be a still of a work another frame already found.
     relocked: list[dict] = []
@@ -10787,9 +11064,13 @@ def run_multi_identify_pipeline(
         title = str(row.get("title") or "")
         return bool(is_usable_title(title) and not title.startswith("（"))
 
-    n_ok = sum(1 for r in results if _slot_needs_related(r))
-    # Split budget across works; keep a floor so later rows still get actress+keyword.
-    per_budget = 12.0 if n_ok <= 1 else max(8.0, min(12.0, 36.0 / max(n_ok, 1)))
+    def _related_budget_for_slot(row: dict) -> float:
+        idx = row.get("from_image_index")
+        used = float(slot_used.get(idx) or 0.0) if isinstance(idx, int) else 0.0
+        remaining = SLOT_WORK_BUDGET_S - used
+        # Floor still tries the three buckets. It does not stamp a timeout.
+        return remaining if remaining > 16.0 else 16.0
+
     for i, row in enumerate(results):
         if not _slot_needs_related(row):
             if isinstance(row, dict):
@@ -10804,7 +11085,9 @@ def run_multi_identify_pipeline(
                 0.94 + 0.05 * ((i + 1) / max(len(results), 1)),
                 phase="相關作品",
             )
-            filled = attach_related_by_title(row, budget_sec=per_budget, per_item=False)
+            filled = attach_related_by_title(
+                row, budget_sec=_related_budget_for_slot(row), per_item=False
+            )
             rel = _sanitize_related_rows(filled.get("related_by_title") or [])
             row["related_by_title"] = rel
             total_rel += len(rel)
@@ -11050,6 +11333,7 @@ def _complete_identify_result(
     extra_candidates: list | None = None,
     skip_related: bool = False,
     image_hash: str | None = None,
+    related_budget_sec: float | None = None,
 ) -> dict:
     """Shared finish for code, title, and image identify.
 
@@ -11073,7 +11357,8 @@ def _complete_identify_result(
             pass
     elif not skip_related:
         try:
-            result = attach_related_by_title(result, budget_sec=14.0)
+            budget = SLOT_WORK_BUDGET_S if related_budget_sec is None else float(related_budget_sec)
+            result = attach_related_by_title(result, budget_sec=budget)
         except Exception:
             result.setdefault("related_by_title", [])
     else:
@@ -11103,6 +11388,7 @@ def run_identify_pipeline(
     Returns (payload_dict, http_status).
     skip_related=True: caller (e.g. multi) will attach related_by_title once later.
     """
+    slot_t0 = time.monotonic()
     ocr_preview = None
     ocr_text = ""
     vision_used = False
@@ -11145,6 +11431,8 @@ def run_identify_pipeline(
     img_hash = image_content_hash(image_bytes) if image_bytes else None
 
     def _finish(payload: dict, extras: list | None = None) -> dict:
+        remaining = SLOT_WORK_BUDGET_S - (time.monotonic() - slot_t0)
+        budget = remaining if remaining > 16.0 else 16.0
         return _complete_identify_result(
             payload,
             image_bytes=image_bytes,
@@ -11152,6 +11440,7 @@ def run_identify_pipeline(
             extra_candidates=extras,
             skip_related=skip_related,
             image_hash=img_hash,
+            related_budget_sec=budget,
         )
     # Same screenshot may reuse catalog fields, but must re-check cover + stills
     # against this upload. A previous 僅排序未鎖定 must not be replayed as-is.
@@ -12167,22 +12456,45 @@ def related_by_keywords_api():
 
 @app.post("/api/identify/stream")
 def identify_stream():
-    """SSE progress stream then final result event. Accepts multiple images."""
+    """SSE progress stream then final result event. Accepts multiple images.
+
+    The pipeline runs in a daemon thread and writes a job file, so a dropped
+    SSE client can resume from GET /api/identify/jobs/<id>. Keepalive comments
+    plus Worker.notify() keep gunicorn from treating a live batch as silence.
+    Each image still has its own SLOT_WORK_BUDGET_S; this timeout is only the
+    process-wide silence backstop (GUNICORN_WORKER_TIMEOUT_S).
+    """
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
     images = collect_images_from_request()
     n_images = len(images)
+    job_id = identify_job_create(n_images)
 
     def generate():
         import queue
-        import threading
 
         q: queue.Queue = queue.Queue()
 
         def on_progress(evt: dict) -> None:
+            if job_id:
+                try:
+                    identify_job_note(job_id, evt)
+                except Exception:
+                    pass
             q.put(("progress", evt))
+            _notify_gunicorn_worker()
 
         def worker() -> None:
+            stop_hb = threading.Event()
+
+            def heartbeat() -> None:
+                while not stop_hb.wait(15):
+                    if job_id:
+                        identify_job_touch(job_id)
+                    else:
+                        _notify_gunicorn_worker()
+
+            threading.Thread(target=heartbeat, daemon=True).start()
             try:
                 if n_images > 1:
                     result, status = run_multi_identify_pipeline(
@@ -12199,7 +12511,6 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                    # related already attached in pipeline
                 else:
                     result, status = run_identify_pipeline(
                         image_bytes=None,
@@ -12208,21 +12519,23 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
-                    # related already attached in pipeline
                 result = _ensure_identify_session(result, images)
+                if job_id:
+                    try:
+                        identify_job_finish(job_id, result, status)
+                    except Exception:
+                        pass
                 q.put(("result", {"type": "result", "data": result, "status": status}))
             except Exception as e:
-                q.put(
-                    (
-                        "result",
-                        {
-                            "type": "result",
-                            "data": empty_identify(message=f"伺服器錯誤：{e}"),
-                            "status": 500,
-                        },
-                    )
-                )
+                err = empty_identify(message=f"伺服器錯誤：{e}")
+                if job_id:
+                    try:
+                        identify_job_finish(job_id, err, 500)
+                    except Exception:
+                        pass
+                q.put(("result", {"type": "result", "data": err, "status": 500}))
             finally:
+                stop_hb.set()
                 q.put(("end", None))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -12239,10 +12552,26 @@ def identify_stream():
             ]
         else:
             steps = [{"id": s, "label": l} for s, l in IDENTIFY_STEPS]
+        if job_id:
+            yield (
+                "data: "
+                + json.dumps(
+                    {"type": "job", "job_id": job_id, "image_count": n_images},
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            )
         yield f"data: {json.dumps({'type': 'steps', 'steps': steps}, ensure_ascii=False)}\n\n"
 
         while True:
-            kind, payload = q.get()
+            try:
+                kind, payload = q.get(timeout=float(STREAM_KEEPALIVE_S))
+            except queue.Empty:
+                _notify_gunicorn_worker()
+                if job_id:
+                    identify_job_touch(job_id)
+                yield ": keepalive\n\n"
+                continue
             if kind == "end":
                 break
             if kind == "progress":

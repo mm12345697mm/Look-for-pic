@@ -497,6 +497,9 @@
       cid: src.cid || fb.cid || '',
       stills: Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
       actress: src.actress || fb.actress || '',
+      actress_zh: String(src.actress_zh || src.actressZh || fb.actress_zh || fb.actressZh || '').trim(),
+      studio: src.studio || fb.studio || '',
+      studio_zh: String(src.studio_zh || src.studioZh || fb.studio_zh || fb.studioZh || '').trim(),
       line: lineOut,
       related: slimRelatedForHistory(relatedSrc),
       theme_keywords: normalizeKeywordList(src.theme_keywords || src.themeKeywords),
@@ -618,7 +621,9 @@
     return items;
   }
 
-  /** Unique chip labels from an API list. Does not invent keywords from a title. */
+  /** Unique chip labels from an API list. Does not invent keywords from a title.
+   *  ノーブラ誘惑 is two chips, never one compound.
+   */
   function normalizeKeywordList(raw) {
     const out = [];
     const seen = {};
@@ -626,18 +631,127 @@
       ? raw
       : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
     items.forEach((item) => {
-      const s = String(item || '').trim();
-      if (!keywordTokenOk(s) || seen[s]) return;
-      seen[s] = true;
-      out.push(s);
+      const rawTok = String(item || '').trim();
+      const pieces = rawTok === 'ノーブラ誘惑' ? ['ノーブラ', '誘惑'] : [rawTok];
+      pieces.forEach((s) => {
+        if (!keywordTokenOk(s) || seen[s]) return;
+        seen[s] = true;
+        out.push(s);
+      });
     });
     return orderCompoundsBeforeParts(out).slice(0, 10);
+  }
+
+  /**
+   * Traditional Chinese gloss for a keyword chip. Lexicon only — never a
+   * guessed catalog title. Same-script words (巨乳, 誘惑) still get the
+   * parenthetical the chip rule asks for.
+   */
+  const KEYWORD_GLOSS = {
+    '巨乳': '巨乳',
+    '美乳': '美乳',
+    '爆乳': '爆乳',
+    'ノーブラ': '無胸罩',
+    '誘惑': '誘惑',
+    '水泳部': '游泳社',
+    '合宿': '集訓',
+    '媚薬': '媚藥',
+    '媚藥': '媚藥',
+    '水着': '泳衣',
+    'スク水': '學校泳衣',
+    'スクール水着': '學校泳衣',
+    '満員': '滿員',
+    '滿員': '滿員',
+    '電車': '電車',
+    '痴漢': '痴漢',
+    '癡漢': '痴漢',
+    '彼女': '女朋友',
+    '妹': '妹妹',
+    '彼女の妹': '女朋友的妹妹',
+    '姉': '姐姐',
+    '兄': '哥哥',
+    '弟': '弟弟',
+    '息子': '兒子',
+    'ママ': '媽媽',
+    '家庭教師': '家教',
+    '息子の家庭教師': '兒子的家教',
+    '肉欲教育': '肉慾教育',
+    '羞恥教育': '羞恥教育',
+    '10秒挿入': '10秒插入',
+    '眼鏡': '眼鏡',
+    'メガネ': '眼鏡',
+    '地味': '土味',
+    '美人': '美人',
+    'OL': 'OL',
+    '中出し': '中出',
+    '叔母': '叔母',
+    'ナマ乳沼': '生乳沼',
+    '巨乳沼': '巨乳沼',
+    'オイル': '精油',
+    '温泉': '溫泉',
+    '人妻': '人妻',
+    '痴女': '痴女',
+    'パンスト': '絲襪',
+    '夜行バス': '夜間巴士',
+    '指マン': '指交',
+    '声我慢': '忍住聲音',
+    '羞恥': '羞恥',
+    '美尻': '美臀',
+    '乳首': '乳頭',
+    '女教師': '女教師',
+    'ナース': '護士',
+    '女医': '女醫師',
+    '秘書': '秘書',
+    '童貞': '處男',
+    '絶倫': '性能力強',
+    '搾精': '榨精',
+    '顔射': '顏射',
+    '拘束': '拘束',
+    '監禁': '監禁',
+    '調教': '調教',
+    '開発': '開發',
+    '開發': '開發',
+    'マッサージ': '按摩',
+    'エステ': '美容',
+    '寝取': '寢取',
+    '義妹': '義妹',
+    '義母': '義母',
+    '義父': '義父',
+    '義姉': '義姉',
+    '義兄': '義兄',
+    '下着': '內衣',
+    '通勤': '通勤',
+    '会社': '公司',
+    'オフィス': '辦公室',
+    '毎朝': '每天早上',
+    '毎晩': '每天晚上',
+    '交尾': '交尾',
+    '逆NTR': '反向NTR',
+    'CA': '空姐',
+    'VR': 'VR',
+    'SP': '特別篇',
+  };
+
+  function keywordGloss(tok) {
+    const s = String(tok || '').trim();
+    if (!s || !Object.prototype.hasOwnProperty.call(KEYWORD_GLOSS, s)) return '';
+    return KEYWORD_GLOSS[s];
+  }
+
+  /** Chip label: 日文（中文）. Unmapped tokens stay as-is (no invented gloss). */
+  function formatKeywordChip(tok) {
+    const s = String(tok || '').trim();
+    const zh = keywordGloss(s);
+    if (!s) return '';
+    if (!zh) return s;
+    if (s.indexOf('（' + zh + '）') !== -1 || s.indexOf('(' + zh + ')') !== -1) return s;
+    return s + '（' + zh + '）';
   }
 
   function formatKeywordListLabel(prefix, keywords) {
     const kws = normalizeKeywordList(keywords);
     if (!kws.length) return prefix;
-    return prefix + '（' + kws.join('・') + '）';
+    return prefix + '（' + kws.map(formatKeywordChip).join('・') + '）';
   }
 
   function cjkScript(ch) {
@@ -775,6 +889,19 @@
     return ja + '（' + zh + '）';
   }
 
+  /**
+   * Actress / studio / series name. Chinese only when the catalog supplied it.
+   * Kanji names still get the parenthetical. No name_zh → Japanese only.
+   */
+  function formatPersonName(nameJa, nameZh) {
+    const ja = stripEmptyParens(nameJa);
+    const zh = stripEmptyParens(nameZh);
+    if (!ja) return '';
+    if (!zh || zh === ja) return ja;
+    if (ja.indexOf('（' + zh + '）') !== -1 || ja.indexOf('(' + zh + ')') !== -1) return ja;
+    return ja + '（' + zh + '）';
+  }
+
   /** Clipboard string for 番號+名稱: CODE then newline then the on-screen title. */
   function formatCodeTitleClipboard(code, displayTitle) {
     const c = String(code || '').trim();
@@ -841,7 +968,9 @@
       title: raw.title ? String(raw.title) : '',
       titleZh: String(raw.title_zh || raw.titleZh || '').trim(),
       actress: raw.actress ? String(raw.actress) : '',
+      actressZh: String(raw.actress_zh || raw.actressZh || '').trim(),
       studio: raw.studio ? String(raw.studio) : '',
+      studioZh: String(raw.studio_zh || raw.studioZh || '').trim(),
       cid,
       line: lineOut,
       why: raw.why ? String(raw.why) : '',
@@ -1129,6 +1258,39 @@
     }
   }
 
+  function resumePayloadFromJob(job) {
+    if (!job || (job.status !== 'done' && job.status !== 'error')) return null;
+    const data = job.result;
+    if (!data || typeof data !== 'object') return null;
+    return data;
+  }
+
+  async function followIdentifyJob(jobId) {
+    const maxTries = 160;
+    for (let i = 0; i < maxTries; i++) {
+      await sleep(i < 3 ? 400 * (i + 1) : 5000);
+      let body = null;
+      try {
+        const res = await fetch('/api/identify/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
+        try {
+          body = await res.json();
+        } catch (_) {
+          body = null;
+        }
+      } catch (_) {
+        continue;
+      }
+      const job = body && body.job;
+      if (!job) continue;
+      const ready = resumePayloadFromJob(job);
+      if (ready) return ready;
+      if (job.status === 'stalled') break;
+    }
+    const err = new Error('查詢還在伺服器上，請稍後再開');
+    err.jobId = jobId;
+    throw err;
+  }
+
   async function apiIdentifyStream({ images, image, code, title } = {}, onProgress) {
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
@@ -1152,6 +1314,7 @@
     let buffer = '';
     let finalData = null;
     let httpStatus = res.status;
+    let jobId = '';
 
     while (true) {
       const { done, value } = await reader.read();
@@ -1172,7 +1335,9 @@
         } catch (_) {
           continue;
         }
-        if (evt.type === 'steps' && Array.isArray(evt.steps)) {
+        if (evt.type === 'job' && evt.job_id) {
+          jobId = String(evt.job_id);
+        } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
           showProgress(evt.steps);
         } else if (evt.type === 'progress') {
           if (onProgress) onProgress(evt);
@@ -1183,7 +1348,19 @@
         }
       }
     }
-    if (!finalData) throw new Error('stream_incomplete');
+    if (!finalData && jobId) {
+      try {
+        finalData = await followIdentifyJob(jobId);
+      } catch (e) {
+        if (e && !e.jobId) e.jobId = jobId;
+        throw e;
+      }
+    }
+    if (!finalData) {
+      const err = new Error('stream_incomplete');
+      if (jobId) err.jobId = jobId;
+      throw err;
+    }
     return { status: httpStatus, data: finalData };
   }
 
@@ -1532,9 +1709,11 @@
     if (w.actress || w.studio) {
       const actressEl = document.createElement('p');
       actressEl.className = 'card-actress';
-      actressEl.textContent = w.actress
-        ? '女優：' + w.actress + (w.studio ? ' · ' + w.studio : '')
-        : String(w.studio);
+      const act = formatPersonName(w.actress, w.actressZh || w.actress_zh);
+      const stu = formatPersonName(w.studio, w.studioZh || w.studio_zh);
+      actressEl.textContent = act
+        ? '女優：' + act + (stu ? ' · ' + stu : '')
+        : stu;
       meta.appendChild(actressEl);
     }
     if (w.visualMismatch) {
@@ -1564,7 +1743,7 @@
       hitKeywords.forEach((kw) => {
         const hit = document.createElement('span');
         hit.className = 'card-hit-kw';
-        hit.textContent = kw;
+        hit.textContent = formatKeywordChip(kw);
         hitWrap.appendChild(hit);
       });
       badgeRow.appendChild(hitWrap);
@@ -2870,10 +3049,10 @@
         const chip = document.createElement('button');
         chip.type = 'button';
         chip.className = 'kw-chip';
-        chip.textContent = kw;
+        chip.textContent = formatKeywordChip(kw);
         chip.setAttribute('data-kw', kw);
         chip.setAttribute('aria-pressed', 'false');
-        chip.title = kw;
+        chip.title = formatKeywordChip(kw);
         bindWorkAction(chip, () => {
           const on = !selected[kw];
           if (on) selected[kw] = true;
@@ -3386,6 +3565,9 @@
       title: first.title || rec.title || '',
       title_zh: first.title_zh || rec.title_zh || '',
       actress: first.actress || rec.actress || '',
+      actress_zh: first.actress_zh || rec.actress_zh || '',
+      studio: first.studio || rec.studio || '',
+      studio_zh: first.studio_zh || rec.studio_zh || '',
       cover: first.cover || rec.cover || '',
       stills: Array.isArray(first.stills) ? first.stills : (rec.stills || []),
       related_by_title: first.related || rec.related || [],
@@ -3399,6 +3581,9 @@
         title: w.title,
         title_zh: w.title_zh,
         actress: w.actress,
+        actress_zh: w.actress_zh || '',
+        studio: w.studio || '',
+        studio_zh: w.studio_zh || '',
         cid: w.cid,
         cover: w.cover,
         stills: w.stills || [],
@@ -3763,6 +3948,9 @@
         data = streamed.data;
       } catch (streamErr) {
         if (myRun !== runId) return;
+        if (streamErr && streamErr.jobId) {
+          data = await followIdentifyJob(streamErr.jobId);
+        } else {
         const abort = { aborted: false };
         const sim = simulateProgress({ images: imgs, code, title }, abort);
         try {
@@ -3776,6 +3964,7 @@
         } catch (e) {
           abort.aborted = true;
           throw e;
+        }
         }
       }
       handleResult(data);
@@ -4153,6 +4342,9 @@
       relatedBucketsNeedFill,
       showProgress,
       applyProgressEvent,
+      formatKeywordChip,
+      formatPersonName,
+      resumePayloadFromJob,
       workNeedsTitleZh,
       workNeedsManualFix,
       batchQueryKeepsFrames,

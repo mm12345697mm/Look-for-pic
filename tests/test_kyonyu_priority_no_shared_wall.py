@@ -83,7 +83,10 @@ class TestNoSharedIdentifyWall(unittest.TestCase):
             phases.append(("lock", hit.get("code")))
             return hit
 
+        budgets = []
+
         def fake_related(result, **kwargs):
+            budgets.append(float(kwargs.get("budget_sec") or 0))
             phases.append(("related", result.get("code")))
             out = dict(result)
             out["related_by_title"] = [
@@ -156,6 +159,11 @@ class TestNoSharedIdentifyWall(unittest.TestCase):
         self.assertLess(step_phases.index("辨識中"), step_phases.index("目錄查詢"))
         self.assertLess(step_phases.index("目錄查詢"), step_phases.index("封面鎖定"))
         self.assertLess(step_phases.index("封面鎖定"), step_phases.index("相關作品"))
+        self.assertEqual(len(budgets), 4, budgets)
+        for b in budgets:
+            self.assertGreaterEqual(b, 500.0, budgets)
+        self.assertEqual(S.SLOT_WORK_BUDGET_S, 600.0)
+        self.assertEqual(S.GUNICORN_WORKER_TIMEOUT_S, 2400)
 
         def walk(rows):
             for row in rows or []:
@@ -307,8 +315,11 @@ class TestKyonyuKeywordPriority(unittest.TestCase):
         self.assertNotIn("合宿", no_camp)
         self.assertNotIn("水泳部", no_camp)
         mida = S._extract_title_theme_keywords(MIDA)
-        self.assertEqual(mida[0], "ノーブラ誘惑", mida)
+        self.assertNotIn("ノーブラ誘惑", mida)
+        self.assertEqual(mida[0], "ノーブラ", mida)
         self.assertEqual(mida[1], "巨乳", mida)
+        self.assertIn("誘惑", mida)
+        self.assertLess(mida.index("巨乳"), mida.index("誘惑"))
 
     def test_swim_camp_keyword_bucket_mixes_kyonyu_and_requires_https(self):
         """巨乳+媚薬 and 巨乳+合宿/水泳部 lead. 媚薬+合宿 alone does not fill the cap.
@@ -505,6 +516,46 @@ class TestKyonyuKeywordPriority(unittest.TestCase):
             self.assertFalse(cover.startswith("data:"))
             for u in row.get("stills") or []:
                 self.assertFalse(str(u).startswith("data:"))
+
+    def test_per_image_budget_and_worker_timeout_scale(self):
+        self.assertEqual(S.SLOT_WORK_BUDGET_S, 600.0)
+        self.assertEqual(S.GUNICORN_WORKER_TIMEOUT_S, 2400)
+        self.assertFalse(hasattr(S, "MULTI_IDENTIFY_BUDGET_S"))
+        root = os.path.join(ROOT)
+        for name in ("Dockerfile", "Procfile", "railway.toml"):
+            with open(os.path.join(root, name), encoding="utf-8") as fh:
+                text = fh.read()
+            self.assertIn("--timeout 2400", text, name)
+            self.assertNotIn("--timeout 600", text, name)
+        S._notify_gunicorn_worker()
+        kws = S._normalize_keyword_list(["ノーブラ誘惑", "巨乳"])
+        self.assertEqual(kws[:3], ["ノーブラ", "誘惑", "巨乳"])
+        qs = S._keyword_search_queries(MIDA, kws)
+        self.assertIn("ノーブラ", qs)
+        self.assertIn("誘惑", qs)
+        self.assertNotIn("ノーブラ誘惑", qs)
+
+    def test_identify_job_roundtrip_has_no_false_timeout(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            S._IDENTIFY_JOBS_PATH = Path(tmp) / "jobs.json"
+            try:
+                job_id = S.identify_job_create(4)
+                self.assertTrue(job_id)
+                S.identify_job_touch(job_id)
+                S.identify_job_note(job_id, {"step": "vision", "status": "active", "phase": "辨識中"})
+                payload = {"ok": True, "code": "AAA-001", "title": MIDA, "results": []}
+                S.identify_job_finish(job_id, payload, 200)
+                view = S.identify_job_public(job_id)
+            finally:
+                S._IDENTIFY_JOBS_PATH = None
+        self.assertEqual(view["status"], "done")
+        blob = json.dumps(view, ensure_ascii=False)
+        for phrase in FALSE_TIMEOUT:
+            self.assertNotIn(phrase, blob)
+        self.assertEqual(view["result"]["code"], "AAA-001")
 
 
 if __name__ == "__main__":
