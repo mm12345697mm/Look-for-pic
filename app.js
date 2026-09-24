@@ -3151,8 +3151,6 @@
       userShots: userShots,
       related: first.related || [],
       works: works,
-      session_id: data.session_id || data.sessionId || null,
-      identify_session: data.identify_session || data.identifySession || null,
     };
 
     let list = loadHistory();
@@ -3995,52 +3993,6 @@
       if (!confirm('確定清除全部辨識紀錄？')) return;
       saveHistory([]);
       renderHistoryList();
-    });
-  }
-  function downloadJsonFile(obj, filename) {
-    const blob = new Blob([JSON.stringify(obj, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename || 'identify-session.json';
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
-  }
-
-  async function exportHistorySession(rec) {
-    if (!rec) return;
-    const local = rec.identify_session || rec.identifySession;
-    if (local && typeof local === 'object') {
-      downloadJsonFile({ ok: true, session: local }, (local.id || 'identify-session') + '.json');
-      return;
-    }
-    const sid = rec.session_id || rec.sessionId;
-    if (!sid) {
-      setStatus('這筆紀錄沒有可匯出的對照表', 'warn');
-      return;
-    }
-    try {
-      const res = await fetch('/api/owner/identify-sessions/' + encodeURIComponent(sid), {
-        credentials: 'same-origin',
-      });
-      const data = await res.json();
-      if (!res.ok || !data || !data.session) {
-        setStatus((data && data.message) || '無法讀取辨識紀錄', 'warn');
-        return;
-      }
-      downloadJsonFile(data, (data.session.id || sid) + '.json');
-    } catch (_) {
-      setStatus('無法讀取辨識紀錄', 'warn');
-    }
-  }
-
-  if ($('btn-history-export')) {
-    $('btn-history-export').addEventListener('click', () => {
-      if (!viewingHistoryId) return;
-      const rec = loadHistory().find((x) => x.id === viewingHistoryId);
-      exportHistorySession(rec);
     });
   }
   if ($('btn-history-delete')) {

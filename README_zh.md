@@ -90,13 +90,13 @@ Expo 版（`Look-for-pic`）有確認主作品、多選相關步驟。本 Web �
 
 主人手機免密：設定 `OWNER_DEVICE_TOKEN` 後，用 Safari 打開一次 `https://你的網域/d/<token>`，可加入主畫面；之後此裝置免輸入分享密碼。訪客仍走 `/login`。
 
-## 讀取辨識紀錄（給助手）
+## 讀取辨識紀錄（給助手／Grok Bot 診斷用）
 
-每次單圖或多圖辨識完成後，伺服器把「每一張上傳對到哪一張卡片」寫進 `data/identify-sessions.json`（執行期檔，不進 git）。未帶主人身分的請求會得到 **401**。
+這不是給使用者的功能，畫面上沒有匯出按鈕。使用者回報辨識錯誤時，助手用主人權杖讀伺服器上的對照表，確認每一張上傳對到哪一張卡片，而不是猜縮圖。
 
-`frames[]` 的 `index` 是上傳順序，對應紀錄詳情裡「你的截圖」由左到右。`final_code` / `final_title` 是那一張最後的番號與作品名稱。`drop_reason` 為 `null` 表示沒有被丟掉；`merged_same_work` 表示這張併進了另一張的卡片。`vision_title` / `ocr_title` / `parsed_code` 是辨識當下讀到的字，`preview_ref` 是這張圖的 `sha256:` 指紋（不含圖片本身）。
+每次單圖或多圖辨識完成後，伺服器把對照寫進 `data/identify-sessions.json`（執行期檔，不進 git，不含圖片）。未帶主人身分的請求會得到 **401**。已登入的網站 session，或與 `OWNER_DEVICE_TOKEN` 相同的權杖，才能讀。
 
-主人用與 `OWNER_DEVICE_TOKEN` 相同的值：
+`frames[]` 的 `index` 是上傳順序（由左到右）。`final_code` / `final_title` 是那一張最後的番號與作品名稱。`drop_reason` 為 `null` 表示沒有被丟掉；`merged_same_work` 表示這張併進了另一張的卡片。`vision_title` / `ocr_title` / `parsed_code` 是辨識當下讀到的字，`preview_ref` 是這張圖的 `sha256:` 指紋。`summary` 是 `N 張上傳 → M 部結果`。
 
 ```bash
 curl -sS -H "Authorization: Bearer $OWNER_DEVICE_TOKEN" \
@@ -106,4 +106,4 @@ curl -sS -H "Authorization: Bearer $OWNER_DEVICE_TOKEN" \
   https://你的網域/api/owner/identify-sessions/ses_...
 ```
 
-也可以用標頭 `X-Owner-Token`。已登入的瀏覽器在「紀錄詳情」按「匯出 JSON」，下載的內容與上面 detail 的回應相同（`{ "ok": true, "session": { ... } }`）。把那個檔貼給助手即可，不必猜哪一張縮圖對到哪一張卡片。
+也可以用標頭 `X-Owner-Token`。列表是精簡欄位；`/<id>` 才有完整的每一張對照（`{ "ok": true, "session": { ... } }`）。
