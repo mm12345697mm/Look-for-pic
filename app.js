@@ -603,9 +603,49 @@
     return /(?:^|[^a-z0-9])(?:vol(?:ume)?|ep(?:isode)?|bod|bd|dvd|uhd|bluray|4k)[0-9]*(?:[^a-z0-9]|$)/.test(key);
   }
 
+  // Picture-quality / distribution labels. Not theme chips.
+  const FORMAT_GENRE = {
+    'ハイビジョン': 1,
+    '高画質': 1,
+    '高畫質': 1,
+    '高清': 1,
+    'HD': 1,
+    '4K': 1,
+    '４Ｋ': 1,
+    'UHD': 1,
+    '字幕': 1,
+    '中文字幕': 1,
+    '中字': 1,
+    '独占配信': 1,
+    'DMM独占': 1,
+    'DMM獨家': 1,
+    '獨家': 1,
+    '単体作品': 1,
+    '單體作品': 1,
+    'サンプル動画': 1,
+    '配信専用': 1,
+    '特典': 1,
+    '特典付き': 1,
+    'セット商品': 1,
+    '福袋': 1,
+    'デジモ': 1,
+    'ベスト': 1,
+    '総集編': 1,
+    'アウトレット': 1,
+    'デビュー作品': 1,
+    'イメージビデオ': 1,
+    '写真集': 1,
+  };
+
+  function isFormatGenre(s) {
+    const t = String(s || '').trim();
+    if (!t) return false;
+    return !!FORMAT_GENRE[t] || !!FORMAT_GENRE[t.toUpperCase()];
+  }
+
   function keywordTokenOk(s) {
     if (!s || s.length > 24) return false;
-    if (isEditionKeyword(s)) return false;
+    if (isEditionKeyword(s) || isFormatGenre(s)) return false;
     if (s.length >= 2) return true;
     return !!RELATION_CHIP[s];
   }
@@ -658,7 +698,32 @@
         out.push(s);
       });
     });
-    return orderCompoundsBeforeParts(out).slice(0, 10);
+    return capKeywordList(orderCompoundsBeforeParts(out));
+  }
+
+  /** At most 10 chips. 巨乳 / 美乳 / 爆乳 stay when later tokens would crowd them out. */
+  function capKeywordList(items) {
+    const ranked = (items || []).slice();
+    const limit = 10;
+    if (ranked.length <= limit) return ranked;
+    const body = { '巨乳': 1, '美乳': 1, '爆乳': 1 };
+    const chosen = ranked.slice(0, limit);
+    ranked.slice(limit).forEach((tok) => {
+      if (!body[tok] || chosen.indexOf(tok) !== -1) return;
+      for (let i = chosen.length - 1; i >= 0; i--) {
+        if (!body[chosen[i]]) {
+          chosen.splice(i, 1);
+          break;
+        }
+      }
+      if (chosen.indexOf(tok) === -1 && chosen.length < limit) chosen.push(tok);
+    });
+    const order = {};
+    ranked.forEach((tok, i) => {
+      order[tok] = i;
+    });
+    chosen.sort((a, b) => order[a] - order[b]);
+    return chosen;
   }
 
   /**
@@ -670,6 +735,62 @@
     '巨乳': '巨乳',
     '美乳': '美乳',
     '爆乳': '爆乳',
+    '貧乳': '貧乳',
+    '微乳': '微乳',
+    '超乳': '超乳',
+    'ギャル': '辣妹',
+    '黒ギャル': '黑辣妹',
+    '白ギャル': '白辣妹',
+    'キャンギャル': '宣傳辣妹',
+    '金髪': '金髮',
+    '細身': '纖細',
+    'スレンダー': '苗條',
+    '映画館': '電影院',
+    '手コキ': '手淫',
+    '射精': '射精',
+    '色白': '白皙',
+    '日焼け': '曬黑',
+    '童顔': '童顏',
+    '長身': '高挑',
+    'ぽっちゃり': '豐滿',
+    'タトゥー': '刺青',
+    '女子校生': '女學生',
+    '制服': '制服',
+    '熟女': '熟女',
+    '美少女': '美少女',
+    '未亡人': '寡婦',
+    '女上司': '女上司',
+    '家政婦': '家政婦',
+    'メイド': '女僕',
+    'コスプレ': '角色扮演',
+    'バニーガール': '兔女郎',
+    'ラブホテル': '賓館',
+    'ホテル': '飯店',
+    '旅館': '旅館',
+    '教室': '教室',
+    '学園': '校園',
+    '学校': '學校',
+    '病院': '醫院',
+    '浴室': '浴室',
+    '風呂': '浴室',
+    '車内': '車內',
+    '露出': '露出',
+    '野外': '野外',
+    '自宅': '自宅',
+    '個室': '包廂',
+    'コンビニ': '便利商店',
+    'フェラ': '口交',
+    'フェラチオ': '口交',
+    'パイズリ': '乳交',
+    'クンニ': '舔陰',
+    '潮吹き': '潮吹',
+    '乱交': '亂交',
+    'ハーレム': '後宮',
+    '姉妹': '姊妹',
+    '双子': '雙胞胎',
+    '不倫': '不倫',
+    '盗撮': '偷拍',
+    '近親相姦': '近親',
     'ノーブラ': '無胸罩',
     '誘惑': '誘惑',
     '水泳部': '游泳社',

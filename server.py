@@ -2823,6 +2823,8 @@ def enrich_title_candidate(c: dict, why: str = "片名候選") -> dict:
         "title_score": c.get("title_score", c.get("score")),
         "source": c.get("source"),
     }
+    if c.get("genres"):
+        out["genres"] = c.get("genres")
     if c.get("visual") is not None:
         out["visual"] = c.get("visual")
     if c.get("visual_score") is not None:
@@ -3178,6 +3180,43 @@ def _cid_from_avbase_product(product: dict | None, work_id: str | None = None) -
 
 
 
+def _genres_from_mapping(node, depth: int = 0) -> list[str]:
+    """Genre-like names already on an avbase work JSON. No extra request."""
+    if depth > 3 or node is None:
+        return []
+    keys = {"genres", "genre", "tags", "categories"}
+    found: list[str] = []
+    if isinstance(node, dict):
+        for key, val in node.items():
+            if key in keys:
+                found.extend(_normalize_catalog_genres(val))
+            elif key in {"products", "product"} and isinstance(val, (dict, list)):
+                found.extend(_genres_from_mapping(val, depth + 1))
+    elif isinstance(node, list):
+        for item in node[:6]:
+            if isinstance(item, (dict, list)):
+                found.extend(_genres_from_mapping(item, depth + 1))
+    out: list[str] = []
+    seen: set[str] = set()
+    for tok in found:
+        if tok in seen:
+            continue
+        seen.add(tok)
+        out.append(tok)
+    return out
+
+
+def _catalog_genres_for_code(code: str, present: list | None = None) -> list[str]:
+    """Genres already parsed, otherwise one javbus work page. Failures stay empty."""
+    got = _normalize_catalog_genres(present)
+    if got:
+        return got
+    try:
+        return _javbus_genres_for_code(code)
+    except Exception:
+        return []
+
+
 def fetch_avbase_by_code(code: str) -> dict | None:
     """Resolve a 品番 via avbase.net work page / works?q=code (title + actress + studio)."""
     from urllib.parse import quote
@@ -3234,6 +3273,7 @@ def fetch_avbase_by_code(code: str) -> dict | None:
                     "studio": row.get("studio"),
                     "cid": row.get("cid") or code_to_cid(display),
                     "related": [],
+                    "genres": _catalog_genres_for_code(display, row.get("genres")),
                     "source": "avbase",
                     "cover": row.get("cover"),
                 }
@@ -3281,6 +3321,9 @@ def fetch_avbase_by_code(code: str) -> dict | None:
         cover = p0.get("image_url") or p0.get("thumbnail_url")
     if not cover and cid:
         cover = cover_url(cid)
+    genres = _genres_from_mapping(work)
+    if not genres and isinstance(p0, dict):
+        genres = _genres_from_mapping(p0)
     return {
         "code": display,
         "title": title,
@@ -3288,6 +3331,7 @@ def fetch_avbase_by_code(code: str) -> dict | None:
         "studio": studio,
         "cid": cid,
         "related": [],
+        "genres": _catalog_genres_for_code(display, genres),
         "source": "avbase",
         "cover": cover,
     }
@@ -3412,6 +3456,7 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
                     if dig:
                         cover = dig
                 seen.add(code)
+                row_genres = _genres_from_mapping(w)
                 out.append(
                     {
                         "code": code,
@@ -3420,6 +3465,7 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
                         "studio": studio,
                         "cid": cid,
                         "cover": cover,
+                        "genres": row_genres,
                         "href": f"https://www.avbase.net/works/{w.get('id')}" if w.get("id") else None,
                         "source": "avbase",
                         "score": float(score),
@@ -3536,8 +3582,69 @@ def _fetch_javbus_title_results(title: str, actress: str | None = None) -> list[
     return out
 
 
+_JAVBUS_GENRE_RE = re.compile(
+    r'<span class="genre">\s*<label>.*?href="https://www\.javbus\.com(?:/ja)?/genre/[^"]+"[^>]*>([^<]+)</a>',
+    re.S,
+)
+
+
+def _parse_javbus_genres(html: str) -> list[str]:
+    """Theme genres from a javbus work page. Quality/distribution labels drop.
+
+    The Japanese page (`/ja/`) is the source of chip text. A Chinese page
+    only contributes labels we can map onto that same Japanese genre.
+    """
+    if not html:
+        return []
+    japanese = ("/ja/genre/" in html) or ("ジャンル:" in html)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in _JAVBUS_GENRE_RE.findall(html):
+        tok = _genre_label_text(raw, japanese_page=japanese)
+        if not tok:
+            continue
+        key = tok.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tok)
+    return out
+
+
+def _javbus_genres_for_code(code: str) -> list[str]:
+    """Best-effort genre list. Reuses a memoized work row when one exists."""
+    display = format_display_code(code) if parse_code_parts(code or "") else ""
+    if not display:
+        return []
+    memo_key = "code\n" + display
+    cached = _JAVBUS_SEARCH_MEMO.get(memo_key)
+    if cached:
+        genres = cached[0].get("genres") if isinstance(cached[0], dict) else None
+        if isinstance(genres, list) and genres:
+            return _normalize_catalog_genres(genres)
+    for url in (
+        f"https://www.javbus.com/ja/{display}",
+        f"https://www.javbus.com/{display}",
+    ):
+        try:
+            r = requests.get(url, headers=_javbus_headers(), timeout=8, verify=False)
+        except Exception:
+            continue
+        if r.status_code >= 400 or not r.text:
+            continue
+        genres = _parse_javbus_genres(r.text)
+        if genres:
+            return genres
+        if "/ja/" in url and ("ジャンル:" in r.text or 'class="genre"' in r.text):
+            return genres
+    return []
+
+
 def _fetch_javbus_by_code(code: str) -> dict | None:
-    """One work page: catalog title and billed actress. No invented Chinese."""
+    """One work page: catalog title, billed actress, and theme genres.
+
+    Japanese page first so genre chips stay Japanese. No invented Chinese.
+    """
     display = format_display_code(code) if parse_code_parts(code or "") else ""
     if not display:
         return None
@@ -3546,13 +3653,22 @@ def _fetch_javbus_by_code(code: str) -> dict | None:
     if cached is not None:
         return dict(cached[0]) if cached else None
     try:
-        r = requests.get(
+        r = None
+        for url in (
+            f"https://www.javbus.com/ja/{display}",
             f"https://www.javbus.com/{display}",
-            headers=_javbus_headers(),
-            timeout=12,
-            verify=False,
-        )
-        if r.status_code >= 400 or not r.text or "avatar-box" not in r.text and "<h3>" not in r.text:
+        ):
+            try:
+                got = requests.get(url, headers=_javbus_headers(), timeout=12, verify=False)
+            except Exception:
+                got = None
+            if got is None or got.status_code >= 400 or not got.text:
+                continue
+            if "avatar-box" not in got.text and "<h3>" not in got.text:
+                continue
+            r = got
+            break
+        if r is None:
             _JAVBUS_SEARCH_MEMO[memo_key] = []
             return None
         h3 = ""
@@ -3580,6 +3696,7 @@ def _fetch_javbus_by_code(code: str) -> dict | None:
             "studio": None,
             "cid": cid,
             "related": [],
+            "genres": _parse_javbus_genres(r.text),
             "source": "javbus",
             "cover": cover_url(cid) if cid else None,
         }
@@ -4992,6 +5109,13 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
         if not isinstance(it, dict):
             continue
         code = it.get("code")
+        fresh = _recompute_theme_keywords(
+            {
+                "title": it.get("title"),
+                "actress": it.get("actress"),
+                "genres": it.get("genres"),
+            }
+        )
         slim.append(
             {
                 "code": format_display_code(str(code)) if code and parse_code_parts(str(code)) else code,
@@ -5005,6 +5129,8 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "why": it.get("why"),
                 "keyword_hits": it.get("keyword_hits"),
                 "matched_keywords": list(it.get("matched_keywords") or it.get("hit_keywords") or []),
+                "genres": list(fresh.get("genres") or it.get("genres") or []),
+                "theme_keywords": list(fresh.get("theme_keywords") or []),
                 "stills": list(it.get("stills") or [])[:10] if isinstance(it.get("stills"), list) else [],
             }
         )
@@ -5509,6 +5635,8 @@ def _backfill_catalog_identity(payload: dict) -> dict:
         payload["actress"] = str(meta.get("actress")).strip()
     if not str(payload.get("studio") or "").strip() and meta.get("studio"):
         payload["studio"] = meta.get("studio")
+    if not payload.get("genres") and meta.get("genres"):
+        payload["genres"] = list(meta.get("genres") or [])
     return payload
 
 
@@ -5637,6 +5765,9 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "stills": list(stills)[:20],
         "related_by_title": _slim_related_for_cache(
             payload.get("related_by_title") or payload.get("related")
+        ),
+        "genres": _normalize_catalog_genres(
+            payload.get("genres"), actress=str(payload.get("actress") or "") or None
         ),
         "theme_keywords": list((_recompute_theme_keywords(payload).get("theme_keywords")) or []),
         "keyword_queries": list(payload.get("keyword_queries") or []),
@@ -5802,6 +5933,7 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                         "actress",
                         "studio",
                         "cid",
+                        "genres",
                         "theme_keywords",
                         "keyword_queries",
                     ):
@@ -5992,6 +6124,8 @@ def identify_code(
                     meta["cid"] = src_meta["cid"]
                 if src_meta.get("related") and not meta.get("related"):
                     meta["related"] = src_meta["related"]
+                if src_meta.get("genres") and not meta.get("genres"):
+                    meta["genres"] = src_meta.get("genres")
         elif src_meta and not meta:
             meta = src_meta
 
@@ -6140,6 +6274,7 @@ def identify_code(
         "ocr_text_preview": ocr_preview,
         "message": message,
         "related_note": related_note,
+        "genres": list(meta.get("genres") or []) if isinstance(meta, dict) else [],
     }
     try:
         _backfill_catalog_identity(out)
@@ -7419,6 +7554,9 @@ _WEAK_THEME_TOKENS = frozenset(
         "開發",
         "下着",
         "会社",
+        # Bare 射精 is a real act chip when the title says it. It stays weak
+        # so it does not lead related search ahead of 巨乳 / 映画館 / ギャル.
+        "射精",
     }
 )
 
@@ -7594,6 +7732,65 @@ _THEME_KEYWORD_LEXICON = (
     "スク水",
     "水着",
     "合宿",
+    # Look / setting / role tokens that catalog genres and titles actually use.
+    # Longer labels precede shorter ones at match time (黒ギャル before ギャル).
+    # These are Japanese genre words, not invented English tags.
+    "黒ギャル",
+    "白ギャル",
+    "キャンギャル",
+    "ギャル",
+    "金髪",
+    "細身",
+    "スレンダー",
+    "貧乳",
+    "微乳",
+    "超乳",
+    "色白",
+    "日焼け",
+    "童顔",
+    "長身",
+    "ぽっちゃり",
+    "タトゥー",
+    "女子校生",
+    "制服",
+    "熟女",
+    "美少女",
+    "未亡人",
+    "女上司",
+    "家政婦",
+    "メイド",
+    "コスプレ",
+    "バニーガール",
+    "ラブホテル",
+    "ホテル",
+    "旅館",
+    "映画館",
+    "教室",
+    "学園",
+    "学校",
+    "病院",
+    "浴室",
+    "風呂",
+    "車内",
+    "露出",
+    "野外",
+    "自宅",
+    "個室",
+    "コンビニ",
+    "手コキ",
+    "射精",
+    "フェラチオ",
+    "フェラ",
+    "パイズリ",
+    "クンニ",
+    "潮吹き",
+    "乱交",
+    "ハーレム",
+    "姉妹",
+    "双子",
+    "不倫",
+    "盗撮",
+    "近親相姦",
 )
 
 # Short setting / identity nouns (valid even at 2 chars). Not 地位 — 地味.
@@ -7639,6 +7836,36 @@ _SHORT_THEME_NOUNS = frozenset(
         "水着",
         "スク水",
         "合宿",
+        "ギャル",
+        "金髪",
+        "細身",
+        "貧乳",
+        "微乳",
+        "超乳",
+        "色白",
+        "熟女",
+        "制服",
+        "学校",
+        "学園",
+        "教室",
+        "病院",
+        "風呂",
+        "浴室",
+        "車内",
+        "露出",
+        "野外",
+        "自宅",
+        "個室",
+        "姉妹",
+        "双子",
+        "旅館",
+        "長身",
+        "童顔",
+        "乱交",
+        "不倫",
+        "盗撮",
+        "ホテル",
+        "映画館",
     }
 )
 
@@ -7654,6 +7881,8 @@ _THEME_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
     "水着": ("水着", "スク水", "スクール水着"),
     "スク水": ("水着", "スク水", "スクール水着"),
     "スクール水着": ("水着", "スク水", "スクール水着"),
+    "フェラ": ("フェラ", "フェラチオ"),
+    "フェラチオ": ("フェラ", "フェラチオ"),
 }
 
 
@@ -7662,7 +7891,9 @@ def _keyword_index(text: str, kw: str) -> int:
 
     ASCII lexicon tokens (OL, NTR, SEX) must be a whole Latin/digit token.
     OL matches 美人OL and 巨乳OL, not the middle of VOL / GOLD / COOL.
-    CJK keywords stay ordinary substrings (逆NTR, 家庭教師).
+    Pure katakana tokens (ギャル, メイド, ホテル) must not match inside a
+    longer katakana word (マーメイド, ラブホテル). Kanji prefixes still count
+    (黒ギャル contains ギャル). Other CJK keywords stay substrings (逆NTR).
     """
     if not text or not kw:
         return -1
@@ -7671,6 +7902,12 @@ def _keyword_index(text: str, kw: str) -> int:
             rf"(?<![A-Za-z0-9]){re.escape(kw)}(?![A-Za-z0-9])",
             text,
             flags=re.IGNORECASE,
+        )
+        return m.start() if m else -1
+    if re.fullmatch(r"[\u30a0-\u30ffー]+", kw):
+        m = re.search(
+            rf"(?<![\u30a0-\u30ffー]){re.escape(kw)}(?![\u30a0-\u30ffー])",
+            text,
         )
         return m.start() if m else -1
     # Mixed tokens such as 逆NTR stay case-insensitive substrings. casefold
@@ -8142,17 +8379,71 @@ def _contains_edition_marker(tok: str) -> bool:
     return _EDITION_MARKER_RE.search(_fold_fullwidth_latin(raw)) is not None
 
 
+# Catalog / page chrome that is not a theme. Javbus labels these beside
+# 巨乳 / ギャル / 痴女. They must not become chips or search queries.
+_FORMAT_GENRE_TOKENS = frozenset(
+    {
+        "ハイビジョン",
+        "高画質",
+        "高畫質",
+        "高清",
+        "HD",
+        "4K",
+        "４Ｋ",
+        "UHD",
+        "字幕",
+        "中文字幕",
+        "中字",
+        "独占配信",
+        "DMM独占",
+        "DMM獨家",
+        "獨家",
+        "単体作品",
+        "單體作品",
+        "サンプル動画",
+        "配信専用",
+        "特典",
+        "特典付き",
+        "セット商品",
+        "福袋",
+        "デジモ",
+        "ベスト",
+        "総集編",
+        "アウトレット",
+        "デビュー作品",
+        "イメージビデオ",
+        "写真集",
+        "Blu-ray",
+        "ブルーレイ",
+    }
+)
+
+
+def _is_format_genre(tok: str) -> bool:
+    """Distribution / picture-quality labels, not plot themes."""
+    t = (tok or "").strip()
+    if not t:
+        return False
+    if t in _FORMAT_GENRE_TOKENS or t.upper() in _FORMAT_GENRE_TOKENS:
+        return True
+    compact = re.sub(r"[\s·・]+", "", t)
+    if compact in _FORMAT_GENRE_TOKENS or compact.upper() in _FORMAT_GENRE_TOKENS:
+        return True
+    return False
+
+
 def _keyword_token_ok(tok: str) -> bool:
     """Chip/query token length. 妹 is allowed; other 1-char scraps are not.
 
     Edition/format tokens (BOD, Blu-ray, VOL, 第2巻) are never chips, even
     when a cached list or a re-search payload still contains them, and even
-    when a pair query glued one onto a real theme word.
+    when a pair query glued one onto a real theme word. Catalog chrome
+    (ハイビジョン, 単体作品, 独占配信) is the same kind of non-theme.
     """
     t = (tok or "").strip()
     if not t or len(t) > 24:
         return False
-    if _contains_edition_marker(t):
+    if _contains_edition_marker(t) or _is_format_genre(t):
         return False
     if len(t) >= 2:
         return True
@@ -8508,6 +8799,30 @@ def _normalize_keyword_list(raw, *, limit: int = 10) -> list[str]:
     return out
 
 
+def _cap_theme_keywords(ranked: list[str], *, limit: int = 10) -> list[str]:
+    """Keep at most `limit` chips. 巨乳 / 美乳 / 爆乳 are not the ones dropped.
+
+    A long title can list more than ten real tokens. Body-size words stay
+    even when they sit late in the title, and the kept chips stay in rank order.
+    """
+    items = [str(k or "").strip() for k in ranked if str(k or "").strip()]
+    if len(items) <= limit:
+        return items
+    chosen = items[:limit]
+    for tok in items[limit:]:
+        if not _is_body_generic_token(tok) or tok in chosen:
+            continue
+        for i in range(len(chosen) - 1, -1, -1):
+            if not _is_body_generic_token(chosen[i]):
+                chosen.pop(i)
+                break
+        if tok not in chosen and len(chosen) < limit:
+            chosen.append(tok)
+    order = {tok: i for i, tok in enumerate(items)}
+    chosen.sort(key=lambda tok: order.get(tok, 10_000))
+    return chosen
+
+
 def _extract_title_theme_keywords(title: str, actress: str | None = None) -> list[str]:
     """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
 
@@ -8532,6 +8847,10 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     in the lexicon: it is an occupation chip when the title actually contains
     that token, and it does not match inside VOL. Leftover {4,6} scraps run
     only when nothing distinctive was found (JUFE-271 は隠し切れな must not pad).
+    Look and setting words in the lexicon (映画館, 金髪, ギャル, 細身, …)
+    are chips when the title actually contains them. Format labels
+    (ハイビジョン, 単体作品, 独占配信) are not. When more than ten tokens
+    match, 巨乳 / 美乳 / 爆乳 stay in the capped list.
     """
     raw = (title or "").strip()
     if not raw:
@@ -8617,7 +8936,131 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
                 break
             _add(chunk)
 
-    return _rank_theme_keywords(found, t, compounds)[:10]
+    return _cap_theme_keywords(_rank_theme_keywords(found, t, compounds))
+
+
+# Chinese javbus labels for the same genre ids. Empty string means "drop"
+# (picture quality / distribution). Unknown Chinese labels are not guessed.
+_GENRE_ZH_TO_JP = {
+    "蕩婦": "痴女",
+    "痴女": "痴女",
+    "中出": "中出し",
+    "巨乳": "巨乳",
+    "女生": "ギャル",
+    "辣妹": "ギャル",
+    "打手槍": "手コキ",
+    "手淫": "手コキ",
+    "高清": "",
+    "高畫質": "",
+    "高画質": "",
+    "字幕": "",
+    "單體作品": "",
+    "単体作品": "",
+    "DMM獨家": "",
+    "獨家": "",
+    "獨佔配信": "",
+    "独占配信": "",
+    "ハイビジョン": "",
+}
+
+
+def _genre_label_text(label: str, *, japanese_page: bool) -> str:
+    """One catalog genre label as a JP chip, or empty when it is chrome."""
+    t = unescape((label or "").strip())
+    t = re.sub(r"\s+", "", t)
+    if not t:
+        return ""
+    if not japanese_page and t in _GENRE_ZH_TO_JP:
+        t = _GENRE_ZH_TO_JP[t]
+    if not t or _is_format_genre(t) or not _keyword_token_ok(t):
+        return ""
+    if japanese_page:
+        if re.fullmatch(r"[\u3040-\u30ffー\u4e00-\u9fffA-Za-z0-9]{2,12}", t):
+            return t
+        return ""
+    if t in _THEME_KEYWORD_LEXICON or t in _SHORT_THEME_NOUNS:
+        return t
+    return ""
+
+
+def _normalize_catalog_genres(raw, actress: str | None = None) -> list[str]:
+    """Unique theme genres from a catalog field. Format tags are dropped.
+
+    Accepts a list of strings or ``{"name": ...}`` rows. The actress billing
+    is not a genre. Chinese-only labels stay out unless they map to a known
+    Japanese genre.
+    """
+    actress_bits = set()
+    for piece in re.split(r"[\s　・/|,，]+", str(actress or "")):
+        piece = piece.strip()
+        if len(piece) >= 2:
+            actress_bits.add(piece)
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，、・/|]+", raw)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw:
+        if isinstance(item, dict):
+            label = (
+                item.get("name")
+                or item.get("label")
+                or item.get("ja")
+                or item.get("title")
+                or ""
+            )
+        else:
+            label = item
+        # Map a known Chinese label first. A Japanese catalog label that is
+        # not in that table still passes when it looks like a genre name.
+        text = str(label or "")
+        tok = _genre_label_text(text, japanese_page=False) or _genre_label_text(
+            text, japanese_page=True
+        )
+        if not tok or tok in actress_bits:
+            continue
+        key = tok.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(tok)
+    return out
+
+
+def _merge_catalog_genre_keywords(
+    title: str,
+    keywords: list[str],
+    genres,
+    actress: str | None = None,
+) -> list[str]:
+    """Union title chips with catalog genres. Title order stays when genres are empty.
+
+    Catalog-only tokens sort after tokens that actually occur in the title,
+    then the same ten-chip cap keeps 巨乳. Format tags never enter.
+    """
+    extras = _normalize_catalog_genres(genres, actress=actress)
+    if not extras:
+        return list(keywords)
+    seen = {str(k).casefold() for k in keywords}
+    alias_seen: set[str] = set()
+    for k in keywords:
+        for al in _theme_keyword_aliases(k):
+            alias_seen.add(al.casefold())
+    add: list[str] = []
+    for g in extras:
+        if g.casefold() in seen or g.casefold() in alias_seen:
+            continue
+        if any(al.casefold() in seen or al.casefold() in alias_seen for al in _theme_keyword_aliases(g)):
+            continue
+        add.append(g)
+        seen.add(g.casefold())
+        for al in _theme_keyword_aliases(g):
+            alias_seen.add(al.casefold())
+    if not add:
+        return list(keywords)
+    compounds = _extract_title_compounds(_strip_edition_markers(title or ""))
+    return _cap_theme_keywords(_rank_theme_keywords(list(keywords) + add, title or "", compounds))
 
 
 _TITLE_COMPOUND_STOP = {
@@ -9093,6 +9536,9 @@ def _stamp_theme_keywords(payload: dict) -> dict:
         kws = _normalize_keyword_list(existing)
     else:
         kws = _extract_title_theme_keywords(title, actress=actress)
+        kws = _merge_catalog_genre_keywords(
+            title, kws, payload.get("genres"), actress=actress
+        )
     existing_q = payload.get("keyword_queries")
     if isinstance(existing_q, list) and existing_q and not stale:
         queries = _normalize_keyword_list(existing_q, limit=8)
@@ -9117,6 +9563,7 @@ def _recompute_theme_keywords(payload: dict) -> dict:
         return _stamp_theme_keywords(payload)
     actress = str(payload.get("actress") or "").strip() or None
     kws = _extract_title_theme_keywords(title, actress=actress)
+    kws = _merge_catalog_genre_keywords(title, kws, payload.get("genres"), actress=actress)
     payload["theme_keywords"] = kws
     payload["keyword_queries"] = _keyword_search_queries(title, kws, selected_only=False)
     return payload
@@ -9132,7 +9579,7 @@ def _stamp_listed_work_keywords(payload: dict) -> dict:
     if not isinstance(payload, dict):
         return payload
     _recompute_theme_keywords(payload)
-    for key in ("candidates", "results"):
+    for key in ("candidates", "results", "related_by_title", "related"):
         rows = payload.get(key)
         if not isinstance(rows, list):
             continue
