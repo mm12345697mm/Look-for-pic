@@ -606,6 +606,14 @@ function walkNodes(node, acc) {
     H.normalizeKeywordList(['ノーブラ誘惑', '巨乳', '彼女の妹', '彼女', '妹', '誘']).join('・'),
     'ノーブラ誘惑・巨乳・彼女の妹・彼女・妹'
   );
+  assert.strictEqual(
+    H.normalizeKeywordList(['巨乳', '電車', '彼女', '妹', '彼女の妹']).join('・'),
+    '巨乳・電車・彼女の妹・彼女・妹'
+  );
+  assert.strictEqual(
+    H.normalizeKeywordList(['家庭教師', '10秒挿入', '肉欲教育', '息子の家庭教師', '息子', 'ママ']).join('・'),
+    '息子の家庭教師・家庭教師・10秒挿入・肉欲教育・息子・ママ'
+  );
   assert.strictEqual(H.normalizeKeywordList(['あ', '中']).join('・'), '');
 }
 
@@ -734,7 +742,8 @@ function walkNodes(node, acc) {
 // Hint names 片名 / 關鍵字 / 同演員 only for buckets that are actually present.
 {
   const cover = 'https://pics.dmm.co.jp/digital/video/dandya00001/dandya00001pl.jpg';
-  const kws = ['家庭教師', '10秒挿入', '肉欲教育', '息子の家庭教師', '息子', 'ママ'];
+  const storedKws = ['家庭教師', '10秒挿入', '肉欲教育', '息子の家庭教師', '息子', 'ママ'];
+  const kws = ['息子の家庭教師', '家庭教師', '10秒挿入', '肉欲教育', '息子', 'ママ'];
   const titleJa = '「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入';
   const titleZh = '今天又跟兒子的家教上床了';
   assert.strictEqual(H.formatDisplayTitle(titleJa, ''), titleJa);
@@ -748,7 +757,7 @@ function walkNodes(node, acc) {
     title_zh: titleZh,
     actress: '大浦真奈美',
     studio: 'DANDY',
-    theme_keywords: kws,
+    theme_keywords: storedKws,
     keyword_queries: ['家庭教師', '10秒挿入'],
     search_mode: 'title',
     related_by_title: [
@@ -770,7 +779,7 @@ function walkNodes(node, acc) {
         title_zh: titleZh,
         actress: '大浦真奈美',
         studio: 'DANDY',
-        theme_keywords: kws,
+        theme_keywords: storedKws,
         keyword_queries: ['家庭教師'],
         line: 'candidate',
       },
@@ -779,7 +788,7 @@ function walkNodes(node, acc) {
         title: '息子の家庭教師とセックスしています',
         actress: '竹内夏希',
         studio: 'DANDY',
-        theme_keywords: kws,
+        theme_keywords: storedKws,
         keyword_queries: ['家庭教師', '10秒挿入'],
         line: 'candidate',
       },
@@ -809,13 +818,30 @@ function walkNodes(node, acc) {
   assert.ok(hint0 && hint0.textContent.indexOf('關鍵字') !== -1, hint0 && hint0.textContent);
   assert.ok(hint0 && hint0.textContent.indexOf('同演員') !== -1, hint0 && hint0.textContent);
   const mainKids = (blocks[0].children || []).map((c) => c.className);
-  const trackAt = mainKids.indexOf('work-carousel-track');
+  const sectionAt = mainKids.indexOf('work-main-section');
   const chipBlockAt = mainKids.indexOf('kw-related-panel');
-  assert.ok(trackAt >= 0 && chipBlockAt > trackAt, mainKids.join('|'));
+  assert.strictEqual(sectionAt, 0, mainKids.join('|'));
+  assert.ok(chipBlockAt > sectionAt, mainKids.join('|'));
+  const mainSection = blocks[0].children[sectionAt];
+  assert.ok(walkNodes(mainSection).some((n) => n.className === 'work-carousel-track'));
+  assert.ok(!walkNodes(mainSection).some((n) => n.className === 'kw-chip-row'));
+  assert.ok(!walkNodes(mainSection).some((n) => n.className === 'kw-related-panel'));
+  const flat = walkNodes(blocks[0]);
+  const at = (cls) => flat.findIndex((n) => n.className === cls);
+  const meta = flat.find((n) => n.className === 'card-meta');
+  assert.ok(meta && String(meta.innerHTML || '').indexOf('女優') !== -1);
+  assert.ok(flat.indexOf(meta) < at('work-actions'), 'actress line before copy buttons');
+  assert.ok(at('work-actions') < at('cover-wrap'), 'copy buttons before cover');
+  assert.ok(at('cover-wrap') < at('stills-label'), 'cover before stills');
+  assert.ok(at('stills-label') < at('kw-chip-row'), 'chips below the main-work block, not between actress and cover');
+  const search = flat.find((n) => String(n.className || '').indexOf('kw-search') !== -1);
+  assert.ok(search && flat.indexOf(search) > at('kw-chip-row'));
+  assert.ok(flat.indexOf(search) > at('cover-wrap'), '搜尋 sits with the chips under the main work');
   const mainCard = walkNodes(blocks[0]).find((n) => String(n.className || '').indexOf('card') !== -1 && String(n.className || '').indexOf('work-carousel') === -1);
   assert.ok(mainCard);
   const mainCardClasses = (mainCard.children || []).map((c) => c.className);
   assert.ok(mainCardClasses.indexOf('kw-related-panel') === -1, mainCardClasses.join('|'));
+  assert.ok(mainCardClasses.indexOf('kw-chip-row') === -1, mainCardClasses.join('|'));
   assert.ok(mainCardClasses.indexOf('work-actions') >= 0);
   assert.ok(mainCardClasses.indexOf('cover-wrap') > mainCardClasses.indexOf('work-actions'));
   const mainChips = walkNodes(blocks[0]).filter((n) => n.getAttribute && n.getAttribute('data-kw') && n.className === 'kw-chip');
@@ -839,7 +865,7 @@ function walkNodes(node, acc) {
         title_zh: titleZh,
         actress: '大浦真奈美',
         line: 'main',
-        theme_keywords: kws,
+        theme_keywords: storedKws,
         keyword_queries: ['家庭教師'],
         related: [
           { code: 'SER-001', title: '同系列', line: 'theme', why: '片名相近', cover: cover },

@@ -5359,6 +5359,108 @@ def _extract_title_compounds(title: str) -> list[tuple[str, str]]:
     return out
 
 
+def _chip_contains_part(compound: str, part: str) -> bool:
+    """True when `part` is a shorter chip covered by `compound`.
+
+    の-phrases match a whole side only (息子の家庭教師 covers 家庭教師 and 息子;
+    義妹 does not cover 妹). Glued suffix compounds match a prefix
+    (ノーブラ誘惑 covers ノーブラ, 巨乳沼 covers 巨乳).
+    """
+    compound = (compound or "").strip()
+    part = (part or "").strip()
+    if not compound or not part or compound == part or len(part) >= len(compound):
+        return False
+    if compound.count("の") == 1:
+        left, right = compound.split("の", 1)
+        return part == left or part == right
+    return compound.startswith(part)
+
+
+def _subsumed_keyword_parts(keywords: list[str] | None) -> set[str]:
+    """Chips that are a shorter piece of some other chip in the same list."""
+    items = [str(k or "").strip() for k in (keywords or []) if str(k or "").strip()]
+    parts: set[str] = set()
+    for comp in items:
+        for other in items:
+            if _chip_contains_part(comp, other):
+                parts.add(other)
+    return parts
+
+
+def _compound_covers_auto_theme(compound: str, keywords: list[str] | None) -> bool:
+    """True when a phrase covers a real theme noun, not only weak kinship.
+
+    息子の家庭教師 covers 家庭教師, so automatic search must lead with the
+    phrase. 彼女の妹 covers only 彼女 / 妹, so it stays behind 巨乳.
+    """
+    for part in keywords or []:
+        if _chip_contains_part(compound, part) and _is_auto_theme_keyword(part):
+            return True
+    return False
+
+
+def _order_compounds_before_parts(found: list[str]) -> list[str]:
+    """Move a longer chip to just before its own shorter chips.
+
+    Leaves a compound where it is when it already sits ahead of those parts,
+    so 巨乳 stays in front of 彼女の妹. 息子の家庭教師 moves ahead of 家庭教師.
+    """
+    items = [str(k or "").strip() for k in found if str(k or "").strip()]
+    compounds = [tok for tok in items if any(_chip_contains_part(tok, other) for other in items)]
+    compounds.sort(key=len, reverse=True)
+    for comp in compounds:
+        parts = [other for other in items if _chip_contains_part(comp, other)]
+        if not parts or comp not in items:
+            continue
+        if items.index(comp) < min(items.index(part) for part in parts):
+            continue
+        items.remove(comp)
+        at = min(items.index(part) for part in parts)
+        items.insert(at, comp)
+    return items
+
+
+def _split_auto_keyword_queries(
+    keywords: list[str] | None,
+) -> tuple[list[str], list[str], list[str]]:
+    """Leading auto queries: covering compounds, other theme nouns, weak phrases.
+
+    Parts of a longer chip (家庭教師 under 息子の家庭教師, 彼女 under 彼女の妹)
+    are omitted here. Single-term fallback asks for them only after the phrase.
+    """
+    items = [str(k or "").strip() for k in (keywords or []) if str(k or "").strip()]
+    parts = _subsumed_keyword_parts(items)
+    early: list[str] = []
+    late: list[str] = []
+    distinctive: list[str] = []
+    for tok in items:
+        if _is_relation_phrase(tok) and _compound_covers_auto_theme(tok, items):
+            early.append(tok)
+        elif _is_relation_phrase(tok):
+            late.append(tok)
+        elif tok in parts or _is_weak_theme_token(tok):
+            continue
+        else:
+            distinctive.append(tok)
+    return early, distinctive, late
+
+
+def _redundant_substring_only(matched: list[str], keywords: list[str] | None) -> bool:
+    """True when the row only hits shorter pieces of a longer available chip.
+
+    家庭教師 + 息子 without 息子の家庭教師 must not fill the strict bucket
+    ahead of the phrase. 肉欲教育 / 10秒挿入 are not pieces of that phrase.
+    """
+    parts = _subsumed_keyword_parts(keywords)
+    if not parts or not matched:
+        return False
+    if any(any(_chip_contains_part(tok, part) for part in parts) for tok in matched):
+        return False
+    if any(tok not in parts and _is_auto_theme_keyword(tok) for tok in matched):
+        return False
+    return any(tok in parts for tok in matched)
+
+
 def _rank_theme_keywords(
     found: list[str],
     title: str,
@@ -5368,7 +5470,9 @@ def _rank_theme_keywords(
 
     The noun half of a kept compound stays (ノーブラ under ノーブラ誘惑) but
     ranks after strong nouns that are not already covered by that compound,
-    so 巨乳 is not pushed behind a duplicate of the same head.
+    so 巨乳 is not pushed behind a duplicate of the same head. A phrase that
+    contains another chip then moves to just before that chip (息子の家庭教師
+    before 家庭教師 / 息子) without passing unrelated theme nouns.
     """
     compact = re.sub(r"\s+", "", title or "")
     compound_head = {comp: noun for comp, noun in compounds}
@@ -5397,7 +5501,7 @@ def _rank_theme_keywords(
         pos = _keyword_surface_pos(compact, tok)
         return (_tier(tok), pos, -len(tok))
 
-    return sorted(found, key=_key)
+    return _order_compounds_before_parts(sorted(found, key=_key))
 
 
 def _keyword_min_hits(keywords: list[str] | None) -> int:
@@ -5452,8 +5556,9 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
     彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
-    and both parts. Those stay on the chip list, but rank after theme nouns so
-    息子 / ママ / 彼女 / 妹 do not lead automatic search. Bare 誘惑 / 教育 are
+    and both parts. Weak halves stay selectable, but a longer chip is ordered
+    before its own shorter chips. Unrelated theme nouns (巨乳) stay ahead of
+    彼女の妹. Bare 誘惑 / 教育 are
     not chips unless glued to a noun. A time+action hook (10秒で挿入, 3分で絶頂)
     becomes one compact chip (10秒挿入) and is searched like other theme nouns.
     Edition / episode junk (VOL, Vol, VOL.2, EP.2, 第2巻, 第十二話) is stripped
@@ -5715,11 +5820,14 @@ def _keyword_search_queries(
     compounds/aliases, not unrelated sibling phrases from the full title.
     Cap 10 (關鍵字再搜).
 
-    Default bucket: distinctive compounds and theme nouns lead (cap 8). Weak
-    relationship/action tokens are queried only when the title has no stronger
-    term, or when there are just 1–2 keywords total. They must not lead.
-    When a ≥3-keyword multi-hit pass finds nothing usable, `_find_related_by_keywords`
-    asks `_keyword_fallback_singles` for 息子 / ママ and the other chips alone.
+    Default bucket: a phrase that covers a theme noun leads (息子の家庭教師
+    before 家庭教師). Other theme nouns follow (10秒挿入, 肉欲教育, 巨乳).
+    A weak phrase such as 彼女の妹 is queried after those nouns and before its
+    halves, which are not in this leading list. Weak kinship tokens are queried
+    only when the title has no stronger term, or when there are just 1–2
+    keywords total. When a ≥3-keyword pass finds nothing or only one usable
+    work, `_find_related_by_keywords` asks `_keyword_fallback_singles`, with
+    substring singles after the compound.
     """
     title = title or ""
     queries: list[str] = []
@@ -5729,17 +5837,21 @@ def _keyword_search_queries(
         if _keyword_token_ok(q) and q not in queries:
             queries.append(q)
 
-    # Relationship chips (彼女 / 妹 / 彼女の妹) stay selectable, but automatic
-    # queries are led by theme compounds and nouns.
-    distinctive = [
-        k
-        for k in keywords
-        if k and not _is_weak_theme_token(k) and not _is_relation_phrase(k)
-    ]
-    ordered = sorted(
-        keywords if selected_only else (distinctive or keywords),
-        key=lambda k: (_keyword_surface_pos(title, k), -len(k)),
-    )
+    # Selectable chips keep every half. Automatic queries lead with a phrase
+    # that covers a theme noun, then other theme nouns, then a weak phrase
+    # such as 彼女の妹. Shorter pieces of those phrases are fallback-only.
+    early, distinctive, late = _split_auto_keyword_queries(keywords)
+    if selected_only:
+        ordered = sorted(
+            list(keywords),
+            key=lambda k: (_keyword_surface_pos(title, k), -len(k)),
+        )
+    else:
+        # Pairs follow title order. Singles stay in chip rank (compound first).
+        ordered = sorted(
+            distinctive,
+            key=lambda k: (_keyword_surface_pos(title, k), -len(k)),
+        )
 
     def _add_pairs() -> None:
         for i in range(len(ordered) - 1):
@@ -5791,10 +5903,15 @@ def _keyword_search_queries(
         _add_singles(list(keywords), include_weak=True)
         return queries[:10]
 
-    # Distinctive compounds / nouns first, in chip rank order.
+    # Covering phrase first (息子の家庭教師), then theme nouns, then 彼女の妹.
+    if early:
+        _add_singles(early, include_weak=True)
     if distinctive:
         _add_singles(distinctive, include_weak=False)
-    _add_pairs()
+    if distinctive:
+        _add_pairs()
+    if late:
+        _add_singles(late, include_weak=True)
     if distinctive:
         for p in _title_sibling_phrases(title):
             if len(queries) >= 8:
@@ -5803,12 +5920,19 @@ def _keyword_search_queries(
                 continue
             if any(p.startswith(k) for k in distinctive):
                 _add_q(p)
-    else:
-        # No theme noun: series scraps, then the weak tokens themselves.
+    elif not early and not late:
+        # No theme noun and no phrase: series scraps, then the weak tokens.
         for p in _title_sibling_phrases(title)[:6]:
             if p not in _WEAK_THEME_TOKENS and len(p) >= 4:
                 _add_q(p)
         _add_singles(list(keywords), include_weak=True)
+    elif not early and not distinctive:
+        # Phrase only (彼女の妹): the phrase is already queued; halves follow
+        # when nothing stronger exists.
+        _add_singles(
+            [k for k in keywords if k not in late and k not in early],
+            include_weak=True,
+        )
     # 1–2 keywords may still query a weak token, but only after stronger ones.
     if distinctive and len(keywords) <= 2:
         _add_singles(
@@ -5821,10 +5945,21 @@ def _keyword_search_queries(
 def _keyword_fallback_singles(keywords: list[str] | None) -> list[str]:
     """One-token queries for when multi-hit / compound search is empty or thin.
 
-    Chip rank order: distinctive nouns, then relation phrases, then weak
-    kinship tokens. Aliases follow their chip (10秒挿入 also searches 10秒で挿入).
-    Kept off `_keyword_search_queries`, which must not lead with 息子 / ママ.
+    Order: the longer chip, then theme nouns it does not cover, then the
+    shorter pieces (家庭教師 after 息子の家庭教師), then weak kinship
+    (息子 / ママ). Aliases follow their chip (10秒挿入 also searches 10秒で挿入).
     """
+    items = [str(k or "").strip() for k in (keywords or []) if str(k or "").strip()]
+    parts = _subsumed_keyword_parts(items)
+    compounds = [tok for tok in items if any(_chip_contains_part(tok, part) for part in parts)]
+    auto_rest = [
+        tok
+        for tok in items
+        if tok not in compounds and tok not in parts and _is_auto_theme_keyword(tok)
+    ]
+    subsumed = [tok for tok in items if tok in parts]
+    rest = [tok for tok in items if tok not in compounds and tok not in auto_rest and tok not in subsumed]
+    ordered = compounds + auto_rest + subsumed + rest
     queries: list[str] = []
 
     def _add(q: str) -> None:
@@ -5832,10 +5967,7 @@ def _keyword_fallback_singles(keywords: list[str] | None) -> list[str]:
         if _keyword_token_ok(q) and q not in queries:
             queries.append(q)
 
-    for kw in keywords or []:
-        tok = str(kw or "").strip()
-        if not tok:
-            continue
+    for tok in ordered:
         _add(tok)
         for alias in _theme_keyword_aliases(tok):
             if alias != tok:
@@ -5965,11 +6097,13 @@ def _find_related_by_keywords(
     """Up to max_n works matching title theme keywords; more hits rank higher.
 
     Default (keywords is None): extract from the title.
-    If the title yields ≥3 keywords, prefer ≥2 hits. When that multi-hit /
-    compound pass finds nothing or only one usable work, fall back to
-    individual chips (家庭教師, 肉欲教育, 10秒挿入, then 息子 / ママ) so the
-    bucket is not left empty. Caps stay maxima: do not pad once two or more
-    multi-hits exist, and never invent a non-matching row.
+    If the title yields ≥3 keywords, prefer ≥2 hits and search a covering
+    phrase first (息子の家庭教師 before 家庭教師). Rows that only hit the
+    shorter pieces stay out of that strict pass. When the pass finds nothing
+    or only one usable work, fall back to individual chips: the phrase, then
+    uncovered theme nouns, then the shorter pieces, then 息子 / ママ. Caps
+    stay maxima: do not pad once two or more multi-hits exist, and never
+    invent a non-matching row.
 
     If the title yields only 1–2 keywords, those may define the bucket.
 
@@ -6030,7 +6164,7 @@ def _find_related_by_keywords(
             code = format_display_code(code_raw)
             if code in seen:
                 continue
-            hits, base, _matched, theme_hits = _keyword_overlap(
+            hits, base, matched, theme_hits = _keyword_overlap(
                 str(c.get("title") or ""), keywords
             )
             if hits < 1:
@@ -6039,11 +6173,15 @@ def _find_related_by_keywords(
             weak_only = theme_hits < 1 and any(
                 _is_auto_theme_keyword(k) for k in keywords
             )
+            # Shorter pieces of a chip already in the set (家庭教師 under
+            # 息子の家庭教師) must not occupy the strict bucket. They fill
+            # only when the compound / multi-hit pass is empty or has one row.
+            redundant = (not explicit) and _redundant_substring_only(matched, keywords)
             # Keep single-keyword rows aside. They fill the bucket only when
             # the multi-hit pass is empty or too thin.
             if not explicit and min_hits > 1:
                 _remember(loose, code, sc, c)
-            if hits < min_hits:
+            if hits < min_hits or redundant:
                 continue
             if not explicit and weak_only:
                 continue
@@ -6104,9 +6242,17 @@ def _find_related_by_keywords(
         compound = 1 if any(_is_relation_phrase(k) for k in matched) else 0
         return (1 if theme_hits else 0, compound, hits, sc)
 
+    def _strict_rank(pair: tuple[float, dict]) -> tuple:
+        sc, c = pair
+        _hits, _base, matched, _theme = _keyword_overlap(
+            str(c.get("title") or ""), keywords
+        )
+        cover = 1 if any(_compound_covers_auto_theme(tok, keywords) for tok in matched) else 0
+        return (cover, sc)
+
     if use_singles:
         ordered_rows: list[tuple[float, dict]] = sorted(
-            strict.values(), key=lambda x: x[0], reverse=True
+            strict.values(), key=_strict_rank, reverse=True
         )
         used = {
             format_display_code(str(c.get("code") or ""))
@@ -6119,7 +6265,7 @@ def _find_related_by_keywords(
         emit_floor = 1
         allow_weak = True
     else:
-        ordered_rows = sorted(strict.values(), key=lambda x: x[0], reverse=True)
+        ordered_rows = sorted(strict.values(), key=_strict_rank, reverse=True)
         emit_floor = min_hits
         allow_weak = explicit
 

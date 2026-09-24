@@ -525,6 +525,36 @@
     return !!RELATION_CHIP[s];
   }
 
+  /**
+   * Longer chip covers a shorter one: の-phrase sides (息子の家庭教師 covers
+   * 家庭教師 and 息子; 義妹 does not cover 妹) or a glued prefix (巨乳沼 / 巨乳).
+   */
+  function chipContainsPart(compound, part) {
+    compound = String(compound || '');
+    part = String(part || '');
+    if (!compound || !part || compound === part || part.length >= compound.length) return false;
+    const bits = compound.split('の');
+    if (bits.length === 2) return bits[0] === part || bits[1] === part;
+    return compound.indexOf(part) === 0;
+  }
+
+  /** Put a compound just before its own shorter chips. Leave unrelated order. */
+  function orderCompoundsBeforeParts(found) {
+    const items = (found || []).slice();
+    const compounds = items.filter((tok) => items.some((other) => chipContainsPart(tok, other)));
+    compounds.sort((a, b) => b.length - a.length);
+    compounds.forEach((comp) => {
+      const parts = items.filter((other) => chipContainsPart(comp, other));
+      if (!parts.length || items.indexOf(comp) < 0) return;
+      const earliest = Math.min.apply(null, parts.map((part) => items.indexOf(part)));
+      if (items.indexOf(comp) < earliest) return;
+      items.splice(items.indexOf(comp), 1);
+      const at = Math.min.apply(null, parts.map((part) => items.indexOf(part)));
+      items.splice(at, 0, comp);
+    });
+    return items;
+  }
+
   /** Unique chip labels from an API list. Does not invent keywords from a title. */
   function normalizeKeywordList(raw) {
     const out = [];
@@ -538,7 +568,7 @@
       seen[s] = true;
       out.push(s);
     });
-    return out.slice(0, 10);
+    return orderCompoundsBeforeParts(out).slice(0, 10);
   }
 
   function formatKeywordListLabel(prefix, keywords) {
@@ -2380,10 +2410,14 @@
       window.requestAnimationFrame(updatePager);
     }, { passive: true });
 
-    // Track first, then hint/pager as snug footer under stills (no stretch gap).
-    // Chips sit under this primary card only — never inside related slides.
-    block.appendChild(track);
-    block.appendChild(head);
+    // The main-work section is the carousel (card + stills + hint). Chips are
+    // the next sibling, under that whole section — not between actress, the
+    // copy buttons, and the cover inside the card, and not on related slides.
+    const mainSection = document.createElement('div');
+    mainSection.className = 'work-main-section';
+    mainSection.appendChild(track);
+    mainSection.appendChild(head);
+    block.appendChild(mainSection);
     if (String((mainWork && mainWork.line) || 'main') === 'main') {
       mountKeywordResearch(block, mainWork, related, themeKeywords);
     }
@@ -2391,8 +2425,9 @@
   }
 
   /**
-   * Keyword chips + 搜尋 under the 主作品 block, not inside the card and not
-   * on 片名 / 關鍵字 / 同演員 slides or title-search candidate cards.
+   * Keyword chips + 搜尋 as a sibling under the 主作品 section, outside the
+   * card (not between actress / 番名合 and the cover) and not on 片名 / 關鍵字
+   * / 同演員 slides or title-search candidate cards.
    * Re-search uses only the selected chips (server enforces multi-hit / cap 10).
    */
   function mountKeywordResearch(block, mainWork, related, themeKeywords) {
