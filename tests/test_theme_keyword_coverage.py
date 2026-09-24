@@ -49,6 +49,52 @@ ROYD_WITH_CATALOG = [
     "射精",
     "中出し",
 ]
+# MissAV /cn/ tags beyond the javbus list, plus the ROYAL cinema series.
+# スレンダー / 淫語 are real page labels. The ten-chip cap keeps them and
+# drops weak 射精 / 中出し. Format chrome and the maker (ROYAL) stay out.
+ROYD_SERIES = "平日昼間の映画館で…（ROYAL）"
+ROYD_WITH_MISSAV = [
+    "映画館",
+    "細身",
+    "巨乳",
+    "金髪",
+    "ギャル",
+    "乳首",
+    "スレンダー",
+    "手コキ",
+    "痴女",
+    "淫語",
+]
+ROYD_MISSAV_HTML = """
+<html><head>
+<meta property="og:title" content="ROYD-343 幾乎包場的電影院 - MissAV">
+</head><body>
+<a href="https://missav.ai/cn/actresses/momoe-sarina">百永紗里奈</a>
+<a href="https://missav.ai/cn/genres/slut">蕩婦</a>
+<a href="https://missav.ai/cn/genres/creampie">中出</a>
+<a href="https://missav.ai/cn/genres/big-tits">巨乳</a>
+<a href="https://missav.ai/cn/genres/gal">辣妹</a>
+<a href="https://missav.ai/cn/genres/handjob">打手槍</a>
+<a href="https://missav.ai/cn/genres/blonde">金髮</a>
+<a href="https://missav.ai/cn/genres/slender">苗條</a>
+<a href="https://missav.ai/cn/genres/dirty-talk">淫語</a>
+<a href="https://missav.ai/cn/genres/cinema">電影院</a>
+<a href="https://missav.ai/cn/genres/hd">高清</a>
+<a href="https://missav.ai/cn/genres/solo">單體作品</a>
+<a href="https://missav.ai/cn/genres/exclusive">獨家</a>
+<a href="https://missav.ai/cn/makers/royal">ROYAL</a>
+<a href="https://missav.ai/cn/series/heijitsu-hiruma-eigakan">平日昼間の映画館で…（ROYAL）</a>
+</body></html>
+"""
+ROYD_JABLE_HTML = """
+<html><body>
+<a href="https://jable.tv/models/momoe-sarina/"><span>百永さりな</span></a>
+<a href="https://jable.tv/categories/big-tits/" class="cat">巨乳</a>
+<a href="https://jable.tv/tags/movie-theater/">電影院</a>
+<a href="https://jable.tv/tags/dirty-talk/">淫語</a>
+<a href="https://jable.tv/categories/hd/">高清</a>
+</body></html>
+"""
 
 
 class TestRoyd343KeywordSufficiency(unittest.TestCase):
@@ -218,6 +264,166 @@ class TestJavbusGenreParse(unittest.TestCase):
         for tok in ("映画館", "細身", "巨乳", "金髪", "ギャル", "乳首", "痴女", "手コキ"):
             self.assertIn(tok, chips["theme_keywords"], chips["theme_keywords"])
         self.assertNotIn("ハイビジョン", chips["theme_keywords"])
+
+
+def _cinema_catalog() -> list[dict]:
+    """High-score non-cinema hits, plus several cinema-series siblings."""
+    spec = (
+        ("BODY-001", "金髪ギャルの巨乳痴女", 9),
+        ("BODY-002", "巨乳ギャルの乳首", 8),
+        ("BODY-003", "細身巨乳の手コキ", 7),
+        ("BODY-004", "ギャル巨乳痴女", 6),
+        ("BODY-005", "金髪巨乳のギャル", 5),
+        ("ROYD-100", "平日昼間の映画館で隣の細身巨乳", 2),
+        ("ROYD-200", "平日昼間の映画館で巨乳", 1),
+        ("ROYD-300", "平日昼間の映画館でまた", 1),
+        ("ROYD-400", "平日昼間の映画館で三人", 1),
+    )
+    out = []
+    for code, title, score in spec:
+        slug = code.lower()
+        out.append(
+            {
+                "code": code,
+                "title": title,
+                "score": score,
+                "cover": f"https://pics.dmm.co.jp/digital/video/{slug}/{slug}pl.jpg",
+            }
+        )
+    return out
+
+
+class TestMissavTagsAndCinemaSeries(unittest.TestCase):
+    """MissAV / Jable tags and the cinema series, beyond title + javbus."""
+
+    def test_page_tags_and_series_are_parsed(self):
+        genres, series = S._parse_public_catalog_tags(ROYD_MISSAV_HTML)
+        self.assertEqual(series, ROYD_SERIES)
+        for tok in ("痴女", "中出し", "巨乳", "ギャル", "手コキ", "金髪", "スレンダー", "淫語", "映画館"):
+            self.assertIn(tok, genres, genres)
+        for junk in ("高清", "單體作品", "獨家", "ROYAL", "百永紗里奈", "play", "cinema"):
+            self.assertNotIn(junk, genres, genres)
+        self.assertEqual(S._series_theme_tokens(series), ["映画館"])
+        self.assertEqual(S._series_search_phrase(series), "平日昼間の映画館")
+        jable_genres, jable_series = S._parse_public_catalog_tags(ROYD_JABLE_HTML)
+        self.assertIsNone(jable_series)
+        self.assertEqual(jable_genres, ["巨乳", "映画館", "淫語"], jable_genres)
+
+    def test_fetch_folds_tags_into_the_same_zh_catalog_call(self):
+        def fake_get(url, timeout=8.0, headers=None):
+            if url == "https://missav.ai/cn/royd-343":
+                return ROYD_MISSAV_HTML
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("ROYD-343", actress_ja="百永さりな", title_ja=ROYD_TITLE)
+        self.assertIn("スレンダー", meta["genres"], meta)
+        self.assertIn("淫語", meta["genres"])
+        self.assertIn("映画館", meta["genres"])
+        self.assertNotIn("高清", meta["genres"])
+        self.assertNotIn("ROYAL", meta["genres"])
+        self.assertEqual(meta["series"], ROYD_SERIES)
+
+    def test_three_chip_layers_for_royd_343(self):
+        title_only = S._extract_title_theme_keywords(ROYD_TITLE, actress="百永さりな")
+        self.assertEqual(title_only, ROYD_TITLE_CHIPS, title_only)
+        with_javbus = S._recompute_theme_keywords(
+            {
+                "title": ROYD_TITLE,
+                "actress": "百永さりな",
+                "genres": list(ROYD_CATALOG_GENRES),
+            }
+        )
+        self.assertEqual(with_javbus["theme_keywords"], ROYD_WITH_CATALOG, with_javbus["theme_keywords"])
+        genres, series = S._parse_public_catalog_tags(ROYD_MISSAV_HTML)
+        merged = list(ROYD_CATALOG_GENRES)
+        for tok in genres:
+            if tok not in merged:
+                merged.append(tok)
+        with_missav = S._recompute_theme_keywords(
+            {
+                "title": ROYD_TITLE,
+                "actress": "百永さりな",
+                "genres": merged,
+                "series": series,
+            }
+        )
+        self.assertEqual(with_missav["theme_keywords"], ROYD_WITH_MISSAV, with_missav["theme_keywords"])
+        self.assertLessEqual(len(with_missav["theme_keywords"]), 10)
+        self.assertIn("巨乳", with_missav["theme_keywords"])
+        self.assertLess(
+            with_missav["theme_keywords"].index("巨乳"),
+            with_missav["theme_keywords"].index("乳首"),
+        )
+        for tok in ("映画館", "スレンダー", "淫語", "手コキ", "痴女"):
+            self.assertIn(tok, with_missav["theme_keywords"])
+        for junk in ("ハイビジョン", "単体作品", "独占配信", "ROYAL", "play", "cinema", "百永さりな"):
+            self.assertNotIn(junk, with_missav["theme_keywords"])
+        self.assertNotIn("ノーブラ誘惑", with_missav["theme_keywords"])
+        qs = with_missav["keyword_queries"]
+        self.assertIn("映画館", qs, qs)
+        self.assertIn("平日昼間の映画館", qs, qs)
+        self.assertIn("巨乳", qs)
+        self.assertLessEqual(len(qs), 8)
+        self.assertTrue(all(not S._is_format_genre(q) for q in qs), qs)
+
+    def test_series_token_is_a_chip_when_the_title_omits_it(self):
+        title = "隣に座る細身巨乳な金髪ギャルに乳首を弄られた"
+        bare = S._extract_title_theme_keywords(title)
+        self.assertNotIn("映画館", bare, bare)
+        stamped = S._recompute_theme_keywords(
+            {"title": title, "genres": list(ROYD_CATALOG_GENRES), "series": ROYD_SERIES}
+        )
+        self.assertIn("映画館", stamped["theme_keywords"], stamped["theme_keywords"])
+        self.assertIn("映画館", stamped["keyword_queries"], stamped["keyword_queries"])
+        self.assertIn("平日昼間の映画館", stamped["keyword_queries"])
+        self.assertNotIn("ROYAL", stamped["theme_keywords"])
+
+    def test_cinema_keyword_bucket_is_not_thinner_with_missav(self):
+        catalog = _cinema_catalog()
+        seen: dict[str, list[str]] = {"javbus": [], "missav": []}
+
+        def _run(label: str, keywords: list[str], series: str | None):
+            def fake_fetch(q, actress=None):
+                seen[label].append(q)
+                return [dict(row) for row in catalog]
+
+            def fake_enrich(c, why="片名候選"):
+                item = dict(c)
+                item["why"] = why
+                item.setdefault("stills", [])
+                return item
+
+            with mock.patch.object(S, "fetch_avbase_title_results", side_effect=fake_fetch), mock.patch.object(
+                S, "fetch_jav321_title_results", return_value=[]
+            ), mock.patch.object(
+                S, "fetch_javlibrary_title_results", return_value=[]
+            ), mock.patch.object(S, "enrich_title_candidate", side_effect=fake_enrich):
+                return S._find_related_by_keywords(
+                    ROYD_TITLE,
+                    auto_keywords=keywords,
+                    series=series,
+                    max_n=5,
+                    budget_sec=6.0,
+                    exclude_code="ROYD-343",
+                )
+
+        javbus_rows = _run("javbus", list(ROYD_WITH_CATALOG), None)
+        missav_rows = _run("missav", list(ROYD_WITH_MISSAV), ROYD_SERIES)
+
+        def cinema_codes(rows: list[dict]) -> list[str]:
+            return [str(r.get("code")) for r in rows if "映画館" in str(r.get("title") or "")]
+
+        javbus_cinema = cinema_codes(javbus_rows)
+        missav_cinema = cinema_codes(missav_rows)
+        self.assertGreaterEqual(len(javbus_cinema), 2, javbus_rows)
+        self.assertGreaterEqual(len(missav_cinema), len(javbus_cinema), (javbus_cinema, missav_cinema))
+        self.assertLessEqual(len(javbus_rows), 5)
+        self.assertLessEqual(len(missav_rows), 5)
+        self.assertIn("映画館", seen["javbus"], seen["javbus"])
+        self.assertIn("映画館", seen["missav"], seen["missav"])
+        self.assertIn("平日昼間の映画館", seen["missav"], seen["missav"])
+        self.assertNotIn("平日昼間の映画館", seen["javbus"])
 
 
 if __name__ == "__main__":
