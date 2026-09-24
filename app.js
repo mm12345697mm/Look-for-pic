@@ -1100,8 +1100,211 @@
     progressFinished = false;
   }
 
-  function showProgress(steps) {
+  // High-water mark for one identify run. SSE and job polls can arrive out of
+  // order; a later slot must not jump back to 搜尋第 3/4 or an earlier percent.
+  // The denominator is part of that mark: 搜尋第 2/4 is 61% and 搜尋第 2/7 is
+  // 59%, so a stale 4-image poll looks "ahead" of the live 7-image run unless
+  // N itself is refused.
+  let progressEpoch = 0;
+  let activeIdentifyReader = null;
+  let progressHigh = {
+    jobId: '',
+    started: false,
+    stepIndex: -1,
+    percent: -1,
+    imageIndex: null,
+    imageTotal: null,
+    phaseRank: 0,
+    runImageCount: 0,
+    epoch: 0,
+  };
+
+  function resetProgressHigh(jobId) {
+    progressHigh = {
+      jobId: jobId == null ? '' : String(jobId),
+      started: false,
+      stepIndex: -1,
+      percent: -1,
+      imageIndex: null,
+      imageTotal: null,
+      phaseRank: 0,
+      runImageCount: 0,
+      epoch: 0,
+    };
+  }
+
+  function releaseIdentifyReader() {
+    const reader = activeIdentifyReader;
+    activeIdentifyReader = null;
+    if (!reader) return;
+    try {
+      const cancel = reader.cancel();
+      if (cancel && typeof cancel.catch === 'function') cancel.catch(function () {});
+    } catch (_) {}
+  }
+
+  // A new upload starts a new run. Slot, percent, and denominator high-water
+  // reset. The previous stream and its job poll stop painting this panel.
+  function beginIdentifyProgress(imageCount) {
+    progressEpoch += 1;
+    releaseIdentifyReader();
+    const count = parseInt(imageCount, 10);
+    resetProgressHigh('');
+    progressHigh.epoch = progressEpoch;
+    progressHigh.runImageCount = count > 0 ? count : 0;
+  }
+
+  function bindIdentifyJob(jobId) {
+    const id = String(jobId || '');
+    if (!id) return;
+    if (!progressHigh.jobId) progressHigh.jobId = id;
+    else if (progressHigh.jobId !== id) {
+      const epoch = progressHigh.epoch || 0;
+      const runImageCount = progressHigh.runImageCount || 0;
+      resetProgressHigh(id);
+      progressHigh.epoch = epoch;
+      progressHigh.runImageCount = runImageCount;
+    }
+  }
+
+  function noteProgressImageCount(imageCount) {
+    const count = parseInt(imageCount, 10);
+    if (!(count > 0)) return;
+    progressHigh.runImageCount = Math.max(progressHigh.runImageCount || 0, count);
+  }
+
+  function progressStepIndex(stepId) {
+    const ids = listStepRows(progressStepsEl).map((n) => (n.dataset && n.dataset.step) || '');
+    let idx = ids.indexOf(stepId);
+    if (idx < 0) idx = DEFAULT_STEPS.findIndex((s) => s.id === stepId);
+    return idx;
+  }
+
+  function imageProgressFromDetail(detail) {
+    const text = String(detail || '');
+    const match = text.match(/(?:搜尋第|封面鎖定第|辨識第|相關作品|第)\s*(\d+)\s*\/\s*(\d+)/);
+    if (!match) return null;
+    const slot = parseInt(match[1], 10);
+    const total = parseInt(match[2], 10);
+    if (!(slot > 0) || !(total > 0)) return null;
+    // 「相關作品 1/4」counts merged works after search. It is not the upload count.
+    const relatedOnly = text.indexOf('相關作品') !== -1 && !/(?:搜尋第|封面鎖定第|辨識第)/.test(text);
+    return { slot: slot, total: relatedOnly ? null : total };
+  }
+
+  function imageSlotFromDetail(detail) {
+    const parsed = imageProgressFromDetail(detail);
+    return parsed ? parsed.slot : null;
+  }
+
+  function imageCountFromSteps(steps) {
+    const list = Array.isArray(steps) ? steps : [];
+    for (let i = 0; i < list.length; i++) {
+      const label = String((list[i] && list[i].label) || '');
+      const match = label.match(/（\s*(\d+)\s*張）/);
+      if (!match) continue;
+      const n = parseInt(match[1], 10);
+      if (n > 0) return n;
+    }
+    return 0;
+  }
+
+  function phaseRankOf(evt) {
+    let name = (evt && evt.phase) || '';
+    if (!name) name = phaseLabelForEvent(evt) || '';
+    if (!name) {
+      const detail = String((evt && evt.detail) || '');
+      if (detail.indexOf('封面鎖定') !== -1) name = '封面鎖定';
+      else if (detail.indexOf('搜尋第') !== -1 || detail.indexOf('目錄') !== -1) name = '目錄查詢';
+      else if (detail.indexOf('相關') !== -1) name = '相關作品';
+      else if (detail.indexOf('辨識') !== -1) name = '辨識中';
+    }
+    const order = ['辨識中', '目錄查詢', '封面鎖定', '相關作品'];
+    const idx = order.indexOf(String(name));
+    return idx < 0 ? 0 : idx + 1;
+  }
+
+  function progressRunSuperseded(epoch, jobId) {
+    if ((progressHigh.epoch || 0) !== epoch) return true;
+    if (jobId && progressHigh.jobId && progressHigh.jobId !== jobId) return true;
+    return false;
+  }
+
+  function progressEventWouldRewind(evt) {
+    if (!evt) return false;
+    if (evt.jobId && progressHigh.jobId && String(evt.jobId) !== String(progressHigh.jobId)) return true;
+    const parsed = imageProgressFromDetail(evt.detail);
+    const eventTotal = parsed ? parsed.total : null;
+    const runCount = progressHigh.runImageCount || 0;
+    // A 4-image snapshot must not paint over a 7-image run, even when its
+    // percent is higher (搜尋第 2/4 is 61%, 搜尋第 2/7 is 59%).
+    if (eventTotal != null && runCount > 0 && eventTotal < runCount) return true;
+    if (eventTotal != null && progressHigh.imageTotal != null && eventTotal < progressHigh.imageTotal) return true;
+    if (!progressHigh.started) return false;
+    const stepIndex = progressStepIndex(evt.step);
+    const percent = typeof evt.progress === 'number' && !Number.isNaN(evt.progress) ? evt.progress : null;
+    const imageIndex = parsed ? parsed.slot : null;
+    const phase = phaseRankOf(evt);
+    if (stepIndex >= 0 && progressHigh.stepIndex >= 0 && stepIndex < progressHigh.stepIndex) return true;
+    if (percent != null && progressHigh.percent >= 0 && percent + 1e-6 < progressHigh.percent) return true;
+    if (stepIndex !== progressHigh.stepIndex) return false;
+    if (
+      imageIndex != null &&
+      progressHigh.imageIndex != null &&
+      imageIndex < progressHigh.imageIndex
+    ) {
+      return true;
+    }
+    if (
+      imageIndex != null &&
+      progressHigh.imageIndex != null &&
+      imageIndex === progressHigh.imageIndex &&
+      phase &&
+      progressHigh.phaseRank &&
+      phase < progressHigh.phaseRank
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function commitProgressHigh(evt) {
+    const stepIndex = progressStepIndex(evt.step);
+    const percent = typeof evt.progress === 'number' && !Number.isNaN(evt.progress) ? evt.progress : null;
+    const parsed = imageProgressFromDetail(evt.detail);
+    const imageIndex = parsed ? parsed.slot : null;
+    const imageTotal = parsed ? parsed.total : null;
+    const phase = phaseRankOf(evt);
+    const stepUp = stepIndex > progressHigh.stepIndex;
+    if (stepIndex >= 0) progressHigh.stepIndex = Math.max(progressHigh.stepIndex, stepIndex);
+    if (percent != null) progressHigh.percent = Math.max(progressHigh.percent, percent);
+    if (imageTotal != null) {
+      progressHigh.imageTotal =
+        progressHigh.imageTotal == null ? imageTotal : Math.max(progressHigh.imageTotal, imageTotal);
+    }
+    if (stepUp) {
+      progressHigh.imageIndex = imageIndex;
+      progressHigh.phaseRank = phase;
+    } else if (imageIndex != null) {
+      if (progressHigh.imageIndex == null || imageIndex > progressHigh.imageIndex) {
+        progressHigh.imageIndex = imageIndex;
+        progressHigh.phaseRank = phase;
+      } else if (imageIndex === progressHigh.imageIndex) {
+        progressHigh.phaseRank = Math.max(progressHigh.phaseRank, phase);
+      }
+    }
+    progressHigh.started = true;
+  }
+
+  function showProgress(steps, imageCount) {
     if (!progressPanel) return;
+    const keepJob = progressHigh.jobId;
+    const keepEpoch = progressHigh.epoch || 0;
+    resetProgressHigh(keepJob);
+    progressHigh.epoch = keepEpoch;
+    const passed = parseInt(imageCount, 10);
+    const fromSteps = imageCountFromSteps(steps);
+    progressHigh.runImageCount = passed > 0 ? passed : fromSteps > 0 ? fromSteps : 0;
     const list = steps && steps.length ? steps : DEFAULT_STEPS;
     progressState = {};
     progressLabels = {};
@@ -1131,6 +1334,7 @@
 
   function applyProgressEvent(evt) {
     if (!evt || !evt.step) return;
+    if (progressEventWouldRewind(evt)) return;
     const step = evt.step;
     const status = evt.status || 'active';
     progressState[step] = status;
@@ -1187,6 +1391,7 @@
         updateProgressSummary('處理中：' + label);
       }
     }
+    commitProgressHigh(evt);
   }
 
   function toggleProgressCollapsed() {
@@ -1269,14 +1474,27 @@
   const IDENTIFY_JOB_FOLLOW_MS = 4 * 600 * 1000 + 60 * 1000;
 
   async function followIdentifyJob(jobId, onProgress) {
+    const id = String(jobId || '');
+    const epoch = progressHigh.epoch || 0;
+    if (progressRunSuperseded(epoch, '')) {
+      const err = new Error('superseded');
+      err.superseded = true;
+      throw err;
+    }
+    bindIdentifyJob(id);
     const deadline = Date.now() + IDENTIFY_JOB_FOLLOW_MS;
     let wait = 400;
     while (Date.now() < deadline) {
       await sleep(wait);
       wait = Math.min(5000, wait + 400);
+      if (progressRunSuperseded(epoch, id)) {
+        const err = new Error('superseded');
+        err.superseded = true;
+        throw err;
+      }
       let body = null;
       try {
-        const res = await fetch('/api/identify/jobs/' + encodeURIComponent(jobId), { cache: 'no-store' });
+        const res = await fetch('/api/identify/jobs/' + encodeURIComponent(id), { cache: 'no-store' });
         try {
           body = await res.json();
         } catch (_) {
@@ -1285,9 +1503,17 @@
       } catch (_) {
         continue;
       }
+      if (progressRunSuperseded(epoch, id)) {
+        const err = new Error('superseded');
+        err.superseded = true;
+        throw err;
+      }
       const job = body && body.job;
       if (!job) continue;
-      if (job.progress && onProgress) onProgress(job.progress);
+      if (job.progress && onProgress) {
+        const stamped = Object.assign({ jobId: id }, job.progress);
+        if (!progressEventWouldRewind(stamped)) onProgress(stamped);
+      }
       const ready = resumePayloadFromJob(job);
       if (ready) return ready;
       // A late heartbeat can look stalled. Keep the real result; do not
@@ -1318,14 +1544,23 @@
     }
 
     const reader = res.body.getReader();
+    activeIdentifyReader = reader;
+    const epoch = progressHigh.epoch || 0;
     const decoder = new TextDecoder();
     let buffer = '';
     let finalData = null;
     let httpStatus = res.status;
     let jobId = '';
 
+    try {
     while (true) {
+      if (progressRunSuperseded(epoch, jobId)) {
+        return { status: 0, data: null, superseded: true };
+      }
       const { done, value } = await reader.read();
+      if (progressRunSuperseded(epoch, jobId)) {
+        return { status: 0, data: null, superseded: true };
+      }
       if (done) break;
       buffer += decoder.decode(value, { stream: true });
       const parts = buffer.split('\n\n');
@@ -1345,9 +1580,15 @@
         }
         if (evt.type === 'job' && evt.job_id) {
           jobId = String(evt.job_id);
+          bindIdentifyJob(jobId);
+          if (evt.image_count) noteProgressImageCount(evt.image_count);
         } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
           showProgress(evt.steps);
         } else if (evt.type === 'progress') {
+          if (progressRunSuperseded(epoch, jobId)) {
+            return { status: 0, data: null, superseded: true };
+          }
+          if (jobId) evt.jobId = jobId;
           if (onProgress) onProgress(evt);
           else applyProgressEvent(evt);
         } else if (evt.type === 'result') {
@@ -1355,6 +1596,12 @@
           if (typeof evt.status === 'number') httpStatus = evt.status;
         }
       }
+    }
+    } finally {
+      if (activeIdentifyReader === reader) activeIdentifyReader = null;
+    }
+    if (progressRunSuperseded(epoch, jobId)) {
+      return { status: 0, data: null, superseded: true };
     }
     if (!finalData && jobId) {
       try {
@@ -3852,6 +4099,7 @@
           ? '以片名搜尋中…'
           : '載入畫廊…';
     setStatus(busyMsg, 'busy');
+    beginIdentifyProgress(imgs.length);
     showProgress(
       imgs.length > 1
         ? [
@@ -3952,10 +4200,10 @@
       let data;
       try {
         const streamed = await apiIdentifyStream({ images: imgs, code, title }, applyProgressEvent);
-        if (myRun !== runId) return;
+        if (myRun !== runId || (streamed && streamed.superseded)) return;
         data = streamed.data;
       } catch (streamErr) {
-        if (myRun !== runId) return;
+        if (myRun !== runId || (streamErr && streamErr.superseded)) return;
         if (streamErr && streamErr.followed) {
           throw streamErr;
         }
@@ -3980,7 +4228,7 @@
       }
       handleResult(data);
     } catch (e) {
-      if (myRun !== runId) return;
+      if (myRun !== runId || (e && e.superseded)) return;
       identifyBusy = false;
       applyProgressEvent({ step: 'done', status: 'error', detail: (e && e.message) || String(e), progress: 1 });
       setStatus((e && e.message) || String(e), 'err');
@@ -4353,9 +4601,12 @@
       relatedBucketsNeedFill,
       showProgress,
       applyProgressEvent,
+      beginIdentifyProgress,
+      bindIdentifyJob,
       formatKeywordChip,
       formatPersonName,
       resumePayloadFromJob,
+      followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
       workNeedsTitleZh,
       workNeedsManualFix,

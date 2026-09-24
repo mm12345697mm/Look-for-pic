@@ -495,6 +495,182 @@ function related(n, line) {
   assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
 }
 
+// Progress high-water: a later slot must not rewind to 搜尋第 3/4 or an earlier percent.
+{
+  const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+  H.showProgress();
+  H.bindIdentifyJob('job_forward');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 3/4 張…',
+    progress: 0.68,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '封面鎖定第 3/4 張…',
+    progress: 0.7,
+    phase: '封面鎖定',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 4/4 張…',
+    progress: 0.74,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '封面鎖定第 4/4 張…',
+    progress: 0.8,
+    phase: '封面鎖定',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 3/4 張…',
+    progress: 0.68,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'vision',
+    status: 'active',
+    detail: '第 2/4 張',
+    progress: 0.3,
+    phase: '辨識中',
+  });
+  H.applyProgressEvent({
+    step: 'receive',
+    status: 'active',
+    detail: '正在接收 4 張…',
+    progress: 0.02,
+  });
+  const steps = getEl('progress-steps').children;
+  const search = steps.find((row) => row.dataset && row.dataset.step === 'search');
+  const vision = steps.find((row) => row.dataset && row.dataset.step === 'vision');
+  assert.strictEqual(getEl('progress-detail').textContent, '封面鎖定第 4/4 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, '80%');
+  assert.strictEqual(getEl('progress-bar').style.width, '80%');
+  assert.ok(search && search.dataset.phase === '封面鎖定');
+  assert.ok(String(search.className).indexOf('is-active') !== -1);
+  assert.ok(vision && String(vision.className).indexOf('is-active') === -1);
+  const blob =
+    getEl('progress-detail').textContent +
+    getEl('progress-summary').textContent +
+    getEl('progress-pct').textContent;
+  FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+
+  H.bindIdentifyJob('job_restart');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 1/4 張…',
+    progress: 0.55,
+    phase: '目錄查詢',
+  });
+  assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 1/4 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, '55%');
+}
+
+// 7-image run must not adopt a stale 4-image denominator. 搜尋第 2/4 is 61%
+// and 搜尋第 2/7 is 59%, so percent alone would oscillate 7↔4.
+{
+  const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+  const sevenSteps = [
+    { id: 'receive', label: '接收圖片（7 張）' },
+    { id: 'vision', label: '逐張看圖辨識' },
+    { id: 'parse', label: '彙整番號／片名' },
+    { id: 'verify', label: '核對片名與番號' },
+    { id: 'search', label: '搜尋作品資料' },
+    { id: 'cover', label: '抓取封面與劇照' },
+    { id: 'done', label: '完成，進入畫廊' },
+  ];
+  const pct27 = 0.55 + 0.25 * (1 / 7);
+  H.beginIdentifyProgress(7);
+  H.showProgress(sevenSteps, 7);
+  H.bindIdentifyJob('job_seven');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 2/7 張…',
+    progress: pct27,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 2/4 張…',
+    progress: 0.55 + 0.25 * (1 / 4),
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 3/4 張…',
+    progress: 0.68,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 1/7 張…',
+    progress: 0.55,
+    phase: '目錄查詢',
+  });
+  const steps = getEl('progress-steps').children;
+  const receive = steps.find((row) => row.dataset && row.dataset.step === 'receive');
+  assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/7 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, Math.round(pct27 * 100) + '%');
+  assert.ok(getEl('progress-detail').textContent.indexOf('/4') === -1);
+  assert.ok(receive && String(receive.innerHTML).indexOf('7') !== -1);
+  // Merged-work related counts are not the upload denominator.
+  H.applyProgressEvent({
+    step: 'done',
+    status: 'active',
+    detail: '相關作品 1/4…',
+    progress: 0.95,
+    phase: '相關作品',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 4/4 張…',
+    progress: 0.8,
+    phase: '封面鎖定',
+  });
+  assert.strictEqual(getEl('progress-detail').textContent, '相關作品 1/4…');
+  assert.strictEqual(getEl('progress-pct').textContent, '95%');
+  const blob =
+    getEl('progress-detail').textContent +
+    getEl('progress-summary').textContent +
+    getEl('progress-pct').textContent;
+  FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+
+  // A new upload resets. The same panel may then show a real 4-image run.
+  H.beginIdentifyProgress(4);
+  H.showProgress(
+    [
+      { id: 'receive', label: '接收圖片（4 張）' },
+      { id: 'search', label: '搜尋作品資料' },
+      { id: 'done', label: '完成，進入畫廊' },
+    ],
+    4
+  );
+  H.bindIdentifyJob('job_four_new');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 2/4 張…',
+    progress: 0.55 + 0.25 * (1 / 4),
+    phase: '目錄查詢',
+  });
+  assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/4 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, '61%');
+}
+
 // Multi-shot history: persist and render every user upload; legacy single-shot still OK
 {
   function shotsOf(rec) {
@@ -2123,6 +2299,276 @@ function walkNodes(node, acc) {
     assert.strictEqual((rec.works[0].related || []).length, 14, 'saved related count stays 14');
     assert.strictEqual(rec.works[0].related[0].code, 'KEEP-001');
     assert.strictEqual(rec.works[0].related[13].code, 'KEEP-014');
+  }
+
+  // SSE died on 目錄查詢 3/4. Polling the job must walk later slots and finish.
+  {
+    const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+    const shots = [
+      {
+        status: 'running',
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 3/4 張…',
+          progress: 0.68,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'stalled',
+        stale: true,
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 3/4 張…',
+          progress: 0.68,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'running',
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 4/4 張…',
+          progress: 0.74,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'running',
+        progress: {
+          step: 'cover',
+          status: 'active',
+          detail: '抓取封面與劇照',
+          progress: 0.88,
+          phase: '封面鎖定',
+        },
+      },
+      {
+        status: 'done',
+        progress: {
+          step: 'done',
+          status: 'done',
+          detail: '完成，列出 4 部',
+          progress: 1,
+        },
+        result: {
+          ok: true,
+          code: 'MIDA-616',
+          title: '作品1',
+          results: ['MIDA-616', 'APGH-012', 'JUFE-271', 'SSIS-001'].map((code) => {
+            const cid = code.toLowerCase().replace('-', '');
+            return {
+              ok: true,
+              code,
+              title: code,
+              cover: 'https://pics.dmm.co.jp/digital/video/' + cid + '/' + cid + 'pl.jpg',
+            };
+          }),
+        },
+      },
+    ];
+    let n = 0;
+    context.fetch = async (url) => {
+      assert.ok(String(url).indexOf('/api/identify/jobs/job_batch') !== -1);
+      const job = shots[Math.min(n, shots.length - 1)];
+      n += 1;
+      return { ok: true, json: async () => ({ ok: true, job }) };
+    };
+    H.showProgress();
+    const seen = [];
+    const data = await H.followIdentifyJob('job_batch', (evt) => {
+      seen.push(String(evt.detail || ''));
+      H.applyProgressEvent(evt);
+    });
+    assert.ok(seen.indexOf('搜尋第 3/4 張…') !== -1, seen.join('|'));
+    assert.ok(seen.indexOf('搜尋第 4/4 張…') !== -1, seen.join('|'));
+    assert.ok(seen.indexOf('搜尋第 3/4 張…') < seen.indexOf('搜尋第 4/4 張…'));
+    assert.ok(seen.indexOf('抓取封面與劇照') > seen.indexOf('搜尋第 4/4 張…'));
+    const steps = getEl('progress-steps').children;
+    const search = steps.find((row) => row.dataset && row.dataset.step === 'search');
+    const cover = steps.find((row) => row.dataset && row.dataset.step === 'cover');
+    assert.ok(search && !search.dataset.phase, '目錄查詢 clears once the batch moves on');
+    assert.ok(cover && cover.dataset.phase === '封面鎖定');
+    assert.strictEqual(getEl('progress-detail').textContent, '完成，列出 4 部');
+    assert.strictEqual(data.results.length, 4);
+    data.results.forEach((row) => {
+      assert.ok(String(row.cover).indexOf('https://pics.dmm.co.jp/') === 0);
+      assert.ok(String(row.cover).indexOf('data:') !== 0);
+    });
+    const blob = JSON.stringify(data) + seen.join('');
+    FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+    assert.strictEqual(H.resumePayloadFromJob({ status: 'stalled', progress: shots[0].progress }), null);
+  }
+
+  // A poll snapshot older than the SSE high-water mark must not rewind the bar.
+  {
+    const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+    H.showProgress();
+    H.bindIdentifyJob('job_rewind');
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      detail: '封面鎖定第 4/4 張…',
+      progress: 0.8,
+      phase: '封面鎖定',
+    });
+    const polls = [
+      {
+        status: 'running',
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 3/4 張…',
+          progress: 0.68,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'running',
+        progress: {
+          step: 'vision',
+          status: 'active',
+          detail: '第 2/4 張',
+          progress: 0.3,
+          phase: '辨識中',
+        },
+      },
+      {
+        status: 'done',
+        progress: { step: 'done', status: 'done', detail: '完成，列出 4 部', progress: 1 },
+        result: {
+          ok: true,
+          code: 'MIDA-616',
+          title: '作品1',
+          cover: 'https://pics.dmm.co.jp/digital/video/mida616/mida616pl.jpg',
+          visual_lock: true,
+          results: [
+            {
+              ok: true,
+              code: 'MIDA-616',
+              cover: 'https://pics.dmm.co.jp/digital/video/mida616/mida616pl.jpg',
+            },
+          ],
+        },
+      },
+    ];
+    let n = 0;
+    const prevTimeout = context.setTimeout;
+    context.setTimeout = (fn) => {
+      fn();
+      return 0;
+    };
+    context.fetch = async (url) => {
+      assert.ok(String(url).indexOf('/api/identify/jobs/job_rewind') !== -1);
+      const job = polls[Math.min(n, polls.length - 1)];
+      n += 1;
+      return { ok: true, json: async () => ({ ok: true, job }) };
+    };
+    const seen = [];
+    let data;
+    try {
+      data = await H.followIdentifyJob('job_rewind', (evt) => {
+        seen.push(String(evt.detail || ''));
+        H.applyProgressEvent(evt);
+      });
+    } finally {
+      context.setTimeout = prevTimeout;
+    }
+    assert.deepStrictEqual(seen, ['完成，列出 4 部']);
+    assert.strictEqual(getEl('progress-detail').textContent, '完成，列出 4 部');
+    assert.strictEqual(getEl('progress-pct').textContent, '100%');
+    assert.ok(seen.join('').indexOf('搜尋第 3/4') === -1);
+    assert.strictEqual(data.code, 'MIDA-616');
+    assert.strictEqual(data.visual_lock, true);
+    assert.ok(String(data.cover).indexOf('https://pics.dmm.co.jp/') === 0);
+    assert.ok(String(data.results[0].cover).indexOf('data:') !== 0);
+    const blob = JSON.stringify(data) + getEl('progress-detail').textContent + seen.join('');
+    FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+  }
+
+  // A 4-image job poll still in flight must not paint over a new 7-image run.
+  {
+    const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+    H.beginIdentifyProgress(4);
+    H.showProgress(
+      [
+        { id: 'receive', label: '接收圖片（4 張）' },
+        { id: 'search', label: '搜尋作品資料' },
+        { id: 'done', label: '完成，進入畫廊' },
+      ],
+      4
+    );
+    H.bindIdentifyJob('job_old_four');
+    const prevTimeout = context.setTimeout;
+    const prevFetch = context.fetch;
+    let release = null;
+    context.setTimeout = (fn) => {
+      fn();
+      return 0;
+    };
+    context.fetch = () =>
+      new Promise((resolve) => {
+        release = resolve;
+      });
+    const applied = [];
+    const pending = H.followIdentifyJob('job_old_four', (evt) => {
+      applied.push(String(evt.detail || ''));
+      H.applyProgressEvent(evt);
+    });
+    pending.catch(() => {});
+    await new Promise((r) => prevTimeout(r, 20));
+    assert.strictEqual(typeof release, 'function');
+    H.beginIdentifyProgress(7);
+    H.showProgress(
+      [
+        { id: 'receive', label: '接收圖片（7 張）' },
+        { id: 'search', label: '搜尋作品資料' },
+        { id: 'done', label: '完成，進入畫廊' },
+      ],
+      7
+    );
+    H.bindIdentifyJob('job_seven_live');
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      detail: '搜尋第 2/7 張…',
+      progress: 0.55 + 0.25 * (1 / 7),
+      phase: '目錄查詢',
+    });
+    release({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        job: {
+          status: 'running',
+          progress: {
+            step: 'search',
+            status: 'active',
+            detail: '搜尋第 2/4 張…',
+            progress: 0.55 + 0.25 * (1 / 4),
+            phase: '目錄查詢',
+          },
+        },
+      }),
+    });
+    let superseded = false;
+    try {
+      await pending;
+    } catch (err) {
+      superseded = !!(err && err.superseded);
+    } finally {
+      context.setTimeout = prevTimeout;
+      context.fetch = prevFetch;
+    }
+    assert.strictEqual(superseded, true);
+    assert.ok(applied.indexOf('搜尋第 2/4 張…') === -1, applied.join('|'));
+    assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/7 張…');
+    assert.strictEqual(getEl('progress-pct').textContent, '59%');
+    const blob = getEl('progress-detail').textContent + getEl('progress-pct').textContent;
+    FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
   }
 
   console.log('test_history_session.js: ok');

@@ -68,8 +68,12 @@ SLOT_WORK_BUDGET_S = 600.0
 # railway.toml). 2400 = 4 × SLOT_WORK_BUDGET_S so a sync stream of four
 # images can finish. The identify job calls Worker.notify() while it runs,
 # so this is the silence backstop for a stuck worker, not a shared wall.
+# A Railway service start command overrides those files. Production was
+# still `gunicorn --timeout 180` after the 2400 edit, so the heartbeat below
+# has to land on this process's worker well inside that shorter window.
 GUNICORN_WORKER_TIMEOUT_S = 2400
 STREAM_KEEPALIVE_S = 5.0
+GUNICORN_HEARTBEAT_S = 5.0
 GEMINI_MODELS = (
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
@@ -568,39 +572,98 @@ _IDENTIFY_JOBS_PATH: Path | None = None
 _IDENTIFY_JOBS_LOCK = threading.Lock()
 _GUNICORN_WORKER = None
 _GUNICORN_WORKER_MISSING = False
+_GUNICORN_NOTIFY_LOCK = threading.Lock()
+
+
+def _gunicorn_worker_is_live(worker, pid: int) -> bool:
+    """True for this process's worker whose heartbeat file is still open.
+
+    ``gunicorn -w 2`` forks siblings into the child and then closes their
+    temp fds. Those dead Worker objects stay reachable from gc. Notifying
+    the first one raises and does not utime the live WorkerTmp, so the
+    arbiter's silence timer (180s on the current Railway start command)
+    still murders the stream inside ``queue.Queue.get``.
+    """
+    if worker is None or getattr(worker, "pid", None) != pid:
+        return False
+    tmp = getattr(worker, "tmp", None)
+    if tmp is None:
+        return False
+    try:
+        fd = tmp.fileno()
+    except Exception:
+        return False
+    return isinstance(fd, int) and fd >= 0
+
+
+def _iter_gunicorn_workers():
+    global _GUNICORN_WORKER_MISSING
+    if _GUNICORN_WORKER_MISSING:
+        return []
+    try:
+        import gc
+        from gunicorn.workers.base import Worker
+    except Exception:
+        _GUNICORN_WORKER_MISSING = True
+        return []
+    found = []
+    for obj in gc.get_objects():
+        try:
+            if isinstance(obj, Worker):
+                found.append(obj)
+        except Exception:
+            continue
+    return found
+
+
+def _select_live_gunicorn_worker(candidates, pid: int | None = None):
+    want = os.getpid() if pid is None else int(pid)
+    for obj in candidates or []:
+        if _gunicorn_worker_is_live(obj, want):
+            return obj
+    return None
+
+
+def _gunicorn_silence_age(worker) -> float | None:
+    """Seconds since this worker's heartbeat, using the arbiter's clock.
+
+    Gunicorn 26 stores ``time.monotonic()`` via ``os.utime`` and the master
+    murders when ``time.monotonic() - last_update() > timeout``. A fresh
+    temp file still has a wall-clock mtime, which looks negative (not
+    expired) until the first real ``notify()``.
+    """
+    tmp = getattr(worker, "tmp", None)
+    if tmp is None:
+        return None
+    try:
+        updated = float(tmp.last_update())
+    except (OSError, ValueError, TypeError):
+        return None
+    return time.monotonic() - updated
 
 
 def _notify_gunicorn_worker() -> None:
     """Reset the arbiter silence timer while identify is still running.
 
     Sync workers only notify between requests. SSE keepalive bytes do not.
-    Missing gunicorn (local `python server.py`) is a no-op, and the lookup
-    runs once so a long batch does not walk every object every keepalive.
+    Missing gunicorn (local ``python server.py``) is a no-op. The cached
+    worker is this process only; a closed sibling is never reused.
     """
-    global _GUNICORN_WORKER, _GUNICORN_WORKER_MISSING
+    global _GUNICORN_WORKER
     if _GUNICORN_WORKER_MISSING:
         return
-    worker = _GUNICORN_WORKER
-    if worker is None:
-        try:
-            import gc
-            from gunicorn.workers.base import Worker
-        except Exception:
-            _GUNICORN_WORKER_MISSING = True
-            return
-        for obj in gc.get_objects():
-            if isinstance(obj, Worker):
-                worker = obj
-                _GUNICORN_WORKER = obj
-                break
+    pid = os.getpid()
+    with _GUNICORN_NOTIFY_LOCK:
+        worker = _GUNICORN_WORKER
+        if not _gunicorn_worker_is_live(worker, pid):
+            worker = _select_live_gunicorn_worker(_iter_gunicorn_workers(), pid)
+            _GUNICORN_WORKER = worker
         if worker is None:
-            _GUNICORN_WORKER_MISSING = True
             return
-    try:
-        worker.notify()
-    except Exception:
-        _GUNICORN_WORKER = None
-        _GUNICORN_WORKER_MISSING = False
+        try:
+            worker.notify()
+        except Exception:
+            _GUNICORN_WORKER = None
 
 
 def _identify_jobs_resolve_path() -> Path:
@@ -722,6 +785,112 @@ def identify_job_touch(job_id: str) -> None:
     _notify_gunicorn_worker()
 
 
+_PROGRESS_PHASE_RANK = {"辨識中": 1, "目錄查詢": 2, "封面鎖定": 3, "相關作品": 4}
+_PROGRESS_SLOT_RE = re.compile(
+    r"(?:搜尋第|封面鎖定第|辨識第|相關作品|第)\s*(\d+)\s*/\s*(\d+)"
+)
+
+
+def _progress_step_index(step: str) -> int:
+    try:
+        return [name for name, _label in IDENTIFY_STEPS].index(str(step or ""))
+    except ValueError:
+        return -1
+
+
+def _progress_image_slot(detail: str) -> int | None:
+    match = _PROGRESS_SLOT_RE.search(str(detail or ""))
+    if not match:
+        return None
+    try:
+        slot = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return slot or None
+
+
+def _progress_image_total(detail: str) -> int | None:
+    """Upload denominator in 「搜尋第 i/N」. Related-work counts are not N.
+
+    A 7-image run must not store 搜尋第 2/4. 「相關作品 1/4」 is how many
+    merged works are left, so it is not this denominator.
+    """
+    text = str(detail or "")
+    match = _PROGRESS_SLOT_RE.search(text)
+    if not match:
+        return None
+    if (
+        "相關作品" in text
+        and "搜尋第" not in text
+        and "封面鎖定第" not in text
+        and "辨識第" not in text
+    ):
+        return None
+    try:
+        total = int(match.group(2))
+    except (TypeError, ValueError):
+        return None
+    return total or None
+
+
+def _progress_phase_rank(evt: dict) -> int:
+    name = str((evt or {}).get("phase") or "")
+    if not name:
+        detail = str((evt or {}).get("detail") or "")
+        if "封面鎖定" in detail:
+            name = "封面鎖定"
+        elif "搜尋第" in detail or "目錄" in detail:
+            name = "目錄查詢"
+        elif "相關" in detail:
+            name = "相關作品"
+        elif "辨識" in detail:
+            name = "辨識中"
+    return _PROGRESS_PHASE_RANK.get(name, 0)
+
+
+def _progress_snapshot_is_backward(prev: dict, evt: dict) -> bool:
+    """True when this note would rewind the same identify run.
+
+    A later image may start again at 目錄查詢. The same image must not go
+    back to an earlier phase, and 搜尋第 i/N must not decrease i or N.
+    A brand-new job has no previous note, so its first event is never a rewind.
+    """
+    if not isinstance(prev, dict) or not prev:
+        return False
+    if not isinstance(evt, dict) or not evt:
+        return False
+    prev_total = _progress_image_total(str(prev.get("detail") or ""))
+    next_total = _progress_image_total(str(evt.get("detail") or ""))
+    if prev_total is not None and next_total is not None and next_total < prev_total:
+        return True
+    prev_step = _progress_step_index(str(prev.get("step") or ""))
+    next_step = _progress_step_index(str(evt.get("step") or ""))
+    if next_step >= 0 and prev_step >= 0 and next_step < prev_step:
+        return True
+    try:
+        prev_pct = float(prev.get("progress"))
+    except (TypeError, ValueError):
+        prev_pct = None
+    try:
+        next_pct = float(evt.get("progress"))
+    except (TypeError, ValueError):
+        next_pct = None
+    if prev_pct is not None and next_pct is not None and next_pct + 1e-6 < prev_pct:
+        return True
+    if next_step != prev_step:
+        return False
+    prev_slot = _progress_image_slot(str(prev.get("detail") or ""))
+    next_slot = _progress_image_slot(str(evt.get("detail") or ""))
+    if prev_slot is not None and next_slot is not None and next_slot < prev_slot:
+        return True
+    if prev_slot is not None and next_slot is not None and next_slot == prev_slot:
+        prev_phase = _progress_phase_rank(prev)
+        next_phase = _progress_phase_rank(evt)
+        if prev_phase and next_phase and next_phase < prev_phase:
+            return True
+    return False
+
+
 def identify_job_note(job_id: str, evt: dict | None) -> None:
     evt = evt if isinstance(evt, dict) else {}
 
@@ -733,8 +902,19 @@ def identify_job_note(job_id: str, evt: dict | None) -> None:
         for key in ("step", "status", "detail", "progress", "phase"):
             if key in evt:
                 progress[key] = evt.get(key)
-        if progress:
-            job["progress"] = progress
+        if not progress:
+            return
+        current = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+        if _progress_snapshot_is_backward(current, progress):
+            return
+        try:
+            floor = int(job.get("image_count") or 0)
+        except (TypeError, ValueError):
+            floor = 0
+        next_total = _progress_image_total(str(progress.get("detail") or ""))
+        if floor > 0 and next_total is not None and next_total < floor:
+            return
+        job["progress"] = progress
 
     _identify_jobs_mutate(job_id, mutate)
 
@@ -10713,14 +10893,18 @@ def run_multi_identify_pipeline(
     _progress(on_progress, "verify", "active", "逐張對照原圖的人物／衣服／姿勢…", 0.52)
     _progress(on_progress, "verify", "done", "開始逐張搜尋", 0.54)
     results: list[dict] = []
+    # Denominator stays at the upload count when a typed query does not add a
+    # row, and grows only when an extra manual job is appended. It never
+    # shrinks below the photos the user just sent.
+    slot_total = max(len(jobs), int(n or 0), 1)
     for ji, job in enumerate(jobs):
         t_slot = time.monotonic()
         _progress(
             on_progress,
             "search",
             "active",
-            f"搜尋第 {ji + 1}/{len(jobs)} 張…",
-            0.55 + 0.25 * (ji / max(len(jobs), 1)),
+            f"搜尋第 {ji + 1}/{slot_total} 張…",
+            0.55 + 0.25 * (ji / slot_total),
             phase="目錄查詢",
         )
         row = job.get("row") if isinstance(job.get("row"), dict) else None
@@ -10927,8 +11111,8 @@ def run_multi_identify_pipeline(
                 on_progress,
                 "search",
                 "active",
-                f"封面鎖定第 {ji + 1}/{len(jobs)} 張…",
-                0.55 + 0.25 * ((ji + 0.5) / max(len(jobs), 1)),
+                f"封面鎖定第 {ji + 1}/{slot_total} 張…",
+                0.55 + 0.25 * ((ji + 0.5) / slot_total),
                 phase="封面鎖定",
             )
             try:
@@ -12495,7 +12679,7 @@ def identify_stream():
             stop_hb = threading.Event()
 
             def heartbeat() -> None:
-                while not stop_hb.wait(15):
+                while not stop_hb.wait(float(GUNICORN_HEARTBEAT_S)):
                     if job_id:
                         identify_job_touch(job_id)
                     else:
@@ -12570,6 +12754,7 @@ def identify_stream():
             )
         yield f"data: {json.dumps({'type': 'steps', 'steps': steps}, ensure_ascii=False)}\n\n"
 
+        _notify_gunicorn_worker()
         while True:
             try:
                 kind, payload = q.get(timeout=float(STREAM_KEEPALIVE_S))

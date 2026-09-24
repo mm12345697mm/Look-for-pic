@@ -3,6 +3,9 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# A start command saved on the Railway service overrides this file.
+# Production was still `--timeout 180` after this line said 2400, so the
+# app also heartbeats the live worker from inside the identify stream.
 startCommand = "sh -c 'gunicorn -b 0.0.0.0:${PORT:-8080} -w 2 --timeout 2400 server:app'"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 5
