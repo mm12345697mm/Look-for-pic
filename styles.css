@@ -1236,6 +1236,7 @@ body.lightbox-open {
 .work-actions {
   display: flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 6px;
   padding: 0 14px 10px;
   touch-action: manipulation;
@@ -1276,6 +1277,11 @@ body.lightbox-open {
 .work-action-mark {
   font-size: 0.62rem;
   font-weight: 700;
+  letter-spacing: 0;
+}
+.work-action-promote {
+  padding: 0 8px;
+  color: var(--text);
   letter-spacing: 0;
 }
 .work-action:active {

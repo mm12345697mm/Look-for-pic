@@ -1296,6 +1296,67 @@ function walkNodes(node, acc) {
   assert.ok(!bare.some((n) => n.className === 'card-hit-kw'), 'do not invent hit keywords');
 }
 
+// Promote a related 品番: catalog jacket, same-code gloss, no parent Chinese leak
+{
+  const catalog = 'https://pics.dmm.co.jp/digital/video/ssis00123/ssis00123pl.jpg';
+  const still = 'https://pics.dmm.co.jp/digital/video/ssis00123/ssis00123jp-1.jpg';
+  const parent = { code: 'AAAA-001', title: '舊主', titleZh: '舊主中文', line: 'multi' };
+  const prior = { code: 'SSIS-123', title: '相關', title_zh: '相關自帶', line: 'theme' };
+  const jacket = H.promotedGalleryWork(
+    {
+      ok: true,
+      code: 'SSIS-123',
+      title: 'ジャケット',
+      cid: 'ssis00123',
+      cover: 'data:image/jpeg;base64,UPLOAD',
+      user_preview: 'data:image/jpeg;base64,UPLOAD',
+      stills: ['data:image/jpeg;base64,STILL', still],
+      related_by_title: [
+        {
+          code: 'SSIS-200',
+          title: '次',
+          line: 'keyword',
+          why: '關鍵字',
+          cover: 'data:image/jpeg;base64,REL',
+          cid: 'ssis00200',
+        },
+      ],
+    },
+    parent,
+    prior
+  );
+  assert.ok(jacket, 'code identify becomes a gallery main');
+  assert.strictEqual(jacket.code, 'SSIS-123');
+  assert.strictEqual(jacket.line, 'multi');
+  assert.strictEqual(jacket.cover, catalog);
+  assert.ok(jacket.cover.indexOf('data:') === -1, jacket.cover);
+  assert.strictEqual(jacket.userPreview, '');
+  assert.deepStrictEqual(jacket.stills, [still]);
+  assert.strictEqual(jacket.titleZh, '相關自帶', 'keep this 品番 gloss when identify omits Chinese');
+  assert.ok(jacket.titleZh !== '舊主中文');
+  assert.strictEqual(jacket.relatedByTitle[0].cover, 'https://pics.dmm.co.jp/digital/video/ssis00200/ssis00200pl.jpg');
+  assert.ok(H.workShowsKeywordChips(jacket));
+
+  const named = H.promotedGalleryWork(
+    {
+      ok: true,
+      code: 'SSIS-123',
+      title: 'ジャケット',
+      title_zh: '目錄中文',
+      cover: catalog,
+    },
+    parent,
+    prior
+  );
+  assert.strictEqual(named.titleZh, '目錄中文');
+  assert.notStrictEqual(named.titleZh, parent.titleZh);
+
+  assert.strictEqual(H.reliablePromoteCode({ code: '', line: 'theme' }), '');
+  assert.strictEqual(H.reliablePromoteCode({ code: '片名搜尋', line: 'theme' }), '');
+  assert.strictEqual(H.reliablePromoteCode({ code: '未辨識', line: 'keyword' }), '');
+  assert.strictEqual(H.reliablePromoteCode({ code: 'promo-150', line: 'actress' }), 'PROMO-150');
+}
+
 (async function () {
   const cover = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001pl.jpg';
   const still = 'https://pics.dmm.co.jp/digital/video/aaa00001/aaa00001jp-1.jpg';
@@ -2726,6 +2787,311 @@ function walkNodes(node, acc) {
     assert.strictEqual(visionOn.index, 4);
   }
 
+  // 「以此為主」 on a related card: code identify replaces that slot only.
+  {
+    const coverA = 'https://pics.dmm.co.jp/digital/video/promo00100/promo00100pl.jpg';
+    const coverB = 'https://pics.dmm.co.jp/digital/video/promo00200/promo00200pl.jpg';
+    const coverNew = 'https://pics.dmm.co.jp/digital/video/promo00150/promo00150pl.jpg';
+    const stillNew = 'https://pics.dmm.co.jp/digital/video/promo00150/promo00150jp-1.jpg';
+    const shot = 'data:image/jpeg;base64,usershot';
+    const session = {
+      ok: true,
+      code: 'PROMO-100',
+      title: '第一張',
+      title_zh: '舊主中文',
+      cover: coverA,
+      results: [
+        {
+          ok: true,
+          code: 'PROMO-100',
+          title: '第一張',
+          title_zh: '舊主中文',
+          cover: coverA,
+          line: 'main',
+          related_by_title: [
+            {
+              code: 'PROMO-110',
+              title: '第一相關',
+              title_zh: '第一相關中',
+              line: 'theme',
+              why: '片名相近',
+              cover: coverA,
+            },
+          ],
+        },
+        {
+          ok: true,
+          code: 'PROMO-200',
+          title: '第二張',
+          title_zh: '第二中文',
+          cover: coverB,
+          line: 'multi',
+          related_by_title: [
+            {
+              code: 'PROMO-150',
+              title: '要升主',
+              title_zh: '相關自帶',
+              line: 'theme',
+              why: '片名相近',
+              cover: coverB,
+            },
+          ],
+        },
+      ],
+    };
+    const works = H.sessionWorksFromIdentify(session);
+    assert.strictEqual(works.length, 2);
+    const rec = {
+      id: 'promo-session',
+      ts: Date.now(),
+      kind: 'session',
+      code: works[0].code,
+      title: works[0].title,
+      title_zh: works[0].title_zh,
+      cover: works[0].cover,
+      related: works[0].related,
+      userShots: [shot],
+      works: works,
+    };
+    const saved = H.loadHistory();
+    saved.unshift(rec);
+    H.saveHistory(saved);
+    if (typeof context.scrollTo !== 'function') context.scrollTo = function () {};
+    H.renderGallery(H.galleryFromIdentify(session));
+
+    function actionLabels(node) {
+      return walkNodes(node)
+        .filter((n) => n.tagName === 'BUTTON' && String(n.className || '').indexOf('work-action') !== -1)
+        .map((n) => n.getAttribute('aria-label'));
+    }
+    const blocks = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+    assert.strictEqual(blocks.length, 2, 'two upload slots stay vertical');
+    const firstSlides = walkNodes(blocks[0]).filter((n) => n.className === 'work-carousel-slide');
+    const secondSlides = walkNodes(blocks[1]).filter((n) => n.className === 'work-carousel-slide');
+    assert.ok(actionLabels(firstSlides[0]).indexOf('以此為主') === -1, 'main card has no promote button');
+    assert.deepStrictEqual(actionLabels(firstSlides[1]).slice(-2), ['下載封面與劇照', '以此為主']);
+    assert.ok(actionLabels(secondSlides[0]).indexOf('以此為主') === -1);
+    const relatedLabels = actionLabels(secondSlides[1]);
+    assert.deepStrictEqual(relatedLabels.slice(-2), ['下載封面與劇照', '以此為主']);
+    const promoteBtn = walkNodes(secondSlides[1]).find(
+      (n) => n.getAttribute && n.getAttribute('aria-label') === '以此為主'
+    );
+    assert.ok(promoteBtn, 'related card shows 以此為主 beside download');
+
+    const identifyPayload = {
+      ok: true,
+      code: 'PROMO-150',
+      title: '要升主的完整包',
+      title_zh: '延伸中文',
+      actress: '女優甲',
+      actress_zh: '女優甲中',
+      cid: 'promo00150',
+      cover: coverNew,
+      stills: [stillNew, 'data:image/jpeg;base64,STILL'],
+      user_preview: shot,
+      theme_keywords: ['巨乳', '水泳部'],
+      keyword_queries: ['巨乳'],
+      related_by_title: [
+        {
+          code: 'PROMO-888',
+          title: '延伸相關',
+          title_zh: '延伸相關中',
+          line: 'keyword',
+          why: '關鍵字',
+          cover: 'https://pics.dmm.co.jp/digital/video/promo00888/promo00888pl.jpg',
+          matched_keywords: ['巨乳'],
+        },
+      ],
+    };
+    const forms = [];
+    function RecForm() {
+      this.pairs = [];
+      forms.push(this);
+    }
+    RecForm.prototype.append = function (k, v) {
+      this.pairs.push([String(k), v]);
+    };
+    const prevFetch = context.fetch;
+    const prevForm = context.FormData;
+    context.FormData = RecForm;
+    const cover110 = 'https://pics.dmm.co.jp/digital/video/promo00110/promo00110pl.jpg';
+    const slot0Payload = {
+      ok: true,
+      code: 'PROMO-110',
+      title: '第一張改由相關延伸',
+      title_zh: '第一延伸',
+      cid: 'promo00110',
+      cover: cover110,
+      user_preview: shot,
+      stills: [cover110],
+      theme_keywords: ['巨乳'],
+      related_by_title: [
+        {
+          code: 'PROMO-111',
+          title: '新相關',
+          title_zh: '新相關中',
+          line: 'theme',
+          why: '片名相近',
+          cover: coverA,
+        },
+      ],
+    };
+    context.fetch = async (url, opts) => {
+      const u = String(url || '');
+      if (u.indexOf('/api/identify/stream') !== -1) {
+        return { ok: false, status: 404, headers: { get: () => '' }, body: null, json: async () => ({}) };
+      }
+      if (u.indexOf('/api/identify') !== -1) {
+        const body = opts && opts.body;
+        const codePair = body && body.pairs && body.pairs.find((p) => p[0] === 'code');
+        const asked = codePair && codePair[1];
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => (asked === 'PROMO-110' ? slot0Payload : identifyPayload),
+        };
+      }
+      return { ok: false, status: 404, headers: { get: () => '' }, json: async () => ({}) };
+    };
+    try {
+      const missed = await H.promoteRelatedToMain(
+        { code: '舌技が神', line: 'theme', title: '口號' },
+        null,
+        { surface: 'gallery', slotIndex: 1 }
+      );
+      assert.strictEqual(missed.ok, false);
+      assert.strictEqual(missed.reason, 'nocode');
+      assert.ok(getEl('lfp-toast').textContent.indexOf('沒有可用番號') !== -1);
+      assert.strictEqual(forms.length, 0, 'no code means no identify request');
+
+      promoteBtn.click();
+      const result = await H.promoteTask();
+      assert.strictEqual(result.ok, true, result && result.reason);
+      assert.strictEqual(result.slotIndex, 1);
+      assert.ok(forms.length >= 1, 'identify was called');
+      forms.forEach((form) => {
+        const keys = form.pairs.map((p) => p[0]);
+        assert.ok(keys.indexOf('image') === -1, keys.join(','));
+        assert.ok(keys.indexOf('images') === -1, keys.join(','));
+        const codePair = form.pairs.find((p) => p[0] === 'code');
+        assert.ok(codePair, 'identify by code');
+        assert.strictEqual(codePair[1], 'PROMO-150');
+      });
+
+      const after = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(after.length, 2, 'promoting one related does not drop the other upload');
+      const codes0 = walkNodes(after[0]).filter((n) => n.className === 'card-code').map((n) => n.textContent);
+      const codes1 = walkNodes(after[1]).filter((n) => n.className === 'card-code').map((n) => n.textContent);
+      assert.strictEqual(codes0[0], 'PROMO-100');
+      assert.strictEqual(codes0[1], 'PROMO-110');
+      assert.strictEqual(codes1[0], 'PROMO-150');
+      assert.ok(codes1.indexOf('PROMO-888') !== -1, 'new related bucket is on the promoted main');
+      const promotedMainLabels = actionLabels(
+        walkNodes(after[1]).filter((n) => n.className === 'work-carousel-slide')[0]
+      );
+      assert.ok(promotedMainLabels.indexOf('以此為主') === -1);
+      const chipText = walkNodes(after[1]).map((n) => n.textContent || '').join('\n');
+      assert.ok(chipText.indexOf('巨乳（巨乳）') !== -1, chipText);
+      assert.ok(chipText.indexOf('水泳部（游泳社）') !== -1, chipText);
+      assert.ok(chipText.indexOf('延伸中文') !== -1, chipText);
+
+      const stored = H.loadHistory().find((x) => x.id === 'promo-session');
+      assert.ok(stored);
+      assert.strictEqual(stored.works.length, 2);
+      assert.strictEqual(stored.works[0].code, 'PROMO-100');
+      assert.strictEqual(stored.works[0].related[0].code, 'PROMO-110');
+      assert.strictEqual(stored.code, 'PROMO-100', 'session head stays the first upload');
+      assert.strictEqual(stored.cover, coverA);
+      assert.strictEqual(stored.userShots.length, 1);
+      assert.strictEqual(stored.userShots[0], shot);
+      assert.strictEqual(stored.works[1].code, 'PROMO-150');
+      assert.strictEqual(stored.works[1].title_zh, '延伸中文');
+      assert.notStrictEqual(stored.works[1].title_zh, '第二中文');
+      assert.strictEqual(stored.works[1].cover, coverNew);
+      assert.ok(stored.works[1].cover.indexOf('data:') === -1);
+      assert.ok(stored.works[1].stills.indexOf(stillNew) !== -1);
+      assert.ok(stored.works[1].stills.every((u) => String(u).indexOf('data:') !== 0));
+      assert.ok(stored.works[1].theme_keywords.indexOf('巨乳') !== -1);
+      assert.ok(stored.works[1].theme_keywords.indexOf('水泳部') !== -1);
+      assert.ok(stored.works[1].related.some((r) => r.code === 'PROMO-888'));
+      const replay = H.sessionWorksFromIdentify(H.identifyPayloadFromHistory(stored));
+      assert.strictEqual(replay.length, 2, 'promoted related stays nested, not a new vertical row');
+      assert.ok(!replay.some((w) => w.code === 'PROMO-888'));
+
+      const toast = getEl('lfp-toast').textContent;
+      assert.ok(toast.indexOf('已以 PROMO-150 為主作品') !== -1, toast);
+      assert.ok(toast.indexOf('時間不夠') === -1, toast);
+      assert.ok(toast.indexOf('尚未查完') === -1, toast);
+      assert.ok(toast.indexOf('尚未鎖定') === -1, toast);
+
+      const firstRelatedBtn = walkNodes(after[0]).find(
+        (n) => n.getAttribute && n.getAttribute('aria-label') === '以此為主'
+      );
+      assert.ok(firstRelatedBtn);
+      firstRelatedBtn.click();
+      const slot0 = await H.promoteTask();
+      assert.strictEqual(slot0.ok, true);
+      assert.strictEqual(slot0.slotIndex, 0);
+      const head = H.loadHistory().find((x) => x.id === 'promo-session');
+      assert.strictEqual(head.works.length, 2);
+      assert.strictEqual(head.works[0].code, 'PROMO-110');
+      assert.strictEqual(head.works[0].title_zh, '第一延伸');
+      assert.notStrictEqual(head.works[0].title_zh, '舊主中文');
+      assert.strictEqual(head.works[0].cover, cover110);
+      assert.ok(head.works[0].cover.indexOf('data:') === -1);
+      assert.strictEqual(head.works[1].code, 'PROMO-150');
+      assert.strictEqual(head.code, 'PROMO-110');
+      assert.strictEqual(head.cover, cover110);
+      assert.strictEqual(head.userShots.length, 1);
+      assert.strictEqual(head.userShots[0], shot);
+
+      // History detail: same button replaces that record's slot and keeps screenshots.
+      const histRec = {
+        id: 'promo-history',
+        ts: Date.now(),
+        kind: 'session',
+        code: works[0].code,
+        title: works[0].title,
+        title_zh: works[0].title_zh,
+        cover: coverA,
+        related: works[0].related,
+        userShots: [shot],
+        works: works.map((w) => Object.assign({}, w, { related: (w.related || []).slice() })),
+      };
+      const list = H.loadHistory();
+      list.unshift(histRec);
+      H.saveHistory(list);
+      assert.strictEqual(H.openHistoryDetail('promo-history'), true);
+      const detailBlocks = walkNodes(getEl('history-detail')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(detailBlocks.length, 2);
+      const detailSlides = walkNodes(detailBlocks[1]).filter((n) => n.className === 'work-carousel-slide');
+      const detailBtn = walkNodes(detailSlides[1]).find(
+        (n) => n.getAttribute && n.getAttribute('aria-label') === '以此為主'
+      );
+      assert.ok(detailBtn);
+      detailBtn.click();
+      const histResult = await H.promoteTask();
+      assert.strictEqual(histResult.ok, true);
+      assert.strictEqual(histResult.slotIndex, 1);
+      const histStored = H.loadHistory().find((x) => x.id === 'promo-history');
+      assert.strictEqual(histStored.works[0].code, 'PROMO-100');
+      assert.strictEqual(histStored.works[1].code, 'PROMO-150');
+      assert.strictEqual(histStored.userShots.length, 1);
+      assert.strictEqual(histStored.userShots[0], shot);
+      assert.strictEqual(histStored.code, 'PROMO-100');
+      const detailText = walkNodes(getEl('history-detail')).map((n) => n.textContent || '').join('\n');
+      assert.ok(detailText.indexOf('你的截圖') !== -1);
+      assert.ok(detailText.indexOf('PROMO-100') !== -1);
+      assert.ok(detailText.indexOf('PROMO-150') !== -1);
+      assert.ok(detailText.indexOf('時間不夠') === -1);
+      assert.ok(detailText.indexOf('尚未查完') === -1);
+      assert.ok(detailText.indexOf('尚未鎖定') === -1);
+    } finally {
+      context.fetch = prevFetch;
+      context.FormData = prevForm;
+    }
+  }
 
   console.log('test_history_session.js: ok');
 })().catch((err) => {
