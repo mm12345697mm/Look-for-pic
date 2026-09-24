@@ -7719,10 +7719,40 @@ def _lock_unknown_onto_sibling(
     return adopted
 
 
+def _frame_title_supports_code(catalog_title: str | None, frame_title: str | None) -> bool:
+    """False when the words on this frame belong to a different work than the code.
+
+    A short fragment of the catalog line still supports it. A different phrase
+    (school-swimsuit 媚薬合宿 vs a JUFE title) does not.
+    """
+    frame = str(frame_title or "").strip()
+    if not is_usable_title(frame):
+        return True
+    catalog = str(catalog_title or "").strip()
+    if not is_usable_title(catalog):
+        return False
+    if _titles_are_same_phrase(catalog, frame):
+        return True
+    return title_similarity(frame, catalog) >= TITLE_CODE_MATCH_MIN
+
+
+def _frame_titles_conflict(a: dict, b: dict) -> bool:
+    """True when both uploads printed different works, so they must not merge."""
+    left = str(a.get("_frame_title") or "").strip()
+    right = str(b.get("_frame_title") or "").strip()
+    if not is_usable_title(left) or not is_usable_title(right):
+        return False
+    if _titles_are_same_phrase(left, right):
+        return False
+    return title_similarity(left, right) < TITLE_CODE_MATCH_MIN
+
+
 def _merge_locked_same_work(results: list[dict]) -> tuple[list[dict], int]:
     """Collapse two slots only when both visually locked the same code.
 
     A shared actress, a fuzzy title, or a frame that never locked stays.
+    Two frames whose own titles name different works stay even if a misread
+    code and a visual lock would otherwise fold them together.
     """
     kept: list[dict] = []
     merged = 0
@@ -7734,7 +7764,13 @@ def _merge_locked_same_work(results: list[dict]) -> tuple[list[dict], int]:
             kept.append(row)
             continue
         host = next(
-            (prev for prev in kept if prev.get("visual_lock") and _catalog_code_of(prev) == code),
+            (
+                prev
+                for prev in kept
+                if prev.get("visual_lock")
+                and _catalog_code_of(prev) == code
+                and not _frame_titles_conflict(prev, row)
+            ),
             None,
         )
         if host is None:
@@ -7854,6 +7890,22 @@ def run_multi_identify_pipeline(
                 ocr_title = _title_from_ocr_text(ocr_text)
                 if ocr_title:
                     row["title"] = ocr_title
+        # This cover may already have succeeded on its own. A multi pass that
+        # reads nothing must reuse that image's cached 番號 and 作品名稱,
+        # instead of leaving the frame to be merged into another upload.
+        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))) and not is_usable_title(
+            row.get("title")
+        ):
+            cached_img = None
+            try:
+                cached_img = offline_cache_get(image_hash=image_content_hash(img_bytes))
+            except Exception:
+                cached_img = None
+            if isinstance(cached_img, dict) and _catalog_code_of(cached_img):
+                row["code"] = _catalog_code_of(cached_img)
+                if is_usable_title(cached_img.get("title")):
+                    row["title"] = str(cached_img.get("title")).strip()
+                row["image_cache"] = cached_img
         # Manual overrides apply to first image only as seed
         if i == 0 and user_code and not row.get("code"):
             row["code"] = user_code
@@ -7932,7 +7984,17 @@ def run_multi_identify_pipeline(
         image_index = row.get("index") if row else None
         one: dict | None = None
         try:
-            if job["kind"] == "code":
+            cached_frame = row.get("image_cache") if row else None
+            if (
+                job["kind"] == "code"
+                and isinstance(cached_frame, dict)
+                and _catalog_code_of(cached_frame) == job.get("code")
+            ):
+                one = dict(cached_frame)
+                one["ok"] = True
+                one["from_offline_cache"] = True
+                one.setdefault("search_mode", "code")
+            elif job["kind"] == "code":
                 one, _st = run_identify_pipeline(
                     image_bytes=None,
                     filename=None,
@@ -7960,11 +8022,21 @@ def run_multi_identify_pipeline(
 
         if not isinstance(one, dict):
             one = {}
+        frame_title = (job.get("title") or (vm or {}).get("title") or "").strip()
+        # A code stamped on this frame is not enough when the printed title
+        # belongs to another work. The school-swimsuit cover must not collapse
+        # into a JUFE code that a different upload actually is.
+        title_rejects_code = bool(
+            job["kind"] == "code"
+            and _catalog_code_of(one)
+            and is_usable_title(frame_title)
+            and not _frame_title_supports_code(one.get("title"), frame_title)
+        )
         if job["kind"] == "unknown":
             one = _unidentified_slot(row)
-        elif not _catalog_code_of(one):
+        elif not _catalog_code_of(one) or title_rejects_code:
             escalated = None
-            title_q = (job.get("title") or (vm or {}).get("title") or "").strip()
+            title_q = frame_title
             if is_usable_title(title_q) or is_usable_title(
                 _strip_glued_actress(title_q, (vm or {}).get("actress"))
             ):
@@ -7981,6 +8053,8 @@ def run_multi_identify_pipeline(
                     escalated = None
             if escalated and _catalog_code_of(escalated):
                 one = escalated
+            elif title_rejects_code:
+                pass
             elif job["kind"] == "title":
                 one = _unresolved_title_slot(
                     job,
@@ -8008,6 +8082,7 @@ def run_multi_identify_pipeline(
                 one["code"] = disp
         one.setdefault("related_by_title", [])
         one["from_image_index"] = image_index if image_index is not None else one.get("from_image_index")
+        one["_frame_title"] = frame_title
         one["why"] = one.get("why") or "多圖辨識"
         one["line"] = "main" if not results else "multi"
         one["ok"] = True
@@ -8025,6 +8100,9 @@ def run_multi_identify_pipeline(
         relocked.append(slot)
     results = relocked
     results, n_merged = _merge_locked_same_work(results)
+    for slot in results:
+        if isinstance(slot, dict):
+            slot.pop("_frame_title", None)
 
     if not results:
         _progress(on_progress, "search", "error", "查詢後無有效作品", 0.8)
