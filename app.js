@@ -471,6 +471,8 @@
       related: slimRelatedForHistory(relatedSrc),
       theme_keywords: normalizeKeywordList(src.theme_keywords || src.themeKeywords),
       keyword_queries: normalizeKeywordList(src.keyword_queries || src.keywordQueries),
+      visual_mismatch: !!(src.visual_mismatch || src.visualMismatch),
+      visual_note: String(src.visual_note || src.visualNote || '').trim(),
     };
   }
 
@@ -577,6 +579,105 @@
     return prefix + '（' + kws.join('・') + '）';
   }
 
+  function cjkScript(ch) {
+    const c = ch.charCodeAt(0);
+    if ((c >= 0x30A0 && c <= 0x30FF) || (c >= 0xFF66 && c <= 0xFF9D)) return 'kata';
+    if (c >= 0x3040 && c <= 0x309F) return 'hira';
+    if (c >= 0x4E00 && c <= 0x9FFF) return 'han';
+    if (/[A-Za-z0-9]/.test(ch)) return 'latin';
+    return 'break';
+  }
+
+  /**
+   * Split display text so a CJK token is one unbreakable span.
+   * Keywords stay whole (夜行バス). Katakana+okurigana stays whole (イカされて).
+   * Long Han runs (Chinese sentences) stay breakable. Does not insert ellipsis.
+   */
+  function segmentDisplayText(text, keywords) {
+    const src = String(text || '');
+    if (!src) return [];
+    const covered = new Array(src.length).fill(false);
+    const atoms = [];
+    const kws = normalizeKeywordList(keywords).slice().sort((a, b) => b.length - a.length);
+    kws.forEach((kw) => {
+      if (!kw || kw.length < 2) return;
+      let from = 0;
+      while (from <= src.length - kw.length) {
+        const at = src.indexOf(kw, from);
+        if (at < 0) break;
+        let free = true;
+        for (let i = at; i < at + kw.length; i++) {
+          if (covered[i]) {
+            free = false;
+            break;
+          }
+        }
+        if (free) {
+          for (let i = at; i < at + kw.length; i++) covered[i] = true;
+          atoms.push({ start: at, end: at + kw.length });
+        }
+        from = at + kw.length;
+      }
+    });
+    let i = 0;
+    while (i < src.length) {
+      if (covered[i]) {
+        i += 1;
+        continue;
+      }
+      const kind = cjkScript(src.charAt(i));
+      if (kind === 'break') {
+        i += 1;
+        continue;
+      }
+      let j = i + 1;
+      while (j < src.length && !covered[j] && cjkScript(src.charAt(j)) === kind) j += 1;
+      if (
+        kind === 'kata' &&
+        j - i <= 6 &&
+        j < src.length &&
+        !covered[j] &&
+        cjkScript(src.charAt(j)) === 'hira'
+      ) {
+        while (j < src.length && !covered[j] && cjkScript(src.charAt(j)) === 'hira') j += 1;
+      }
+      const len = j - i;
+      const atomic = kind !== 'han' || len <= 8;
+      if (atomic) {
+        for (let k = i; k < j; k++) covered[k] = true;
+        atoms.push({ start: i, end: j });
+      }
+      i = j;
+    }
+    atoms.sort((a, b) => a.start - b.start);
+    const out = [];
+    let cursor = 0;
+    atoms.forEach((span) => {
+      if (span.start > cursor) out.push({ text: src.slice(cursor, span.start), atom: false });
+      out.push({ text: src.slice(span.start, span.end), atom: true });
+      cursor = span.end;
+    });
+    if (cursor < src.length) out.push({ text: src.slice(cursor), atom: false });
+    return out.filter((seg) => seg.text);
+  }
+
+  function setProtectedText(el, text, keywords) {
+    if (!el) return;
+    el.textContent = '';
+    segmentDisplayText(text, keywords).forEach((seg) => {
+      const span = document.createElement('span');
+      if (seg.atom) span.className = 'cjk-atom';
+      span.textContent = seg.text;
+      el.appendChild(span);
+    });
+  }
+
+  /** Gallery mains (single or each multi-image slot). Candidates and related slides do not. */
+  function workShowsKeywordChips(work) {
+    const line = String((work && work.line) || 'main');
+    return line === 'main' || line === 'multi';
+  }
+
   function copyKeywordFields(work, src) {
     if (!work || !src) return work;
     if (!work.themeKeywords || !work.themeKeywords.length) {
@@ -674,6 +775,8 @@
       matchedKeywords: normalizeKeywordList(
         raw.matched_keywords || raw.matchedKeywords || raw.hit_keywords || raw.hitKeywords
       ),
+      visualMismatch: !!(raw.visual_mismatch || raw.visualMismatch),
+      visualNote: String(raw.visual_note || raw.visualNote || '').trim(),
     };
   }
 
@@ -1251,39 +1354,56 @@
 
     const meta = document.createElement('div');
     meta.className = 'card-meta';
-    const lineClass = w.line === 'multi' ? ' card-line line-multi' : ' card-line';
+    const keywords = w.themeKeywords || w.theme_keywords;
+    const codeEl = document.createElement('p');
+    codeEl.className = 'card-code';
+    codeEl.textContent = w.code || '';
+    meta.appendChild(codeEl);
+    const titleEl = document.createElement('p');
+    titleEl.className = 'card-title';
+    setProtectedText(titleEl, formatDisplayTitle(w.title, w.titleZh), keywords);
+    meta.appendChild(titleEl);
+    if (w.actress || w.studio) {
+      const actressEl = document.createElement('p');
+      actressEl.className = 'card-actress';
+      actressEl.textContent = w.actress
+        ? '女優：' + w.actress + (w.studio ? ' · ' + w.studio : '')
+        : String(w.studio);
+      meta.appendChild(actressEl);
+    }
+    if (w.visualMismatch) {
+      const noteEl = document.createElement('p');
+      noteEl.className = 'card-visual-note';
+      setProtectedText(
+        noteEl,
+        w.visualNote || '未核對圖片（人物／衣服／姿勢與這張上傳圖不符）',
+        keywords
+      );
+      meta.appendChild(noteEl);
+    }
     const badge = opts.badgeLabel || lineLabel(w.line);
     const hitKeywords =
       badge === '關鍵字'
         ? normalizeKeywordList(w.matchedKeywords || w.matched_keywords || w.hitKeywords || w.hit_keywords)
         : [];
-    const hitHtml = hitKeywords.length
-      ? '<span class="card-hit-keywords">' +
-        hitKeywords
-          .map((kw) => '<span class="card-hit-kw">' + escapeHtml(kw) + '</span>')
-          .join('') +
-        '</span>'
-      : '';
-    meta.innerHTML =
-      '<p class="card-code">' +
-      escapeHtml(w.code) +
-      '</p>' +
-      '<p class="card-title">' +
-      escapeHtml(formatDisplayTitle(w.title, w.titleZh)) +
-      '</p>' +
-      (w.actress
-        ? '<p class="card-actress">女優：' + escapeHtml(w.actress) + (w.studio ? ' · ' + escapeHtml(w.studio) : '') + '</p>'
-        : w.studio
-          ? '<p class="card-actress">' + escapeHtml(w.studio) + '</p>'
-          : '') +
-      '<span class="card-badge-row">' +
-      '<span class="' +
-      lineClass.trim() +
-      '">' +
-      escapeHtml(badge) +
-      '</span>' +
-      hitHtml +
-      '</span>';
+    const badgeRow = document.createElement('span');
+    badgeRow.className = 'card-badge-row';
+    const badgeEl = document.createElement('span');
+    badgeEl.className = w.line === 'multi' ? 'card-line line-multi' : 'card-line';
+    badgeEl.textContent = badge;
+    badgeRow.appendChild(badgeEl);
+    if (hitKeywords.length) {
+      const hitWrap = document.createElement('span');
+      hitWrap.className = 'card-hit-keywords';
+      hitKeywords.forEach((kw) => {
+        const hit = document.createElement('span');
+        hit.className = 'card-hit-kw';
+        hit.textContent = kw;
+        hitWrap.appendChild(hit);
+      });
+      badgeRow.appendChild(hitWrap);
+    }
+    meta.appendChild(badgeRow);
 
     const coverWrap = document.createElement('div');
     coverWrap.className = 'cover-wrap';
@@ -2357,12 +2477,15 @@
       mainWork.themeKeywords || mainWork.theme_keywords
     );
     if (related.length) {
-      hint.textContent =
+      setProtectedText(
+        hint,
         '左右滑 · 主作品 ↔️ 相關（' +
-        relatedHeadingForList(related, themeKeywords) +
-        '）· ' +
-        total +
-        ' 張';
+          relatedHeadingForList(related, themeKeywords) +
+          '）· ' +
+          total +
+          ' 張',
+        themeKeywords
+      );
     } else {
       hint.textContent = '主作品（尚無相關可左右滑）';
     }
@@ -2418,7 +2541,7 @@
     mainSection.appendChild(track);
     mainSection.appendChild(head);
     block.appendChild(mainSection);
-    if (String((mainWork && mainWork.line) || 'main') === 'main') {
+    if (workShowsKeywordChips(mainWork)) {
       mountKeywordResearch(block, mainWork, related, themeKeywords);
     }
     return block;
@@ -2442,9 +2565,11 @@
     panel.className = 'kw-related-panel';
     const label = document.createElement('div');
     label.className = 'kw-related-label';
-    label.textContent = keywords.length
-      ? formatKeywordListLabel('關鍵字相關', keywords)
-      : '關鍵字相關';
+    setProtectedText(
+      label,
+      keywords.length ? formatKeywordListLabel('關鍵字相關', keywords) : '關鍵字相關',
+      keywords
+    );
     panel.appendChild(label);
 
     const research = document.createElement('div');
@@ -2471,7 +2596,7 @@
       const headText = formatKeywordListLabel('關鍵字再搜', picked);
       research.hidden = false;
       if (state.loading) {
-        researchLabel.textContent = headText + ' · 搜尋中…';
+        setProtectedText(researchLabel, headText + ' · 搜尋中…', picked);
         researchTrack.innerHTML = '';
         researchTrack.hidden = true;
         return;
@@ -2480,14 +2605,14 @@
       researchTrack.innerHTML = '';
       const items = state.items || [];
       if (state.error) {
-        researchLabel.textContent = headText + ' · 再搜失敗';
+        setProtectedText(researchLabel, headText + ' · 再搜失敗', picked);
         return;
       }
       if (!items.length) {
-        researchLabel.textContent = headText + ' · 沒有符合的作品';
+        setProtectedText(researchLabel, headText + ' · 沒有符合的作品', picked);
         return;
       }
-      researchLabel.textContent = headText;
+      setProtectedText(researchLabel, headText, picked);
       items.slice(0, KEYWORD_RESEARCH_CAP).forEach((raw) => {
         const w = workFromApi(raw, 'keyword');
         const slide = document.createElement('div');
@@ -3114,6 +3239,8 @@
         related_by_title: w.related || [],
         theme_keywords: normalizeKeywordList(w.theme_keywords || w.themeKeywords),
         keyword_queries: normalizeKeywordList(w.keyword_queries || w.keywordQueries),
+        visual_mismatch: !!(w.visual_mismatch || w.visualMismatch),
+        visual_note: String(w.visual_note || w.visualNote || '').trim(),
         line: i === 0 ? 'main' : (w.line || 'multi'),
       })),
     };
@@ -3834,6 +3961,8 @@
       formatDisplayTitle,
       formatCodeTitleClipboard,
       formatKeywordListLabel,
+      segmentDisplayText,
+      workShowsKeywordChips,
       normalizeKeywordList,
       workNeedsThemeKeywords,
       historyRecordIsOpenable,

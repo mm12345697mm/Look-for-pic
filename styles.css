@@ -317,8 +317,26 @@ label.btn {
 .card-title {
   margin: 0 0 6px;
   font-size: 0.92rem;
-  line-height: 1.4;
+  line-height: 1.45;
   color: var(--text);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: normal;
+  overflow-wrap: normal;
+  line-break: strict;
+}
+.card-visual-note {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  color: var(--danger);
+  word-break: normal;
+  overflow-wrap: normal;
+  line-break: strict;
+}
+.cjk-atom {
+  white-space: nowrap;
 }
 .card-actress {
   margin: 0;
@@ -1112,8 +1130,13 @@ body.lightbox-open {
 .work-carousel-hint {
   font-size: 0.78rem;
   color: var(--muted);
-  line-height: 1.35;
+  line-height: 1.45;
   flex: 1;
+  min-width: 0;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: normal;
+  line-break: strict;
 }
 .work-carousel-pager {
   flex: 0 0 auto;
@@ -1249,8 +1272,12 @@ body.lightbox-open {
 .kw-related-label {
   font-size: 0.78rem;
   color: var(--muted);
-  line-height: 1.35;
+  line-height: 1.45;
   margin: 0 0 6px;
+  white-space: normal;
+  word-break: normal;
+  overflow-wrap: normal;
+  line-break: strict;
 }
 .kw-chip-row {
   display: flex;

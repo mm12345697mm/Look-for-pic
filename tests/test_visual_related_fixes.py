@@ -2321,5 +2321,208 @@ class TestActressQueryKeep(unittest.TestCase):
         )
 
 
+class TestTitleCutAndMultiVisual(unittest.TestCase):
+    """Japanese titles stay whole, and each multi-image slot re-checks itself."""
+
+    FULL_JA = (
+        "息子からの母親不倫NTR告白 ママ不倫してるよ？"
+        "可憐な妻が息子の家庭教師の絶倫チ●ポにナマでイカされて何度も何度も中出しに溺れて… 弥生みづき"
+    )
+    BUS_TITLE = "夜行バスで激ヤバ合体ロングスカート内でこっそり挿入しちゃう小悪魔女子"
+
+    def test_choose_display_title_keeps_catalog_when_vision_is_cut(self):
+        cut = self.FULL_JA.split("イカされて")[0] + "…"
+        self.assertTrue(cut.endswith("…"))
+        self.assertNotIn("弥生みづき", cut)
+        self.assertEqual(S.choose_display_title(self.FULL_JA, cut), self.FULL_JA)
+        kept = S.apply_vision_meta({"title": self.FULL_JA, "ok": True}, {"title": cut})
+        self.assertEqual(kept.get("title"), self.FULL_JA)
+        self.assertFalse(kept.get("title_zh"))
+        # Official internal ellipsis is not a cut.
+        self.assertEqual(S.choose_display_title(self.FULL_JA, self.FULL_JA), self.FULL_JA)
+        # A longer vision read still wins over a short catalog string.
+        self.assertEqual(S.choose_display_title("短い題", self.FULL_JA), self.FULL_JA)
+        # No Chinese is invented when title_zh is absent.
+        self.assertEqual(S.choose_display_title(self.FULL_JA, None), self.FULL_JA)
+
+    def test_unlocked_slot_is_marked_unverified_with_its_own_keywords(self):
+        reject = {
+            "same_work": False,
+            "confidence": 0.2,
+            "match_person": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            self.assertEqual(user, b"bus-image")
+            ranked = []
+            for c in cands:
+                item = dict(c)
+                item["visual"] = dict(reject)
+                item["visual_score"] = 0.15
+                ranked.append(item)
+            return ranked, {
+                "visual_ranked": True,
+                "visual_lock": False,
+                "note": "僅排序未鎖定（封面與劇照皆未同時符合同一作品與衣服）",
+                "compared": len(ranked),
+            }
+
+        with mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank), mock.patch.object(
+            S, "search_by_title", return_value=None
+        ):
+            out = S.verify_work_against_image(
+                {
+                    "ok": True,
+                    "code": "NHDTC-254",
+                    "title": self.BUS_TITLE,
+                    "actress": "中城葵",
+                    "cover": "https://example.com/bus.jpg",
+                    "stills": ["https://example.com/bus-s.jpg"],
+                },
+                b"bus-image",
+                api_key="test-key",
+                vision_title="夜行バス…",
+            )
+        self.assertFalse(out.get("visual_lock"))
+        self.assertTrue(out.get("visual_mismatch"))
+        self.assertIn("未核對圖片", out.get("visual_note") or "")
+        self.assertIn("夜行バス", out.get("theme_keywords") or [])
+        self.assertNotIn("家庭教師", out.get("theme_keywords") or [])
+        self.assertNotIn("息子", out.get("theme_keywords") or [])
+
+    def test_multi_rechecks_each_image_and_keeps_separate_keywords(self):
+        img1 = b"tutor-image"
+        img2 = b"bus-image"
+        rank_calls = []
+        searches = []
+        lock = {
+            "same_work": True,
+            "confidence": 0.93,
+            "match_person": True,
+            "match_face": True,
+            "match_accessories": True,
+            "match_clothes": True,
+            "match_pose": True,
+        }
+        reject = {
+            "same_work": False,
+            "confidence": 0.2,
+            "match_person": False,
+            "match_clothes": False,
+            "match_pose": False,
+        }
+
+        def fake_vision(image_bytes, mime, api_key):
+            if image_bytes == img1:
+                return {"code": "HMN-419", "title": self.FULL_JA.split("イカされて")[0] + "…"}
+            return {"code": "NHDTC-254", "title": "夜行バスでこっそり…"}
+
+        def fake_pipe(**kwargs):
+            self.assertIsNone(kwargs.get("image_bytes"))
+            code = str(kwargs.get("user_code") or "")
+            if code.startswith("HMN"):
+                return {
+                    "ok": True,
+                    "code": "HMN-419",
+                    "title": self.FULL_JA,
+                    "actress": "弥生みづき",
+                    "studio": "本中",
+                    "cover": "https://example.com/t.jpg",
+                    "stills": ["https://example.com/t-s.jpg"],
+                    "candidates": [],
+                }, 200
+            return {
+                "ok": True,
+                "code": "NHDTC-254",
+                "title": "全然違う家庭教師の作品です",
+                "actress": "別人",
+                "studio": "ナチュラルハイ",
+                "cover": "https://example.com/bad.jpg",
+                "stills": ["https://example.com/bad-s.jpg"],
+                "candidates": [],
+            }, 200
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            rank_calls.append({"image": user, "codes": [c.get("code") for c in cands]})
+            ranked = []
+            for c in cands:
+                item = dict(c)
+                code = str(item.get("code") or "")
+                take = (user == img1 and code == "HMN-419") or (user == img2 and code == "NHDTC-099")
+                item["visual"] = dict(lock if take else reject)
+                item["visual_score"] = 0.91 if take else 0.12
+                ranked.append(item)
+            ranked.sort(
+                key=lambda it: (
+                    1 if (it.get("visual") or {}).get("match_clothes") and (it.get("visual") or {}).get("same_work") else 0,
+                    float(it.get("visual_score") or 0),
+                ),
+                reverse=True,
+            )
+            best = (ranked[0].get("visual") if ranked else {}) or {}
+            locked = bool(best.get("same_work") and best.get("match_clothes"))
+            return ranked, {
+                "visual_ranked": True,
+                "visual_lock": locked,
+                "note": "已對照使用者原圖（視覺鎖定）" if locked else "僅排序未鎖定",
+                "compared": len(ranked),
+                "note_stills": True,
+            }
+
+        def fake_search(title, actress=None):
+            searches.append(str(title or ""))
+            if "夜行バス" not in str(title or ""):
+                return None
+            hit = {
+                "code": "NHDTC-099",
+                "title": self.BUS_TITLE,
+                "actress": "中城葵",
+                "studio": "ナチュラルハイ",
+                "cover": "https://example.com/good.jpg",
+                "stills": ["https://example.com/good-s.jpg"],
+            }
+            return {"ok": True, **hit, "candidates": [dict(hit)]}
+
+        def fake_attach(result, **kwargs):
+            S._recompute_theme_keywords(result)
+            result["related_by_title"] = list(result.get("related_by_title") or [])
+            return result
+
+        with mock.patch.object(S, "get_gemini_api_key", return_value="test-key"), mock.patch.object(
+            S, "call_gemini_vision", side_effect=fake_vision
+        ), mock.patch.object(S, "run_identify_pipeline", side_effect=fake_pipe), mock.patch.object(
+            S, "rank_candidates_by_visual", side_effect=fake_rank
+        ), mock.patch.object(S, "search_by_title", side_effect=fake_search), mock.patch.object(
+            S, "attach_related_by_title", side_effect=fake_attach
+        ):
+            payload, status = S.run_multi_identify_pipeline([(img1, "a.jpg"), (img2, "b.jpg")])
+
+        self.assertEqual(status, 200)
+        results = payload.get("results") or []
+        self.assertEqual(len(results), 2)
+        self.assertEqual(results[0].get("code"), "HMN-419")
+        self.assertEqual(results[0].get("title"), self.FULL_JA)
+        self.assertFalse(results[0].get("title_zh"))
+        self.assertTrue(results[0].get("visual_lock"))
+        self.assertFalse(results[0].get("visual_mismatch"))
+        self.assertIn("家庭教師", results[0].get("theme_keywords") or [])
+        self.assertNotIn("夜行バス", results[0].get("theme_keywords") or [])
+        self.assertEqual(results[1].get("code"), "NHDTC-099")
+        self.assertEqual(results[1].get("title"), self.BUS_TITLE)
+        self.assertFalse(results[1].get("title_zh"))
+        self.assertTrue(results[1].get("visual_lock"))
+        self.assertIn("夜行バス", results[1].get("theme_keywords") or [])
+        self.assertNotIn("家庭教師", results[1].get("theme_keywords") or [])
+        self.assertNotIn("息子", results[1].get("theme_keywords") or [])
+        images = [c["image"] for c in rank_calls]
+        self.assertIn(img1, images)
+        self.assertIn(img2, images)
+        self.assertTrue(all("夜行バス" in q for q in searches), searches)
+        self.assertTrue(all("家庭教師" not in q for q in searches), searches)
+        self.assertTrue(any(c["image"] == img2 and "NHDTC-099" in c["codes"] for c in rank_calls))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
