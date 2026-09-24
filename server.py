@@ -2808,6 +2808,7 @@ def enrich_title_candidate(c: dict, why: str = "片名候選") -> dict:
         "title": (str(c.get("title") or "").strip() or None),
         "title_zh": title_zh,
         "actress": (str(c.get("actress") or "").strip() or None),
+        "actress_zh": (str(c.get("actress_zh") or c.get("actressZh") or "").strip() or None),
         "studio": (str(c.get("studio") or "").strip() or None),
         "cid": cid or None,
         "cover": cover or None,
@@ -4997,6 +4998,7 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "title": it.get("title"),
                 "title_zh": it.get("title_zh"),
                 "actress": it.get("actress"),
+                "actress_zh": it.get("actress_zh"),
                 "cover": it.get("cover"),
                 "cid": it.get("cid"),
                 "line": it.get("line"),
@@ -5355,6 +5357,7 @@ def _merge_related_for_cache(prev_items, new_items) -> list:
             "title",
             "title_zh",
             "actress",
+            "actress_zh",
             "cover",
             "cid",
             "line",
@@ -5627,6 +5630,7 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "title": payload.get("title"),
         "title_zh": payload.get("title_zh"),
         "actress": payload.get("actress"),
+        "actress_zh": payload.get("actress_zh"),
         "studio": payload.get("studio"),
         "cid": payload.get("cid"),
         "cover": payload.get("cover") if usable_cover_url(payload.get("cover")) else None,
@@ -6093,23 +6097,33 @@ def identify_code(
     )
 
     title_zh = None
+    actress_zh = None
+    catalog_zh: dict = {}
     try:
-        # Prefer Chinese from online meta if present
+        # Prefer Chinese already on the primary hit. A mismatched vision
+        # phrase must not keep that other work's Chinese line.
         if meta and isinstance(meta, dict):
             title_zh = meta.get("title_zh")
+            actress_zh = meta.get("actress_zh") or meta.get("actressZh")
         if (
             catalog_title
             and title
             and not _titles_are_same_phrase(str(catalog_title), str(title))
         ):
             title_zh = None
+            actress_zh = None
         title_zh = resolve_chinese_title(
             display,
             title_ja=title,
             existing_zh=title_zh,
+            actress_ja=actress,
+            catalog_out=catalog_zh,
         )
+        if not str(actress_zh or "").strip():
+            actress_zh = catalog_zh.get("actress_zh")
     except Exception:
         title_zh = None
+        actress_zh = None
 
     out = {
         "ok": True,
@@ -6117,6 +6131,7 @@ def identify_code(
         "title": title,
         "title_zh": title_zh,
         "actress": actress,
+        "actress_zh": actress_zh,
         "studio": studio,
         "cid": cid,
         "cover": cover,
@@ -6899,7 +6914,7 @@ def _clean_title_zh(raw: str | None, *, title_ja: str | None = None, code: str |
     # Strip site name suffixes only (avoid eating 品番 hyphens like NHDTC-099)
     t = re.sub(r"\s*[\|／/]\s*.{0,40}$", "", t).strip()
     t = re.sub(
-        r"\s+[\-–—]\s*(MissAV|JAVLibrary|JavBus|AVBase|FANZA|DMM).*$",
+        r"\s+[\-–—]\s*(MissAV|JAVLibrary|JavBus|AVBase|FANZA|DMM|Jable(?:\.TV)?).*$",
         "",
         t,
         flags=re.I,
@@ -6933,49 +6948,181 @@ def _clean_title_zh(raw: str | None, *, title_ja: str | None = None, code: str |
     return t
 
 
-def fetch_missav_chinese_title(code: str) -> str | None:
-    """Best-effort Chinese title from MissAV public HTML (no magnets)."""
-    if not code or not parse_code_parts(str(code)):
+_ACTRESS_CHROME = frozenset(
+    {
+        "女優",
+        "演员",
+        "演員",
+        "女优",
+        "發行商",
+        "发行商",
+        "廠商",
+        "系列",
+        "標籤",
+        "标签",
+        "類別",
+        "类别",
+        "導演",
+        "导演",
+    }
+)
+_ACTRESS_HREF_RE = re.compile(
+    r'<a\b[^>]*\bhref=["\'][^"\']*(?:actresses|models|stars)/[^"\']*["\'][^>]*>(.*?)</a>',
+    re.I | re.S,
+)
+_ZH_CATALOG_FETCH_CAP = 4
+
+
+def _clean_actress_zh(
+    raw: str | None,
+    *,
+    actress_ja: str | None = None,
+    title_zh: str | None = None,
+) -> str | None:
+    """Chinese billing from a catalog page. Kana, site chrome, and guesses are dropped."""
+    import html as _html
+
+    t = _html.unescape(re.sub(r"<[^>]+>", "", raw or ""))
+    t = re.sub(r"\s+", "", t).strip(" -\u3000:：")
+    if not t or len(t) < 2 or len(t) > 16:
         return None
+    if re.search(r"[\u3040-\u30ff]", t):
+        return None
+    if re.search(r"[A-Za-z0-9]", t):
+        return None
+    if t in _ACTRESS_CHROME or any(word in t for word in ("MissAV", "Jable", "JAVLibrary")):
+        return None
+    if any(word in t for word in _ACTRESS_CHROME):
+        return None
+    han = len(re.findall(r"[\u4e00-\u9fff]", t))
+    if han < 2 or han < len(t) * 0.8:
+        return None
+    # A title fragment (…的…) is not an actress billing.
+    if "的" in t:
+        return None
+    if title_zh and t == re.sub(r"\s+", "", str(title_zh)):
+        return None
+    ja = re.sub(r"\s+", "", (actress_ja or "").strip())
+    if ja and t == ja:
+        return None
+    return t
+
+
+def _actress_names_from_html(
+    html: str | None,
+    *,
+    actress_ja: str | None = None,
+    title_zh: str | None = None,
+) -> str | None:
+    """First Chinese names linked as actress / model on a MissAV, Jable, or JAVLibrary page."""
+    names: list[str] = []
+    seen: set[str] = set()
+
+    def add(raw: str | None) -> None:
+        if len(names) >= 3:
+            return
+        text = re.sub(r"<img\b[^>]*>", " ", raw or "", flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+        parts = re.split(r"[・·,/／&＆]", text)
+        if len(parts) == 1:
+            parts = [text]
+        for part in parts:
+            name = _clean_actress_zh(part, actress_ja=actress_ja, title_zh=title_zh)
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+            if len(names) >= 3:
+                return
+
+    page = html or ""
+    for m in _ACTRESS_HREF_RE.finditer(page):
+        add(m.group(1))
+        if len(names) >= 3:
+            break
+    if not names:
+        for m in re.finditer(r'class="star"[^>]*>\s*<a[^>]*>([^<]+)</a>', page, flags=re.I | re.S):
+            add(m.group(1))
+            if len(names) >= 3:
+                break
+    if not names:
+        for m in re.finditer(r'"actor"\s*:\s*(\{[^{}]*\}|\[[^\[\]]*\])', page, flags=re.S):
+            for nm in re.finditer(r'"name"\s*:\s*"([^"]+)"', m.group(1)):
+                add(nm.group(1))
+                if len(names) >= 3:
+                    break
+    if not names:
+        return None
+    return "・".join(names)
+
+
+def _html_title_candidates(html: str | None) -> list[str]:
+    out: list[str] = []
+    for pat in (
+        r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
+        r'content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']',
+        r"<h1[^>]*>(.*?)</h1>",
+        r"<title[^>]*>([^<]+)</title>",
+    ):
+        m = re.search(pat, html or "", flags=re.I | re.S)
+        if not m:
+            continue
+        raw = re.sub(r"<[^>]+>", " ", m.group(1))
+        raw = re.sub(r"\s+", " ", raw).strip()
+        if raw:
+            out.append(raw)
+    return out
+
+
+def _parse_zh_catalog_html(
+    html: str | None,
+    *,
+    code: str,
+    actress_ja: str | None = None,
+    title_ja: str | None = None,
+) -> tuple[str | None, str | None]:
+    title_zh = None
+    for raw in _html_title_candidates(html):
+        title_zh = _clean_title_zh(raw, title_ja=title_ja, code=code)
+        if title_zh:
+            break
+    actress_zh = _actress_names_from_html(html, actress_ja=actress_ja, title_zh=title_zh)
+    return title_zh, actress_zh
+
+
+def _zh_catalog_page_urls(code: str) -> list[str]:
+    """MissAV /cn/ and Jable first, then the older MissAV work URL."""
     disp = format_display_code(str(code))
+    if not disp:
+        return []
     slugs = [disp.lower()]
     alt = code_stripped_form(disp)
-    if alt:
+    if alt and alt.lower() not in slugs:
         slugs.append(alt.lower())
-    host_bases = (
-        "https://missav.ai",
-        "https://missav.ws",
-        "https://missav.live",
-    )
-    for slug in slugs:
-        for host in host_bases:
-            url = f"{host}/{slug}"
-            html = http_get(url, timeout=8.0)
-            if not html:
-                continue
-            # og:title / h1 often: "CODE 中文标题" or "中文标题 - CODE"
-            for pat in (
-                r'property=["\']og:title["\'][^>]*content=["\']([^"\']+)',
-                r'content=["\']([^"\']+)["\'][^>]*property=["\']og:title["\']',
-                r"<h1[^>]*>(.*?)</h1>",
-                r"<title[^>]*>([^<]+)</title>",
-            ):
-                m = re.search(pat, html, flags=re.I | re.S)
-                if not m:
-                    continue
-                raw = re.sub(r"<[^>]+>", "", m.group(1))
-                zh = _clean_title_zh(raw, code=disp)
-                if zh:
-                    return zh
-    return None
+    first = slugs[0]
+    urls = [
+        f"https://missav.ai/cn/{first}",
+        f"https://jable.tv/videos/{first}/",
+    ]
+    if len(slugs) > 1:
+        urls.append(f"https://missav.ai/cn/{slugs[1]}")
+        urls.append(f"https://jable.tv/videos/{slugs[1]}/")
+    urls.append(f"https://missav.ai/{first}")
+    urls.append(f"https://missav.ws/cn/{first}")
+    return urls
 
 
-def fetch_javlibrary_chinese_title(code: str) -> str | None:
-    """Best-effort Chinese title from JAVLibrary CN search/detail."""
+def _fetch_javlibrary_zh_pair(
+    code: str,
+    *,
+    actress_ja: str | None = None,
+    title_ja: str | None = None,
+) -> tuple[str | None, str | None]:
+    """Chinese title and actress from one JAVLibrary CN search/detail page."""
     from urllib.parse import quote
 
     if not code or not parse_code_parts(str(code)):
-        return None
+        return None, None
     disp = format_display_code(str(code))
     keywords = [disp]
     alt = code_stripped_form(disp)
@@ -6986,30 +7133,106 @@ def fetch_javlibrary_chinese_title(code: str) -> str | None:
         html = http_get(url, timeout=8.0, headers={"Referer": "https://www.javlibrary.com/cn/"})
         if not html:
             continue
-        # Direct detail redirect page
+        title_zh = None
         tm = re.search(r'id="video_title".*?<a[^>]*>([^<]+)</a>', html, flags=re.I | re.S)
         if tm:
-            zh = _clean_title_zh(tm.group(1), code=disp)
-            if zh:
-                return zh
-        # Search result cards: title="CODE 中文..."
-        for m in re.finditer(
-            r'class="video"[^>]*>.*?title="([^"]+)"', html, flags=re.I | re.S
-        ):
-            raw = m.group(1)
-            blob = re.sub(r"[\s\-]", "", raw).upper()
-            if (
-                disp.replace("-", "").upper() not in blob
-                and disp.upper() not in raw.upper()
-                and (not alt or alt.replace("-", "").upper() not in blob)
+            title_zh = _clean_title_zh(tm.group(1), title_ja=title_ja, code=disp)
+        if not title_zh:
+            for m in re.finditer(
+                r'class="video"[^>]*>.*?title="([^"]+)"', html, flags=re.I | re.S
             ):
-                # still accept if starts with code-ish
-                if not re.match(re.escape(disp.split("-")[0]), raw, flags=re.I):
-                    continue
-            zh = _clean_title_zh(raw, code=disp)
-            if zh:
-                return zh
-    return None
+                raw = m.group(1)
+                blob = re.sub(r"[\s\-]", "", raw).upper()
+                if (
+                    disp.replace("-", "").upper() not in blob
+                    and disp.upper() not in raw.upper()
+                    and (not alt or alt.replace("-", "").upper() not in blob)
+                ):
+                    if not re.match(re.escape(disp.split("-")[0]), raw, flags=re.I):
+                        continue
+                title_zh = _clean_title_zh(raw, title_ja=title_ja, code=disp)
+                if title_zh:
+                    break
+        if title_zh:
+            actress_zh = _actress_names_from_html(
+                html, actress_ja=actress_ja, title_zh=title_zh
+            )
+            return title_zh, actress_zh
+    return None, None
+
+
+def fetch_javlibrary_chinese_title(code: str) -> str | None:
+    """Best-effort Chinese title from JAVLibrary CN search/detail."""
+    title, _actress = _fetch_javlibrary_zh_pair(code)
+    return title
+
+
+def fetch_public_zh_catalog(
+    code: str,
+    *,
+    actress_ja: str | None = None,
+    title_ja: str | None = None,
+) -> dict:
+    """品番 lookup for a Chinese title and actress name.
+
+    MissAV /cn/ and Jable supply 品番 + 中文標題 (and a Chinese billing when the
+    page has one). JAVLibrary CN is the fallback already used for titles.
+    Missing fields stay empty — nothing is translated or invented.
+    """
+    empty = {"title_zh": None, "actress_zh": None}
+    if not code or not parse_code_parts(str(code)):
+        return empty
+    disp = format_display_code(str(code))
+    title_zh = None
+    actress_zh = None
+    saw_cn = False
+    saw_jable = False
+    fetches = 0
+    for url in _zh_catalog_page_urls(disp):
+        if title_zh and actress_zh:
+            break
+        if title_zh and saw_cn and saw_jable:
+            break
+        if fetches >= _ZH_CATALOG_FETCH_CAP:
+            break
+        fetches += 1
+        if "/cn/" in url:
+            saw_cn = True
+        if "jable.tv" in url:
+            saw_jable = True
+        try:
+            html = http_get(url, timeout=8.0)
+        except Exception:
+            html = None
+        if not html:
+            continue
+        t, a = _parse_zh_catalog_html(
+            html, code=disp, actress_ja=actress_ja, title_ja=title_ja
+        )
+        if t and not title_zh:
+            title_zh = t
+        if a and not actress_zh:
+            actress_zh = a
+        if title_zh and actress_zh:
+            break
+        if title_zh and "jable.tv" in url:
+            break
+    if not title_zh:
+        try:
+            jt, ja_name = _fetch_javlibrary_zh_pair(
+                disp, actress_ja=actress_ja, title_ja=title_ja
+            )
+        except Exception:
+            jt, ja_name = None, None
+        title_zh = jt or title_zh
+        if ja_name and not actress_zh:
+            actress_zh = ja_name
+    return {"title_zh": title_zh, "actress_zh": actress_zh}
+
+
+def fetch_missav_chinese_title(code: str) -> str | None:
+    """Chinese title for a 品番 from MissAV / Jable / JAVLibrary. No magnets."""
+    return fetch_public_zh_catalog(code).get("title_zh")
 
 
 def resolve_chinese_title(
@@ -7018,12 +7241,18 @@ def resolve_chinese_title(
     title_ja: str | None = None,
     existing_zh: str | None = None,
     user_title: str | None = None,
+    actress_ja: str | None = None,
+    catalog_out: dict | None = None,
 ) -> str | None:
-    """Resolve Traditional/Simplified Chinese title from public catalogs.
+    """Resolve a Chinese title from public catalogs.
 
     Sources (public HTML only): existing payload → user Chinese query →
-    MissAV → JAVLibrary CN. No pirate/magnet links. Returns None if unavailable.
+    MissAV /cn/ and Jable by 品番 → JAVLibrary CN. No pirate/magnet links.
+    When catalog_out is a dict and this call scrapes, it receives actress_zh
+    from that same page. Returns None if no Chinese title was found.
     """
+    if isinstance(catalog_out, dict):
+        catalog_out.pop("actress_zh", None)
     zh = _clean_title_zh(existing_zh, title_ja=title_ja, code=code)
     if zh:
         return zh
@@ -7036,14 +7265,26 @@ def resolve_chinese_title(
         return None  # caller already showing Chinese as main title
     if not code or not parse_code_parts(str(code)):
         return None
-    for fetcher in (fetch_missav_chinese_title, fetch_javlibrary_chinese_title):
-        try:
-            zh = fetcher(str(code))
-        except Exception:
-            zh = None
-        if zh:
-            return zh
-    return None
+    try:
+        meta = fetch_public_zh_catalog(
+            str(code), actress_ja=actress_ja, title_ja=title_ja
+        )
+    except Exception:
+        meta = {}
+    if isinstance(catalog_out, dict) and meta.get("actress_zh"):
+        catalog_out["actress_zh"] = meta.get("actress_zh")
+    return meta.get("title_zh")
+
+
+def _apply_catalog_actress(item: dict, catalog_out: dict | None) -> None:
+    """Copy a scraped Chinese billing onto a work that does not have one yet."""
+    if not isinstance(item, dict) or not isinstance(catalog_out, dict):
+        return
+    if str(item.get("actress_zh") or "").strip():
+        return
+    name = catalog_out.get("actress_zh")
+    if name:
+        item["actress_zh"] = name
 
 
 def attach_chinese_titles(
@@ -7052,10 +7293,12 @@ def attach_chinese_titles(
     related_network: bool = True,
     related_budget_sec: float = 3.0,
 ) -> dict:
-    """Fill title_zh on main work (and optionally related) when missing.
+    """Fill title_zh (and actress_zh from the same 品番 page) when missing.
 
-    related_network=True: also try title_zh for related slides, but with a hard
-    wall-clock budget so MissAV/JAVLibrary stalls cannot wipe the whole identify.
+    related_network=True: also try related slides, but with a hard wall-clock
+    budget so MissAV/Jable/JAVLibrary stalls cannot wipe the whole identify.
+    Keyword chips are not filled here. Nothing is invented when a page has no
+    Chinese title or billing.
     """
     import time as _time
 
@@ -7065,17 +7308,22 @@ def attach_chinese_titles(
     if code and (str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code))):
         code = None
     if not payload.get("title_zh"):
+        catalog_out: dict = {}
         try:
             zh = resolve_chinese_title(
                 str(code) if code else None,
                 title_ja=payload.get("title"),
                 existing_zh=payload.get("title_zh"),
                 user_title=payload.get("user_title") or payload.get("query_title"),
+                actress_ja=payload.get("actress"),
+                catalog_out=catalog_out,
             )
         except Exception:
             zh = None
+            catalog_out = {}
         if zh:
             payload["title_zh"] = zh
+        _apply_catalog_actress(payload, catalog_out)
     t_rel0 = _time.monotonic()
     for key in ("related_by_title", "related"):
         items = payload.get(key)
@@ -7099,16 +7347,21 @@ def attach_chinese_titles(
             icode = item.get("code")
             if not icode or not parse_code_parts(str(icode)):
                 continue
+            catalog_out = {}
             try:
                 zh = resolve_chinese_title(
                     str(icode),
                     title_ja=item.get("title"),
                     existing_zh=item.get("title_zh"),
+                    actress_ja=item.get("actress"),
+                    catalog_out=catalog_out,
                 )
             except Exception:
                 zh = None
+                catalog_out = {}
             if zh:
                 item["title_zh"] = zh
+            _apply_catalog_actress(item, catalog_out)
     return payload
 
 

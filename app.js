@@ -148,6 +148,8 @@
       code: r.code || '',
       title: r.title || '',
       title_zh: r.title_zh || r.titleZh || '',
+      actress: r.actress || '',
+      actress_zh: r.actress_zh || r.actressZh || '',
       cover: r.cover || '',
       cid: r.cid || '',
       stills: Array.isArray(r.stills) ? r.stills.slice(0, 10) : [],
@@ -913,7 +915,7 @@
   function formatPersonName(nameJa, nameZh) {
     const ja = stripEmptyParens(nameJa);
     const zh = stripEmptyParens(nameZh);
-    if (!ja) return '';
+    if (!ja) return zh || '';
     if (!zh || zh === ja) return ja;
     if (ja.indexOf('（' + zh + '）') !== -1 || ja.indexOf('(' + zh + ')') !== -1) return ja;
     return ja + '（' + zh + '）';
