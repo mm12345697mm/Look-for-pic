@@ -155,8 +155,41 @@ def _is_owner_device() -> bool:
     return _hmac.compare_digest(got, _owner_cookie_value(tok))
 
 
+def _presented_owner_token() -> str:
+    header = (_request.headers.get("Authorization") or "").strip()
+    if header.lower().startswith("bearer "):
+        return header[7:].strip()
+    return (_request.headers.get("X-Owner-Token") or "").strip()
+
+
+def _bearer_owner_token_ok() -> bool:
+    expect = _owner_device_token()
+    supplied = _presented_owner_token()
+    if not expect or not supplied:
+        return False
+    return _hmac.compare_digest(supplied, expect)
+
+
+def _can_read_identify_sessions() -> bool:
+    """Owner cookie, owner token header, or a logged-in site session.
+
+    These records map private screenshots to catalog titles. A request that
+    merely reached an open local port is not enough once a token or password
+    is configured.
+    """
+    if _is_owner_device() or _bearer_owner_token_ok():
+        return True
+    if _session.get("site_ok") is True and _site_password():
+        return True
+    if not _site_password() and not _owner_device_token():
+        if (os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT")) and not os.environ.get("ALLOW_PUBLIC"):
+            return False
+        return True
+    return False
+
+
 def _is_authed() -> bool:
-    if _is_owner_device():
+    if _is_owner_device() or _bearer_owner_token_ok():
         return True
     pw = _site_password()
     if not pw:
@@ -214,6 +247,297 @@ def healthz():
         "private": bool(_site_password()),
         "owner_device": _is_owner_device(),
     })
+
+
+IDENTIFY_SESSION_MAX = 80
+_IDENTIFY_SESSIONS_PATH: Path | None = None
+_IDENTIFY_SESSIONS_LOCK = threading.Lock()
+
+
+def _identify_sessions_resolve_path() -> Path:
+    """Prefer data/identify-sessions.json; fall back to /tmp if data/ is not writable."""
+    global _IDENTIFY_SESSIONS_PATH
+    if _IDENTIFY_SESSIONS_PATH is not None:
+        return _IDENTIFY_SESSIONS_PATH
+    preferred = ROOT / "data" / "identify-sessions.json"
+    fallback = Path("/tmp/lfp-identify-sessions.json")
+    try:
+        preferred.parent.mkdir(parents=True, exist_ok=True)
+        probe = preferred.parent / ".identify-sessions-writetest"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        _IDENTIFY_SESSIONS_PATH = preferred
+    except Exception:
+        _IDENTIFY_SESSIONS_PATH = fallback
+    return _IDENTIFY_SESSIONS_PATH
+
+
+def _identify_sessions_read(path: Path) -> list[dict]:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except Exception:
+        return []
+    try:
+        data = json.loads(raw or "{}")
+    except Exception:
+        return []
+    rows = data.get("sessions") if isinstance(data, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [row for row in rows if isinstance(row, dict) and row.get("id")]
+
+
+def _identify_sessions_write(path: Path, sessions: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(
+        json.dumps({"sessions": sessions[:IDENTIFY_SESSION_MAX]}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    tmp.replace(path)
+
+
+def identify_session_put(record: dict) -> dict | None:
+    """Persist one identify session. Fail-soft: identify still succeeds if this cannot write."""
+    if not isinstance(record, dict) or not record.get("id"):
+        return None
+    path = _identify_sessions_resolve_path()
+    with _IDENTIFY_SESSIONS_LOCK:
+        try:
+            with open(path, "a+", encoding="utf-8") as lockf:
+                try:
+                    fcntl.flock(lockf.fileno(), fcntl.LOCK_EX)
+                except Exception:
+                    pass
+                sessions = _identify_sessions_read(path)
+                sessions = [row for row in sessions if row.get("id") != record["id"]]
+                sessions.insert(0, record)
+                _identify_sessions_write(path, sessions[:IDENTIFY_SESSION_MAX])
+            return record
+        except Exception:
+            return None
+
+
+def identify_session_list(limit: int = 20) -> list[dict]:
+    limit = max(1, min(int(limit or 20), IDENTIFY_SESSION_MAX))
+    path = _identify_sessions_resolve_path()
+    with _IDENTIFY_SESSIONS_LOCK:
+        rows = _identify_sessions_read(path)
+    return [_identify_session_public(row, full=False) for row in rows[:limit]]
+
+
+def identify_session_get(session_id: str) -> dict | None:
+    sid = (session_id or "").strip()
+    if not sid:
+        return None
+    path = _identify_sessions_resolve_path()
+    with _IDENTIFY_SESSIONS_LOCK:
+        for row in _identify_sessions_read(path):
+            if row.get("id") == sid:
+                return _identify_session_public(row, full=True)
+    return None
+
+
+def _identify_session_public(record: dict, *, full: bool) -> dict:
+    frames_in = [f for f in (record.get("frames") or []) if isinstance(f, dict)]
+    if full:
+        frames = frames_in
+    else:
+        frames = [
+            {
+                "index": f.get("index"),
+                "final_code": f.get("final_code"),
+                "final_title": f.get("final_title"),
+                "title_only": bool(f.get("title_only")),
+                "unidentified": bool(f.get("unidentified")),
+                "drop_reason": f.get("drop_reason"),
+                "visual_lock": bool(f.get("visual_lock")),
+            }
+            for f in frames_in
+        ]
+    return {
+        "id": record.get("id"),
+        "ts": record.get("ts"),
+        "created_at": record.get("created_at"),
+        "image_count": record.get("image_count") or 0,
+        "result_count": record.get("result_count") or 0,
+        "banner": record.get("banner") or "",
+        "message": record.get("message") or "",
+        "summary": record.get("summary") or "",
+        "frames": frames,
+    }
+
+
+def _new_session_id() -> str:
+    return "ses_" + time.strftime("%Y%m%d%H%M%S") + "_" + _secrets.token_hex(4)
+
+
+def _trace_title_only(slot: dict | None) -> bool:
+    if not isinstance(slot, dict) or slot.get("unidentified"):
+        return False
+    if slot.get("needs_code"):
+        return True
+    code = str(slot.get("code") or "").strip()
+    if not code or code == "TITLE-SEARCH" or not parse_code_parts(code):
+        return bool(str(slot.get("title") or "").strip())
+    return False
+
+
+def _frame_trace(row: dict, slot: dict | None, *, slot_pos: int | None, drop_reason: str | None) -> dict:
+    image = row.get("image_bytes")
+    digest = image_content_hash(image) if image else None
+    parsed = row.get("parsed_code") or row.get("code")
+    parsed_s = ""
+    if parsed and parse_code_parts(str(parsed)):
+        parsed_s = format_display_code(str(parsed))
+    final_code = ""
+    if isinstance(slot, dict):
+        raw_code = str(slot.get("code") or "").strip()
+        if raw_code == "TITLE-SEARCH":
+            final_code = "TITLE-SEARCH"
+        elif raw_code and parse_code_parts(raw_code):
+            final_code = format_display_code(raw_code)
+        else:
+            final_code = raw_code
+    return {
+        "index": row.get("index"),
+        "filename": row.get("filename") or None,
+        "fingerprint": digest,
+        "preview_ref": ("sha256:" + digest) if digest else None,
+        "vision_title": row.get("vision_title") or None,
+        "vision_code": row.get("vision_code") or None,
+        "ocr_title": row.get("ocr_title") or None,
+        "parsed_code": parsed_s or None,
+        "drop_reason": drop_reason,
+        "final_slot": slot_pos,
+        "final_code": final_code or None,
+        "final_title": (str(slot.get("title")).strip() if isinstance(slot, dict) and slot.get("title") else None),
+        "title_only": _trace_title_only(slot),
+        "unidentified": bool(isinstance(slot, dict) and slot.get("unidentified")),
+        "visual_lock": bool(isinstance(slot, dict) and slot.get("visual_lock")),
+        "needs_code": bool(isinstance(slot, dict) and slot.get("needs_code")),
+    }
+
+
+def _build_identify_session(payload: dict, frames: list[dict]) -> dict:
+    now = time.time()
+    image_count = int(payload.get("image_count") or len(frames) or 0)
+    result_count = int(payload.get("result_count") or len(payload.get("results") or []) or (1 if payload.get("ok") else 0))
+    banner = str(payload.get("related_note") or payload.get("message") or "").strip()
+    summary = f"{image_count} 張上傳 → {result_count} 部結果"
+    return {
+        "id": _new_session_id(),
+        "ts": now,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+        "image_count": image_count,
+        "result_count": result_count,
+        "banner": banner,
+        "message": str(payload.get("message") or "").strip(),
+        "summary": summary,
+        "frames": frames,
+    }
+
+
+def _attach_saved_session(payload: dict, frames: list[dict]) -> dict:
+    if not isinstance(payload, dict):
+        return payload
+    try:
+        record = _build_identify_session(payload, frames)
+        saved = identify_session_put(record)
+        if not saved:
+            return payload
+        payload["session_id"] = saved["id"]
+        payload["identify_session"] = _identify_session_public(saved, full=True)
+    except Exception:
+        pass
+    return payload
+
+
+def _frames_from_multi(vision_rows: list[dict], results: list[dict]) -> list[dict]:
+    """One trace row per upload, in upload order, after merge."""
+    placed: dict[int, tuple[int, dict, str | None]] = {}
+    for pos, slot in enumerate(results or [], start=1):
+        if not isinstance(slot, dict):
+            continue
+        host = slot.get("from_image_index")
+        indexes = []
+        if host is not None:
+            indexes.append(host)
+        for extra in slot.get("merged_image_indexes") or []:
+            if extra not in indexes:
+                indexes.append(extra)
+        for idx in indexes:
+            try:
+                key = int(idx)
+            except (TypeError, ValueError):
+                continue
+            reason = None
+            if host is not None and key != int(host) and key in {
+                int(n) for n in (slot.get("merged_image_indexes") or []) if isinstance(n, int) or str(n).isdigit()
+            }:
+                reason = "merged_same_work"
+            placed[key] = (pos, slot, reason)
+    frames = []
+    for row in vision_rows or []:
+        try:
+            key = int(row.get("index"))
+        except (TypeError, ValueError):
+            key = None
+        hit = placed.get(key) if key is not None else None
+        if hit is None:
+            frames.append(_frame_trace(row, None, slot_pos=None, drop_reason="no_slot"))
+        else:
+            pos, slot, reason = hit
+            frames.append(_frame_trace(row, slot, slot_pos=pos, drop_reason=reason))
+    return frames
+
+
+def _frames_from_single(payload: dict, images: list[tuple[bytes, str | None]]) -> list[dict]:
+    blob = images[0][0] if images else None
+    name = images[0][1] if images else None
+    row = {
+        "index": 1,
+        "filename": name,
+        "image_bytes": blob,
+        "vision_title": payload.get("read_title") or None,
+        "vision_code": payload.get("read_code") or None,
+        "ocr_title": payload.get("read_ocr_title") or None,
+        "parsed_code": payload.get("code"),
+    }
+    return [_frame_trace(row, payload, slot_pos=1 if payload.get("ok") else None, drop_reason=None)]
+
+
+def _ensure_identify_session(payload: dict, images: list[tuple[bytes, str | None]]) -> dict:
+    if not isinstance(payload, dict) or payload.get("session_id"):
+        return payload
+    image_count = len(images or [])
+    payload.setdefault("image_count", image_count or (1 if payload.get("ok") else 0))
+    if not payload.get("result_count"):
+        payload["result_count"] = len(payload.get("results") or []) or (1 if payload.get("ok") else 0)
+    return _attach_saved_session(payload, _frames_from_single(payload, images or []))
+
+
+@app.get("/api/owner/identify-sessions")
+def owner_identify_sessions():
+    if not _can_read_identify_sessions():
+        return jsonify({"ok": False, "message": "需要主人登入才能讀取辨識紀錄"}), 401
+    try:
+        limit = int(request.args.get("limit") or 20)
+    except (TypeError, ValueError):
+        limit = 20
+    return jsonify({"ok": True, "sessions": identify_session_list(limit)})
+
+
+@app.get("/api/owner/identify-sessions/<session_id>")
+def owner_identify_session_detail(session_id: str):
+    if not _can_read_identify_sessions():
+        return jsonify({"ok": False, "message": "需要主人登入才能讀取辨識紀錄"}), 401
+    row = identify_session_get(session_id)
+    if not row:
+        return jsonify({"ok": False, "message": "找不到這筆辨識紀錄"}), 404
+    return jsonify({"ok": True, "session": row})
 
 
 @app.route("/d/<token>")
@@ -7872,6 +8196,9 @@ def run_multi_identify_pipeline(
                     row["code"] = best
             except Exception:
                 pass
+        if row.get("vision_used"):
+            row["vision_code"] = str(row["code"]) if row.get("code") else None
+            row["vision_title"] = str(row["title"]) if row.get("title") else None
         # Vision can "succeed" with an empty read (a still, a tight crop).
         # OCR is the alternate path; the frame is still kept if both miss.
         if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))) and not is_usable_title(row.get("title")):
@@ -7889,6 +8216,7 @@ def run_multi_identify_pipeline(
             if not is_usable_title(row.get("title")):
                 ocr_title = _title_from_ocr_text(ocr_text)
                 if ocr_title:
+                    row["ocr_title"] = ocr_title
                     row["title"] = ocr_title
         # This cover may already have succeeded on its own. A multi pass that
         # reads nothing must reuse that image's cached 番號 and 作品名稱,
@@ -8240,6 +8568,7 @@ def run_multi_identify_pipeline(
     if total_rel:
         done_detail += f"；相關共 {total_rel}"
     _progress(on_progress, "done", "done", done_detail, 1.0)
+    _attach_saved_session(payload, _frames_from_multi(vision_rows, results))
     return payload, 200
 
 
@@ -9092,6 +9421,7 @@ def identify():
             user_title=user_title,
         )
         # related_by_title already attached inside pipeline — do not run twice
+    result = _ensure_identify_session(result, images)
     return jsonify(result), status
 
 
@@ -9380,6 +9710,7 @@ def identify_stream():
                         on_progress=on_progress,
                     )
                     # related already attached in pipeline
+                result = _ensure_identify_session(result, images)
                 q.put(("result", {"type": "result", "data": result, "status": status}))
             except Exception as e:
                 q.put(

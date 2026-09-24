@@ -89,3 +89,21 @@ Expo 版（`Look-for-pic`）有確認主作品、多選相關步驟。本 Web �
 請在 Railway 設定環境變數 `SITE_PASSWORD`。打開網站會先要求輸入此密碼；只有你分享密碼的人能用。登出路徑：`/logout`。
 
 主人手機免密：設定 `OWNER_DEVICE_TOKEN` 後，用 Safari 打開一次 `https://你的網域/d/<token>`，可加入主畫面；之後此裝置免輸入分享密碼。訪客仍走 `/login`。
+
+## 讀取辨識紀錄（給助手）
+
+每次單圖或多圖辨識完成後，伺服器把「每一張上傳對到哪一張卡片」寫進 `data/identify-sessions.json`（執行期檔，不進 git）。未帶主人身分的請求會得到 **401**。
+
+`frames[]` 的 `index` 是上傳順序，對應紀錄詳情裡「你的截圖」由左到右。`final_code` / `final_title` 是那一張最後的番號與作品名稱。`drop_reason` 為 `null` 表示沒有被丟掉；`merged_same_work` 表示這張併進了另一張的卡片。`vision_title` / `ocr_title` / `parsed_code` 是辨識當下讀到的字，`preview_ref` 是這張圖的 `sha256:` 指紋（不含圖片本身）。
+
+主人用與 `OWNER_DEVICE_TOKEN` 相同的值：
+
+```bash
+curl -sS -H "Authorization: Bearer $OWNER_DEVICE_TOKEN" \
+  https://你的網域/api/owner/identify-sessions
+
+curl -sS -H "Authorization: Bearer $OWNER_DEVICE_TOKEN" \
+  https://你的網域/api/owner/identify-sessions/ses_...
+```
+
+也可以用標頭 `X-Owner-Token`。已登入的瀏覽器在「紀錄詳情」按「匯出 JSON」，下載的內容與上面 detail 的回應相同（`{ "ok": true, "session": { ... } }`）。把那個檔貼給助手即可，不必猜哪一張縮圖對到哪一張卡片。
