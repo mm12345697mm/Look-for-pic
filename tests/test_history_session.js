@@ -836,6 +836,16 @@ function walkNodes(node, acc) {
   assert.strictEqual(H.formatKeywordChip('合宿'), '合宿（集訓）');
   assert.strictEqual(H.formatKeywordChip('媚薬'), '媚薬（媚藥）');
   assert.strictEqual(H.formatKeywordChip('巨乳'), '巨乳（巨乳）');
+  assert.strictEqual(H.formatKeywordChip('映画館'), '映画館（電影院）');
+  assert.strictEqual(H.formatKeywordChip('金髪'), '金髪（金髮）');
+  assert.strictEqual(H.formatKeywordChip('ギャル'), 'ギャル（辣妹）');
+  assert.strictEqual(H.formatKeywordChip('細身'), '細身（纖細）');
+  assert.strictEqual(H.formatKeywordChip('乳首'), '乳首（乳頭）');
+  assert.strictEqual(H.formatKeywordChip('手コキ'), '手コキ（手淫）');
+  assert.strictEqual(
+    H.normalizeKeywordList(['ハイビジョン', '単体作品', '独占配信', '巨乳', 'ギャル']).join('・'),
+    '巨乳・ギャル'
+  );
   assert.strictEqual(H.formatPersonName('福田ゆあ', ''), '福田ゆあ');
   assert.ok(H.formatPersonName('福田ゆあ', '').indexOf('（') === -1);
   assert.strictEqual(H.formatPersonName('福田ゆあ', '福田由愛'), '福田ゆあ（福田由愛）');
