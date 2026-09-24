@@ -566,12 +566,22 @@ label.btn {
 }
 .progress-step {
   display: grid;
-  grid-template-columns: 22px 1fr;
+  grid-template-columns: 22px 1fr auto;
   gap: 8px;
   align-items: start;
   font-size: 0.86rem;
   color: var(--muted);
   line-height: 1.35;
+}
+.progress-step .step-phase {
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: var(--accent2);
+  white-space: nowrap;
+  padding-top: 1px;
+}
+.progress-step .step-phase[hidden] {
+  display: none;
 }
 .progress-step .step-mark {
   width: 18px;

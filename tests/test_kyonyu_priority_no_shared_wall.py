@@ -259,10 +259,166 @@ class TestKyonyuKeywordPriority(unittest.TestCase):
         self.assertFalse(any("巨肝" in q for q in qs))
         plain = S._extract_title_theme_keywords("媚薬の合宿記録")
         self.assertNotIn("巨乳", plain)
+        self.assertIn("合宿", plain)
+        self.assertIn("媚薬", plain)
         reject = getattr(S, "_title_has_ocr_garbage", None)
         if reject is not None:
             self.assertFalse(reject(SWIM))
             self.assertFalse(reject("巨乳水泳部員"))
+
+    def test_swim_camp_emits_swim_and_camp_chips_and_keeps_kyonyu(self):
+        """水泳部 and 合宿 are chips beside 巨乳 and 媚薬. Compounds still lead."""
+        titled = "巨乳水泳部員 媚薬漬けレ●プ合宿"
+        kws = S._extract_title_theme_keywords(titled)
+        for tok in ("巨乳", "媚薬", "水泳部", "合宿"):
+            self.assertIn(tok, kws, kws)
+        self.assertNotIn("巨肝", "".join(kws))
+        self.assertNotIn("水泳部員", kws)
+        qs = S._keyword_search_queries(titled, kws)
+        for tok in ("巨乳", "媚薬", "水泳部", "合宿"):
+            self.assertIn(tok, qs, qs)
+        wear = S._extract_title_theme_keywords("巨乳の水着")
+        self.assertIn("巨乳", wear)
+        self.assertIn("水着", wear)
+        self.assertNotIn("合宿", wear)
+        school = S._extract_title_theme_keywords("スクール水着の巨乳")
+        self.assertIn("スクール水着", school, school)
+        self.assertIn("巨乳", school)
+        trad = S._extract_title_theme_keywords("巨乳媚藥水泳部合宿")
+        self.assertIn("媚藥", trad, trad)
+        self.assertIn("水泳部", trad)
+        self.assertIn("合宿", trad)
+        self.assertIn("巨乳", trad)
+        no_camp = S._extract_title_theme_keywords("巨乳の媚薬")
+        self.assertIn("巨乳", no_camp)
+        self.assertIn("媚薬", no_camp)
+        self.assertNotIn("合宿", no_camp)
+        self.assertNotIn("水泳部", no_camp)
+        mida = S._extract_title_theme_keywords(MIDA)
+        self.assertEqual(mida[0], "ノーブラ誘惑", mida)
+        self.assertEqual(mida[1], "巨乳", mida)
+
+    def test_swim_camp_keyword_bucket_mixes_kyonyu_and_requires_https(self):
+        """巨乳+媚薬 and 巨乳+合宿/水泳部 lead. 媚薬+合宿 alone does not fill the cap.
+
+        A coverless or data-URL row never enters 關鍵字相關 for this title.
+        """
+        title = "巨乳水泳部員 媚薬漬けレ●プ合宿"
+        catalog = [
+            {
+                "code": "DRUG-001",
+                "title": "媚薬合宿の記録",
+                "score": 9,
+                "cover": "https://pics.dmm.co.jp/digital/video/drug001/drug001pl.jpg",
+            },
+            {
+                "code": "DRUG-002",
+                "title": "媚薬の合宿水泳部",
+                "score": 8,
+                "cover": "https://pics.dmm.co.jp/digital/video/drug002/drug002pl.jpg",
+            },
+            {
+                "code": "DRUG-003",
+                "title": "合宿で媚薬",
+                "score": 7,
+                "cover": "https://pics.dmm.co.jp/digital/video/drug003/drug003pl.jpg",
+            },
+            {
+                "code": "DRUG-004",
+                "title": "水泳部の媚薬合宿",
+                "score": 6,
+                "cover": "https://pics.dmm.co.jp/digital/video/drug004/drug004pl.jpg",
+            },
+            {
+                "code": "DRUG-005",
+                "title": "媚薬合宿",
+                "score": 5,
+                "cover": "https://pics.dmm.co.jp/digital/video/drug005/drug005pl.jpg",
+            },
+            {
+                "code": "BODY-101",
+                "title": "巨乳の媚薬記録",
+                "score": 0.2,
+                "cover": "https://pics.dmm.co.jp/digital/video/body101/body101pl.jpg",
+            },
+            {
+                "code": "BODY-102",
+                "title": "巨乳の合宿記録",
+                "score": 0.2,
+                "cover": "https://pics.dmm.co.jp/digital/video/body102/body102pl.jpg",
+            },
+            {
+                "code": "BODY-103",
+                "title": "巨乳水泳部の記録",
+                "score": 0.2,
+                "cover": "https://pics.dmm.co.jp/digital/video/body103/body103pl.jpg",
+            },
+            {"code": "BODY-104", "title": "巨乳の媚薬合宿", "score": 4, "cover": ""},
+            {
+                "code": "BODY-105",
+                "title": "巨乳媚薬の合宿",
+                "score": 3,
+                "cover": "data:image/jpeg;base64,QUJD",
+            },
+        ]
+        seen: list[str] = []
+        spent = {"on": False}
+
+        def fake_fetch(q, actress=None):
+            seen.append(q)
+            spent["on"] = True
+            return [dict(row) for row in catalog]
+
+        def mono():
+            return 1000.0 if spent["on"] else 0.0
+
+        def fake_enrich(c, why="片名候選"):
+            item = dict(c)
+            item["why"] = why
+            item.setdefault("stills", [])
+            return item
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=fake_fetch), mock.patch.object(
+            S, "fetch_jav321_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "fetch_javlibrary_title_results", return_value=[]
+        ), mock.patch.object(
+            S, "enrich_title_candidate", side_effect=fake_enrich
+        ), mock.patch("time.monotonic", side_effect=mono):
+            rows = S._find_related_by_keywords(title, max_n=5, budget_sec=6.0)
+
+        for tok in ("巨乳", "水泳部", "合宿", "媚薬"):
+            self.assertIn(tok, seen, seen)
+        codes = [r["code"] for r in rows]
+        self.assertNotIn("BODY-104", codes, codes)
+        self.assertNotIn("BODY-105", codes, codes)
+        self.assertIn("BODY-101", codes, codes)
+        self.assertTrue("BODY-102" in codes or "BODY-103" in codes, codes)
+        partners = set()
+        for row in rows:
+            cover = str(row.get("cover") or "")
+            self.assertTrue(cover.startswith("https://"), cover)
+            self.assertNotIn("QUJD", cover)
+            matched = row.get("matched_keywords") or []
+            if "巨乳" not in matched:
+                continue
+            if "媚薬" in matched or "媚藥" in matched:
+                partners.add("drug")
+            if "合宿" in matched or "水泳部" in matched:
+                partners.add("camp")
+        self.assertIn("drug", partners, rows)
+        self.assertIn("camp", partners, rows)
+        self.assertTrue(any("巨乳" in (r.get("matched_keywords") or []) for r in rows))
+        first_body = min(
+            i for i, r in enumerate(rows) if "巨乳" in (r.get("matched_keywords") or [])
+        )
+        drug_only = [
+            i
+            for i, r in enumerate(rows)
+            if "巨乳" not in (r.get("matched_keywords") or [])
+        ]
+        if drug_only:
+            self.assertLess(first_body, drug_only[0], codes)
 
     def test_kyonyu_hits_beat_weak_and_coverless_rows(self):
         catalog = [

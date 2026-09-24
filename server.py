@@ -4658,6 +4658,14 @@ def _related_has_real_cover(row: dict | None) -> bool:
     return any(_catalog_jacket_url(u) for u in stills)
 
 
+def _related_cover_is_usable_https(row: dict | None) -> bool:
+    """True when the keyword row's own cover is an https catalog jacket."""
+    if not isinstance(row, dict):
+        return False
+    cover = _catalog_jacket_url(row.get("cover") or row.get("cover_url"))
+    return cover.startswith("https://")
+
+
 def _cap_related_buckets(items) -> list[dict]:
     """Keep existing order within each bucket; enforce 5+5+3 maxima; no padding."""
     theme: list[dict] = []
@@ -4685,15 +4693,7 @@ def _cap_related_buckets(items) -> list[dict]:
             keyword_pool.append(item)
         elif ln == "actress" and len(actress) < RELATED_ACTRESS_CAP:
             actress.append(item)
-    # Without a body-size hit, keep the first five then the #25 sort.
-    # With 巨乳 / 美乳 / 爆乳 in the pool, rank those first so a later
-    # coverless row cannot fill the cap ahead of them.
-    if any(_row_matches_body_generic(it) for it in keyword_pool):
-        keyword_pool.sort(key=_keyword_related_sort_key, reverse=True)
-        keyword = keyword_pool[:RELATED_KEYWORD_CAP]
-    else:
-        keyword = keyword_pool[:RELATED_KEYWORD_CAP]
-        keyword.sort(key=_keyword_related_sort_key, reverse=True)
+    keyword = _finalize_keyword_bucket(keyword_pool, None, RELATED_KEYWORD_CAP)
     return theme + keyword + actress
 
 
@@ -6731,6 +6731,14 @@ _THEME_KEYWORD_LEXICON = (
     "美人",
     "辦公室",
     "办公室",
+    # Swim-camp titles (巨乳水泳部員 … 合宿). Longest match wins, so
+    # スクール水着 is the chip when that whole word is present, and 水泳部
+    # is the chip inside 水泳部員. These do not demote 巨乳 or 媚薬.
+    "スクール水着",
+    "水泳部",
+    "スク水",
+    "水着",
+    "合宿",
 )
 
 # Short setting / identity nouns (valid even at 2 chars). Not 地位 — 地味.
@@ -6772,6 +6780,10 @@ _SHORT_THEME_NOUNS = frozenset(
         "爆乳",
         "通勤",
         "ナース",
+        "水泳部",
+        "水着",
+        "スク水",
+        "合宿",
     }
 )
 
@@ -6784,6 +6796,9 @@ _THEME_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
     "オフィス": ("オフィス", "辦公室", "办公室"),
     "辦公室": ("オフィス", "辦公室", "办公室"),
     "办公室": ("オフィス", "辦公室", "办公室"),
+    "水着": ("水着", "スク水", "スクール水着"),
+    "スク水": ("水着", "スク水", "スクール水着"),
+    "スクール水着": ("水着", "スク水", "スクール水着"),
 }
 
 
@@ -7204,23 +7219,40 @@ def _is_weak_theme_token(tok: str) -> bool:
 # Body-size words are real chips when the title says them. They are not weak
 # generics and they are not dropped once another theme is present.
 _BODY_GENERIC_TOKENS = frozenset({"巨乳", "美乳", "爆乳"})
+# Setting chips on a swim-camp title. Not a substitute for 巨乳.
+_SWIM_CAMP_TOKENS = frozenset({"水泳部", "合宿", "水着", "スク水", "スクール水着"})
+_APHRODISIAC_TOKENS = frozenset({"媚薬", "媚藥"})
+# Partner order when a swim-camp bucket is mixed: 巨乳+媚薬 and 巨乳+合宿/水泳部
+# both take a slot before a second row of either, and before 媚薬+合宿 alone.
+_SWIM_PARTNER_PRIORITY = ("媚薬", "媚藥", "合宿", "水泳部", "水着", "スク水", "スクール水着")
 
 
 def _is_body_generic_token(tok: str) -> bool:
     return (tok or "").strip() in _BODY_GENERIC_TOKENS
 
 
-def _keyword_query_is_required_chip(q: str, keywords: list[str] | None) -> bool:
-    """True when this query is the 巨乳 / 美乳 / 爆乳 chip itself.
+def _is_swim_camp_token(tok: str) -> bool:
+    return (tok or "").strip() in _SWIM_CAMP_TOKENS
 
-    A compound may spend the keyword time window. The body-size chip is still
-    issued so a swim-camp title does not lose its 巨乳 hits.
+
+def _keyword_query_is_required_chip(q: str, keywords: list[str] | None) -> bool:
+    """True when this query is a chip that must still be issued.
+
+    A compound may spend the keyword time window. 巨乳 / 美乳 / 爆乳 are still
+    issued. On a swim-camp title, 水泳部 / 合宿 / 水着 and 媚薬 / 媚藥 are too,
+    so the keyword search does not stop after the first pair.
     """
     tok = (q or "").strip()
-    if not tok or not _is_body_generic_token(tok):
+    if not tok:
         return False
     chips = {str(k or "").strip() for k in (keywords or []) if str(k or "").strip()}
-    return tok in chips
+    if tok not in chips:
+        return False
+    if _is_body_generic_token(tok) or _is_swim_camp_token(tok):
+        return True
+    if tok in _APHRODISIAC_TOKENS and any(_is_swim_camp_token(k) for k in chips):
+        return True
+    return False
 
 
 def _is_relation_noun(tok: str) -> bool:
@@ -8480,6 +8512,100 @@ def _find_related_by_keywords(
     return _sanitize_related_rows(out)
 
 
+def _keyword_pool_is_swim_camp(keywords: list[str] | None, rows: list | None) -> bool:
+    """True when this keyword bucket came from a 水泳部 / 合宿 / 水着 title."""
+    if any(_is_swim_camp_token(k) for k in (keywords or [])):
+        return True
+    for row in rows or []:
+        if any(_is_swim_camp_token(k) for k in _matched_keywords_of(row)):
+            return True
+    return False
+
+
+def _diversify_body_keyword_rows(
+    eligible: list[dict],
+    keywords: list[str] | None,
+    max_n: int,
+) -> list[dict]:
+    """Mix 巨乳 pairings inside a swim-camp keyword cap.
+
+    One covered 巨乳+媚薬 row and one covered 巨乳+合宿 / 水泳部 row lead,
+    before a second of either and before 媚薬+合宿 rows that never say 巨乳.
+    Order inside a group stays the order the catalog already ranked.
+    """
+    if max_n <= 0:
+        return []
+    body_rows = [it for it in eligible if _row_matches_body_generic(it)]
+    other = [it for it in eligible if not _row_matches_body_generic(it)]
+    if not body_rows:
+        return list(other[:max_n])
+
+    def _partners(item: dict) -> list[str]:
+        return [k for k in _matched_keywords_of(item) if not _is_body_generic_token(k)]
+
+    paired = [it for it in body_rows if _partners(it)]
+    body_only = [it for it in body_rows if not _partners(it)]
+    order: list[str] = []
+    for raw in list(keywords or []) + list(_SWIM_PARTNER_PRIORITY):
+        tok = str(raw or "").strip()
+        if tok and not _is_body_generic_token(tok) and tok not in order:
+            order.append(tok)
+    for item in paired:
+        for partner in _partners(item):
+            if partner not in order:
+                order.append(partner)
+    chosen: list[dict] = []
+    seen: set[str] = set()
+
+    def _take(item: dict) -> None:
+        code = str(item.get("code") or "")
+        if not code or code in seen:
+            return
+        seen.add(code)
+        chosen.append(item)
+
+    for partner in order:
+        if len(chosen) >= max_n:
+            break
+        for item in paired:
+            if partner in _partners(item) and str(item.get("code") or "") not in seen:
+                _take(item)
+                break
+    for group in (paired, body_only, other):
+        for item in group:
+            if len(chosen) >= max_n:
+                break
+            _take(item)
+        if len(chosen) >= max_n:
+            break
+    return chosen[:max_n]
+
+
+def _finalize_keyword_bucket(
+    items: list | None,
+    keywords: list[str] | None,
+    cap: int,
+) -> list[dict]:
+    """Cap the keyword bucket.
+
+    Swim-camp titles only keep rows with an https jacket, then mix
+    巨乳+媚薬 with 巨乳+合宿/水泳部. Other titles keep the #25 cut: body-size
+    hits are ranked before the cap; everyone else keeps the first five.
+    """
+    rows = [it for it in (items or []) if isinstance(it, dict)]
+    if cap <= 0:
+        return []
+    if _keyword_pool_is_swim_camp(keywords, rows):
+        covered = [it for it in rows if _related_cover_is_usable_https(it)]
+        return _diversify_body_keyword_rows(covered, keywords, cap)
+    if any(_row_matches_body_generic(it) for it in rows):
+        rows.sort(key=_keyword_related_sort_key, reverse=True)
+        return rows[:cap]
+    head = rows[:cap]
+    head.sort(key=_keyword_related_sort_key, reverse=True)
+    return head
+
+
 def _prefer_body_keyword_rows(
     eligible: list[dict],
     keywords: list[str] | None,
@@ -8487,12 +8613,16 @@ def _prefer_body_keyword_rows(
 ) -> list[dict]:
     """Keep 巨乳 / 美乳 / 爆乳 hits inside the keyword cap.
 
-    Covered body-size hits lead, then coverless body-size hits, then the
-    other rows in their existing rank. A weak or coverless title does not
-    fill the cap ahead of a 巨乳 hit. Titles that never say 巨乳 are unchanged.
+    A swim-camp title (水泳部 / 合宿 / 水着) only admits https jackets, and
+    mixes 巨乳+媚薬 with 巨乳+合宿/水泳部 instead of filling the cap with
+    媚薬+合宿 alone. Other titles keep covered body-size hits, then coverless
+    body-size hits, then the other rows in their existing rank.
     """
     if max_n <= 0:
         return []
+    if _keyword_pool_is_swim_camp(keywords, eligible):
+        covered = [it for it in eligible if _related_cover_is_usable_https(it)]
+        return _diversify_body_keyword_rows(covered, keywords, max_n)
     if not any(_is_body_generic_token(k) for k in (keywords or [])):
         return list(eligible[:max_n])
     body = [it for it in eligible if _row_matches_body_generic(it)]
@@ -8902,14 +9032,7 @@ def find_related_by_title(
         for x in normalized
         if x.get("line") not in {"theme", "keyword", "actress"}
     ]
-    # Within keyword tier: a 巨乳 hit is ranked before the cap so a weak
-    # title cannot push it out. Other titles keep the first-five #25 cut.
-    if any(_row_matches_body_generic(it) for it in keyword_items):
-        keyword_items.sort(key=_keyword_related_sort_key, reverse=True)
-        keyword_items = keyword_items[:keyword_cap]
-    else:
-        keyword_items = keyword_items[:keyword_cap]
-        keyword_items.sort(key=_keyword_related_sort_key, reverse=True)
+    keyword_items = _finalize_keyword_bucket(keyword_items, keywords, keyword_cap)
     return _sanitize_related_rows(theme_items + keyword_items + actress_items + other_items)
 
 

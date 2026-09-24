@@ -234,19 +234,33 @@
     return !normalizeKeywordList(raw).length;
   }
 
+  function relatedHasPersistedMembership(related) {
+    return (related || []).some((r) => r && String(r.code || '').trim());
+  }
+
   function relatedBucketsNeedFill(related, opts) {
+    // Caps are maxima. A saved list — even a short one — is finished.
+    // Search only when related was never stored and we have a title or actress.
     opts = opts || {};
-    const counts = { theme: 0, keyword: 0, actress: 0 };
-    (related || []).forEach((r) => {
-      const ln = relatedLineFromRaw(r);
-      if (counts[ln] != null) counts[ln] += 1;
-    });
+    if (relatedHasPersistedMembership(related)) return false;
     const hasTitle = !!(opts.title && String(opts.title).trim());
     const hasActress = !!(opts.actress && String(opts.actress).trim());
-    if (hasTitle && counts.theme < 5) return true;
-    if (hasTitle && counts.keyword < 5) return true;
-    if (hasActress && counts.actress < 3) return true;
-    return false;
+    return hasTitle || hasActress;
+  }
+
+  function applyTitleZhOntoRelated(existing, incoming) {
+    const byCode = {};
+    (incoming || []).forEach((r) => {
+      if (!r || !r.code) return;
+      byCode[String(r.code)] = r;
+    });
+    return (existing || []).map((r) => {
+      if (!r || !r.code) return r;
+      const hit = byCode[String(r.code)];
+      const zh = hit ? String(hit.title_zh || hit.titleZh || '').trim() : '';
+      if (!zh || String(r.title_zh || r.titleZh || '').trim()) return r;
+      return Object.assign({}, r, { title_zh: zh });
+    });
   }
 
   function workNeedsTitleZh(w) {
@@ -884,6 +898,70 @@
     return progressLabels[stepId] || (DEFAULT_STEPS.find((s) => s.id === stepId) || {}).label || stepId;
   }
 
+  function phaseLabelForEvent(evt) {
+    if (!evt || evt.status !== 'active') return '';
+    if (evt.phase) return String(evt.phase);
+    const step = evt.step;
+    const detail = String(evt.detail || '');
+    if (step === 'vision') return '辨識中';
+    if (step === 'search') return '目錄查詢';
+    if (step === 'verify' || step === 'cover') return '封面鎖定';
+    if (step === 'done' && detail.indexOf('相關') !== -1) return '相關作品';
+    return '';
+  }
+
+  function listStepRows(root) {
+    if (!root) return [];
+    if (root.querySelectorAll) {
+      const found = root.querySelectorAll('.progress-step');
+      if (found && found.length) return Array.from(found);
+    }
+    return Array.from(root.children || []).filter((n) => {
+      if (!n) return false;
+      if (n.dataset && n.dataset.step) return true;
+      return String(n.className || '').indexOf('progress-step') !== -1;
+    });
+  }
+
+  function findStepRow(root, stepId) {
+    if (!root) return null;
+    if (root.querySelector) {
+      const hit = root.querySelector('[data-step="' + stepId + '"]');
+      if (hit) return hit;
+    }
+    const rows = listStepRows(root);
+    for (let i = 0; i < rows.length; i++) {
+      if (rows[i] && rows[i].dataset && rows[i].dataset.step === stepId) return rows[i];
+    }
+    return null;
+  }
+
+  function setStepPhase(li, phase) {
+    if (!li) return;
+    const text = phase ? String(phase) : '';
+    let el = li.querySelector && li.querySelector('.step-phase');
+    if (!el && li.children) {
+      el = Array.from(li.children).find((n) => {
+        if (!n) return false;
+        if (n.classList && n.classList.contains('step-phase')) return true;
+        return String(n.className || '').indexOf('step-phase') !== -1;
+      }) || null;
+    }
+    if (!el && text && document && document.createElement) {
+      el = document.createElement('span');
+      el.className = 'step-phase';
+      li.appendChild(el);
+    }
+    if (el) {
+      el.hidden = !text;
+      el.textContent = text;
+    }
+    if (li.dataset) {
+      if (text) li.dataset.phase = text;
+      else delete li.dataset.phase;
+    }
+  }
+
   function hideProgress() {
     if (!progressPanel) return;
     progressPanel.classList.add('hidden');
@@ -907,7 +985,10 @@
       const li = document.createElement('li');
       li.className = 'progress-step is-pending';
       li.dataset.step = s.id;
-      li.innerHTML = '<span class="step-mark" aria-hidden="true"></span><span class="step-label">' + escapeHtml(s.label) + '</span>';
+      li.innerHTML =
+        '<span class="step-mark" aria-hidden="true"></span>' +
+        '<span class="step-label">' + escapeHtml(s.label) + '</span>' +
+        '<span class="step-phase" hidden></span>';
       progressStepsEl.appendChild(li);
     });
     progressDetailEl.textContent = '';
@@ -924,18 +1005,27 @@
     const step = evt.step;
     const status = evt.status || 'active';
     progressState[step] = status;
-    const li = progressStepsEl.querySelector('[data-step="' + step + '"]');
+    const li = findStepRow(progressStepsEl, step);
     if (li) {
       li.className = 'progress-step is-' + status;
+      setStepPhase(li, phaseLabelForEvent(evt));
+    }
+    if (status === 'active') {
+      listStepRows(progressStepsEl).forEach((row) => {
+        if (row !== li) setStepPhase(row, '');
+      });
     }
     if (status === 'active' || status === 'done') {
-      const ids = Array.from(progressStepsEl.querySelectorAll('.progress-step')).map((n) => n.dataset.step);
+      const ids = listStepRows(progressStepsEl).map((n) => n.dataset.step);
       const idx = ids.indexOf(step);
       for (let i = 0; i < idx; i++) {
         if (progressState[ids[i]] === 'pending') {
           progressState[ids[i]] = 'done';
-          const prev = progressStepsEl.querySelector('[data-step="' + ids[i] + '"]');
-          if (prev) prev.className = 'progress-step is-done';
+          const prev = findStepRow(progressStepsEl, ids[i]);
+          if (prev) {
+            prev.className = 'progress-step is-done';
+            setStepPhase(prev, '');
+          }
         }
       }
     }
@@ -3441,9 +3531,14 @@
       const data = await res.json();
       if (data && data.ok && Array.isArray(data.related_by_title)) {
         const incoming = data.related_by_title;
-        const merged = related && related.length
-          ? mergeRelatedIncremental(related, incoming)
-          : slimRelatedForHistory(incoming);
+        // A saved related list is frozen. A later search must not shrink 14↔9.
+        // Chinese titles may be copied onto the same rows; membership stays.
+        const frozen = relatedHasPersistedMembership(related);
+        const merged = frozen
+          ? applyTitleZhOntoRelated(related, incoming)
+          : (related && related.length
+            ? mergeRelatedIncremental(related, incoming)
+            : slimRelatedForHistory(incoming));
         const patch = { related: merged, stills: work.stills, cid: work.cid };
         const incomingZh = String(data.title_zh || '').trim();
         if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
@@ -4056,6 +4151,8 @@
       appendHistoryFromIdentify,
       relatedNeedsTitleZh,
       relatedBucketsNeedFill,
+      showProgress,
+      applyProgressEvent,
       workNeedsTitleZh,
       workNeedsManualFix,
       batchQueryKeepsFrames,
