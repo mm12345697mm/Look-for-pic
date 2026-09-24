@@ -1635,6 +1635,300 @@ class TestDandyCodeLookupAndVisualLock(unittest.TestCase):
         self.assertNotEqual(result.get("code"), "DANDY-893")
 
 
+class TestTutorTitleKeywordChips(unittest.TestCase):
+    """DANDYA tutor title: chips on every listed card, keyword bucket stays keyword.
+
+    Short fragments such as 肉欲教育ママ used to score as the same series
+    (containment similarity 0.92) and were relabeled 片名相近, so the carousel
+    hint was only 片名／同演員 and the other candidate had no chip payload.
+    """
+
+    DANDY_TITLE = TestDandyCodeLookupAndVisualLock.DANDY_TITLE
+    EXPECTED_KEYWORDS = TestDandyCodeLookupAndVisualLock.EXPECTED_KEYWORDS
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._prev_cache = S._OFFLINE_CACHE_PATH
+        S._OFFLINE_CACHE_PATH = Path(self.tmp.name) / "offline-cache.json"
+
+    def tearDown(self):
+        S._OFFLINE_CACHE_PATH = self._prev_cache
+        self.tmp.cleanup()
+
+    def _enrich_copy(self, c, why="片名候選"):
+        item = dict(c)
+        item["why"] = why
+        item.setdefault("stills", [])
+        item.setdefault("cover", "https://example.com/x.jpg")
+        return item
+
+    def test_short_fragment_is_not_a_series_title_match(self):
+        ok, _sc = S._is_title_theme_match(self.DANDY_TITLE, "肉欲教育ママ")
+        self.assertFalse(ok, "keyword fragment must not be 片名相近")
+        vol2 = self.DANDY_TITLE.replace("VOL.2", "").strip()
+        ok2, _sc2 = S._is_title_theme_match(self.DANDY_TITLE, vol2)
+        self.assertTrue(ok2, "the other volume stays a title-series match")
+
+    def test_keyword_fragment_stays_in_keyword_bucket(self):
+        fragment = {
+            "code": "KW-010",
+            "title": "肉欲教育ママ",
+            "actress": "別人",
+            "score": 0.4,
+            "why": "關鍵字×2",
+            "line": "keyword",
+            "keyword_hits": 2,
+            "matched_keywords": ["肉欲教育", "ママ"],
+        }
+
+        def fake_kw(*_a, **_k):
+            return [dict(fragment)]
+
+        with mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ), mock.patch.object(S, "_find_related_by_keywords", side_effect=fake_kw), mock.patch.object(
+            S, "_find_related_by_actress", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich_copy):
+            out = S.find_related_by_title(
+                self.DANDY_TITLE,
+                exclude_code="DANDYA-001",
+                actress="大浦真奈美",
+                budget_sec=2,
+            )
+        kw = [r for r in out if r.get("line") == "keyword"]
+        self.assertTrue(any(r.get("code") == "KW-010" for r in kw), out)
+        self.assertFalse(any(r.get("code") == "KW-010" and r.get("line") == "theme" for r in out))
+        self.assertLessEqual(sum(1 for r in out if r.get("line") == "keyword"), 5)
+        self.assertLessEqual(sum(1 for r in out if r.get("line") == "theme"), 5)
+        self.assertLessEqual(sum(1 for r in out if r.get("line") == "actress"), 3)
+
+    def test_image_multi_candidate_stamps_each_card_and_keeps_keyword_bucket(self):
+        vol2 = self.DANDY_TITLE.replace("VOL.2", "").strip()
+        fragment = {
+            "code": "KW-010",
+            "title": "肉欲教育ママ",
+            "actress": "別人",
+            "score": 0.4,
+            "why": "關鍵字×2",
+            "line": "keyword",
+            "keyword_hits": 2,
+            "matched_keywords": ["肉欲教育", "ママ"],
+        }
+        other = {
+            "code": "KW-011",
+            "title": "巨乳の家庭教師が10秒で挿入",
+            "actress": "別人",
+            "score": 0.3,
+            "why": "關鍵字×2",
+            "line": "keyword",
+            "keyword_hits": 2,
+            "matched_keywords": ["家庭教師", "10秒挿入"],
+        }
+        hit = {
+            "code": "DANDYA-001",
+            "title": self.DANDY_TITLE,
+            "actress": "大浦真奈美",
+            "studio": "DANDY",
+            "score": 0.9,
+            "candidates": [
+                {
+                    "code": "DANDYA-001",
+                    "title": self.DANDY_TITLE,
+                    "actress": "大浦真奈美",
+                    "studio": "DANDY",
+                    "score": 0.9,
+                },
+                {
+                    "code": "DANDY-893",
+                    "title": vol2,
+                    "actress": "竹内夏希",
+                    "studio": "DANDY",
+                    "score": 0.8,
+                },
+            ],
+        }
+
+        def fake_rank(user, cands, api_key=None, **kwargs):
+            best = dict(next(c for c in cands if "DANDYA" in str(c.get("code"))))
+            best["visual"] = {
+                "same_work": True,
+                "confidence": 0.93,
+                "reason": "same crop",
+                "match_person": True,
+                "match_face": True,
+                "match_accessories": True,
+                "match_clothes": True,
+                "match_pose": True,
+            }
+            best["visual_score"] = 0.91
+            rest = [dict(c) for c in cands if c.get("code") != best.get("code")]
+            note = (
+                "已對照使用者原圖比對 8 張封面＋劇照"
+                "（主選 DANDYA-001；視覺鎖定；依人物／衣服／表情／飾品／姿勢）"
+            )
+            return [best] + rest, {
+                "visual_ranked": True,
+                "note": note,
+                "note_stills": True,
+                "compared": 8,
+                "visual_lock": True,
+            }
+
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    S,
+                    "fetch_avbase_by_code",
+                    return_value={
+                        "code": "DANDYA-001",
+                        "title": self.DANDY_TITLE,
+                        "actress": "大浦真奈美",
+                        "studio": "DANDY",
+                        "source": "avbase",
+                    },
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    S,
+                    "sanitize_cover_fields",
+                    return_value=(
+                        "1dandya00001",
+                        "https://example.com/c.jpg",
+                        ["https://example.com/s.jpg"],
+                    ),
+                )
+            )
+            stack.enter_context(mock.patch.object(S, "resolve_chinese_title", return_value=None))
+            stack.enter_context(mock.patch.object(S, "search_by_title", return_value=hit))
+            stack.enter_context(mock.patch.object(S, "fetch_avbase_title_results", return_value=[]))
+            stack.enter_context(
+                mock.patch.object(S, "_find_related_by_keywords", return_value=[dict(fragment), dict(other)])
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    S,
+                    "_find_related_by_actress",
+                    return_value=[
+                        {"code": "MDBK-434", "title": "揺れる尻", "actress": "大浦真奈美", "score": 0.4}
+                    ],
+                )
+            )
+            stack.enter_context(mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich_copy))
+            stack.enter_context(mock.patch.object(S, "get_gemini_api_key", return_value="test-key"))
+            stack.enter_context(
+                mock.patch.object(
+                    S,
+                    "call_gemini_vision",
+                    return_value={"code": None, "title": "今日も息子の家庭教師とセックスしています。"},
+                )
+            )
+            stack.enter_context(mock.patch.object(S, "rank_candidates_by_visual", side_effect=fake_rank))
+            stack.enter_context(mock.patch.object(S, "ocr_image_bytes", return_value=""))
+            result, status = S.run_identify_pipeline(image_bytes=b"user-image-tutor")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(result.get("code"), "DANDYA-001")
+        blob = (result.get("message") or "") + (result.get("related_note") or "")
+        self.assertIn("視覺鎖定", blob)
+        self.assertIn("找到 2 個不同番號", blob)
+        self.assertEqual(result.get("theme_keywords"), self.EXPECTED_KEYWORDS)
+        self.assertTrue(result.get("keyword_queries"))
+        # Resolver returned nothing — do not invent Chinese.
+        self.assertFalse(str(result.get("title_zh") or "").strip())
+        cands = result.get("candidates") or []
+        codes = [c.get("code") for c in cands]
+        self.assertIn("DANDYA-001", codes)
+        self.assertIn("DANDY-893", codes)
+        for c in cands:
+            self.assertEqual(c.get("theme_keywords"), self.EXPECTED_KEYWORDS, c.get("code"))
+            self.assertTrue(c.get("keyword_queries"), c.get("code"))
+            self.assertFalse(str(c.get("title_zh") or "").strip(), c.get("code"))
+        rel = result.get("related_by_title") or []
+        lines = [r.get("line") for r in rel]
+        self.assertIn("keyword", lines, rel)
+        self.assertIn("theme", lines, rel)
+        self.assertIn("actress", lines, rel)
+        frag = next(r for r in rel if r.get("code") == "KW-010")
+        self.assertEqual(frag.get("line"), "keyword", rel)
+        self.assertLessEqual(sum(1 for r in rel if r.get("line") == "theme"), 5)
+        self.assertLessEqual(sum(1 for r in rel if r.get("line") == "keyword"), 5)
+        self.assertLessEqual(sum(1 for r in rel if r.get("line") == "actress"), 3)
+        self.assertGreaterEqual(sum(1 for r in rel if r.get("line") == "keyword"), 1)
+
+    def test_listed_results_keep_keyword_line_and_chips(self):
+        row = {
+            "code": "KW-010",
+            "title": "肉欲教育ママ",
+            "line": "keyword",
+            "why": "關鍵字×2",
+            "matched_keywords": ["肉欲教育", "ママ"],
+            "keyword_hits": 2,
+            "cover": "https://example.com/k.jpg",
+        }
+        payload = {
+            "ok": True,
+            "code": "DANDYA-001",
+            "title": self.DANDY_TITLE,
+            "actress": "大浦真奈美",
+            "cover": "https://example.com/c.jpg",
+            "related_by_title": [
+                dict(row),
+                {
+                    "code": "SER-001",
+                    "title": self.DANDY_TITLE,
+                    "line": "theme",
+                    "why": "片名相近",
+                    "cover": "https://example.com/t.jpg",
+                },
+                {
+                    "code": "MDBK-434",
+                    "title": "揺れる尻",
+                    "line": "actress",
+                    "why": "同演員",
+                    "cover": "https://example.com/a.jpg",
+                },
+            ],
+            "candidates": [
+                {"code": "DANDYA-001", "title": self.DANDY_TITLE, "actress": "大浦真奈美"},
+                {
+                    "code": "DANDY-893",
+                    "title": self.DANDY_TITLE.replace("VOL.2", "").strip(),
+                    "actress": "竹内夏希",
+                },
+            ],
+            "results": [
+                {
+                    "ok": True,
+                    "code": "DANDYA-001",
+                    "title": self.DANDY_TITLE,
+                    "actress": "大浦真奈美",
+                    "related_by_title": [dict(row)],
+                }
+            ],
+        }
+        with mock.patch.object(S, "search_by_title", return_value=None), mock.patch.object(
+            S, "fetch_avbase_title_results", return_value=[]
+        ), mock.patch.object(S, "_find_related_by_keywords", return_value=[]), mock.patch.object(
+            S, "_find_related_by_actress", return_value=[]
+        ), mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich_copy), mock.patch.object(
+            S, "attach_chinese_titles", side_effect=lambda payload, **kwargs: payload
+        ):
+            out = S.attach_related_by_title(payload, budget_sec=1, per_item=True)
+        self.assertEqual(out.get("theme_keywords"), self.EXPECTED_KEYWORDS)
+        for c in out.get("candidates") or []:
+            self.assertEqual(c.get("theme_keywords"), self.EXPECTED_KEYWORDS, c.get("code"))
+        nested = (out.get("results") or [{}])[0].get("related_by_title") or []
+        self.assertTrue(nested, nested)
+        self.assertEqual(nested[0].get("line"), "keyword", nested)
+        self.assertIn("肉欲教育", nested[0].get("matched_keywords") or [])
+        self.assertEqual(out["results"][0].get("theme_keywords"), self.EXPECTED_KEYWORDS)
+        top_lines = [r.get("line") for r in out.get("related_by_title") or []]
+        self.assertIn("keyword", top_lines)
+        self.assertIn("theme", top_lines)
+        self.assertIn("actress", top_lines)
+
+
 class TestActressQueryKeep(unittest.TestCase):
     def test_is_actress_query_detection_via_score_path(self):
         # Unit-level: compact JP name without particles looks like actress query

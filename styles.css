@@ -1239,6 +1239,9 @@ body.lightbox-open {
 .kw-related-panel {
   padding: 2px 2px 8px;
 }
+.card > .kw-related-panel {
+  padding: 0 14px 8px;
+}
 .kw-related-label {
   font-size: 0.78rem;
   color: var(--muted);

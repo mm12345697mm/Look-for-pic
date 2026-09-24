@@ -5586,6 +5586,41 @@ def _keyword_hit_count(candidate_title: str, keywords: list[str]) -> int:
     return len(_matched_theme_keywords(candidate_title, keywords))
 
 
+def _high_sim_is_same_series(ref: str, cand: str, sim: float) -> bool:
+    """True when similarity is a near-duplicate volume, not a short fragment.
+
+    title_similarity returns 0.92 when either string contains the other, so
+    肉欲教育ママ scores like a second volume of a long series title. Those
+    fragments belong in the keyword bucket. A real sibling is long and covers
+    a large share of the other title.
+    """
+    if sim < 0.72:
+        return False
+    ref_n = len(re.sub(r"\s+", "", ref or ""))
+    cand_n = len(re.sub(r"\s+", "", cand or ""))
+    shorter = min(ref_n, cand_n)
+    longer = max(ref_n, cand_n, 1)
+    if shorter < 18:
+        return False
+    if shorter / float(longer) < 0.55:
+        return False
+    return True
+
+
+def _shared_run_is_series(ref_compact: str, cand_compact: str, lcs: int) -> bool:
+    """A long shared run is a series template only when it is most of the shorter title.
+
+    Twelve characters of 今日も息子の家庭教師 inside an unrelated 家庭教師 title
+    must not steal that work out of the keyword bucket.
+    """
+    if lcs < 12:
+        return False
+    shorter = min(len(ref_compact or ""), len(cand_compact or ""))
+    if shorter <= 0:
+        return False
+    return lcs >= 12 and (lcs / float(shorter)) >= 0.55
+
+
 def _is_title_theme_match(
     ref_title: str,
     cand_title: str,
@@ -5611,10 +5646,12 @@ def _is_title_theme_match(
     opening = [p for p in shared if 0 <= ref_compact.find(p) <= 5]
 
     # Long contiguous series template (NHDTC 声我慢SEX…中出し)
-    if lcs >= 12:
+    if lcs >= 12 and _shared_run_is_series(ref_compact, cand_compact, lcs):
         return True, max(sim, 0.62)
-    # Very high overall similarity (near-duplicate / same series rename)
-    if sim >= 0.72:
+    # Very high overall similarity (near-duplicate / same series rename).
+    # Containment alone is 0.92 for a short fragment such as 肉欲教育ママ inside
+    # a long series title. That fragment is a keyword hit, not another volume.
+    if _high_sim_is_same_series(ref, cand, sim):
         return True, sim
     # Opening compound + rich keyword overlap (DRPT ↔ ATID 満員電車…)
     if opening and hits >= 3 and sim >= 0.22:
@@ -5793,6 +5830,52 @@ def _recompute_theme_keywords(payload: dict) -> dict:
     payload["theme_keywords"] = kws
     payload["keyword_queries"] = _keyword_search_queries(title, kws, selected_only=False)
     return payload
+
+
+def _stamp_listed_work_keywords(payload: dict) -> dict:
+    """Recompute chips on the main work and every listed candidate or result.
+
+    Title/image multi-candidate payloads used to stamp only the top-level work.
+    The other vertical card (DANDY-893 next to DANDYA-001) then had no
+    theme_keywords, so the UI could not render selectable chips on it.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    _recompute_theme_keywords(payload)
+    for key in ("candidates", "results"):
+        rows = payload.get(key)
+        if not isinstance(rows, list):
+            continue
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            if not str(item.get("title") or "").strip():
+                continue
+            _recompute_theme_keywords(item)
+    return payload
+
+
+def _preserve_related_bucket(raw: dict) -> dict:
+    """Re-enrich a related row without dropping its bucket or hit keywords.
+
+    enrich_title_candidate always sets line=candidate. Doing that to a
+    results[].related_by_title row turned 關鍵字 into 片名候選 and the
+    carousel cap then dropped the keyword bucket.
+    """
+    why = str(raw.get("why") or "片名相近")
+    item = enrich_title_candidate(raw, why=why)
+    for field in ("line", "keyword_hits", "matched_keywords", "hit_keywords"):
+        val = raw.get(field)
+        if val not in (None, "", []):
+            item[field] = val
+    item["line"] = _related_line_of(item)
+    if item["line"] == "keyword":
+        matched = item.get("matched_keywords") or item.get("hit_keywords")
+        if not isinstance(matched, list):
+            matched = []
+        item["matched_keywords"] = _normalize_keyword_list(matched)
+        item["hit_keywords"] = item["matched_keywords"]
+    return item
 
 
 def _find_related_by_keywords(
@@ -6221,8 +6304,6 @@ def find_related_by_title(
         except Exception:
             pass
 
-    theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
-
     # --- 2) Keywords — independent bucket (cap 5), always try when keywords exist ---
     # Dedicated floor: a long 片名 search used to exhaust `_left()` and skip this
     # bucket, so code/title lookups showed 片名/同演員 with no 關鍵字相關.
@@ -6239,14 +6320,10 @@ def find_related_by_title(
                 budget_sec=kw_budget,
                 already=seen,
             ):
-                # Strong title-series matches found via keyword search → promote to theme
-                ok, _sc = _is_title_theme_match(
-                    title, str(r.get("title") or ""), keywords=keywords, phrases=phrases
-                )
-                if ok and theme_n < title_cap:
-                    _push(r, why="片名相近", line="theme")
-                    theme_n += 1
-                    continue
+                # Keep this bucket independent. A fragment such as 肉欲教育ママ used
+                # to be relabeled 片名相近 because containment similarity is ~0.92,
+                # which emptied 關鍵字 on the DANDY tutor-title path (hint became
+                # 片名／同演員 only). Codes already listed as 片名 stay there via seen.
                 _push(r, why=str(r.get("why") or "名稱關鍵字"), line="keyword")
                 keyword_items_added += 1
                 if keyword_items_added >= keyword_cap:
@@ -6393,7 +6470,7 @@ def attach_related_by_title(
     except Exception:
         pass
 
-    _recompute_theme_keywords(result)
+    _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
     if not per_item:
         return result
@@ -6406,7 +6483,7 @@ def attach_related_by_title(
             for r in item.get("related_by_title") or []:
                 if not isinstance(r, dict):
                     continue
-                fixed.append(enrich_title_candidate(r, why=str(r.get("why") or "片名相近")))
+                fixed.append(_preserve_related_bucket(r))
             item["related_by_title"] = fixed[:13]
             try:
                 attach_chinese_titles(
@@ -6416,7 +6493,7 @@ def attach_related_by_title(
                 )
             except Exception:
                 pass
-            _recompute_theme_keywords(item)
+            _stamp_listed_work_keywords(item)
             continue
         it_title = item.get("title") or title
         it_code = item.get("code")
@@ -6437,7 +6514,7 @@ def attach_related_by_title(
             )
         except Exception:
             item["related_by_title"] = []
-        _recompute_theme_keywords(item)
+        _stamp_listed_work_keywords(item)
     _finalize_related_note(result)
     return result
 
@@ -7163,7 +7240,7 @@ def _complete_identify_result(
             result.setdefault("related_by_title", [])
     else:
         result.setdefault("related_by_title", [])
-    _recompute_theme_keywords(result)
+    _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
     try:
         offline_cache_put(result, image_hash=image_hash)
