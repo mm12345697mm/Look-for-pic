@@ -415,6 +415,87 @@ class TestIdentifyStreamSurvivesSilence(unittest.TestCase):
         self.assertFalse(str(result.get("cover")).startswith("data:"))
         self.assertNotIn("results", result)
 
+    def test_job_progress_snapshot_does_not_rewind(self):
+        job_id = S.identify_job_create(4)
+        self.assertTrue(job_id)
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 3/4 張…",
+                "progress": 0.68,
+                "phase": "目錄查詢",
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "封面鎖定第 3/4 張…",
+                "progress": 0.7,
+                "phase": "封面鎖定",
+            },
+        )
+        # Next image may start catalog search again. That is forward.
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 4/4 張…",
+                "progress": 0.74,
+                "phase": "目錄查詢",
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "封面鎖定第 4/4 張…",
+                "progress": 0.8,
+                "phase": "封面鎖定",
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "search",
+                "status": "active",
+                "detail": "搜尋第 3/4 張…",
+                "progress": 0.68,
+                "phase": "目錄查詢",
+            },
+        )
+        S.identify_job_note(
+            job_id,
+            {
+                "step": "vision",
+                "status": "active",
+                "detail": "第 2/4 張",
+                "progress": 0.3,
+                "phase": "辨識中",
+            },
+        )
+        view = S.identify_job_public(job_id)
+        progress = view.get("progress") or {}
+        self.assertEqual(progress.get("detail"), "封面鎖定第 4/4 張…")
+        self.assertEqual(progress.get("phase"), "封面鎖定")
+        self.assertGreaterEqual(float(progress.get("progress") or 0), 0.8)
+        self.assertEqual(view.get("status"), "running")
+        blob = json.dumps(view, ensure_ascii=False)
+        for phrase in FALSE_TIMEOUT:
+            self.assertNotIn(phrase, blob)
+        S.identify_job_note(
+            job_id,
+            {"step": "done", "status": "done", "detail": "完成，列出 4 部", "progress": 1.0},
+        )
+        done = S.identify_job_public(job_id)
+        self.assertEqual((done.get("progress") or {}).get("step"), "done")
+        self.assertEqual((done.get("progress") or {}).get("detail"), "完成，列出 4 部")
+
 
 if __name__ == "__main__":
     unittest.main()

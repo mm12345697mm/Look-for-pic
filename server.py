@@ -785,6 +785,84 @@ def identify_job_touch(job_id: str) -> None:
     _notify_gunicorn_worker()
 
 
+_PROGRESS_PHASE_RANK = {"辨識中": 1, "目錄查詢": 2, "封面鎖定": 3, "相關作品": 4}
+_PROGRESS_SLOT_RE = re.compile(
+    r"(?:搜尋第|封面鎖定第|辨識第|相關作品|第)\s*(\d+)\s*/\s*(\d+)"
+)
+
+
+def _progress_step_index(step: str) -> int:
+    try:
+        return [name for name, _label in IDENTIFY_STEPS].index(str(step or ""))
+    except ValueError:
+        return -1
+
+
+def _progress_image_slot(detail: str) -> int | None:
+    match = _PROGRESS_SLOT_RE.search(str(detail or ""))
+    if not match:
+        return None
+    try:
+        slot = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return slot or None
+
+
+def _progress_phase_rank(evt: dict) -> int:
+    name = str((evt or {}).get("phase") or "")
+    if not name:
+        detail = str((evt or {}).get("detail") or "")
+        if "封面鎖定" in detail:
+            name = "封面鎖定"
+        elif "搜尋第" in detail or "目錄" in detail:
+            name = "目錄查詢"
+        elif "相關" in detail:
+            name = "相關作品"
+        elif "辨識" in detail:
+            name = "辨識中"
+    return _PROGRESS_PHASE_RANK.get(name, 0)
+
+
+def _progress_snapshot_is_backward(prev: dict, evt: dict) -> bool:
+    """True when this note would rewind the same identify run.
+
+    A later image may start again at 目錄查詢. The same image must not go
+    back to an earlier phase, and 搜尋第 N/M must not decrease. A brand-new
+    job has no previous note, so its first event is never a rewind.
+    """
+    if not isinstance(prev, dict) or not prev:
+        return False
+    if not isinstance(evt, dict) or not evt:
+        return False
+    prev_step = _progress_step_index(str(prev.get("step") or ""))
+    next_step = _progress_step_index(str(evt.get("step") or ""))
+    if next_step >= 0 and prev_step >= 0 and next_step < prev_step:
+        return True
+    try:
+        prev_pct = float(prev.get("progress"))
+    except (TypeError, ValueError):
+        prev_pct = None
+    try:
+        next_pct = float(evt.get("progress"))
+    except (TypeError, ValueError):
+        next_pct = None
+    if prev_pct is not None and next_pct is not None and next_pct + 1e-6 < prev_pct:
+        return True
+    if next_step != prev_step:
+        return False
+    prev_slot = _progress_image_slot(str(prev.get("detail") or ""))
+    next_slot = _progress_image_slot(str(evt.get("detail") or ""))
+    if prev_slot is not None and next_slot is not None and next_slot < prev_slot:
+        return True
+    if prev_slot is not None and next_slot is not None and next_slot == prev_slot:
+        prev_phase = _progress_phase_rank(prev)
+        next_phase = _progress_phase_rank(evt)
+        if prev_phase and next_phase and next_phase < prev_phase:
+            return True
+    return False
+
+
 def identify_job_note(job_id: str, evt: dict | None) -> None:
     evt = evt if isinstance(evt, dict) else {}
 
@@ -796,8 +874,12 @@ def identify_job_note(job_id: str, evt: dict | None) -> None:
         for key in ("step", "status", "detail", "progress", "phase"):
             if key in evt:
                 progress[key] = evt.get(key)
-        if progress:
-            job["progress"] = progress
+        if not progress:
+            return
+        current = job.get("progress") if isinstance(job.get("progress"), dict) else {}
+        if _progress_snapshot_is_backward(current, progress):
+            return
+        job["progress"] = progress
 
     _identify_jobs_mutate(job_id, mutate)
 

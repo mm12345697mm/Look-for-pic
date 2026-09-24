@@ -1100,8 +1100,120 @@
     progressFinished = false;
   }
 
+  // High-water mark for one identify run. SSE and job polls can arrive out of
+  // order; a later slot must not jump back to 搜尋第 3/4 or an earlier percent.
+  let progressHigh = {
+    jobId: '',
+    started: false,
+    stepIndex: -1,
+    percent: -1,
+    imageIndex: null,
+    phaseRank: 0,
+  };
+
+  function resetProgressHigh(jobId) {
+    progressHigh = {
+      jobId: jobId == null ? '' : String(jobId),
+      started: false,
+      stepIndex: -1,
+      percent: -1,
+      imageIndex: null,
+      phaseRank: 0,
+    };
+  }
+
+  function bindIdentifyJob(jobId) {
+    const id = String(jobId || '');
+    if (!id) return;
+    if (!progressHigh.jobId) progressHigh.jobId = id;
+    else if (progressHigh.jobId !== id) resetProgressHigh(id);
+  }
+
+  function progressStepIndex(stepId) {
+    const ids = listStepRows(progressStepsEl).map((n) => (n.dataset && n.dataset.step) || '');
+    let idx = ids.indexOf(stepId);
+    if (idx < 0) idx = DEFAULT_STEPS.findIndex((s) => s.id === stepId);
+    return idx;
+  }
+
+  function imageSlotFromDetail(detail) {
+    const text = String(detail || '');
+    const match = text.match(/(?:搜尋第|封面鎖定第|辨識第|相關作品|第)\s*(\d+)\s*\/\s*(\d+)/);
+    if (!match) return null;
+    const n = parseInt(match[1], 10);
+    return n > 0 ? n : null;
+  }
+
+  function phaseRankOf(evt) {
+    let name = (evt && evt.phase) || '';
+    if (!name) name = phaseLabelForEvent(evt) || '';
+    if (!name) {
+      const detail = String((evt && evt.detail) || '');
+      if (detail.indexOf('封面鎖定') !== -1) name = '封面鎖定';
+      else if (detail.indexOf('搜尋第') !== -1 || detail.indexOf('目錄') !== -1) name = '目錄查詢';
+      else if (detail.indexOf('相關') !== -1) name = '相關作品';
+      else if (detail.indexOf('辨識') !== -1) name = '辨識中';
+    }
+    const order = ['辨識中', '目錄查詢', '封面鎖定', '相關作品'];
+    const idx = order.indexOf(String(name));
+    return idx < 0 ? 0 : idx + 1;
+  }
+
+  function progressEventWouldRewind(evt) {
+    if (!evt || !progressHigh.started) return false;
+    const stepIndex = progressStepIndex(evt.step);
+    const percent = typeof evt.progress === 'number' && !Number.isNaN(evt.progress) ? evt.progress : null;
+    const imageIndex = imageSlotFromDetail(evt.detail);
+    const phase = phaseRankOf(evt);
+    if (stepIndex >= 0 && progressHigh.stepIndex >= 0 && stepIndex < progressHigh.stepIndex) return true;
+    if (percent != null && progressHigh.percent >= 0 && percent + 1e-6 < progressHigh.percent) return true;
+    if (stepIndex !== progressHigh.stepIndex) return false;
+    if (
+      imageIndex != null &&
+      progressHigh.imageIndex != null &&
+      imageIndex < progressHigh.imageIndex
+    ) {
+      return true;
+    }
+    if (
+      imageIndex != null &&
+      progressHigh.imageIndex != null &&
+      imageIndex === progressHigh.imageIndex &&
+      phase &&
+      progressHigh.phaseRank &&
+      phase < progressHigh.phaseRank
+    ) {
+      return true;
+    }
+    return false;
+  }
+
+  function commitProgressHigh(evt) {
+    const stepIndex = progressStepIndex(evt.step);
+    const percent = typeof evt.progress === 'number' && !Number.isNaN(evt.progress) ? evt.progress : null;
+    const imageIndex = imageSlotFromDetail(evt.detail);
+    const phase = phaseRankOf(evt);
+    const stepUp = stepIndex > progressHigh.stepIndex;
+    if (stepIndex >= 0) progressHigh.stepIndex = Math.max(progressHigh.stepIndex, stepIndex);
+    if (percent != null) progressHigh.percent = Math.max(progressHigh.percent, percent);
+    if (stepUp) {
+      progressHigh.imageIndex = imageIndex;
+      progressHigh.phaseRank = phase;
+    } else if (imageIndex != null) {
+      if (progressHigh.imageIndex == null || imageIndex > progressHigh.imageIndex) {
+        progressHigh.imageIndex = imageIndex;
+        progressHigh.phaseRank = phase;
+      } else if (imageIndex === progressHigh.imageIndex) {
+        progressHigh.phaseRank = Math.max(progressHigh.phaseRank, phase);
+      }
+    }
+    progressHigh.started = true;
+  }
+
   function showProgress(steps) {
     if (!progressPanel) return;
+    const keepJob = progressHigh.jobId;
+    resetProgressHigh(keepJob);
     const list = steps && steps.length ? steps : DEFAULT_STEPS;
     progressState = {};
     progressLabels = {};
@@ -1131,6 +1243,7 @@
 
   function applyProgressEvent(evt) {
     if (!evt || !evt.step) return;
+    if (progressEventWouldRewind(evt)) return;
     const step = evt.step;
     const status = evt.status || 'active';
     progressState[step] = status;
@@ -1187,6 +1300,7 @@
         updateProgressSummary('處理中：' + label);
       }
     }
+    commitProgressHigh(evt);
   }
 
   function toggleProgressCollapsed() {
@@ -1269,6 +1383,7 @@
   const IDENTIFY_JOB_FOLLOW_MS = 4 * 600 * 1000 + 60 * 1000;
 
   async function followIdentifyJob(jobId, onProgress) {
+    bindIdentifyJob(jobId);
     const deadline = Date.now() + IDENTIFY_JOB_FOLLOW_MS;
     let wait = 400;
     while (Date.now() < deadline) {
@@ -1287,7 +1402,7 @@
       }
       const job = body && body.job;
       if (!job) continue;
-      if (job.progress && onProgress) onProgress(job.progress);
+      if (job.progress && onProgress && !progressEventWouldRewind(job.progress)) onProgress(job.progress);
       const ready = resumePayloadFromJob(job);
       if (ready) return ready;
       // A late heartbeat can look stalled. Keep the real result; do not
@@ -1345,6 +1460,7 @@
         }
         if (evt.type === 'job' && evt.job_id) {
           jobId = String(evt.job_id);
+          bindIdentifyJob(jobId);
         } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
           showProgress(evt.steps);
         } else if (evt.type === 'progress') {
@@ -4353,6 +4469,7 @@
       relatedBucketsNeedFill,
       showProgress,
       applyProgressEvent,
+      bindIdentifyJob,
       formatKeywordChip,
       formatPersonName,
       resumePayloadFromJob,

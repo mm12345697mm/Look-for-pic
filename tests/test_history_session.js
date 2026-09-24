@@ -495,6 +495,86 @@ function related(n, line) {
   assert.ok(!H.workNeedsTitleZh({ code: 'AAA-001', title: 'x', title_zh: '中文' }));
 }
 
+// Progress high-water: a later slot must not rewind to 搜尋第 3/4 or an earlier percent.
+{
+  const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+  H.showProgress();
+  H.bindIdentifyJob('job_forward');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 3/4 張…',
+    progress: 0.68,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '封面鎖定第 3/4 張…',
+    progress: 0.7,
+    phase: '封面鎖定',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 4/4 張…',
+    progress: 0.74,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '封面鎖定第 4/4 張…',
+    progress: 0.8,
+    phase: '封面鎖定',
+  });
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 3/4 張…',
+    progress: 0.68,
+    phase: '目錄查詢',
+  });
+  H.applyProgressEvent({
+    step: 'vision',
+    status: 'active',
+    detail: '第 2/4 張',
+    progress: 0.3,
+    phase: '辨識中',
+  });
+  H.applyProgressEvent({
+    step: 'receive',
+    status: 'active',
+    detail: '正在接收 4 張…',
+    progress: 0.02,
+  });
+  const steps = getEl('progress-steps').children;
+  const search = steps.find((row) => row.dataset && row.dataset.step === 'search');
+  const vision = steps.find((row) => row.dataset && row.dataset.step === 'vision');
+  assert.strictEqual(getEl('progress-detail').textContent, '封面鎖定第 4/4 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, '80%');
+  assert.strictEqual(getEl('progress-bar').style.width, '80%');
+  assert.ok(search && search.dataset.phase === '封面鎖定');
+  assert.ok(String(search.className).indexOf('is-active') !== -1);
+  assert.ok(vision && String(vision.className).indexOf('is-active') === -1);
+  const blob =
+    getEl('progress-detail').textContent +
+    getEl('progress-summary').textContent +
+    getEl('progress-pct').textContent;
+  FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
+
+  H.bindIdentifyJob('job_restart');
+  H.applyProgressEvent({
+    step: 'search',
+    status: 'active',
+    detail: '搜尋第 1/4 張…',
+    progress: 0.55,
+    phase: '目錄查詢',
+  });
+  assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 1/4 張…');
+  assert.strictEqual(getEl('progress-pct').textContent, '55%');
+}
+
 // Multi-shot history: persist and render every user upload; legacy single-shot still OK
 {
   function shotsOf(rec) {
@@ -2225,6 +2305,92 @@ function walkNodes(node, acc) {
     const blob = JSON.stringify(data) + seen.join('');
     FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
     assert.strictEqual(H.resumePayloadFromJob({ status: 'stalled', progress: shots[0].progress }), null);
+  }
+
+  // A poll snapshot older than the SSE high-water mark must not rewind the bar.
+  {
+    const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];
+    H.showProgress();
+    H.bindIdentifyJob('job_rewind');
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      detail: '封面鎖定第 4/4 張…',
+      progress: 0.8,
+      phase: '封面鎖定',
+    });
+    const polls = [
+      {
+        status: 'running',
+        progress: {
+          step: 'search',
+          status: 'active',
+          detail: '搜尋第 3/4 張…',
+          progress: 0.68,
+          phase: '目錄查詢',
+        },
+      },
+      {
+        status: 'running',
+        progress: {
+          step: 'vision',
+          status: 'active',
+          detail: '第 2/4 張',
+          progress: 0.3,
+          phase: '辨識中',
+        },
+      },
+      {
+        status: 'done',
+        progress: { step: 'done', status: 'done', detail: '完成，列出 4 部', progress: 1 },
+        result: {
+          ok: true,
+          code: 'MIDA-616',
+          title: '作品1',
+          cover: 'https://pics.dmm.co.jp/digital/video/mida616/mida616pl.jpg',
+          visual_lock: true,
+          results: [
+            {
+              ok: true,
+              code: 'MIDA-616',
+              cover: 'https://pics.dmm.co.jp/digital/video/mida616/mida616pl.jpg',
+            },
+          ],
+        },
+      },
+    ];
+    let n = 0;
+    const prevTimeout = context.setTimeout;
+    context.setTimeout = (fn) => {
+      fn();
+      return 0;
+    };
+    context.fetch = async (url) => {
+      assert.ok(String(url).indexOf('/api/identify/jobs/job_rewind') !== -1);
+      const job = polls[Math.min(n, polls.length - 1)];
+      n += 1;
+      return { ok: true, json: async () => ({ ok: true, job }) };
+    };
+    const seen = [];
+    let data;
+    try {
+      data = await H.followIdentifyJob('job_rewind', (evt) => {
+        seen.push(String(evt.detail || ''));
+        H.applyProgressEvent(evt);
+      });
+    } finally {
+      context.setTimeout = prevTimeout;
+    }
+    assert.deepStrictEqual(seen, ['完成，列出 4 部']);
+    assert.strictEqual(getEl('progress-detail').textContent, '完成，列出 4 部');
+    assert.strictEqual(getEl('progress-pct').textContent, '100%');
+    assert.ok(seen.join('').indexOf('搜尋第 3/4') === -1);
+    assert.strictEqual(data.code, 'MIDA-616');
+    assert.strictEqual(data.visual_lock, true);
+    assert.ok(String(data.cover).indexOf('https://pics.dmm.co.jp/') === 0);
+    assert.ok(String(data.results[0].cover).indexOf('data:') !== 0);
+    const blob = JSON.stringify(data) + getEl('progress-detail').textContent + seen.join('');
+    FALSE_TIMEOUT.forEach((phrase) => assert.ok(blob.indexOf(phrase) === -1, phrase));
   }
 
   console.log('test_history_session.js: ok');
