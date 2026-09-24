@@ -2811,5 +2811,49 @@ class TestJur881ThemeChips(unittest.TestCase):
         self.assertLess(kin.index("叔母"), kin.index("家庭教師"))
 
 
+class TestFrontCropAlignLock(unittest.TestCase):
+    def _pattern(self, w, h, seed):
+        from PIL import Image
+
+        img = Image.new("RGB", (w, h))
+        px = img.load()
+        for y in range(h):
+            for x in range(w):
+                px[x, y] = ((x * seed + 20) % 255, (y * seed) % 255, ((x + y) * seed) % 255)
+        return img
+
+    def test_wide_package_front_matches_the_upload_crop(self):
+        from PIL import Image
+
+        front = self._pattern(120, 160, 7)
+        wide = Image.new("RGB", (400, 160), (20, 20, 20))
+        wide.paste(front, (280, 0))
+        frame, figure = S._aligned_jacket_scores(front, wide)
+        self.assertGreaterEqual(frame, 0.70, frame)
+        self.assertGreaterEqual(figure, 0.58, figure)
+        other = self._pattern(120, 160, 3)
+        other_wide = Image.new("RGB", (400, 160), (20, 20, 20))
+        other_wide.paste(other, (280, 0))
+        wrong, _fig = S._aligned_jacket_scores(front, other_wide)
+        self.assertLess(wrong, frame - 0.12, (wrong, frame))
+
+    def test_series_without_picture_lock_is_not_the_catalog_first_row(self):
+        shared = "架空系列の同じ題名で巻だけ違う"
+        hit = {
+            "code": "SER-001",
+            "title": shared,
+            "candidates": [
+                {"code": "SER-001", "title": shared},
+                {"code": "SER-002", "title": shared},
+                {"code": "SER-003", "title": shared},
+            ],
+        }
+        with mock.patch.object(S, "_jacket_lock_winner", return_value=None):
+            with mock.patch.object(S, "get_gemini_api_key", return_value=""):
+                out = S.apply_visual_rank_to_hit(hit, b"not-an-image")
+        self.assertTrue(out.get("series_unresolved"))
+        self.assertFalse((out.get("visual_meta") or {}).get("visual_lock"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -741,6 +741,25 @@ def _longest_common_substr_len(a: str, b: str) -> int:
     return best
 
 
+def _title_cover_ratio(query: str | None, catalog: str | None) -> float:
+    """How much of the longer string is the shorter one, when one contains the other.
+
+    1.0 is an exact title. A shared series line plus a long extra slogan is lower
+    than the same line plus only a short name.
+    """
+    q = re.sub(r"\s+", "", normalize_ocr_title(query) or (query or ""))
+    c = re.sub(r"\s+", "", normalize_ocr_title(catalog) or (catalog or ""))
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 1.0
+    if q in c:
+        return len(q) / len(c)
+    if c in q:
+        return len(c) / len(q)
+    return 0.0
+
+
 def title_similarity(a: str | None, b: str | None) -> float:
     a = normalize_ocr_title(a) or (a or "").strip()
     b = normalize_ocr_title(b) or (b or "").strip()
@@ -749,7 +768,18 @@ def title_similarity(a: str | None, b: str | None) -> float:
     if a == b:
         return 1.0
     if a in b or b in a:
-        return 0.92
+        # A long query that is almost the whole catalog title is the same work.
+        # A short hook (夜行バス) inside a different title is not.
+        cover = _title_cover_ratio(a, b)
+        short_len = min(
+            len(re.sub(r"\s+", "", a)),
+            len(re.sub(r"\s+", "", b)),
+        )
+        if short_len >= 12 and cover >= 0.8:
+            return 0.92
+        if short_len >= 12:
+            return 0.5 + 0.4 * cover
+        return 0.25 + 0.35 * cover
     # Long shared prefix (vision OCR often drifts only on the tail)
     n = 0
     lim = min(len(a), len(b))
@@ -1076,20 +1106,21 @@ def sanitize_cover_fields(
 
 
 def fetch_catalog_title_for_code(code: str) -> dict | None:
-    """Lightweight code→official title for cross-check (jav321 / javlibrary / ddg)."""
+    """Lightweight code→official title for cross-check.
+
+    Avbase is tried first; its own fallback is the javbus work page. Missing
+    helper names must not raise — a thrown lookup used to reject a printed 品番.
+    """
     display = format_display_code(code)
-    slugs = [display]
-    alt = code_stripped_form(display)
-    if alt:
-        slugs.append(alt)
-    for slug in slugs:
-        for fetcher in (fetch_javbus, fetch_javlibrary, fetch_duckduckgo):
-            try:
-                meta = fetcher(slug)
-            except Exception:
-                meta = None
-            if meta and (meta.get("title") or "").strip():
-                return meta
+    if not display:
+        return None
+    for fetcher in (fetch_avbase_by_code, _fetch_javbus_by_code):
+        try:
+            meta = fetcher(display)
+        except Exception:
+            meta = None
+        if isinstance(meta, dict) and (meta.get("title") or "").strip():
+            return meta
     return None
 
 
@@ -1209,27 +1240,83 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
         td_path = Path(td)
         raw_path = td_path / "upload.bin"
         raw_path.write_bytes(image_bytes)
-        # Ensure readable image extension for tesseract
+        # JPEG q95 keeps caption bars that a PNG rewrite drops (座席の隙間).
         try:
             img = Image.open(raw_path)
-            img = ImageOps.exif_transpose(img)
+            img = ImageOps.exif_transpose(img).convert("RGB")
             png_path = td_path / "orig.png"
             img.save(png_path, format="PNG")
+            jpg_path = td_path / "orig.jpg"
+            img.save(jpg_path, format="JPEG", quality=95)
         except Exception:
             png_path = raw_path
+            jpg_path = raw_path
+            img = None
 
-        t1 = run_tesseract(str(png_path))
+        t1 = run_tesseract(str(jpg_path))
         texts.append(t1)
+        texts.append(run_tesseract(str(png_path)))
 
         try:
             prep = td_path / "prep.png"
-            preprocess_image(png_path, prep)
-            t2 = run_tesseract(str(prep))
-            texts.append(t2)
+            preprocess_image(png_path if png_path != raw_path else jpg_path, prep)
+            texts.append(run_tesseract(str(prep)))
         except Exception:
             pass
 
-    # Prefer the text that yields more AV codes
+        # Caption bars sit on a dark strip. One bottom band and one lower-middle
+        # band catch overlay titles without dumping a grid of neighbor lines.
+        if img is not None:
+            w, h = img.size
+            bands = (
+                (int(h * 0.78), h),
+                (int(h * 0.55), int(h * 0.88)),
+            )
+            for i, (y0, y1) in enumerate(bands):
+                if y1 - y0 < 12:
+                    continue
+                try:
+                    band = img.crop((0, y0, w, y1))
+                    band = band.resize(
+                        (max(8, band.width * 2), max(8, band.height * 2)),
+                        Image.Resampling.LANCZOS,
+                    )
+                    band = ImageOps.autocontrast(band)
+                    band_path = td_path / f"band{i}.jpg"
+                    band.save(band_path, format="JPEG", quality=95)
+                    texts.append(run_tesseract(str(band_path)))
+                except Exception:
+                    continue
+            # A small 品番 in the bottom margin is missed by the full frame.
+            # One high-contrast strip is enough; jacket match drops a misread.
+            if not _trusted_ocr_codes("\n".join(texts)):
+                try:
+                    strip = img.crop((0, int(h * 0.58), w, h))
+                    strip = ImageOps.autocontrast(strip)
+                    strip = ImageEnhance.Contrast(strip).enhance(1.8)
+                    strip = strip.resize(
+                        (max(8, strip.width * 3), max(8, strip.height * 3)),
+                        Image.Resampling.LANCZOS,
+                    )
+                    strip_path = td_path / "bottom.png"
+                    strip.save(strip_path, format="PNG")
+                    texts.append(run_tesseract(str(strip_path), lang="eng"))
+                except Exception:
+                    pass
+
+    joined = "\n".join(t for t in texts if t and not str(t).startswith("[tesseract"))
+    # Scene-text reader is optional. Its lines are not the title; they only
+    # feed particle repairs (先生2人 → 先生が2人) when tesseract missed them.
+    rapid = _rapidocr_lines(image_bytes)
+    # Scene-text lines stay in the read. A vertical title is often one
+    # phrase per line there, which a prefix search can still match.
+    repairs = _ocr_title_repairs(joined + "\n" + rapid)
+    if rapid:
+        joined = joined + "\n" + rapid
+    if repairs:
+        joined = joined + "\n" + "\n".join(repairs)
+    # Prefer the text that yields more AV codes, but keep every line so a
+    # later phrase query can still see 座席の隙間 beside a longer noisy line.
     best = ""
     best_n = -1
     for t in texts:
@@ -1237,7 +1324,384 @@ def ocr_image_bytes(image_bytes: bytes) -> str:
         if n > best_n or (n == best_n and len(t) > len(best)):
             best = t
             best_n = n
-    return best
+    if best_n > 0 and best and best not in joined:
+        joined = best + "\n" + joined
+    return joined
+
+
+_RAPID_OCR = None
+
+
+def _rapidocr_lines(image_bytes: bytes) -> str:
+    """Optional second reader. Missing package → empty. Never raises."""
+    global _RAPID_OCR
+    try:
+        from rapidocr_onnxruntime import RapidOCR
+    except Exception:
+        return ""
+    try:
+        if _RAPID_OCR is None:
+            _RAPID_OCR = RapidOCR()
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            tmp.write(image_bytes)
+            path = tmp.name
+        try:
+            result, _elapse = _RAPID_OCR(path)
+        finally:
+            try:
+                Path(path).unlink(missing_ok=True)
+            except Exception:
+                pass
+        lines = []
+        for row in result or []:
+            if isinstance(row, (list, tuple)) and len(row) >= 2:
+                lines.append(str(row[1] or "").strip())
+        return "\n".join(x for x in lines if x)
+    except Exception:
+        return ""
+
+
+def _title_is_search_ready(text: str | None) -> bool:
+    """A readable title long enough to search as itself, without slicing."""
+    t = re.sub(r"\s+", "", str(text or ""))
+    return _ocr_line_is_clean(t) and len(t) >= 12
+
+
+def _ocr_line_is_clean(text: str | None) -> bool:
+    """True when a line is mostly Japanese, not an OCR garbage mix."""
+    t = re.sub(r"\s+", "", str(text or ""))
+    if re.search(r"[A-Za-z@#]", t):
+        return False
+    cjk = _cjk_count(t)
+    if cjk < 4:
+        return False
+    return cjk >= len(t) * 0.7
+
+
+def _focused_cjk_queries(blob: str | None) -> list[str]:
+    """A few readable phrases from one frame, not every line on a page."""
+    raw = str(blob or "")
+    if not raw or raw.startswith("[tesseract"):
+        return []
+    found = re.findall(r"[\u3040-\u30ff\u4e00-\u9fff0-9]{4,18}", raw)
+    uniq = list(dict.fromkeys(found))
+
+    def _rank(token: str) -> tuple:
+        kana = len(re.findall(r"[\u3040-\u30ff]", token))
+        return (-(1 if kana else 0), -len(token))
+
+    uniq.sort(key=_rank)
+    return uniq[:4]
+
+
+def _ocr_line_prefixes(blob: str | None) -> list[str]:
+    """Short prefixes of OCR lines, for a title the catalog still recognizes.
+
+    A full noisy line often misses. Its 4–6 character head can still be
+    the shared series title. Longer lines first. This is not a product-code list.
+    """
+    raw = str(blob or "")
+    if not raw or raw.startswith("[tesseract"):
+        return []
+    lines: list[str] = []
+    seen_line: set[str] = set()
+    for piece in re.split(r"[\r\n]+", raw):
+        # A short source line is one phrase. A long tesseract smear's
+        # head is not a catalog query, so it stays out of this list.
+        # A line that is mostly symbols or latin is the same kind of smear.
+        source = piece.strip()
+        if not source or len(source) > 18:
+            continue
+        nospace = re.sub(r"\s+", "", source)
+        cjk_n = len(re.findall(r"[\u3040-\u30ff\u4e00-\u9fff]", nospace))
+        if not nospace or cjk_n < 4 or cjk_n / len(nospace) < 0.75:
+            continue
+        compact = re.sub(r"[^\u3040-\u30ff\u4e00-\u9fff]", "", source)
+        if len(compact) < 4 or compact in seen_line:
+            continue
+        if not re.search(r"[\u4e00-\u9fff]", compact):
+            continue
+        seen_line.add(compact)
+        lines.append(compact)
+    # Phrase-length lines first. A smear that survived the length cap is
+    # usually longer than the scene-text line it was copied from.
+    lines.sort(key=lambda s: (0 if 4 <= len(s) <= 14 else 1, abs(len(s) - 8), -len(s)))
+    out: list[str] = []
+    for line in lines[:6]:
+        for n in (4, 6, 8):
+            if len(line) < n:
+                continue
+            pref = line[:n]
+            if pref not in out:
+                out.append(pref)
+        if len(line) <= 10 and line not in out:
+            out.append(line)
+        if len(out) >= 8:
+            break
+    return out[:8]
+
+
+_DASH_OCR_CODE_RE = re.compile(
+    r"(?<![A-Za-z])([A-Za-z]{2,10})[-－‐‑‒–—―ー−](\d{2,5})(?!\d)"
+)
+_SPACE_OCR_CODE_RE = re.compile(
+    r"(?<![A-Za-z])([A-Z]{3,10})[ ](\d{3,5})(?!\d)"
+)
+
+
+def _trusted_ocr_codes(text: str | None) -> list[str]:
+    """品番 actually printed as a code, not a latin-digit accident.
+
+    APGH-012 and APGH 012 count. "rake 12", "yr 33", and "shat 676" do not:
+    those are OCR noise, and they must not become the frame's 番號.
+    """
+    raw = str(text or "")
+    found: list[str] = []
+    seen: set[str] = set()
+    for rx in (_DASH_OCR_CODE_RE, _SPACE_OCR_CODE_RE):
+        for m in rx.finditer(raw):
+            code = normalize_code(f"{m.group(1)}-{m.group(2)}")
+            disp = format_display_code(code) if parse_code_parts(code) else ""
+            if not disp or disp in seen:
+                continue
+            seen.add(disp)
+            found.append(disp)
+    return found
+
+
+def _sole_trusted_ocr_code(text: str | None) -> tuple[str | None, list[str]]:
+    found = _trusted_ocr_codes(text)
+    if len(found) == 1:
+        return found[0], found
+    return None, found
+
+
+_GLUED_OCR_CODE_RE = re.compile(
+    r"(?<![A-Za-z])([A-Za-z]{2,10})[-－‐‑‒–—―ー−](\d{3,8})"
+)
+
+# Characters these covers' fonts swap under OCR. Not a product-code list.
+_OCR_CONFUSION = {
+    "U": "LVJI",
+    "L": "UVIJ",
+    "J": "ILT",
+    "I": "JL1",
+    "O": "Q0D",
+    "Q": "O0D",
+    "D": "O0",
+    "V": "UY",
+    "S": "5",
+    "B": "83",
+    "Z": "2",
+    "G": "6C",
+    "C": "G",
+    "T": "J",
+    "H": "N",
+    "N": "H",
+    "0": "8O",
+    "1": "47",
+    "4": "1",
+    "5": "6",
+    "6": "580",
+    "8": "603B",
+    "2": "7",
+    "3": "8",
+    "7": "1",
+    "9": "0",
+}
+
+
+def _ocr_code_candidates(text: str | None) -> list[str]:
+    """Printed-looking 品番, including a code glued to the next number.
+
+    ABCD-100240 is the code plus a runtime, not a longer 品番. A misread
+    that is only "rake 12" never enters this list.
+    """
+    raw = str(text or "")
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(code: str) -> None:
+        disp = format_display_code(code) if parse_code_parts(code) else ""
+        if not disp or disp in seen:
+            return
+        seen.add(disp)
+        found.append(disp)
+
+    for code in _trusted_ocr_codes(raw):
+        add(code)
+    for m in _GLUED_OCR_CODE_RE.finditer(raw):
+        label, digits = m.group(1), m.group(2)
+        if len(digits) <= 5:
+            continue
+        for n in (3, 4, 5):
+            if len(digits) >= n:
+                add(f"{label}-{digits[:n]}")
+    return found
+
+
+def _confusion_variants(code: str, limit: int = 24) -> list[str]:
+    """One-character and one-letter-plus-one-digit OCR neighbors."""
+    parts = parse_code_parts(code)
+    if not parts:
+        return []
+    label, number = parts
+    chars = list(label.upper() + number)
+    nlab = len(label)
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def push(nxt: list[str]) -> None:
+        if len(out) >= limit:
+            return
+        disp = format_display_code("".join(nxt[:nlab]) + "-" + "".join(nxt[nlab:]))
+        if not disp or disp in seen or disp == format_display_code(code):
+            return
+        if not parse_code_parts(disp):
+            return
+        seen.add(disp)
+        out.append(disp)
+
+    singles: list[list[str]] = []
+    for i, ch in enumerate(chars):
+        for rep in _OCR_CONFUSION.get(ch, ""):
+            if i < nlab and not rep.isalpha():
+                continue
+            if i >= nlab and not rep.isdigit():
+                continue
+            nxt = chars[:]
+            nxt[i] = rep
+            singles.append(nxt)
+    # A misread often changes one letter and one digit together. Those
+    # neighbors go first so the jacket probe is not spent on the rest.
+    letter_idx = list(range(nlab))
+    digit_idx = list(range(nlab, len(chars)))
+    priority: list[list[str]] = []
+    rest: list[list[str]] = []
+    for i in letter_idx:
+        letter_alts = [a for a in _OCR_CONFUSION.get(chars[i], "") if a.isalpha()]
+        for j in digit_idx:
+            digit_alts = [b for b in _OCR_CONFUSION.get(chars[j], "") if b.isdigit()]
+            if letter_alts and digit_alts:
+                nxt = chars[:]
+                nxt[i] = letter_alts[0]
+                nxt[j] = digit_alts[0]
+                priority.append(nxt)
+            for a in letter_alts:
+                for b in digit_alts:
+                    nxt = chars[:]
+                    nxt[i] = a
+                    nxt[j] = b
+                    rest.append(nxt)
+    digit_singles = [nxt for nxt in singles if any(nxt[i] != chars[i] for i in range(nlab, len(chars)))]
+    letter_singles = [nxt for nxt in singles if nxt not in digit_singles]
+    # One-character misreads first (6/8, O/D). Two-character neighbors after,
+    # so the jacket probe is not spent before the single-character fix.
+    for nxt in digit_singles + letter_singles + priority + rest:
+        push(nxt)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _pick_code_by_jacket(
+    codes: list[str] | None,
+    image_bytes: bytes | None,
+    *,
+    limit: int = 8,
+) -> tuple[str | None, float | None, bool]:
+    """Highest jacket score among codes. None when nothing was compared or none locks."""
+    scored: list[tuple[float, str]] = []
+    compared = False
+    for code in list(codes or [])[:limit]:
+        try:
+            _cid, url = resolve_cover_cid(code)
+        except Exception:
+            url = None
+        if not url:
+            continue
+        score = _jacket_score_against_url(image_bytes, url)
+        if score is None:
+            continue
+        compared = True
+        if float(score) >= 0.85:
+            return code, float(score), True
+        scored.append((float(score), code))
+    if not scored:
+        return None, None, compared
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    best_s, best = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    if best_s >= 0.70 and (len(scored) == 1 or best_s - second >= 0.12):
+        return best, best_s, True
+    return None, best_s, True
+
+
+def _resolve_printed_code(
+    text: str | None,
+    image_bytes: bytes | None,
+) -> tuple[str | None, float | None, bool, bool]:
+    """Pick the 品番 whose jacket is this picture.
+
+    Returns (code, score, had_candidates, compared). had_candidates is False
+    when the text had nothing that looked like a printed code, so the caller
+    must not throw away a code that came from somewhere else. compared is
+    False when no cover could be scored.
+    """
+    cands = _ocr_code_candidates(text)
+    if not cands or not image_bytes:
+        return None, None, bool(cands), False
+    picked, score, compared = _pick_code_by_jacket(cands, image_bytes, limit=6)
+    if picked:
+        return picked, score, True, True
+    # A misread often has no catalog row. Try nearby characters before
+    # keeping that token, and before giving up on the printed code.
+    variants: list[str] = []
+    for code in cands[:2]:
+        for variant in _confusion_variants(code):
+            if variant not in cands and variant not in variants:
+                variants.append(variant)
+            if len(variants) >= 24:
+                break
+    picked, score, var_compared = _pick_code_by_jacket(variants, image_bytes, limit=20)
+    if picked:
+        return picked, score, True, True
+    if not compared and not var_compared:
+        if len(cands) == 1:
+            return cands[0], None, True, False
+        return None, None, True, False
+    return None, None, True, True
+
+
+def _ocr_title_repairs(text: str) -> list[str]:
+    """Particle and fragment repairs. These are search phrases, not codes.
+
+    Tesseract/scene OCR drops が between 先生 and 2人, and splits 隙間手コキ.
+    The repaired phrase is searched; a series of hits still has to lock to
+    the uploaded picture before a 品番 is kept.
+    """
+    raw = str(text or "")
+    if not raw or raw.startswith("[tesseract"):
+        return []
+    compact = re.sub(r"[\s　]+", "", raw)
+    out: list[str] = []
+
+    def add(q: str) -> None:
+        q = (q or "").strip()
+        if len(q) < 4 or q in out:
+            return
+        out.append(q)
+
+    if "先生2人" in compact or "先生が2人" in compact or re.search(r"先生\s*2\s*人", raw):
+        add("先生が2人")
+    if "隙間" in compact and "手" in compact:
+        add("座席の隙間")
+        add("隙間手コキ")
+    if "隠れ" in compact and "巨乳" in compact:
+        add("隠れ巨乳な彼女")
+    if ("地味" in compact) and ("眼鏡" in compact or "メガネ" in compact) and ("隠し切れ" in compact):
+        add("地味な眼鏡では隠し切れない")
+    return out
 
 
 def ocr_image(file_storage) -> str:
@@ -2149,6 +2613,12 @@ def fetch_avbase_by_code(code: str) -> dict | None:
             continue
     if work is None:
         try:
+            javbus_row = _fetch_javbus_by_code(display)
+        except Exception:
+            javbus_row = None
+        if isinstance(javbus_row, dict) and (javbus_row.get("title") or javbus_row.get("code")):
+            return javbus_row
+        try:
             rows = fetch_avbase_title_results(display, actress=None)
         except Exception:
             rows = []
@@ -2238,114 +2708,286 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
     out: list[dict] = []
     seen: set[str] = set()
     t0 = _time.monotonic()
+    avbase_failed = False
     try:
         url = f"https://www.avbase.net/works?q={quote(title)}"
         r = requests.get(url, headers=headers, timeout=10, verify=False)
         if r.status_code >= 400 or not r.text:
-            return []
-        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
-        if not m:
-            return []
-        data = json.loads(m.group(1))
-        works = ((data.get("props") or {}).get("pageProps") or {}).get("works") or []
-        for w in works:
-            if not isinstance(w, dict):
-                continue
-            code_raw = str(w.get("work_id") or "").strip()
-            if not code_raw or not parse_code_parts(code_raw):
-                continue
-            code = format_display_code(code_raw)
-            if code in seen:
-                continue
-            rtitle = str(w.get("title") or "").strip()
-            products = w.get("products") or []
-            p0 = products[0] if products and isinstance(products[0], dict) else {}
-            actors = w.get("actors") or (p0.get("actors") if isinstance(p0, dict) else None) or []
-            actor_names: list[str] = []
-            if isinstance(actors, list):
-                for a0 in actors:
-                    if isinstance(a0, dict) and a0.get("name"):
-                        actor_names.append(str(a0.get("name")))
-                    elif isinstance(a0, str) and a0.strip():
-                        actor_names.append(a0.strip())
-            actor_blob = " ".join(actor_names)
+            avbase_failed = True
+        else:
+            m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+            if not m:
+                avbase_failed = True
+            else:
+                data = json.loads(m.group(1))
+                works = ((data.get("props") or {}).get("pageProps") or {}).get("works") or []
+                # Rebind so the loop below sees the parsed list. A 200 with
+                # zero works is a real empty answer and must not hit javbus.
+                r = r  # noqa: keep response in scope for nothing
+                _avbase_works = works
+    except Exception:
+        avbase_failed = True
+        _avbase_works = []
+    else:
+        if avbase_failed:
+            _avbase_works = []
+    if not avbase_failed:
+        try:
+            for w in _avbase_works:
+                if not isinstance(w, dict):
+                    continue
+                code_raw = str(w.get("work_id") or "").strip()
+                if not code_raw or not parse_code_parts(code_raw):
+                    continue
+                code = format_display_code(code_raw)
+                if code in seen:
+                    continue
+                rtitle = str(w.get("title") or "").strip()
+                products = w.get("products") or []
+                p0 = products[0] if products and isinstance(products[0], dict) else {}
+                actors = w.get("actors") or (p0.get("actors") if isinstance(p0, dict) else None) or []
+                actor_names: list[str] = []
+                if isinstance(actors, list):
+                    for a0 in actors:
+                        if isinstance(a0, dict) and a0.get("name"):
+                            actor_names.append(str(a0.get("name")))
+                        elif isinstance(a0, str) and a0.strip():
+                            actor_names.append(a0.strip())
+                actor_blob = " ".join(actor_names)
 
-            # Actress-name queries: keep works starring that person even when
-            # the title text does not contain her name (old filter dropped them).
-            q_compact = re.sub(r"[\s　・·．.]+", "", title)
-            act_q = re.sub(r"[\s　・·．.]+", "", (actress or "").strip())
-            is_actress_query = bool(
-                (actress and (actress in title or act_q == q_compact))
-                or (
-                    len(q_compact) >= 3
-                    and not parse_code_parts(title)
-                    and re.fullmatch(r"[\u3040-\u30ff\u4e00-\u9fff]{2,12}", q_compact or "")
-                    and not re.search(r"[をにでがはもとからまでへの「」]", title or "")
+                # Actress-name queries: keep works starring that person even when
+                # the title text does not contain her name (old filter dropped them).
+                q_compact = re.sub(r"[\s　・·．.]+", "", title)
+                act_q = re.sub(r"[\s　・·．.]+", "", (actress or "").strip())
+                is_actress_query = bool(
+                    (actress and (actress in title or act_q == q_compact))
+                    or (
+                        len(q_compact) >= 3
+                        and not parse_code_parts(title)
+                        and re.fullmatch(r"[\u3040-\u30ff\u4e00-\u9fff]{2,12}", q_compact or "")
+                        and not re.search(r"[をにでがはもとからまでへの「」]", title or "")
+                    )
                 )
-            )
-            name_in_actors = False
-            if is_actress_query and q_compact:
-                for an in actor_names:
-                    an_c = re.sub(r"[\s　・·．.]+", "", an)
-                    if q_compact in an_c or an_c in q_compact or (actress and actress in an):
+                name_in_actors = False
+                if is_actress_query and q_compact:
+                    for an in actor_names:
+                        an_c = re.sub(r"[\s　・·．.]+", "", an)
+                        if q_compact in an_c or an_c in q_compact or (actress and actress in an):
+                            name_in_actors = True
+                            break
+                    if not name_in_actors and q_compact and q_compact in re.sub(r"\s+", "", rtitle):
                         name_in_actors = True
-                        break
-                if not name_in_actors and q_compact and q_compact in re.sub(r"\s+", "", rtitle):
-                    name_in_actors = True
 
-            score = title_similarity(title, rtitle)
-            if title and title[: min(8, len(title))] and title[:8] in rtitle:
-                score = max(score, 0.85)
-            # Code-style queries (e.g. DRPT-120) must match work_id, not JP title text
-            q_code = format_display_code(title) if parse_code_parts(title) else ""
-            if q_code and q_code == code:
-                score = max(score, 1.0)
-            if is_actress_query and name_in_actors:
-                score = max(score, 0.72)
-            if score < 0.25 and not (is_actress_query and name_in_actors):
+                score = title_similarity(title, rtitle)
+                if title and title[: min(8, len(title))] and title[:8] in rtitle:
+                    score = max(score, 0.85)
+                # Code-style queries (e.g. DRPT-120) must match work_id, not JP title text
+                q_code = format_display_code(title) if parse_code_parts(title) else ""
+                if q_code and q_code == code:
+                    score = max(score, 1.0)
+                if is_actress_query and name_in_actors:
+                    score = max(score, 0.72)
+                if score < 0.25 and not (is_actress_query and name_in_actors):
+                    continue
+                cid = _cid_from_avbase_product(p0, code)
+                cover = None
+                studio = None
+                actress_name = actress
+                if p0:
+                    cover = p0.get("image_url") or p0.get("thumbnail_url")
+                    maker = p0.get("maker") or {}
+                    if isinstance(maker, dict):
+                        studio = maker.get("name")
+                if not actress_name and actor_names:
+                    actress_name = actor_names[0]
+                if is_actress_query and name_in_actors and not actress_name:
+                    actress_name = title
+                if not cid:
+                    cid = code_to_cid(code)
+                if not cover and cid:
+                    cover = cover_url(cid)
+                # Prefer digital CDN pl cover when possible
+                if cover and "mono/movie" in str(cover) and cid:
+                    dig = cover_url(cid)
+                    if dig:
+                        cover = dig
+                seen.add(code)
+                out.append(
+                    {
+                        "code": code,
+                        "title": rtitle or title,
+                        "actress": actress_name,
+                        "studio": studio,
+                        "cid": cid,
+                        "cover": cover,
+                        "href": f"https://www.avbase.net/works/{w.get('id')}" if w.get("id") else None,
+                        "source": "avbase",
+                        "score": float(score),
+                    }
+                )
+                if len(out) >= 24:
+                    break
+        except Exception:
+            avbase_failed = True
+            out = []
+    if out:
+        out.sort(key=lambda x: x.get("score") or 0, reverse=True)
+        return out
+    if avbase_failed:
+        return _fetch_javbus_title_results(title, actress)
+    return []
+
+
+_JAVBUS_SEARCH_MEMO: dict[str, list[dict]] = {}
+
+
+def _javbus_headers() -> dict[str, str]:
+    return {
+        "User-Agent": UA,
+        "Cookie": "dv=1",
+        "Referer": "https://www.javbus.com/",
+        "Accept-Language": "ja,en;q=0.8",
+    }
+
+
+def _javbus_is_actress_query(title: str, actress: str | None) -> bool:
+    q_compact = re.sub(r"[\s　・·．.]+", "", title or "")
+    act_q = re.sub(r"[\s　・·．.]+", "", (actress or "").strip())
+    if actress and (actress in (title or "") or act_q == q_compact):
+        return True
+    # A personal name (柊ゆうき), not a title fragment that happens to use the same script.
+    return bool(re.fullmatch(r"[\u4e00-\u9fff]{1,5}[\u3040-\u309f]{1,8}", q_compact or ""))
+
+
+def _fetch_javbus_title_results(title: str, actress: str | None = None) -> list[dict]:
+    """Title / actress search via javbus when avbase did not answer.
+
+    Used only after an avbase HTTP failure. A successful avbase response,
+    including zero matching works, never calls this.
+    """
+    from urllib.parse import quote
+
+    title = (title or "").strip()
+    if not title:
+        return []
+    memo_key = re.sub(r"\s+", "", title) + "\n" + re.sub(r"\s+", "", actress or "")
+    cached = _JAVBUS_SEARCH_MEMO.get(memo_key)
+    if cached is not None:
+        return [dict(row) for row in cached]
+    out: list[dict] = []
+    try:
+        url = "https://www.javbus.com/search/" + quote(title)
+        r = requests.get(url, headers=_javbus_headers(), timeout=12, verify=False)
+        if r.status_code >= 400 or not r.text:
+            _JAVBUS_SEARCH_MEMO[memo_key] = []
+            return []
+        actress_q = _javbus_is_actress_query(title, actress)
+        seen: set[str] = set()
+        for box in re.finditer(
+            r'<a class="movie-box"\s+href="https://www\.javbus\.com/([A-Za-z0-9]+-\d+)"[^>]*>(.*?)</a>',
+            r.text,
+            re.S,
+        ):
+            code = format_display_code(box.group(1))
+            if not parse_code_parts(code) or code in seen:
                 continue
-            cid = _cid_from_avbase_product(p0, code)
-            cover = None
-            studio = None
+            blob = box.group(2)
+            title_m = re.search(r'<img[^>]*\stitle="([^"]+)"', blob)
+            date_m = re.search(r"<date>\s*([A-Za-z0-9]+-\d+)\s*</date>", blob)
+            if date_m and parse_code_parts(date_m.group(1)):
+                code = format_display_code(date_m.group(1))
+            rtitle = (title_m.group(1).strip() if title_m else "") or title
+            score = title_similarity(title, rtitle)
+            compact_q = re.sub(r"\s+", "", title)
+            if len(compact_q) >= 12 and title[:8] in rtitle:
+                score = max(score, 0.85)
+            q_code = format_display_code(title) if parse_code_parts(title) else ""
+            if q_code and codes_numeric_equal(q_code, code):
+                score = max(score, 1.0)
             actress_name = actress
-            if p0:
-                cover = p0.get("image_url") or p0.get("thumbnail_url")
-                maker = p0.get("maker") or {}
-                if isinstance(maker, dict):
-                    studio = maker.get("name")
-            if not actress_name and actor_names:
-                actress_name = actor_names[0]
-            if is_actress_query and name_in_actors and not actress_name:
-                actress_name = title
-            if not cid:
-                cid = code_to_cid(code)
-            if not cover and cid:
-                cover = cover_url(cid)
-            # Prefer digital CDN pl cover when possible
-            if cover and "mono/movie" in str(cover) and cid:
-                dig = cover_url(cid)
-                if dig:
-                    cover = dig
+            if actress_q:
+                score = max(score, 0.72)
+                if not actress_name:
+                    actress_name = title
+            elif score < 0.25:
+                continue
+            cid = code_to_cid(code)
             seen.add(code)
             out.append(
                 {
                     "code": code,
-                    "title": rtitle or title,
+                    "title": rtitle,
                     "actress": actress_name,
-                    "studio": studio,
+                    "studio": None,
                     "cid": cid,
-                    "cover": cover,
-                    "href": f"https://www.avbase.net/works/{w.get('id')}" if w.get("id") else None,
-                    "source": "avbase",
+                    "cover": cover_url(cid) if cid else None,
+                    "href": f"https://www.javbus.com/{code}",
+                    "source": "javbus",
                     "score": float(score),
+                    "title_fit": _title_cover_ratio(title, rtitle),
                 }
             )
             if len(out) >= 24:
                 break
     except Exception:
-        return out
-    out.sort(key=lambda x: x.get("score") or 0, reverse=True)
+        out = []
+    out.sort(key=lambda x: (-(x.get("score") or 0), -(x.get("title_fit") or 0)))
+    _JAVBUS_SEARCH_MEMO[memo_key] = [dict(row) for row in out]
     return out
+
+
+def _fetch_javbus_by_code(code: str) -> dict | None:
+    """One work page: catalog title and billed actress. No invented Chinese."""
+    display = format_display_code(code) if parse_code_parts(code or "") else ""
+    if not display:
+        return None
+    memo_key = "code\n" + display
+    cached = _JAVBUS_SEARCH_MEMO.get(memo_key)
+    if cached is not None:
+        return dict(cached[0]) if cached else None
+    try:
+        r = requests.get(
+            f"https://www.javbus.com/{display}",
+            headers=_javbus_headers(),
+            timeout=12,
+            verify=False,
+        )
+        if r.status_code >= 400 or not r.text or "avatar-box" not in r.text and "<h3>" not in r.text:
+            _JAVBUS_SEARCH_MEMO[memo_key] = []
+            return None
+        h3 = ""
+        hm = re.search(r"<h3>(.*?)</h3>", r.text, re.S)
+        if hm:
+            h3 = re.sub(r"<[^>]+>", " ", hm.group(1))
+            h3 = re.sub(r"\s+", " ", h3).strip()
+        actress_name = None
+        am = re.search(r'class="avatar-box"[^>]*>.*?title="([^"]+)"', r.text, re.S)
+        if am:
+            actress_name = am.group(1).strip() or None
+        title = h3
+        if title.upper().startswith(display):
+            title = title[len(display) :].strip()
+        if actress_name and title.endswith(actress_name):
+            title = title[: -len(actress_name)].strip()
+        if not is_usable_title(title):
+            _JAVBUS_SEARCH_MEMO[memo_key] = []
+            return None
+        cid = code_to_cid(display)
+        row = {
+            "code": display,
+            "title": title,
+            "actress": actress_name,
+            "studio": None,
+            "cid": cid,
+            "related": [],
+            "source": "javbus",
+            "cover": cover_url(cid) if cid else None,
+        }
+        _JAVBUS_SEARCH_MEMO[memo_key] = [dict(row)]
+        return row
+    except Exception:
+        _JAVBUS_SEARCH_MEMO[memo_key] = []
+        return None
 
 
 def fetch_jav321_title_results(title: str, actress: str | None = None) -> list[dict]:
@@ -2997,7 +3639,8 @@ def filter_title_candidates(candidates: list[dict], min_score: float = 0.25) -> 
         label = (parts[0] if parts else "").upper()
         pref = 1 if label in PREFERRED_LABELS else 0
         src = 1 if c.get("source") in ("javlibrary", "avbase", "jav321") else 0
-        return (c.get("score") or 0, src, pref)
+        fit = float(c.get("title_fit") or 0)
+        return (c.get("score") or 0, fit, src, pref)
 
     ranked.sort(key=rank, reverse=True)
     return ranked
@@ -3071,17 +3714,133 @@ def _boost_title_score(item: dict, *phrases: str) -> dict:
     item = dict(item)
     score = float(item.get("score") or 0)
     catalog = str(item.get("title") or "")
+    fit = float(item.get("title_fit") or 0)
     for phrase in phrases:
         phrase = (phrase or "").strip()
         if not phrase or not catalog:
             continue
+        compact = re.sub(r"\s+", "", phrase)
         score = max(score, title_similarity(phrase, catalog))
-        if phrase in catalog or catalog in phrase:
-            score = max(score, 0.92)
-        elif len(phrase) >= 4 and phrase[:8] in catalog:
+        fit = max(fit, _title_cover_ratio(phrase, catalog))
+        # Only a long phrase may count as the title itself. A 4-char hook
+        # that happens to occur inside another work stays a weak clue.
+        if len(compact) >= 12 and (phrase in catalog or catalog in phrase):
+            cover = _title_cover_ratio(phrase, catalog)
+            score = max(score, 0.92 if cover >= 0.8 else 0.5 + 0.4 * cover)
+        elif len(compact) >= 12 and phrase[:8] in catalog:
             score = max(score, 0.85)
     item["score"] = score
+    item["title_fit"] = fit
     return item
+
+
+def _trailing_billed_name(title: str | None) -> str:
+    """Short name after the series line (先生が… 柊ゆうき). Not a slogan."""
+    raw = re.sub(r"\s+", " ", (normalize_ocr_title(title) or title or "")).strip()
+    parts = [p for p in raw.split(" ") if p]
+    if len(parts) < 2:
+        return ""
+    tail = parts[-1]
+    head = "".join(parts[:-1])
+    if len(head) < 8 or not (2 <= len(tail) <= 8):
+        return ""
+    if not re.fullmatch(r"[\u3040-\u30ff\u4e00-\u9fff・]+", tail):
+        return ""
+    return tail
+
+
+def _core_title(title: str | None) -> str:
+    raw = re.sub(r"\s+", " ", (normalize_ocr_title(title) or title or "")).strip()
+    name = _trailing_billed_name(raw)
+    if name:
+        raw = raw[: raw.rfind(name)].strip()
+    return re.sub(r"\s+", "", raw)
+
+
+def _select_title_volume(
+    cands: list[dict] | None,
+    query: str,
+    actress: str | None = None,
+) -> tuple[dict | None, bool]:
+    """Pick one catalog row for a typed title.
+
+    Returns (row, ambiguous). Ambiguous is true when several volumes share the
+    core title and neither an exact line nor a billed name distinguishes them.
+    Catalog order is not a tie-break.
+    """
+    rows = [c for c in (cands or []) if isinstance(c, dict) and c.get("code")]
+    if not rows:
+        return None, False
+    q_compact = re.sub(r"\s+", "", normalize_ocr_title(query) or query or "")
+    exact = [
+        c
+        for c in rows
+        if q_compact
+        and re.sub(r"\s+", "", normalize_ocr_title(c.get("title")) or str(c.get("title") or ""))
+        == q_compact
+    ]
+    if len(exact) == 1:
+        return exact[0], False
+    pool = exact if len(exact) > 1 else rows
+    q_core = _core_title(query)
+    tied = []
+    for c in pool:
+        core = _core_title(c.get("title") or "")
+        if q_core and core and (core == q_core or q_compact == core):
+            tied.append(c)
+    if len(tied) <= 1:
+        return (tied[0] if tied else rows[0]), False
+    name = re.sub(r"\s+", "", (actress or "").strip())
+    if len(name) >= 2:
+        matched = []
+        for c in tied:
+            blob = re.sub(
+                r"\s+",
+                "",
+                str(c.get("title") or "") + str(c.get("actress") or ""),
+            )
+            if name in blob:
+                matched.append(c)
+        if len(matched) == 1:
+            return matched[0], False
+    return None, True
+
+
+def _title_search_result(
+    cands: list[dict],
+    query: str,
+    actress: str | None = None,
+    *,
+    title_zh: str | None = None,
+    pack,
+) -> dict | None:
+    """One volume, or an unresolved series when the title alone cannot choose."""
+    best, ambiguous = _select_title_volume(cands, query, actress)
+    if ambiguous:
+        return {
+            "code": None,
+            "title": query,
+            "actress": (actress or "").strip() or None,
+            "series_unresolved": True,
+            "candidates": list(cands or []),
+            "score": None,
+            "source": "title",
+        }
+    if not best:
+        return None
+    out = {
+        "code": best.get("code"),
+        "title": best.get("title") or query,
+        "title_zh": best.get("title_zh") or title_zh,
+        "actress": best.get("actress") or actress,
+        "studio": best.get("studio"),
+        "cover": best.get("cover"),
+        "cid": best.get("cid"),
+        "source": best.get("source"),
+        "score": best.get("score"),
+        "title_fit": best.get("title_fit"),
+    }
+    return pack(out, cands)
 
 
 def search_by_title(title: str, actress: str | None = None) -> dict | None:
@@ -3202,28 +3961,23 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
             break
     early_av = filter_title_candidates(early_av, min_score=0.30)
     if early_av and (early_av[0].get("score") or 0) >= 0.45:
-        best = early_av[0]
-        out = {
-            "code": best.get("code"),
-            "title": best.get("title") or original_title,
-            "actress": best.get("actress") or actress,
-            "studio": best.get("studio"),
-            "cover": best.get("cover"),
-            "cid": best.get("cid"),
-            "source": best.get("source"),
-            "score": best.get("score"),
-        }
-        return _pack(out, early_av)
+        return _title_search_result(early_av, original_title, _actress_hint, pack=_pack)
 
     # 0a2) Distinctive short n-grams when full OCR title still misses (censored glyphs / truncation)
     if not early_av or (early_av and (early_av[0].get("score") or 0) < 0.45):
         try:
             short_qs: list[str] = []
+            # The full string can miss (length / a censored glyph). The head of
+            # that same string is still the title; a bare theme word is not.
+            raw = normalize_ocr_title(original_title) or original_title
+            raw_compact = re.sub(r"\s+", "", raw)
+            for n in (40, 32, 24, 18):
+                if len(raw_compact) > n + 6:
+                    short_qs.append(raw_compact[:n])
             for q in _title_related_keyword_queries(original_title):
                 if q and 4 <= len(q) <= 16 and q not in short_qs:
                     short_qs.append(q)
             # Prefer mid-title chunks that OCR usually gets right (bus/seat etc.)
-            raw = normalize_ocr_title(original_title) or original_title
             for n in (6, 8, 10, 12):
                 if len(raw) >= n + 4:
                     mid = raw[len(raw) // 4 : len(raw) // 4 + n]
@@ -3243,18 +3997,7 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
                     break
             early_av = filter_title_candidates(early_av, min_score=0.30)
             if early_av and (early_av[0].get("score") or 0) >= 0.45:
-                best = early_av[0]
-                out = {
-                    "code": best.get("code"),
-                    "title": best.get("title") or original_title,
-                    "actress": best.get("actress") or actress,
-                    "studio": best.get("studio"),
-                    "cover": best.get("cover"),
-                    "cid": best.get("cid"),
-                    "source": best.get("source"),
-                    "score": best.get("score"),
-                }
-                return _pack(out, early_av)
+                return _title_search_result(early_av, original_title, _actress_hint, pack=_pack)
         except Exception:
             pass
 
@@ -3404,19 +4147,11 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
             if not good:
                 return None
             best = good[0]
+            good = [best]
 
-    out = {
-        "code": best.get("code"),
-        "title": best.get("title") or title,
-        "title_zh": best.get("title_zh") or query_title_zh,
-        "actress": best.get("actress") or actress,
-        "studio": best.get("studio"),
-        "cover": best.get("cover"),
-        "cid": best.get("cid"),
-        "source": best.get("source"),
-        "score": best.get("score"),
-    }
-    return _pack(out, good)
+    return _title_search_result(
+        good, original_title, _actress_hint, title_zh=query_title_zh, pack=_pack
+    )
 
 
 
@@ -4749,6 +5484,351 @@ def title_only_payload(
 
 
 
+def _candidate_titles_collide(cands: list | None) -> bool:
+    """True when two catalog titles are the same series template."""
+    titles: list[str] = []
+    for c in cands or []:
+        if not isinstance(c, dict):
+            continue
+        t = re.sub(r"\s+", "", str(c.get("title") or ""))
+        if len(t) >= 8:
+            titles.append(t)
+    if len(titles) < 2:
+        return False
+    for i in range(len(titles)):
+        for j in range(i + 1, len(titles)):
+            if titles[i][:10] and titles[i][:10] == titles[j][:10]:
+                return True
+            try:
+                if title_similarity(titles[i], titles[j]) >= 0.72:
+                    return True
+            except Exception:
+                continue
+    return False
+
+
+def _norm_gray(im: Image.Image, w: int, h: int) -> list[float]:
+    small = im.convert("L").resize((w, h), Image.Resampling.BILINEAR)
+    pix = list(small.getdata())
+    n = float(len(pix) or 1)
+    mean = sum(pix) / n
+    var = sum((p - mean) ** 2 for p in pix) / n
+    std = var ** 0.5 or 1.0
+    return [(p - mean) / std for p in pix]
+
+
+def _gray_corr(a: list[float], b: list[float]) -> float:
+    if not a or len(a) != len(b):
+        return 0.0
+    return sum(x * y for x, y in zip(a, b)) / float(len(a))
+
+
+def _figure_crop(img: Image.Image) -> Image.Image:
+    """Person region: face, body, clothes, expression. Title bars stay out."""
+    w, h = img.size
+    x0, y0 = int(w * 0.16), int(h * 0.18)
+    x1, y1 = int(w * 0.84), int(h * 0.90)
+    if x1 - x0 < 8 or y1 - y0 < 8:
+        return img
+    return img.crop((x0, y0, x1, y1))
+
+
+def _jacket_front_views(cover: Image.Image, user: Image.Image) -> list[Image.Image]:
+    """Whole slide, plus the front panel when the catalog image is a wide package.
+
+    A full jacket is back + spine + front. The upload is often only the front.
+    Comparing the uncropped slide to that crop scores the spine and the back
+    and rejects the right volume.
+    """
+    cw, ch = cover.size
+    if cw < 16 or ch < 16:
+        return [cover]
+    views = [cover]
+    cover_aspect = cw / float(ch)
+    user_aspect = user.size[0] / float(max(user.size[1], 1))
+    if cover_aspect > max(1.35, user_aspect * 1.45):
+        # Package art is usually back | spine | front, with the front on the right.
+        views.append(cover.crop((int(cw * 0.62), 0, cw, ch)))
+        views.append(cover.crop((cw // 2, 0, cw, ch)))
+        views.append(cover.crop((0, 0, max(16, int(cw * 0.40)), ch)))
+    return views
+
+
+def _aligned_jacket_scores(user: Image.Image, cover: Image.Image) -> tuple[float, float]:
+    """Frame score, then the person/clothes score at that same window.
+
+    The catalog front is scaled and slid until its framing matches the upload.
+    The second score is only the figure crop (face, body, clothes, expression),
+    so a shared series layout does not count as the same outfit.
+    """
+    uw, uh = user.size
+    if uw < 8 or uh < 8:
+        return 0.0, 0.0
+    user_fig = _figure_crop(user)
+    best_frame = 0.0
+    best_figure = 0.0
+    for src in _jacket_front_views(cover, user):
+        sw, sh = src.size
+        if sw < 8 or sh < 8:
+            continue
+        for zoom in (1.0, 1.55):
+            win_h = 72
+            win_w = max(12, int(round(uw * (win_h / float(uh)))))
+            src_h = max(win_h, int(round(win_h * zoom)))
+            src_w = max(win_w, int(round(sw * (src_h / float(sh)))))
+            src_r = src.resize((src_w, src_h), Image.Resampling.BILINEAR)
+            step_x = max(6, (src_w - win_w) // 5 or 1)
+            step_y = max(6, (src_h - win_h) // 3 or 1)
+            ua = _norm_gray(user.resize((win_w, win_h), Image.Resampling.BILINEAR), 36, 36)
+            for y in range(0, max(1, src_h - win_h + 1), step_y):
+                for x in range(0, max(1, src_w - win_w + 1), step_x):
+                    patch = src_r.crop((x, y, x + win_w, y + win_h))
+                    frame = _gray_corr(ua, _norm_gray(patch, 36, 36))
+                    if frame <= best_frame:
+                        continue
+                    best_frame = frame
+                    best_figure = _gray_corr(
+                        _norm_gray(user_fig, 28, 28),
+                        _norm_gray(_figure_crop(patch), 28, 28),
+                    )
+                    if best_frame >= 0.93 and best_figure >= 0.72:
+                        return best_frame, best_figure
+    return best_frame, best_figure
+
+
+def _jacket_similarity(user: Image.Image, cover: Image.Image) -> float:
+    """How well the upload sits on this jacket after front crop-align."""
+    frame, _figure = _aligned_jacket_scores(user, cover)
+    return frame
+
+
+def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None) -> dict | None:
+    """Pick a candidate whose jacket matches the upload. No API key required.
+
+    A series template (six APGH volumes, one title) must not keep whichever
+    row the catalog listed first. Lock only on a clear margin.
+    """
+    if not user_image_bytes:
+        return None
+    coded = [c for c in (candidates or []) if isinstance(c, dict) and c.get("code") and parse_code_parts(str(c.get("code")))]
+    if len(coded) < 2:
+        return None
+    try:
+        user = Image.open(io.BytesIO(user_image_bytes))
+        user = ImageOps.exif_transpose(user).convert("RGB")
+    except Exception:
+        return None
+    if min(user.size) < 64:
+        return None
+    scored: list[tuple[float, dict]] = []
+    for cand in coded[:12]:
+        disp = format_display_code(str(cand.get("code")))
+        cid = str(cand.get("cid") or "") or (code_to_cid(disp) or "")
+        url = str(cand.get("cover") or "") or (cover_url(cid) if cid else "")
+        blob = download_cover_bytes(url) if url else None
+        if not blob and cid:
+            alt = cover_url(cid)
+            if alt and alt != url:
+                blob = download_cover_bytes(alt)
+        if not blob:
+            continue
+        try:
+            cover = Image.open(io.BytesIO(blob))
+            cover = ImageOps.exif_transpose(cover).convert("RGB")
+        except Exception:
+            continue
+        frame, figure = _aligned_jacket_scores(user, cover)
+        scored.append((frame, figure, cand))
+    if not scored:
+        return None
+    scored.sort(key=lambda pair: (pair[0], pair[1]), reverse=True)
+    best_s, best_fig, best = scored[0]
+    second = scored[1][0] if len(scored) > 1 else 0.0
+    # same_work is the aligned front. match_clothes is the person region
+    # (face, body, clothes, expression). A series template can share the
+    # first and still fail the second. Text rank must not fill that gap.
+    same_work = best_s >= 0.70 and (best_s - second) >= 0.12
+    match_clothes = best_fig >= 0.58
+    if same_work and match_clothes:
+        winner = dict(best)
+        winner["jacket_score"] = best_s
+        winner["jacket_figure"] = best_fig
+        winner["visual"] = {
+            "same_work": True,
+            "match_person": True,
+            "match_face": best_fig >= 0.70,
+            "match_clothes": True,
+            "match_accessories": best_fig >= 0.64,
+            "match_pose": best_s >= 0.75,
+            "confidence": best_s,
+        }
+        return winner
+    return None
+
+
+def _ocr_code_survives_title_mismatch(verify_meta: dict | None, image_bytes: bytes | None) -> tuple[bool, float | None]:
+    """Keep a printed 品番 when its jacket is this picture, despite a bad OCR title."""
+    if not isinstance(verify_meta, dict) or verify_meta.get("ok"):
+        return False, None
+    if not image_bytes or not verify_meta.get("cover_ok"):
+        return False, None
+    score = _jacket_score_against_url(image_bytes, verify_meta.get("cover"))
+    if score is not None and score >= 0.70:
+        return True, score
+    return False, score
+
+
+def _jacket_score_against_url(image_bytes: bytes | None, url: str | None) -> float | None:
+    """Jacket correlation, or None when the two pictures cannot be compared."""
+    if not image_bytes or not url:
+        return None
+    try:
+        blob = download_cover_bytes(str(url))
+        if not blob:
+            return None
+        user = Image.open(io.BytesIO(image_bytes))
+        user = ImageOps.exif_transpose(user).convert("RGB")
+        cover = Image.open(io.BytesIO(blob))
+        cover = ImageOps.exif_transpose(cover).convert("RGB")
+        return float(_jacket_similarity(user, cover))
+    except Exception:
+        return None
+
+
+def _upload_matches_cached_cover(image_bytes: bytes | None, cached: dict | None) -> bool:
+    """False only when the cached jacket was compared and is a different picture.
+
+    An earlier identify can be stored under this file's hash. Without a
+    vision key that row would be replayed forever. A low jacket score means
+    it is not this cover, so the title search runs again. A missing cover,
+    a failed download, or bytes that are not an image are not a mismatch.
+    """
+    if not image_bytes or not isinstance(cached, dict):
+        return False
+    url = str(cached.get("cover") or "")
+    if not url:
+        return True
+    score = _jacket_score_against_url(image_bytes, url)
+    if score is None:
+        return True
+    return score >= 0.40
+
+
+def _cluster_shares_title(rows: list | None, *, min_rows: int = 3, min_prefix: int = 8) -> bool:
+    """True when several catalog rows are one series template, not unrelated hits."""
+    titles: list[str] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        title = re.sub(r"\s+", "", str(row.get("title") or ""))
+        if len(title) >= min_prefix:
+            titles.append(title)
+    if len(titles) < min_rows:
+        return False
+    pref = titles[0]
+    for title in titles[1:]:
+        n = 0
+        lim = min(len(pref), len(title))
+        while n < lim and pref[n] == title[n]:
+            n += 1
+        pref = pref[:n]
+        if len(pref) < min_prefix:
+            return False
+    return True
+
+
+def _resolve_unnumbered_cover(queries: list[str] | None, image_bytes: bytes | None) -> dict | None:
+    """No printed 品番: search title cues, then lock the jacket to one volume.
+
+    A shared series title must not keep whichever row the catalog listed
+    first. A short unique phrase does not override a jacket lock. When the
+    jacket does not lock, a longer phrase that is actually in a catalog
+    title is kept.
+    """
+    series_pool: list[dict] = []
+    specific: list[tuple[float, int, dict]] = []
+    seen_series: set[str] = set()
+    seen_q: set[str] = set()
+    for raw_q in queries or []:
+        q = re.sub(r"\s+", " ", str(raw_q or "")).strip()
+        key = re.sub(r"\s+", "", q)
+        if len(key) < 4 or key in seen_q or not is_usable_title(q):
+            continue
+        seen_q.add(key)
+        if len(seen_q) > 8:
+            break
+        try:
+            found = search_by_title(q)
+        except Exception:
+            found = None
+        if not isinstance(found, dict) or not _hit_has_catalog_code(found):
+            continue
+        rows = [c for c in (found.get("candidates") or []) if isinstance(c, dict) and c.get("code")]
+        if not rows:
+            rows = [found]
+        if _cluster_shares_title(rows):
+            for row in rows:
+                code = format_display_code(str(row.get("code") or ""))
+                if not code or code in seen_series:
+                    continue
+                seen_series.add(code)
+                series_pool.append(row)
+            continue
+        best = rows[0]
+        title = re.sub(r"\s+", "", str(best.get("title") or ""))
+        if len(key) >= 4 and (key in title or title_similarity(key, title) >= 0.55):
+            specific.append((title_similarity(key, str(best.get("title") or "")), len(key), found))
+    pool = list(series_pool)
+    seen_pool = set(seen_series)
+    for _score, _ln, hit in specific:
+        for row in [hit] + list(hit.get("candidates") or []):
+            if not isinstance(row, dict) or not row.get("code"):
+                continue
+            code = format_display_code(str(row.get("code") or ""))
+            if not code or code in seen_pool:
+                continue
+            seen_pool.add(code)
+            pool.append(row)
+    if image_bytes and len(pool) >= 2:
+        try:
+            winner = _jacket_lock_winner(image_bytes, pool[:12])
+        except Exception:
+            winner = None
+        if isinstance(winner, dict) and winner.get("code"):
+            code = format_display_code(str(winner.get("code")))
+            rest = [
+                c
+                for c in pool
+                if format_display_code(str(c.get("code") or "")) != code
+            ]
+            hit = dict(winner)
+            hit["candidates"] = [winner] + rest
+            hit["visual_confident"] = True
+            hit["series_unresolved"] = False
+            hit["visual_meta"] = {
+                "visual_ranked": True,
+                "visual_lock": True,
+                "mode": "jacket",
+                "compared": min(len(pool), 12),
+                "note": "封面與原圖鎖定",
+            }
+            return hit
+    if specific:
+        specific.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return specific[0][2]
+    return None
+
+
+def _hit_visually_locked(hit: dict | None) -> bool:
+    if not isinstance(hit, dict):
+        return False
+    meta = hit.get("visual_meta") or {}
+    if meta.get("visual_lock") or hit.get("visual_confident"):
+        return True
+    vm = ((hit.get("candidates") or [{}])[0] or {}).get("visual") if hit.get("candidates") else None
+    return bool(isinstance(vm, dict) and vm.get("same_work") and vm.get("match_clothes"))
+
+
 def apply_visual_rank_to_hit(
     hit: dict,
     user_image_bytes: bytes | None,
@@ -4769,23 +5849,72 @@ def apply_visual_rank_to_hit(
     coded = [c for c in cands if c.get("code") and parse_code_parts(str(c["code"]))]
     if len(coded) < 1:
         return hit
+    jacket = None
+    try:
+        jacket = _jacket_lock_winner(user_image_bytes, coded)
+    except Exception:
+        jacket = None
+    if isinstance(jacket, dict) and jacket.get("code"):
+        code = format_display_code(str(jacket.get("code")))
+        rest = [
+            c
+            for c in coded
+            if format_display_code(str(c.get("code") or "")) != code
+        ]
+        winner = dict(jacket)
+        prior = jacket.get("visual") if isinstance(jacket.get("visual"), dict) else {}
+        winner["visual"] = {
+            "same_work": bool(prior.get("same_work")),
+            "match_person": bool(prior.get("match_person")),
+            "match_face": bool(prior.get("match_face")),
+            "match_clothes": bool(prior.get("match_clothes")),
+            "match_accessories": bool(prior.get("match_accessories")),
+            "match_pose": bool(prior.get("match_pose")),
+            "confidence": float(jacket.get("jacket_score") or prior.get("confidence") or 0.9),
+        }
+        if not (winner["visual"]["same_work"] and winner["visual"]["match_clothes"]):
+            jacket = None
+            winner = None
+    if isinstance(jacket, dict) and jacket.get("code") and isinstance(winner, dict):
+        winner["visual_score"] = float(jacket.get("jacket_score") or 0.9)
+        out = dict(hit)
+        out["candidates"] = [winner] + rest
+        out["code"] = winner.get("code")
+        out["title"] = winner.get("title") or out.get("title")
+        out["actress"] = winner.get("actress") or out.get("actress")
+        out["studio"] = winner.get("studio") or out.get("studio")
+        out["cover"] = winner.get("cover") or out.get("cover")
+        out["cid"] = winner.get("cid") or out.get("cid")
+        out["source"] = winner.get("source") or out.get("source")
+        out["visual_best_code"] = code
+        out["visual_confident"] = True
+        out["series_unresolved"] = False
+        out["visual_meta"] = {
+            "visual_ranked": True,
+            "visual_lock": True,
+            "compared": len(coded),
+            "note": "封面與原圖鎖定",
+            "mode": "jacket",
+        }
+        return out
     ranked, meta = rank_candidates_by_visual(
         user_image_bytes, coded, api_key=api_key
     )
     if not meta.get("visual_ranked"):
         hit = dict(hit)
         hit["visual_meta"] = meta
+        # Several volumes, one title, and no picture lock: do not keep
+        # whichever row the catalog listed first.
+        if len(coded) >= 2 and _candidate_titles_collide(coded):
+            hit["series_unresolved"] = True
+            hit["visual_confident"] = False
         return hit
     best = ranked[0]
     out = dict(hit)
     # Candidates already sorted by visual score; expose that ordering as main
     out["candidates"] = ranked
     vm0 = best.get("visual") or {}
-    locked = bool(
-        vm0.get("same_work")
-        and vm0.get("match_person")
-        and vm0.get("match_clothes")
-    )
+    locked = bool(vm0.get("same_work") and vm0.get("match_clothes"))
     # Always expose visual ranking; only *lock* identity fields when gates pass
     out["visual_meta"] = meta
     out["visual_best_code"] = format_display_code(str(best.get("code") or ""))
@@ -4818,6 +5947,8 @@ def apply_visual_rank_to_hit(
         out["visual_confident"] = True
     else:
         out["visual_confident"] = False
+    if _candidate_titles_collide(out.get("candidates") or coded) and not _hit_visually_locked(out):
+        out["series_unresolved"] = True
     return out
 
 
@@ -6431,17 +7562,104 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
             _add(noun)
 
     distinctive_lex = [k for k in found if not _is_weak_theme_token(k)]
-    # Leftover {4,6} only when lexicon/latin/compounds produced no distinctive token.
+    # Particle-bounded compounds only when nothing distinctive was found.
+    # Fixed 4–6 windows sliced プライベート補習 into ライベート補 / 人っきりのプ.
     if not distinctive_lex:
-        for m in re.finditer(r"[\u4e00-\u9fff\u3040-\u30ff]{4,6}", t_norm):
-            chunk = m.group(0)
-            if re.fullmatch(r"[\u3040-\u309f]+", chunk):
-                continue
+        for chunk in _bounded_title_compounds(t_norm):
             if len(found) >= 10:
                 break
             _add(chunk)
 
     return _rank_theme_keywords(found, t, compounds)[:10]
+
+
+_TITLE_COMPOUND_STOP = {
+    "全部",
+    "すべて",
+    "こと",
+    "ため",
+    "為",
+    "本当",
+    "自分",
+    "ここ",
+    "そこ",
+    "これ",
+    "それ",
+    "もの",
+    "とき",
+    "時",
+}
+
+
+# Clause glue that is not a theme particle. Kept out of the single-character
+# class so だけ does not become だ + け. も / いし sit between content words
+# (金も無い, 無いし同僚) and must not glue two clauses into one chip.
+_CLAUSE_JOIN_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff\u30a0-\u30ff0-9])"
+    r"(?:ないし|ながら|けれど|けど|のに|ので|だけ|しか|つつ|ても|でも|いし|も)"
+    r"(?=[\u4e00-\u9fff\u30a0-\u30ff])"
+)
+
+
+def _bounded_title_compounds(text: str) -> list[str]:
+    """Chunks split on particles, not a sliding window.
+
+    先生が2人っきりのプライベート補習で全部面倒みてあげる →
+    先生 / 2人っきり / プライベート補習 / 面倒みてあげる.
+    A token that is only the tail of a longer katakana word is dropped.
+    Pure hiragana and edition junk are not chips. A clause joiner
+    (だけ / ないし / も) splits the chunk so two clauses are not one chip.
+    """
+    t = re.sub(r"\s+", "", text or "")
+    if not t:
+        return []
+    parts = re.split(r"[をにでがはもとからまでへの、。！？！\?／/\|・…]+", t)
+    parts = [piece for part in parts for piece in _CLAUSE_JOIN_RE.split(part)]
+    raw_parts: list[str] = []
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+        # 全部面倒みてあげる → also the act without the generic prefix.
+        if part.startswith("全部") and len(part) > 4:
+            raw_parts.append(part[2:])
+        raw_parts.append(part)
+    katakana_words = re.findall(r"[\u30a0-\u30ffー]{4,}", t)
+    out: list[str] = []
+    seen: set[str] = set()
+    for part in raw_parts:
+        if part in _TITLE_COMPOUND_STOP:
+            continue
+        if _contains_edition_marker(part) or _is_edition_marker_token(part):
+            continue
+        if re.fullmatch(r"[\u3040-\u309f]+", part):
+            continue
+        # 彼女のいない… splits on の into a tail that starts mid-word (いない貧乏…).
+        if re.match(r"[\u3040-\u309f]", part):
+            continue
+        if _CLAUSE_JOIN_RE.search(part):
+            continue
+        # (仮名)アキさん is an alias label, not a theme. 自分以上 is a
+        # comparison ("more than me"), not a compound.
+        if "仮名" in part:
+            continue
+        if re.fullmatch(r"(自分|それ|これ|あれ|彼女|彼氏)以上", part):
+            continue
+        if not re.search(r"[\u4e00-\u9fff\u30a0-\u30ff0-9]", part):
+            continue
+        if part in _COMPOUND_SUFFIXES or any(part.startswith(suf) for suf in _COMPOUND_SUFFIXES):
+            continue
+        if len(part) < 4 and part != "先生":
+            continue
+        if len(part) > 16:
+            continue
+        if any(part != word and part in word and re.fullmatch(r"[\u30a0-\u30ffー]+", part) for word in katakana_words):
+            continue
+        if part in seen:
+            continue
+        seen.add(part)
+        out.append(part)
+    return out
 
 
 def _alias_in_title(alias: str, text: str) -> bool:
@@ -7945,27 +9163,52 @@ def _compose_read_blob(*parts: Any) -> str:
     return "\n".join(lines)
 
 
+# A grid prints 品番 with a hyphen (APGH-012). OCR noise such as "rake 12"
+# or "shat 676" must not count, or one jacket is treated as a listing and
+# its real title line is never searched.
+_DASH_CODE_RE = re.compile(
+    r"([A-Za-z]{2,10})[-－‐‑‒–—―ー−](\d{2,5})",
+    re.I,
+)
+
+
+def _grid_product_codes(text: str | None) -> list[str]:
+    found: list[str] = []
+    seen: set[str] = set()
+    for m in _DASH_CODE_RE.finditer(text or ""):
+        code = normalize_code(f"{m.group(1)}-{m.group(2)}")
+        disp = format_display_code(code) if parse_code_parts(code) else ""
+        if not disp or disp in seen:
+            continue
+        seen.add(disp)
+        found.append(disp)
+    return found
+
+
 def _listing_chrome_in_text(blob: str | None) -> bool:
     """Site row, grid, or player chrome — not text printed on one jacket.
 
     A missav caption is a 品番 plus a latin name under the thumb
     (APGH-012 Yuuki Hiiragi), often with a duration or 無碼影片. Two or more
-    品番 means a grid. LIVE is a player overlay. None of these are a full cover.
+    hyphenated 品番 means a grid. LIVE is a player overlay. None of these
+    are a full cover. Whitespace letter-digit pairs from a noisy OCR pass
+    are not a second 品番.
     """
     text = str(blob or "")
     if re.search(
-        r"(無碼影片|無碼|有碼|中文字幕|missav|javdb|javlibrary|\bLIVE\b|\d{1,2}:\d{2}(?::\d{2})?)",
+        r"(無碼影片|無碼|有碼|中文字幕|missav|javdb|javlibrary|dmm\.co\.jp|\bLIVE\b|\d{1,2}:\d{2}(?::\d{2})?)",
         text,
         re.I,
     ):
         return True
+    # Caption row: hyphenated 品番 plus a latin name (APGH-012 Yuuki Hiiragi).
+    # "rake 12 Haka" from a noisy jacket is not that row.
     if re.search(
-        r"[A-Za-z]{2,10}[\s\-－–—]*\d{2,5}\s+[A-Za-z][A-Za-z.'’\- ]{1,40}",
+        r"[A-Za-z]{2,10}[-－‐‑‒–—―ー−]\d{3,5}\s+[A-Za-z][A-Za-z.'’\- ]{1,40}",
         text,
     ):
         return True
-    _sole, codes = _sole_product_code(text)
-    return len(codes) >= 2
+    return len(_grid_product_codes(text)) >= 2
 
 
 def _cover_full_text_allowed(vision: dict | None, blob: str | None) -> bool:
@@ -8173,6 +9416,8 @@ def _adopt_title_catalog_hit(
             hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
         except Exception:
             pass
+    if isinstance(hit, dict) and hit.get("series_unresolved") and not _hit_visually_locked(hit):
+        return None
     if not _hit_has_catalog_code(hit):
         return None
     code = _catalog_code_of(hit)
@@ -8558,6 +9803,51 @@ def _merge_locked_same_work(results: list[dict]) -> tuple[list[dict], int]:
     return kept, merged
 
 
+def _pin_manual_query(rows: list[dict], user_code: str, user_title: str) -> bool:
+    """Attach a typed 番號 or 片名 to the open frame. Do not add another slot.
+
+    Prefer the frame whose only title is a short slogan (舌技が神), then a
+    frame with no 品番. A frame that already has a different real code is
+    left alone.
+    """
+    disp = format_display_code(user_code) if user_code and parse_code_parts(user_code) else ""
+    title_q = (user_title or "").strip()
+    if disp:
+        if any(codes_numeric_equal(str(r.get("code") or ""), disp) for r in rows):
+            return True
+
+        def _open_rank(row: dict) -> int:
+            if _is_decorative_overlay(row.get("title")):
+                return 0
+            existing = str(row.get("code") or "")
+            if not (existing and parse_code_parts(existing)):
+                return 1
+            return 9
+
+        opens = [r for r in rows if _open_rank(r) < 9]
+        opens.sort(key=_open_rank)
+        if not opens:
+            return False
+        target = opens[0]
+        target["code"] = disp
+        if title_q and is_usable_title(title_q) and (
+            not is_usable_title(target.get("title")) or _is_decorative_overlay(target.get("title"))
+        ):
+            target["title"] = title_q
+        return True
+    if title_q and is_usable_title(title_q):
+        if any(str(r.get("title") or "").strip().casefold() == title_q.casefold() for r in rows):
+            return True
+        for row in rows:
+            existing = str(row.get("code") or "")
+            if existing and parse_code_parts(existing):
+                continue
+            if not is_usable_title(row.get("title")) or _is_decorative_overlay(row.get("title")):
+                row["title"] = title_q
+                return True
+    return False
+
+
 def run_multi_identify_pipeline(
     images: list[tuple[bytes, str | None]],
     *,
@@ -8635,7 +9925,7 @@ def run_multi_identify_pipeline(
                 row["vision_error"] = str(e)[:120]
                 try:
                     ocr_text = ocr_image_bytes(img_bytes)
-                    sole, many = _sole_product_code(ocr_text)
+                    sole, many = _sole_trusted_ocr_code(ocr_text)
                     if sole:
                         row["code"] = sole
                     elif many:
@@ -8645,7 +9935,7 @@ def run_multi_identify_pipeline(
         else:
             try:
                 ocr_text = ocr_image_bytes(img_bytes)
-                sole, many = _sole_product_code(ocr_text)
+                sole, many = _sole_trusted_ocr_code(ocr_text)
                 if sole:
                     row["code"] = sole
                 elif many:
@@ -8670,11 +9960,15 @@ def run_multi_identify_pipeline(
         # OCR runs whenever the code is missing, even if that slogan is a "usable" title.
         # The frame is still kept if both miss.
         if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-            try:
-                ocr_text = ocr_image_bytes(img_bytes)
-            except Exception:
-                ocr_text = ""
-            sole, many = _sole_product_code(ocr_text or "")
+            # The no-key path already OCR'd this frame. A second pass must not
+            # replace that read: tesseract varies, and a later pass can drop a
+            # short badge or title line the first pass actually saw.
+            if not ocr_text:
+                try:
+                    ocr_text = ocr_image_bytes(img_bytes)
+                except Exception:
+                    ocr_text = ""
+            sole, many = _sole_trusted_ocr_code(ocr_text or "")
             if sole:
                 row["code"] = sole
                 row["ocr_code"] = sole
@@ -8685,6 +9979,12 @@ def run_multi_identify_pipeline(
                 if ocr_title:
                     row["ocr_title"] = ocr_title
                     row["title"] = ocr_title
+        elif ocr_text and not is_usable_title(row.get("title")):
+            # A weak OCR 品番 (yr 33 → YR-33) must not hide the caption line.
+            ocr_title = _title_from_ocr_text(ocr_text)
+            if ocr_title:
+                row["ocr_title"] = ocr_title
+                row["title"] = ocr_title
         read_blob = _compose_read_blob(
             row.get("vision_texts"),
             row.get("vision_title"),
@@ -8693,7 +9993,7 @@ def run_multi_identify_pipeline(
             ocr_text,
         )
         if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-            sole_blob, many_blob = _sole_product_code(read_blob)
+            sole_blob, many_blob = _sole_trusted_ocr_code(read_blob)
             if sole_blob:
                 row["code"] = sole_blob
                 row["ocr_code"] = sole_blob
@@ -8713,6 +10013,32 @@ def run_multi_identify_pipeline(
         ):
             row["ocr_title"] = row.get("ocr_title") or row["text_queries"][0]
             row["title"] = row["text_queries"][0]
+        if _listing_chrome_in_text(read_blob):
+            repairs = _ocr_title_repairs(str(row.get("title") or ""))
+        else:
+            repairs = _ocr_title_repairs(read_blob)
+        if repairs:
+            current = re.sub(r"\s+", "", str(row.get("title") or ""))
+            merged_q = list(dict.fromkeys(list(repairs) + list(row.get("text_queries") or [])))
+            if current and current not in merged_q and _ocr_line_is_clean(current):
+                merged_q.append(current)
+            row["text_queries"] = merged_q[:6]
+            # A clean caption that already contains the repair stays (JUFE full line).
+            # A noisy line or a different fragment (特別な補習) yields to the repair.
+            if not _ocr_line_is_clean(current) or repairs[0] not in current:
+                row["ocr_title"] = repairs[0]
+                row["title"] = repairs[0]
+        # Prefixes are for a noisy read. A clean vision/OCR title is already
+        # the catalog query; slicing it searches a different work's words.
+        if not _listing_chrome_in_text(read_blob) and not _title_is_search_ready(
+            str(row.get("title") or "")
+        ):
+            prefixes = _ocr_line_prefixes(read_blob)
+            merged_pref = list(row.get("text_queries") or [])
+            for pref in prefixes:
+                if pref not in merged_pref:
+                    merged_pref.append(pref)
+            row["text_queries"] = merged_pref[:8]
         # This cover may already have succeeded on its own. A multi pass that
         # reads nothing must reuse that image's cached 番號 and 作品名稱,
         # instead of leaving the frame to be merged into another upload.
@@ -8724,16 +10050,15 @@ def run_multi_identify_pipeline(
                 cached_img = offline_cache_get(image_hash=image_content_hash(img_bytes))
             except Exception:
                 cached_img = None
-            if isinstance(cached_img, dict) and _catalog_code_of(cached_img):
+            if (
+                isinstance(cached_img, dict)
+                and _catalog_code_of(cached_img)
+                and _upload_matches_cached_cover(img_bytes, cached_img)
+            ):
                 row["code"] = _catalog_code_of(cached_img)
                 if is_usable_title(cached_img.get("title")):
                     row["title"] = str(cached_img.get("title")).strip()
                 row["image_cache"] = cached_img
-        # Manual overrides apply to first image only as seed
-        if i == 0 and user_code and not row.get("code"):
-            row["code"] = user_code
-        if i == 0 and user_title and not row.get("title"):
-            row["title"] = user_title
         vision_rows.append(row)
         detail = f"第 {idx}/{n} 張"
         if row.get("code"):
@@ -8766,12 +10091,25 @@ def run_multi_identify_pipeline(
         else:
             jobs.append({"kind": "unknown", "code": "", "title": "", "row": row})
 
-    # A typed code/title that no frame already carries is an extra query, not a replacement.
-    if user_code and parse_code_parts(user_code):
+    # A typed code/title pins onto the open frame (slogan or no 品番).
+    # It must not become a sixth card or stamp the first image.
+    pinned_manual = _pin_manual_query(vision_rows, user_code, user_title)
+    if pinned_manual:
+        jobs = []
+        for row in vision_rows:
+            code = (row.get("code") or "").strip()
+            title = (row.get("title") or "").strip()
+            if code and parse_code_parts(code):
+                jobs.append({"kind": "code", "code": format_display_code(code), "title": title, "row": row})
+            elif is_usable_title(title):
+                jobs.append({"kind": "title", "code": "", "title": title, "row": row})
+            else:
+                jobs.append({"kind": "unknown", "code": "", "title": "", "row": row})
+    elif user_code and parse_code_parts(user_code):
         disp = format_display_code(user_code)
-        if not any(j.get("kind") == "code" and j.get("code") == disp for j in jobs):
+        if not any(j.get("kind") == "code" and codes_numeric_equal(str(j.get("code") or ""), disp) for j in jobs):
             jobs.append({"kind": "code", "code": disp, "title": user_title, "row": None})
-    if user_title and is_usable_title(user_title):
+    if not pinned_manual and user_title and is_usable_title(user_title):
         key = user_title.casefold()
         if not any((j.get("title") or "").casefold() == key for j in jobs):
             jobs.append({"kind": "title", "code": "", "title": user_title, "row": None})
@@ -8785,6 +10123,7 @@ def run_multi_identify_pipeline(
     )
 
     _progress(on_progress, "verify", "active", "逐張對照原圖的人物／衣服／姿勢…", 0.52)
+    _progress(on_progress, "verify", "done", "開始逐張搜尋", 0.54)
     results: list[dict] = []
     for ji, job in enumerate(jobs):
         _progress(
@@ -8826,18 +10165,87 @@ def run_multi_identify_pipeline(
                     on_progress=None,
                     skip_related=True,
                 )
-                if vm and isinstance(one, dict) and one.get("ok"):
-                    one = apply_vision_meta(one, vm)
             elif job["kind"] == "title":
-                # Already vision'd — resolve by title only (no second vision call).
-                one, _st = run_identify_pipeline(
-                    image_bytes=None,
-                    filename=None,
-                    user_code="",
-                    user_title=job["title"],
-                    on_progress=None,
-                    skip_related=True,
-                )
+                # No 品番: search the title cues, then let the jacket pick the volume.
+                # A shared series template is not accepted until the picture locks.
+                queries = list((row or {}).get("text_queries") or [])
+                if job.get("title") and job["title"] not in queries:
+                    queries.insert(0, job["title"])
+                resolved = None
+                noisy_title = not _title_is_search_ready(str(job.get("title") or ""))
+                if slot_image and noisy_title:
+                    try:
+                        resolved = _resolve_unnumbered_cover(queries, slot_image)
+                    except Exception:
+                        resolved = None
+                if isinstance(resolved, dict) and _catalog_code_of(resolved):
+                    one, _st = run_identify_pipeline(
+                        image_bytes=None,
+                        filename=None,
+                        user_code=_catalog_code_of(resolved),
+                        user_title="",
+                        on_progress=None,
+                        skip_related=True,
+                    )
+                    if isinstance(one, dict):
+                        one["visual_meta"] = resolved.get("visual_meta")
+                        if (resolved.get("visual_meta") or {}).get("visual_lock"):
+                            one["visual_lock"] = True
+                        one["resolve_queries"] = queries[:8]
+                else:
+                    one, _st = run_identify_pipeline(
+                        image_bytes=None,
+                        filename=None,
+                        user_code="",
+                        user_title=job["title"],
+                        on_progress=None,
+                        skip_related=True,
+                    )
+                if (
+                    not (isinstance(resolved, dict) and _catalog_code_of(resolved))
+                    and slot_image
+                    and isinstance(one, dict)
+                    and (one.get("candidates") or one.get("code"))
+                ):
+                    packed = {
+                        "code": one.get("code"),
+                        "title": one.get("title"),
+                        "actress": one.get("actress"),
+                        "studio": one.get("studio"),
+                        "cover": one.get("cover"),
+                        "cid": one.get("cid"),
+                        "source": one.get("source"),
+                        "candidates": list(one.get("candidates") or []),
+                    }
+                    if not packed["candidates"] and packed.get("code"):
+                        packed["candidates"] = [dict(packed)]
+                    try:
+                        packed = apply_visual_rank_to_hit(packed, slot_image, api_key=api_key)
+                    except Exception:
+                        packed = packed
+                    if _hit_visually_locked(packed):
+                        locked_code = _catalog_code_of(packed)
+                        if locked_code and locked_code != _catalog_code_of(one):
+                            try:
+                                refreshed, _rst = run_identify_pipeline(
+                                    image_bytes=None,
+                                    filename=None,
+                                    user_code=locked_code,
+                                    user_title="",
+                                    on_progress=None,
+                                    skip_related=True,
+                                )
+                            except Exception:
+                                refreshed = None
+                            if isinstance(refreshed, dict) and refreshed.get("ok") and _catalog_code_of(refreshed):
+                                one = refreshed
+                        else:
+                            one["code"] = packed.get("code") or one.get("code")
+                            if packed.get("title"):
+                                one["title"] = packed.get("title")
+                            one["visual_lock"] = True
+                    elif packed.get("series_unresolved"):
+                        one = {}
                 if vm and isinstance(one, dict) and one.get("ok"):
                     one = apply_vision_meta(one, vm)
         except Exception as e:
@@ -9346,6 +10754,7 @@ def run_identify_pipeline(
     filename: str | None = None,
     user_code: str = "",
     user_title: str = "",
+    user_actress: str = "",
     on_progress=None,
     skip_related: bool = False,
 ) -> tuple[dict, int]:
@@ -9355,6 +10764,7 @@ def run_identify_pipeline(
     skip_related=True: caller (e.g. multi) will attach related_by_title once later.
     """
     ocr_preview = None
+    ocr_text = ""
     vision_used = False
     vision_meta: dict | None = None
     extra_msg: str | None = None
@@ -9434,8 +10844,8 @@ def run_identify_pipeline(
                 )
                 _progress(on_progress, "done", "done", "完成（同圖視覺重核）", 1.0)
                 return refreshed, 200
-            if not (api_key or "").strip():
-                # No vision key: cannot re-check clothes/stills. Keep catalog cache.
+            if not (api_key or "").strip() and _upload_matches_cached_cover(image_bytes, cached_img):
+                # No vision key: keep the cache only when the jacket still matches.
                 _progress(on_progress, "vision", "skipped", "離線快取（同圖）", 2 / 6)
                 _progress(on_progress, "parse", "done", f"番號：{cached_img.get('code') or '—'}", 3 / 6)
                 _progress(on_progress, "search", "done", "離線快取", 4 / 6)
@@ -9503,7 +10913,7 @@ def run_identify_pipeline(
                     ocr_text = ocr_image_bytes(image_bytes)
                     ocr_preview = (ocr_text or "")[:500]
                     if not code:
-                        sole, many = _sole_product_code(ocr_text)
+                        sole, many = _sole_trusted_ocr_code(ocr_text)
                         if sole:
                             code = sole
                             search_mode = "code"
@@ -9527,7 +10937,7 @@ def run_identify_pipeline(
                 ocr_text = ocr_image_bytes(image_bytes)
                 ocr_preview = (ocr_text or "")[:500]
                 if not code:
-                    sole, many = _sole_product_code(ocr_text)
+                    sole, many = _sole_trusted_ocr_code(ocr_text)
                     if sole:
                         code = sole
                         search_mode = "code"
@@ -9550,7 +10960,7 @@ def run_identify_pipeline(
             try:
                 ocr_text = ocr_image_bytes(image_bytes)
                 ocr_preview = (ocr_text or "")[:500]
-                sole, many = _sole_product_code(ocr_text)
+                sole, many = _sole_trusted_ocr_code(ocr_text)
                 if sole:
                     code = sole
                     search_mode = "code"
@@ -9580,10 +10990,10 @@ def run_identify_pipeline(
             (vision_meta or {}).get("title") if vision_meta else None,
             (vision_meta or {}).get("actress") if vision_meta else None,
             (vision_meta or {}).get("studio") if vision_meta else None,
-            ocr_preview,
+            ocr_text or ocr_preview,
         )
         if not code:
-            sole_blob, many_blob = _sole_product_code(read_blob)
+            sole_blob, many_blob = _sole_trusted_ocr_code(read_blob)
             if sole_blob:
                 code = sole_blob
                 search_mode = "code"
@@ -9606,6 +11016,33 @@ def run_identify_pipeline(
                 extra_msg = (extra_msg + " " if extra_msg else "") + "已改搜封面上其餘文字。"
         else:
             text_queries = []
+
+    # A dashed OCR token is not the 品番 until its jacket is this picture.
+    # Several tokens, or a token glued to the next number, are scored the
+    # same way. A low score falls through to title cues.
+    code_visually_confirmed = False
+    if image_bytes is not None and not user_code and "read_blob" in locals():
+        printed, printed_score, had_codes, codes_compared = _resolve_printed_code(
+            read_blob, image_bytes
+        )
+        if printed and printed_score is not None:
+            code = printed
+            search_mode = "code"
+            code_visually_confirmed = True
+            extra_msg = (
+                (extra_msg + " " if extra_msg else "")
+                + f"封面與原圖鎖定番號 {format_display_code(printed)}。"
+            )
+        elif had_codes and (codes_compared or printed):
+            # An OCR token with no jacket score is not a 品番. Title cues
+            # take over instead of keeping that unread confirmation.
+            if code:
+                extra_msg = (
+                    (extra_msg + " " if extra_msg else "")
+                    + f"讀到的番號與封面不一致，改以片名搜尋。"
+                )
+            code = ""
+            search_mode = "title"
 
     # Step 3: parse code/title
     _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
@@ -9654,20 +11091,50 @@ def run_identify_pipeline(
                 "title_ok": False,
                 "similarity": 0.0,
             }
-        if not verify_meta.get("ok"):
-            rejected = format_display_code(code)
-            reason = verify_meta.get("reason") or "不符"
-            cat = verify_meta.get("catalog_title") or ""
-            detail = f"拒絕 {rejected}：{reason}"
-            if cat:
-                detail += f"（目錄：{str(cat)[:36]}）"
-            _progress(on_progress, "verify", "error", detail[:120], 3 / 7)
-            extra_msg = (
-                (extra_msg + " " if extra_msg else "")
-                + f"番號 {rejected} 與片名不符或封面無效（{reason}），改以片名搜尋。"
-            )
-            code = ""
-            search_mode = "title"
+            if image_bytes:
+                try:
+                    cid, cover = resolve_cover_cid(format_display_code(code))
+                except Exception:
+                    cid, cover = None, None
+                if cover:
+                    verify_meta["cover_ok"] = True
+                    verify_meta["cover"] = cover
+                    verify_meta["cid"] = cid
+        if not verify_meta.get("ok") and not code_visually_confirmed:
+            # A noisy OCR title must not throw away a 品番 whose jacket is
+            # this picture. A low score still drops the code: that read is
+            # the hallucinated PREFIX-NNN case, and title cues take over.
+            keep_code, jacket_score = _ocr_code_survives_title_mismatch(verify_meta, image_bytes)
+            if keep_code:
+                verify_meta = dict(verify_meta)
+                verify_meta["ok"] = True
+                verify_meta["jacket_score"] = jacket_score
+                verify_meta["reason"] = "封面與原圖一致"
+                if verify_meta.get("cid") and vision_meta is not None:
+                    vision_meta = dict(vision_meta)
+                    vision_meta["_verified_cid"] = verify_meta.get("cid")
+                    vision_meta["_verified_cover"] = verify_meta.get("cover")
+                _progress(
+                    on_progress,
+                    "verify",
+                    "done",
+                    f"{format_display_code(code)} 封面與原圖一致（{float(jacket_score or 0):.2f}）",
+                    3 / 7,
+                )
+            else:
+                rejected = format_display_code(code)
+                reason = verify_meta.get("reason") or "不符"
+                cat = verify_meta.get("catalog_title") or ""
+                detail = f"拒絕 {rejected}：{reason}"
+                if cat:
+                    detail += f"（目錄：{str(cat)[:36]}）"
+                _progress(on_progress, "verify", "error", detail[:120], 3 / 7)
+                extra_msg = (
+                    (extra_msg + " " if extra_msg else "")
+                    + f"番號 {rejected} 與片名不符或封面無效（{reason}），改以片名搜尋。"
+                )
+                code = ""
+                search_mode = "title"
         else:
             _progress(
                 on_progress,
@@ -9697,22 +11164,72 @@ def run_identify_pipeline(
         vstudio = vision_meta.get("studio")
         _progress(on_progress, "parse", "done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
         _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
+        phrase_extras = list(text_queries or [])
+        phrase_blob = "\n".join(
+            str(part or "")
+            for part in (
+                ocr_preview,
+                vtitle,
+                read_blob,
+            )
+        )
+        # Full-text phrases only when this is not a listing/player read.
+        # A grid or UI capture keeps the focused title. Do not drop this gate.
+        if not _listing_chrome_in_text(phrase_blob):
+            for extra_q in _ocr_title_repairs(phrase_blob):
+                if extra_q not in phrase_extras:
+                    phrase_extras.append(extra_q)
+            if not _title_is_search_ready(vtitle):
+                for extra_q in _ocr_line_prefixes(phrase_blob):
+                    if extra_q not in phrase_extras:
+                        phrase_extras.append(extra_q)
+            for extra_q in _focused_cjk_queries(phrase_blob):
+                if extra_q not in phrase_extras:
+                    phrase_extras.append(extra_q)
         hit = None
-        for q in _ordered_title_queries(vtitle, text_queries):
+        cover_queries = _ordered_title_queries(vtitle, phrase_extras)
+        if image_bytes and not _title_is_search_ready(vtitle):
             try:
-                found = search_by_title(q, actress=vactress)
-            except Exception as se:
-                extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
-                found = None
-            if _hit_has_catalog_code(found):
+                hit = _resolve_unnumbered_cover(cover_queries, image_bytes)
+            except Exception:
+                hit = None
+            if isinstance(hit, dict) and hit.get("code"):
+                vtitle = str(hit.get("title") or vtitle)
+        if not (isinstance(hit, dict) and hit.get("code")):
+            hit = None
+        seen_q: set[str] = set()
+        if hit is None:
+            for q in cover_queries:
+                if not q or q in seen_q:
+                    continue
+                seen_q.add(q)
+                if len(seen_q) > 8:
+                    break
+                try:
+                    found = search_by_title(q, actress=vactress)
+                except Exception as se:
+                    extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+                    found = None
+                if not _hit_has_catalog_code(found):
+                    continue
+                if image_bytes:
+                    try:
+                        found = apply_visual_rank_to_hit(found, image_bytes, api_key=api_key)
+                    except Exception:
+                        pass
+                if isinstance(found, dict) and found.get("series_unresolved") and not _hit_visually_locked(found):
+                    continue
                 hit = found
                 vtitle = q
                 break
 
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
-            # Visual rank when multiple same-series candidates
+            # Visual rank when multiple same-series candidates.
+            # A jacket lock already chosen above stays; ranking again can
+            # replace it with whichever row the catalog listed first.
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)
-            if n_pre >= 1 and image_bytes:
+            already_locked = bool((hit.get("visual_meta") or {}).get("visual_lock"))
+            if n_pre >= 1 and image_bytes and not already_locked:
                 _progress(on_progress, "cover", "active", "對照原圖核對人物／衣服／表情／飾品／姿勢…", 4 / 6)
                 hit = apply_visual_rank_to_hit(hit, image_bytes, api_key=api_key)
             code = str(hit["code"])
@@ -9848,9 +11365,25 @@ def run_identify_pipeline(
         _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6)
         hit = None
         try:
-            hit = search_by_title(user_title)
+            hit = search_by_title(user_title, actress=(user_actress or "").strip() or None)
         except Exception as se:
             extra_msg = (extra_msg + " " if extra_msg else "") + f"片名搜尋失敗：{se}"
+
+        if hit and hit.get("series_unresolved") and not image_bytes:
+            _progress(on_progress, "search", "done", "同系列多部，片名無法分卷", 4 / 6)
+            _progress(on_progress, "cover", "skipped", "不指定番號", 5 / 6)
+            _progress(on_progress, "done", "done", "完成（系列未分卷）", 1.0)
+            return (
+                title_only_payload(
+                    title=user_title,
+                    actress=(user_actress or "").strip() or None,
+                    message=(
+                        (extra_msg + " " if extra_msg else "")
+                        + f"以片名「{user_title}」對上同系列多部，沒有女優或圖片可分卷，不指定番號。"
+                    ),
+                ),
+                200,
+            )
 
         if hit and hit.get("code") and parse_code_parts(str(hit["code"])):
             n_pre = len([c for c in (hit.get("candidates") or []) if c.get("code")]) or (1 if hit.get("code") else 0)

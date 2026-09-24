@@ -68,6 +68,190 @@ WORKS = {
 
 
 class TestApgh012Overlay(unittest.TestCase):
+    def test_ocr_noise_is_not_a_product_code(self):
+        self.assertEqual(S._trusted_ocr_codes("rake 12\nshat          676\nyr 33"), [])
+        self.assertEqual(S._sole_trusted_ocr_code("APGH-012\n舌技が神")[0], "APGH-012")
+        self.assertIsNone(S._sole_trusted_ocr_code("APGH-012\nAPGH-015")[0])
+
+    def test_series_jacket_lock_beats_a_short_unique_phrase(self):
+        """No 品番. A short unique hit must not beat a jacket-locked series volume."""
+        series_title = "架空シリーズの長い共通タイトルで巻だけが違う作品群"
+        volumes = [
+            _work("SER-001", series_title),
+            _work("SER-002", series_title),
+            _work("SER-003", series_title),
+        ]
+        slogan = _work("SLG-009", "短い標語だけの別作品")
+
+        def search(title, actress=None):
+            q = re.sub(r"\s+", "", str(title or ""))
+            if q == "共通題名":
+                hit = dict(volumes[0])
+                hit["candidates"] = [dict(v) for v in volumes]
+                return hit
+            if "標語" in q or q == "短い標語":
+                hit = dict(slogan)
+                hit["candidates"] = [dict(slogan)]
+                return hit
+            return None
+
+        def lock(image, cands):
+            for cand in cands or []:
+                if S.format_display_code(str(cand.get("code") or "")) == "SER-002":
+                    winner = dict(cand)
+                    winner["jacket_score"] = 0.91
+                    return winner
+            return None
+
+        resolved = None
+        with mock.patch.multiple(
+            S,
+            search_by_title=mock.Mock(side_effect=search),
+            _jacket_lock_winner=mock.Mock(side_effect=lock),
+        ):
+            resolved = S._resolve_unnumbered_cover(
+                ["短い標語", "共通題名"],
+                b"cover-bytes",
+            )
+        self.assertIsNotNone(resolved)
+        self.assertEqual(resolved.get("code"), "SER-002")
+        self.assertTrue((resolved.get("visual_meta") or {}).get("visual_lock"))
+
+    def test_jacket_match_keeps_code_when_ocr_title_disagrees(self):
+        meta = {
+            "ok": False,
+            "cover_ok": True,
+            "cover": "https://example.com/ser-002.jpg",
+            "title_ok": False,
+            "reason": "片名不符(sim=0.10)",
+        }
+        with mock.patch.object(S, "_jacket_score_against_url", return_value=0.91):
+            keep, score = S._ocr_code_survives_title_mismatch(meta, b"img")
+        self.assertTrue(keep)
+        self.assertGreaterEqual(score, 0.70)
+        with mock.patch.object(S, "_jacket_score_against_url", return_value=0.22):
+            keep_low, _score = S._ocr_code_survives_title_mismatch(meta, b"img")
+        self.assertFalse(keep_low)
+
+    def test_glued_runtime_is_a_code_candidate(self):
+        cands = S._ocr_code_candidates("作品 ABCD-100240分\nrake 12")
+        self.assertIn("ABCD-100", cands)
+        self.assertNotIn("ABCD-100240", cands)
+        self.assertEqual(S._trusted_ocr_codes("rake 12"), [])
+
+    def test_confusion_variants_include_letter_and_digit_neighbor(self):
+        variants = S._confusion_variants("QLQ-621")
+        self.assertIn("QUQ-624", variants)
+
+    def test_one_digit_neighbor_is_probed_early(self):
+        variants = S._confusion_variants("ABCD-818")
+        self.assertIn("ABCD-816", variants[:8])
+        variants = S._confusion_variants("ABH-801")
+        self.assertIn("ABN-801", variants[:12])
+
+    def test_jacket_pick_prefers_the_matching_cover(self):
+        def cover(code):
+            if code == "GOOD-100":
+                return "cid", "https://example.com/good.jpg"
+            return "cid", "https://example.com/bad.jpg"
+
+        def score(image, url):
+            return 0.93 if "good" in str(url) else 0.21
+
+        with mock.patch.object(S, "resolve_cover_cid", side_effect=cover):
+            with mock.patch.object(S, "_jacket_score_against_url", side_effect=score):
+                picked, best, compared = S._pick_code_by_jacket(
+                    ["BAD-621", "GOOD-100"], b"img"
+                )
+        self.assertTrue(compared)
+        self.assertEqual(picked, "GOOD-100")
+        self.assertGreaterEqual(best, 0.70)
+
+    def test_prefix_queries_skip_symbol_smears(self):
+        blob = "xyz !! をな属人金欲にい ff\n短い標語です？！"
+        prefixes = S._ocr_line_prefixes(blob)
+        self.assertTrue(any(p.startswith("短い標語") for p in prefixes), prefixes)
+        self.assertFalse(any("をな属" in p for p in prefixes), prefixes)
+
+    def test_official_title_chips_are_compounds_not_slices(self):
+        chips = S._extract_title_theme_keywords(APGH_TITLE, actress=ACTRESS)
+        blob = " ".join(chips)
+        for bad in ("人っきりのプ", "人っきりりプ", "ライベート補", "習で全部面倒"):
+            self.assertNotIn(bad, chips, blob)
+        for good in ("先生", "2人っきり", "プライベート補習", "面倒みてあげる"):
+            self.assertIn(good, chips, blob)
+
+    def test_clause_joiners_do_not_glue_two_phrases(self):
+        title = "架空題は溢れる欲望と狭い部屋だけ食堂に行く金も無いし同僚は苦手"
+        chips = S._extract_title_theme_keywords(title)
+        blob = " ".join(chips)
+        self.assertNotIn("狭い部屋だけ食堂", chips, blob)
+        self.assertNotIn("無いし同僚", chips, blob)
+        self.assertFalse(any("だけ" in c for c in chips), blob)
+        self.assertTrue(any(c in ("溢れる欲望", "狭い部屋", "食堂", "同僚") for c in chips), blob)
+
+    def test_full_title_beats_a_short_shared_hook(self):
+        """A theme word inside another work must not outrank the typed title."""
+        full = "架空の座席でこっそり発射させる声我慢の長い題名です夜行バスの続きまで書く"
+        right = _work("RIGHT-100", full)
+        wrong = _work("WRONG-200", "別作品の夜行だけの題名で中身は違う")
+
+        def search_rows(title, actress=None):
+            q = re.sub(r"\s+", "", str(title or ""))
+            full_c = re.sub(r"\s+", "", full)
+            if q == full_c:
+                return []
+            if q.startswith(full_c[:12]) and len(q) >= 18:
+                return [dict(right, score=0.2)]
+            if len(q) <= 4:
+                return [dict(wrong, score=0.9)]
+            return []
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=search_rows):
+            hit = S.search_by_title(full)
+        self.assertEqual((hit or {}).get("code"), "RIGHT-100")
+
+    def test_shared_series_line_prefers_the_tighter_title(self):
+        shared = "架空シリーズの同じ題名で巻だけ違う"
+        loose = _work("LOOSE-001", "前置きの標語" + shared + " おまけの長い説明文が続く")
+        tight = _work("TIGHT-002", shared + " 名前")
+        later = _work("LATER-003", shared + " 別名")
+
+        def search_rows(title, actress=None):
+            if shared in str(title or ""):
+                return [dict(loose), dict(tight), dict(later)]
+            return []
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=search_rows):
+            bare = S.search_by_title(shared)
+            named = S.search_by_title(shared, actress="名前")
+            exact = S.search_by_title(shared + " 名前")
+        self.assertTrue((bare or {}).get("series_unresolved"))
+        self.assertFalse(S.parse_code_parts(str((bare or {}).get("code") or "")))
+        self.assertEqual((named or {}).get("code"), "TIGHT-002")
+        self.assertEqual((exact or {}).get("code"), "TIGHT-002")
+
+    def test_alias_labels_and_comparisons_are_not_chips(self):
+        title = "架空題は溢れる欲望と自分以上に勢いが凄い！！ (仮名)アキさん"
+        chips = S._extract_title_theme_keywords(title)
+        blob = " ".join(chips)
+        self.assertNotIn("自分以上", chips, blob)
+        self.assertFalse(any("仮名" in c for c in chips), blob)
+        self.assertIn("溢れる欲望", chips, blob)
+
+    def test_manual_code_pins_slogan_frame_not_a_resolved_neighbor(self):
+        rows = [
+            {"code": "JUFE-271", "title": "地味な眼鏡では隠し切れない美人OL"},
+            {"code": None, "title": "舌技が神"},
+            {"code": None, "title": "根スケベ妻と精飲"},
+        ]
+        self.assertTrue(S._pin_manual_query(rows, "apgh-012", ""))
+        self.assertEqual(rows[0]["code"], "JUFE-271")
+        self.assertEqual(rows[1]["code"], "APGH-012")
+        self.assertIsNone(rows[2]["code"])
+        self.assertTrue(S._pin_manual_query(rows, "APGH-012", ""))
+
+
     def _identify(self, code, ocr_preview=None, vision_meta=None):
         disp = S.format_display_code(str(code))
         row = WORKS.get(disp)
@@ -263,6 +447,8 @@ class TestApgh012Overlay(unittest.TestCase):
             offline_cache_get=mock.Mock(return_value=None),
             offline_cache_put=mock.Mock(return_value=None),
             probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_cover_cid=mock.Mock(return_value=("cid", "https://example.com/cover.jpg")),
+            _jacket_score_against_url=mock.Mock(return_value=0.93),
             resolve_chinese_title=mock.Mock(return_value=None),
             find_related_by_title=mock.Mock(return_value=[]),
             attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
@@ -367,6 +553,8 @@ class TestApgh012Overlay(unittest.TestCase):
             offline_cache_get=mock.Mock(return_value=None),
             offline_cache_put=mock.Mock(return_value=None),
             probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_cover_cid=mock.Mock(return_value=("cid", "https://example.com/cover.jpg")),
+            _jacket_score_against_url=mock.Mock(return_value=0.93),
             resolve_chinese_title=mock.Mock(return_value=None),
             find_related_by_title=mock.Mock(return_value=[]),
             attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
