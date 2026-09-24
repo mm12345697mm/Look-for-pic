@@ -504,7 +504,8 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         self.assertEqual(out.get("title_zh"), "中文主標")
         self.assertEqual(out["related_by_title"][0].get("title_zh"), "中文相關")
 
-    def test_enrich_retries_underfilled_buckets_despite_flags(self):
+    def test_enrich_keeps_under_cap_related_without_searching(self):
+        """A short saved list is finished. Caps are maxima, not a reason to search."""
         payload = self._stored_payload(
             title_zh="中文主標",
             actress="誰か",
@@ -521,26 +522,14 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         )
         payload["cache_backfilled"] = True
         payload["chinese_titles_attached"] = True
-        extra = {
-            "code": "NHDTC-101",
-            "title": "new",
-            "title_zh": "新中文",
-            "line": "theme",
-            "why": "片名相近",
-            "cover": "https://example.com/n.jpg",
-        }
-
-        def fake_find(*args, **kwargs):
-            seed = list(kwargs.get("seed") or [])
-            return seed + [extra]
-
-        with mock.patch.object(S, "find_related_by_title", side_effect=fake_find), mock.patch.object(
+        with mock.patch.object(
+            S, "find_related_by_title", side_effect=AssertionError("saved related must not be re-searched")
+        ), mock.patch.object(
             S, "resolve_chinese_title", side_effect=AssertionError("zh already present on coded rows")
         ):
             out = S.enrich_offline_cache_hit(payload)
         codes = [r["code"] for r in out.get("related_by_title") or []]
-        self.assertIn("NHDTC-100", codes)
-        self.assertIn("NHDTC-101", codes)
+        self.assertEqual(codes, ["NHDTC-100"])
 
     def test_payload_needs_title_zh_only_for_coded(self):
         self.assertFalse(S._payload_needs_title_zh({"ok": True, "title": "no-code"}))
@@ -719,7 +708,7 @@ class TestIncrementalRelatedBackfill(unittest.TestCase):
             S._OFFLINE_CACHE_PATH = None
             tmp.cleanup()
 
-    def test_enrich_adds_related_without_dropping_seed(self):
+    def test_enrich_keeps_saved_related_membership(self):
         tmp = tempfile.TemporaryDirectory()
         try:
             S._OFFLINE_CACHE_PATH = Path(tmp.name) / "offline-cache.json"
@@ -745,28 +734,15 @@ class TestIncrementalRelatedBackfill(unittest.TestCase):
                     "actress": "誰か",
                 }
             )
-            extra = [
-                {
-                    "code": "AAA-002",
-                    "title": "new theme",
-                    "line": "theme",
-                    "why": "片名相近",
-                    "cover": "https://example.com/2.jpg",
-                }
-            ]
-
-            def fake_find(*args, **kwargs):
-                seed = list(kwargs.get("seed") or [])
-                return seed + extra
-
             hit = S.offline_cache_get(code="NHDTC-099")
-            with mock.patch.object(S, "find_related_by_title", side_effect=fake_find), mock.patch.object(
+            with mock.patch.object(
+                S, "find_related_by_title", side_effect=AssertionError("saved related must not be re-searched")
+            ), mock.patch.object(
                 S, "resolve_chinese_title", side_effect=AssertionError("zh already present")
             ):
                 out = S.enrich_offline_cache_hit(hit)
             codes = [r["code"] for r in out["related_by_title"]]
-            self.assertEqual(codes[0], "AAA-001")
-            self.assertIn("AAA-002", codes)
+            self.assertEqual(codes, ["AAA-001"])
             self.assertEqual(out["related_by_title"][0]["title_zh"], "留下")
             self.assertEqual(out["stills"][0], "https://example.com/s.jpg")
         finally:
