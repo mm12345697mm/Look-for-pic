@@ -71,17 +71,18 @@ GEMINI_TEXT_MODELS = (
     "gemini-flash-latest",
     "gemini-flash-lite-latest",
 )
-VISION_PROMPT = """你是 AV／JAV 列表截圖辨識助手。圖片可能是 JAVDB 等網站的整頁截圖：封面圖下方或旁邊有番號與日文片名。
+VISION_PROMPT = """你是 AV／JAV 列表截圖辨識助手。圖片可能是單張封面、封面裁切，或 missav／JAVDB 列表：縮圖下方或旁邊印著番號與女優名。
 
 請只讀取畫面中「主作品／焦點那一筆」的資訊，回傳 JSON（不要 markdown、不要程式碼圍欄、不要多餘說明）：
-{"code":"MIDA-616","title":"日本語タイトル","actress":"...","studio":"...","confidence":0.0,"notes":""}
+{"code":"APGH-012","title":"日本語タイトル","actress":"...","studio":"...","confidence":0.0,"notes":""}
 
 規則：
-1. 務必嘗試讀出番號（品番，如 MIDA-616）以及封面附近／下方的日文片名那一行。若是封面局部裁切、無明顯番號，也請盡力讀出畫面上可見的日文標題片段。
-2. 片名請用畫面上的原文（多半是日文），不要翻譯、不要發明、不要補全看不到的字。
-3. 看不清楚的欄位請填 null；confidence 為 0.0～1.0。
-4. actress／studio 若畫面沒有就 null。
-5. 只輸出一行合法 JSON。
+1. 番號（品番）優先於封面上的裝飾字。縮圖下方、標題列、封面旁的番號都要讀，例如 APGH-012、ApGH-012、APGH 012。讀到就填 code，並寫成「英數-數字」。
+2. 封面上的短直排或宣傳句（例如「舌技」「舌技が神」）不是目錄片名。若同時看得到番號，code 必填；title 只填畫面上真正的作品標題那一行。沒有標題行就讓 title 為 null，不要用短標語充當片名。
+3. 不要把網站介面當成片名：時長（2:25:56）、無碼影片、有碼、中文字幕、LIVE、網站名。這些不是 title。
+4. 看不清楚的欄位填 null。不要翻譯、不要發明、不要補全看不到的字。confidence 為 0.0～1.0。
+5. actress 用畫面上的人名。列表若是羅馬字（Yuuki Hiiragi）而封面有日文名，優先日文名。studio 沒有就 null。
+6. 只輸出一行合法 JSON。
 """
 
 VISUAL_MATCH_PROMPT = """你是 AV／JAV 視覺核對助手。Image A 是使用者上傳的「原始截圖／劇照／封面裁切」；Image B 是候選作品的封面或劇照。
@@ -7786,8 +7787,105 @@ def _catalog_code_of(payload: dict | None) -> str:
     return format_display_code(code)
 
 
+_SITE_CHROME_TITLES = {
+    "無碼影片",
+    "無碼",
+    "有碼",
+    "中文字幕",
+    "字幕",
+    "高清",
+    "馬賽克",
+    "破解",
+    "流出",
+    "live",
+    "missav",
+    "javdb",
+}
+
+
+def _is_site_chrome_title(title: str | None) -> bool:
+    """Listing badges and durations are not catalog titles."""
+    t = re.sub(r"[\s　]+", "", str(title or "").strip())
+    if not t:
+        return False
+    if t.casefold() in _SITE_CHROME_TITLES:
+        return True
+    return bool(re.fullmatch(r"\d{1,2}:\d{2}(?::\d{2})?", t))
+
+
+def _cjk_count(text: str | None) -> int:
+    n = 0
+    for c in text or "":
+        o = ord(c)
+        if (
+            0x3040 <= o <= 0x30FF
+            or 0x4E00 <= o <= 0x9FFF
+            or 0x3400 <= o <= 0x4DBF
+            or c == "々"
+        ):
+            n += 1
+    return n
+
+
+def _is_decorative_overlay(title: str | None) -> bool:
+    """Short jacket slogan, not the catalog title line.
+
+    「舌技が神」 is four characters of cover art. It must not veto a 品番
+    printed under the thumbnail, and title search on that slogan cannot
+    recover a work whose catalog title is a different sentence.
+    """
+    if _is_site_chrome_title(title):
+        return True
+    t = normalize_ocr_title(title) or str(title or "").strip()
+    t = re.sub(r"\s+", "", t)
+    if not is_usable_title(t):
+        return False
+    return _cjk_count(t) <= 6
+
+
+def _sole_product_code(text: str | None) -> tuple[str | None, list[str]]:
+    """One 品番, or every distinct code when the shot is a multi-title listing.
+
+    A grid that shows APGH-025 and APGH-012 must not collapse to whichever
+    code the scorer sees first. A single caption under one thumb is safe to use.
+    """
+    found: list[str] = []
+    seen: set[str] = set()
+    for raw in extract_codes(text or ""):
+        disp = format_display_code(raw)
+        if not parse_code_parts(disp) or disp in seen:
+            continue
+        seen.add(disp)
+        found.append(disp)
+    if len(found) == 1:
+        return found[0], found
+    return None, found
+
+
+def _split_title_and_code(title: str | None) -> tuple[str | None, str | None]:
+    """Separate a readable 品番 from leftover title text. Drop site chrome."""
+    raw = str(title or "").strip()
+    if not raw:
+        return None, None
+    sole, _many = _sole_product_code(raw)
+    cleaned = AV_CODE_RE.sub(" ", raw)
+    cleaned = re.sub(r"[\s　]+", " ", cleaned).strip(" -/|・")
+    if not cleaned or _is_site_chrome_title(cleaned) or not is_usable_title(cleaned):
+        cleaned = None
+    return sole, cleaned
+
+
+def _actress_query_name(name: str | None) -> str | None:
+    """Japanese cast name for catalog search. Romaji listing chrome is not a query."""
+    shown = str(name or "").strip()
+    compact = re.sub(r"[\s　]+", "", shown)
+    if len(compact) < 2 or not re.search(r"[\u3040-\u30ff\u4e00-\u9fff]", compact):
+        return None
+    return shown
+
+
 def _title_from_ocr_text(text: str | None) -> str | None:
-    """Best usable title line in an OCR dump. Ignores tesseract error stubs."""
+    """Best usable title line in an OCR dump. Ignores tesseract stubs and site chrome."""
     raw = (text or "").strip()
     if not raw or raw.startswith("[tesseract"):
         return None
@@ -7797,7 +7895,9 @@ def _title_from_ocr_text(text: str | None) -> str | None:
     for piece in pieces:
         piece = normalize_ocr_title(piece) or str(piece).strip()
         piece = re.sub(r"\s+", " ", piece).strip()
-        if not is_usable_title(piece):
+        _sole, cleaned = _split_title_and_code(piece)
+        piece = cleaned or ""
+        if not piece or _is_site_chrome_title(piece) or not is_usable_title(piece):
             continue
         if len(piece) > len(best):
             best = piece
@@ -7944,6 +8044,171 @@ def _adopt_title_catalog_hit(
     return one
 
 
+def _candidates_for_read_codes(codes: list[str]) -> list[dict]:
+    """Catalog rows for 品番 that were printed on the frame. No invented titles."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for raw in codes[:8]:
+        disp = format_display_code(str(raw))
+        if not parse_code_parts(disp) or disp in seen:
+            continue
+        seen.add(disp)
+        try:
+            rows = fetch_avbase_title_results(disp, actress=None) or []
+        except Exception:
+            rows = []
+        hit = next(
+            (
+                row
+                for row in rows
+                if isinstance(row, dict) and codes_numeric_equal(str(row.get("code") or ""), disp)
+            ),
+            None,
+        )
+        if isinstance(hit, dict) and _catalog_code_of(hit):
+            out.append(hit)
+    return out
+
+
+def _candidates_for_actress(actress: str | None, *, prefer: list[str] | None = None) -> list[dict]:
+    """Works billed to this actress. A romaji caption is not a catalog query."""
+    name = _actress_query_name(actress)
+    if not name:
+        return []
+    try:
+        rows = fetch_avbase_title_results(name, actress=name) or []
+    except Exception:
+        return []
+    out: list[dict] = []
+    seen: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = _catalog_code_of(row)
+        if not code or code in seen:
+            continue
+        if not _actress_name_matches(name, str(row.get("actress") or "")):
+            continue
+        seen.add(code)
+        out.append(row)
+    pref = {
+        format_display_code(str(c))
+        for c in (prefer or [])
+        if parse_code_parts(str(c))
+    }
+    out.sort(key=lambda c: 0 if _catalog_code_of(c) in pref else 1)
+    return out
+
+
+def _visual_lock_winner(
+    image_bytes: bytes | None,
+    candidates: list[dict],
+    api_key: str | None,
+) -> dict | None:
+    """Same lock bar as other identify modes: same work and the same clothes."""
+    coded = [c for c in candidates or [] if isinstance(c, dict) and _catalog_code_of(c)]
+    if not image_bytes or not coded or not (api_key or "").strip():
+        return None
+    try:
+        ranked, meta = rank_candidates_by_visual(image_bytes, coded[:8], api_key=api_key)
+    except Exception:
+        return None
+    if not (meta or {}).get("visual_lock") or not ranked:
+        return None
+    winner = ranked[0]
+    if not isinstance(winner, dict) or not _visual_is_lock(winner.get("visual")):
+        return None
+    if not _catalog_code_of(winner):
+        return None
+    return winner
+
+
+def _slot_from_locked_candidate(
+    winner: dict,
+    *,
+    vision_meta: dict | None,
+    image_index,
+    why: str,
+    search_mode: str,
+) -> dict:
+    code = _catalog_code_of(winner)
+    one = {
+        "ok": True,
+        "code": code,
+        "title": winner.get("title") or "",
+        "actress": winner.get("actress"),
+        "studio": winner.get("studio"),
+        "cid": winner.get("cid"),
+        "cover": winner.get("cover"),
+        "stills": list(winner.get("stills") or []),
+        "related": [],
+        "related_by_title": [],
+        "candidates": [dict(winner)],
+        "visual_lock": True,
+        "visual_mismatch": False,
+        "needs_code": False,
+        "unidentified": False,
+        "stub": False,
+        "search_mode": search_mode,
+        "why": why,
+        "from_image_index": image_index,
+        "message": why,
+        "source": winner.get("source") or search_mode,
+        "visual_meta": {"visual_ranked": True, "visual_lock": True, "note": why},
+    }
+    if vision_meta:
+        one = apply_vision_meta(one, vision_meta)
+    one["code"] = code
+    one["visual_lock"] = True
+    one["needs_code"] = False
+    return one
+
+
+def _recover_locked_work(
+    *,
+    image_bytes: bytes | None,
+    api_key: str | None,
+    actress: str | None,
+    codes: list[str] | None,
+    vision_meta: dict | None,
+    image_index,
+) -> dict | None:
+    """When the printed phrase is not the catalog title, lock a real work.
+
+    A listing crop may show several 品番. One thumb with only a slogan and an
+    actress name uses that filmography. Either way the image has to lock
+    (same work and same clothes) before a code replaces the title-only card.
+    """
+    key = (api_key or "").strip()
+    if not image_bytes or not key:
+        return None
+    code_list = [format_display_code(str(c)) for c in (codes or []) if parse_code_parts(str(c))]
+    if len(code_list) >= 2:
+        winner = _visual_lock_winner(image_bytes, _candidates_for_read_codes(code_list), key)
+        if winner:
+            return _slot_from_locked_candidate(
+                winner,
+                vision_meta=vision_meta,
+                image_index=image_index,
+                why="列表上的番號已對上原圖",
+                search_mode="code",
+            )
+    winner = _visual_lock_winner(
+        image_bytes,
+        _candidates_for_actress(actress, prefer=code_list),
+        key,
+    )
+    if not winner:
+        return None
+    return _slot_from_locked_candidate(
+        winner,
+        vision_meta=vision_meta,
+        image_index=image_index,
+        why="片名對不上目錄，已依女優作品與原圖鎖定",
+        search_mode="actress",
+    )
+
+
 def _escalate_frame_title(
     title: str,
     *,
@@ -8047,10 +8312,12 @@ def _frame_title_supports_code(catalog_title: str | None, frame_title: str | Non
     """False when the words on this frame belong to a different work than the code.
 
     A short fragment of the catalog line still supports it. A different phrase
-    (school-swimsuit 媚薬合宿 vs a JUFE title) does not.
+    (school-swimsuit 媚薬合宿 vs a JUFE title) does not. A short cover slogan
+    such as 舌技が神 is not a catalog title, so it does not veto a 品番 that
+    was actually read off the frame.
     """
     frame = str(frame_title or "").strip()
-    if not is_usable_title(frame):
+    if not is_usable_title(frame) or _is_decorative_overlay(frame):
         return True
     catalog = str(catalog_title or "").strip()
     if not is_usable_title(catalog):
@@ -8183,37 +8450,52 @@ def run_multi_identify_pipeline(
                 row["vision_error"] = str(e)[:120]
                 try:
                     ocr_text = ocr_image_bytes(img_bytes)
-                    best = pick_best_code(extract_codes(ocr_text))
-                    if best:
-                        row["code"] = best
+                    sole, many = _sole_product_code(ocr_text)
+                    if sole:
+                        row["code"] = sole
+                    elif many:
+                        row["ocr_codes"] = many
                 except Exception:
                     pass
         else:
             try:
                 ocr_text = ocr_image_bytes(img_bytes)
-                best = pick_best_code(extract_codes(ocr_text))
-                if best:
-                    row["code"] = best
+                sole, many = _sole_product_code(ocr_text)
+                if sole:
+                    row["code"] = sole
+                elif many:
+                    row["ocr_codes"] = many
             except Exception:
                 pass
         if row.get("vision_used"):
             row["vision_code"] = str(row["code"]) if row.get("code") else None
             row["vision_title"] = str(row["title"]) if row.get("title") else None
-        # Vision can "succeed" with an empty read (a still, a tight crop).
-        # OCR is the alternate path; the frame is still kept if both miss.
-        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))) and not is_usable_title(row.get("title")):
+        # A code glued into the title line, or a badge mistaken for a title.
+        embedded, cleaned_title = _split_title_and_code(row.get("title"))
+        _title_codes_sole, title_codes = _sole_product_code(str(row.get("title") or ""))
+        if cleaned_title != row.get("title"):
+            row["title"] = cleaned_title
+        if _is_site_chrome_title(row.get("title")):
+            row["title"] = None
+        if embedded and not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+            row["code"] = embedded
+        elif len(title_codes) >= 2 and not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
+            row["ocr_codes"] = title_codes
+        # Vision can return a short cover slogan and still miss the 品番 under the thumb.
+        # OCR runs whenever the code is missing, even if that slogan is a "usable" title.
+        # The frame is still kept if both miss.
+        if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
             try:
                 ocr_text = ocr_image_bytes(img_bytes)
             except Exception:
                 ocr_text = ""
-            if not (row.get("code") and parse_code_parts(str(row.get("code") or ""))):
-                try:
-                    best = pick_best_code(extract_codes(ocr_text or ""))
-                except Exception:
-                    best = None
-                if best:
-                    row["code"] = best
-            if not is_usable_title(row.get("title")):
+            sole, many = _sole_product_code(ocr_text or "")
+            if sole:
+                row["code"] = sole
+                row["ocr_code"] = sole
+            elif many:
+                row["ocr_codes"] = many
+            if not is_usable_title(row.get("title")) or _is_site_chrome_title(row.get("title")):
                 ocr_title = _title_from_ocr_text(ocr_text)
                 if ocr_title:
                     row["ocr_title"] = ocr_title
@@ -8383,17 +8665,33 @@ def run_multi_identify_pipeline(
                 one = escalated
             elif title_rejects_code:
                 pass
-            elif job["kind"] == "title":
-                one = _unresolved_title_slot(
-                    job,
-                    why="已用片名搜尋，目錄沒有返回番號。可手動輸入番號。",
-                )
-            elif job["kind"] == "code":
-                one = build_multi_fail_stub(job, why="番號已查，目錄沒有完整資料")
-                one["from_image_index"] = image_index
-                one["needs_code"] = not bool(_catalog_code_of(one))
             else:
-                one = _unidentified_slot(row)
+                recovered = None
+                if not _catalog_code_of(one) and slot_image:
+                    try:
+                        recovered = _recover_locked_work(
+                            image_bytes=slot_image,
+                            api_key=api_key,
+                            actress=(vm or {}).get("actress") if vm else None,
+                            codes=(row or {}).get("ocr_codes") if row else None,
+                            vision_meta=vm,
+                            image_index=image_index,
+                        )
+                    except Exception:
+                        recovered = None
+                if recovered and _catalog_code_of(recovered):
+                    one = recovered
+                elif job["kind"] == "title":
+                    one = _unresolved_title_slot(
+                        job,
+                        why="已用片名搜尋，目錄沒有返回番號。可手動輸入番號。",
+                    )
+                elif job["kind"] == "code":
+                    one = build_multi_fail_stub(job, why="番號已查，目錄沒有完整資料")
+                    one["from_image_index"] = image_index
+                    one["needs_code"] = not bool(_catalog_code_of(one))
+                else:
+                    one = _unidentified_slot(row)
 
         if one.get("ok") and _catalog_code_of(one):
             try:
@@ -8829,6 +9127,7 @@ def run_identify_pipeline(
     vision_used = False
     vision_meta: dict | None = None
     extra_msg: str | None = None
+    ambiguous_codes: list[str] = []
     code = (user_code or "").strip()
     user_title = (user_title or "").strip()
     search_mode = "manual" if code else ("title" if user_title else "code")
@@ -8944,7 +9243,16 @@ def run_identify_pipeline(
             try:
                 vision_meta = call_gemini_vision(image_bytes, mime, api_key)
                 vision_used = True
-                vcode = vision_meta.get("code")
+                if isinstance(vision_meta, dict) and vision_meta.get("title"):
+                    sole_in_title, cleaned_title = _split_title_and_code(vision_meta.get("title"))
+                    _ignored, title_codes = _sole_product_code(str(vision_meta.get("title") or ""))
+                    vision_meta = dict(vision_meta)
+                    vision_meta["title"] = cleaned_title
+                    if sole_in_title and not vision_meta.get("code"):
+                        vision_meta["code"] = sole_in_title
+                    elif len(title_codes) >= 2:
+                        ambiguous_codes = title_codes
+                vcode = (vision_meta or {}).get("code")
                 if vcode and not code:
                     code = str(vcode)
                     search_mode = "code"
@@ -8963,10 +9271,12 @@ def run_identify_pipeline(
                     ocr_text = ocr_image_bytes(image_bytes)
                     ocr_preview = (ocr_text or "")[:500]
                     if not code:
-                        best = pick_best_code(extract_codes(ocr_text))
-                        if best:
-                            code = best
+                        sole, many = _sole_product_code(ocr_text)
+                        if sole:
+                            code = sole
                             search_mode = "code"
+                        elif many:
+                            ambiguous_codes = many
                 except Exception as ocr_e:
                     _progress(on_progress, "parse", "error", f"OCR 亦失敗：{ocr_e}", 0.4)
                     return (
@@ -8985,10 +9295,12 @@ def run_identify_pipeline(
                 ocr_text = ocr_image_bytes(image_bytes)
                 ocr_preview = (ocr_text or "")[:500]
                 if not code:
-                    best = pick_best_code(extract_codes(ocr_text))
-                    if best:
-                        code = best
+                    sole, many = _sole_product_code(ocr_text)
+                    if sole:
+                        code = sole
                         search_mode = "code"
+                    elif many:
+                        ambiguous_codes = many
             except Exception as e:
                 _progress(on_progress, "parse", "error", f"OCR 失敗：{e}", 0.4)
                 return (
@@ -9006,11 +9318,13 @@ def run_identify_pipeline(
             try:
                 ocr_text = ocr_image_bytes(image_bytes)
                 ocr_preview = (ocr_text or "")[:500]
-                best = pick_best_code(extract_codes(ocr_text))
-                if best:
-                    code = best
+                sole, many = _sole_product_code(ocr_text)
+                if sole:
+                    code = sole
                     search_mode = "code"
                     extra_msg = (extra_msg + " " if extra_msg else "") + "看圖未讀出番號，已用 OCR 補番號。"
+                elif many:
+                    ambiguous_codes = many
             except Exception:
                 pass
     else:
@@ -9041,6 +9355,17 @@ def run_identify_pipeline(
         ref_title_for_verify = user_title.strip()
     elif vision_meta and is_usable_title(vision_meta.get("title")):
         ref_title_for_verify = str(vision_meta.get("title") or "").strip()
+
+    # 「舌技が神」 is cover art, not the catalog line. A 品番 read from the
+    # listing caption must not be discarded because that slogan disagrees.
+    if (
+        code
+        and ref_title_for_verify
+        and not user_code
+        and _is_decorative_overlay(ref_title_for_verify)
+    ):
+        _progress(on_progress, "verify", "skipped", "短標語不是目錄片名，保留已讀番號", 3 / 7)
+        ref_title_for_verify = ""
 
     if code and ref_title_for_verify and not user_code:
         _progress(
@@ -9163,6 +9488,20 @@ def run_identify_pipeline(
                 _progress(on_progress, "cover", "done", "已依番號帶入 CDN 封面", 5 / 6)
                 _progress(on_progress, "done", "done", "完成", 1.0)
                 return payload, 200
+            recovered = _recover_locked_work(
+                image_bytes=image_bytes,
+                api_key=api_key,
+                actress=vactress,
+                codes=ambiguous_codes,
+                vision_meta=vision_meta,
+                image_index=1,
+            )
+            if recovered and _catalog_code_of(recovered):
+                _progress(on_progress, "search", "done", str(recovered.get("message") or "已對上原圖")[:100], 4 / 6)
+                payload = _finish(recovered)
+                _progress(on_progress, "cover", "done" if payload.get("cover") else "skipped", "封面就緒" if payload.get("cover") else "無封面", 5 / 6)
+                _progress(on_progress, "done", "done", "完成", 1.0)
+                return payload, 200
             early_payload = _finish(
                 title_only_payload(
                     title=vtitle,
@@ -9184,6 +9523,19 @@ def run_identify_pipeline(
 
     if image_bytes is not None and not code and not early_payload:
         vtitle = (vision_meta or {}).get("title") if vision_meta else None
+        recovered = _recover_locked_work(
+            image_bytes=image_bytes,
+            api_key=api_key,
+            actress=(vision_meta or {}).get("actress") if vision_meta else None,
+            codes=ambiguous_codes,
+            vision_meta=vision_meta,
+            image_index=1,
+        )
+        if recovered and _catalog_code_of(recovered):
+            _progress(on_progress, "search", "done", str(recovered.get("message") or "已對上原圖")[:100], 4 / 6)
+            payload = _finish(recovered)
+            _progress(on_progress, "done", "done", "完成", 1.0)
+            return payload, 200
         if is_usable_title(vtitle):
             early_payload = _finish(
                 title_only_payload(

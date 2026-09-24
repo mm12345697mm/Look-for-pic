@@ -375,7 +375,9 @@ class TestSwimsuitCoverStaysBesideJufeAndTitle(unittest.TestCase):
     """The dropped card was the school-swimsuit cover, not the yellow-bikini crop.
 
     Left: a title-rich 媚薬／水泳部 cover that identifies on its own.
-    Middle: a short phrase (舌技が神) that must gain a code and catalog title.
+    Middle: fictional mechanic only. The mocked catalog title contains 「舌技が神」
+    (SHJG-448). That is not the real listing: APGH-012's catalog title does not
+    contain 舌技. See tests/test_apgh012_overlay.py.
     Right: a still crop that resolves like JUFE-271, and must not absorb the left cover.
     """
 

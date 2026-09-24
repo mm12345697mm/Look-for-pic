@@ -48,6 +48,8 @@ class TestIdentifySessions(unittest.TestCase):
         img_swim = b"school-swimsuit-cover"
         img_phrase = b"tongue-title-frame"
         img_crop = b"yellow-bikini-crop"
+        # SHJG-448 is a fictional stand-in so this session test can show three
+        # different outcomes. It is not the real 「舌技」 work (APGH-012).
         expected = {img_swim: "SWIM-804", img_phrase: "SHJG-448", img_crop: "JULX-271"}
 
         def vision(image_bytes, mime, api_key):

@@ -45,6 +45,8 @@ def _work(code: str, title: str, actresses: list[str], studio: str) -> dict:
 WORKS = [
     _work("KZTH-701", "星屑図書館で司書が朗読する午後の全記録", ["架空栞"], "架空書房"),
     _work("SWCD-318", "競泳表紙に番号だけが印刷された記録", ["架空泳"], "架空水泳"),
+    # Fictional mechanic: this catalog title contains the OCR phrase. The real
+    # 「舌技」 listing is APGH-012, and its catalog title does not contain 舌技.
     _work("SHJG-448", "舌技が神と呼ばれる架空の夜", ["架空ゆうき"], "架空夜"),
     _work("BODX-214", "深夜個室で繰り返された密会の全記録", ["架空密"], "架空密会"),
     _work("MACT-552", "双子姉妹が放課後に入れ替わる実験", ["架空綾", "架空凛"], "架空双子"),
