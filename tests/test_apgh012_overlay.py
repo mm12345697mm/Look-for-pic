@@ -181,6 +181,15 @@ class TestApgh012Overlay(unittest.TestCase):
         for good in ("先生", "2人っきり", "プライベート補習", "面倒みてあげる"):
             self.assertIn(good, chips, blob)
 
+    def test_clause_joiners_do_not_glue_two_phrases(self):
+        title = "架空題は溢れる欲望と狭い部屋だけ食堂に行く金も無いし同僚は苦手"
+        chips = S._extract_title_theme_keywords(title)
+        blob = " ".join(chips)
+        self.assertNotIn("狭い部屋だけ食堂", chips, blob)
+        self.assertNotIn("無いし同僚", chips, blob)
+        self.assertFalse(any("だけ" in c for c in chips), blob)
+        self.assertTrue(any(c in ("溢れる欲望", "狭い部屋", "食堂", "同僚") for c in chips), blob)
+
     def test_manual_code_pins_slogan_frame_not_a_resolved_neighbor(self):
         rows = [
             {"code": "JUFE-271", "title": "地味な眼鏡では隠し切れない美人OL"},
@@ -389,6 +398,8 @@ class TestApgh012Overlay(unittest.TestCase):
             offline_cache_get=mock.Mock(return_value=None),
             offline_cache_put=mock.Mock(return_value=None),
             probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_cover_cid=mock.Mock(return_value=("cid", "https://example.com/cover.jpg")),
+            _jacket_score_against_url=mock.Mock(return_value=0.93),
             resolve_chinese_title=mock.Mock(return_value=None),
             find_related_by_title=mock.Mock(return_value=[]),
             attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),
@@ -493,6 +504,8 @@ class TestApgh012Overlay(unittest.TestCase):
             offline_cache_get=mock.Mock(return_value=None),
             offline_cache_put=mock.Mock(return_value=None),
             probe_cover_url=mock.Mock(side_effect=lambda url, timeout=0: (True, url)),
+            resolve_cover_cid=mock.Mock(return_value=("cid", "https://example.com/cover.jpg")),
+            _jacket_score_against_url=mock.Mock(return_value=0.93),
             resolve_chinese_title=mock.Mock(return_value=None),
             find_related_by_title=mock.Mock(return_value=[]),
             attach_related_by_title=mock.Mock(side_effect=lambda result, **kwargs: result),

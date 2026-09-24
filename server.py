@@ -7466,18 +7466,30 @@ _TITLE_COMPOUND_STOP = {
 }
 
 
+# Clause glue that is not a theme particle. Kept out of the single-character
+# class so だけ does not become だ + け. も / いし sit between content words
+# (金も無い, 無いし同僚) and must not glue two clauses into one chip.
+_CLAUSE_JOIN_RE = re.compile(
+    r"(?<=[\u4e00-\u9fff\u30a0-\u30ff0-9])"
+    r"(?:ないし|ながら|けれど|けど|のに|ので|だけ|しか|つつ|ても|でも|いし|も)"
+    r"(?=[\u4e00-\u9fff\u30a0-\u30ff])"
+)
+
+
 def _bounded_title_compounds(text: str) -> list[str]:
     """Chunks split on particles, not a sliding window.
 
     先生が2人っきりのプライベート補習で全部面倒みてあげる →
     先生 / 2人っきり / プライベート補習 / 面倒みてあげる.
     A token that is only the tail of a longer katakana word is dropped.
-    Pure hiragana and edition junk are not chips.
+    Pure hiragana and edition junk are not chips. A clause joiner
+    (だけ / ないし / も) splits the chunk so two clauses are not one chip.
     """
     t = re.sub(r"\s+", "", text or "")
     if not t:
         return []
     parts = re.split(r"[をにでがはもとからまでへの、。！？！\?／/\|・…]+", t)
+    parts = [piece for part in parts for piece in _CLAUSE_JOIN_RE.split(part)]
     raw_parts: list[str] = []
     for part in parts:
         part = part.strip()
@@ -7499,6 +7511,8 @@ def _bounded_title_compounds(text: str) -> list[str]:
             continue
         # 彼女のいない… splits on の into a tail that starts mid-word (いない貧乏…).
         if re.match(r"[\u3040-\u309f]", part):
+            continue
+        if _CLAUSE_JOIN_RE.search(part):
             continue
         if not re.search(r"[\u4e00-\u9fff\u30a0-\u30ff0-9]", part):
             continue
