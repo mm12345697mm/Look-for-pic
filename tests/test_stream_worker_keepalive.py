@@ -222,7 +222,7 @@ class TestIdentifyStreamSurvivesSilence(unittest.TestCase):
                 if age is not None and age >= 0:
                     ages.append(age)
 
-        def fake_multi(images, user_code="", user_title="", on_progress=None):
+        def fake_multi(images, user_code="", user_title="", on_progress=None, job_id=None):
             self.assertEqual(len(images), 4)
             for i in range(4):
                 S._progress(
@@ -270,7 +270,7 @@ class TestIdentifyStreamSurvivesSilence(unittest.TestCase):
         job_box: dict = {}
         seen_slots: list[int] = []
 
-        def fake_multi(images, user_code="", user_title="", on_progress=None):
+        def fake_multi(images, user_code="", user_title="", on_progress=None, job_id=None):
             self.assertEqual(len(images), 4)
             for i in range(4):
                 S._progress(

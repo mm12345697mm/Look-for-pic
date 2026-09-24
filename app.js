@@ -38,6 +38,8 @@
   const progressDetailEl = $('progress-detail');
   const progressBar = $('progress-bar');
   const progressPct = $('progress-pct');
+  const progressSkipRow = $('progress-skip-row');
+  const btnSkipSlot = $('btn-skip-slot');
   const codeInput = $('code-input');
   const galleryCards = $('gallery-cards');
   const galleryCount = $('gallery-count');
@@ -288,7 +290,7 @@
 
   /** Missing cover and/or name — user can fix without the bot. */
   function workNeedsManualFix(w) {
-    if (!w) return false;
+    if (!w || w.skipped) return false;
     return !workHasUsableCover(w) || !workHasUsableTitle(w);
   }
 
@@ -475,11 +477,15 @@
     const src = item || {};
     const fb = fallback || {};
     const lineOut = line || src.line || 'main';
-    const codeRaw = src.code || fb.code || '';
-    const code = codeRaw && parseCodeParts(String(codeRaw))
-      ? formatDisplayCode(String(codeRaw))
-      : String(codeRaw || '');
-    const relatedSrc = pickRelatedSource(src, lineOut === 'main', fb);
+    const skippedSlot = !!(src.skipped);
+    const codeRaw = skippedSlot ? '' : (src.code || fb.code || '');
+    const code = skippedSlot
+      ? ''
+      : codeRaw && parseCodeParts(String(codeRaw))
+        ? formatDisplayCode(String(codeRaw))
+        : String(codeRaw || '');
+    const skipped = !!(src.skipped);
+    const relatedSrc = skipped ? [] : pickRelatedSource(src, lineOut === 'main', fb);
     // Another 番號 must not inherit this query's Chinese title. Missing
     // title_zh stays Japanese-only; never invent a translation.
     const sameCode = !!(
@@ -491,22 +497,30 @@
       || (sameCode ? String(fb.title_zh || fb.titleZh || '').trim() : '');
     return {
       code: code,
-      title: src.title || fb.title || '',
-      title_zh: titleZh,
-      cover: src.cover || fb.cover || '',
-      cid: src.cid || fb.cid || '',
-      stills: Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
-      actress: src.actress || fb.actress || '',
-      actress_zh: String(src.actress_zh || src.actressZh || fb.actress_zh || fb.actressZh || '').trim(),
-      studio: src.studio || fb.studio || '',
-      studio_zh: String(src.studio_zh || src.studioZh || fb.studio_zh || fb.studioZh || '').trim(),
+      title: skippedSlot ? String(src.title || '').trim() : (src.title || fb.title || ''),
+      title_zh: skippedSlot ? '' : titleZh,
+      cover: skippedSlot ? '' : (src.cover || fb.cover || ''),
+      cid: skippedSlot ? '' : (src.cid || fb.cid || ''),
+      stills: skippedSlot
+        ? []
+        : Array.isArray(src.stills) ? src.stills.slice(0, 12) : (fb.stills || []).slice(0, 12),
+      actress: skippedSlot ? '' : (src.actress || fb.actress || ''),
+      actress_zh: skippedSlot
+        ? ''
+        : String(src.actress_zh || src.actressZh || fb.actress_zh || fb.actressZh || '').trim(),
+      studio: skippedSlot ? '' : (src.studio || fb.studio || ''),
+      studio_zh: skippedSlot
+        ? ''
+        : String(src.studio_zh || src.studioZh || fb.studio_zh || fb.studioZh || '').trim(),
       line: lineOut,
       related: slimRelatedForHistory(relatedSrc),
-      theme_keywords: normalizeKeywordList(src.theme_keywords || src.themeKeywords),
-      keyword_queries: normalizeKeywordList(src.keyword_queries || src.keywordQueries),
+      theme_keywords: skippedSlot ? [] : normalizeKeywordList(src.theme_keywords || src.themeKeywords),
+      keyword_queries: skippedSlot ? [] : normalizeKeywordList(src.keyword_queries || src.keywordQueries),
       visual_mismatch: !!(src.visual_mismatch || src.visualMismatch),
       visual_note: String(src.visual_note || src.visualNote || '').trim(),
-      unidentified: !!(src.unidentified || src.frame_unidentified),
+      unidentified: skippedSlot ? false : !!(src.unidentified || src.frame_unidentified),
+      skipped: skippedSlot,
+      user_preview: String(src.user_preview || src.userPreview || '').trim(),
       from_image_index: src.from_image_index || src.fromImageIndex || null,
     };
   }
@@ -520,7 +534,7 @@
     function pushWork(item, line) {
       if (!item || isRelatedBucketItem(item)) return;
       const work = slimWorkForHistory(item, data, line);
-      if (!work.code && !work.title) return;
+      if (!work.code && !work.title && !work.skipped) return;
       const idx = work.from_image_index;
       const key = idx
         ? 'i:' + idx
@@ -921,20 +935,24 @@
 
   function workFromApi(raw, line) {
     const rawCode = raw.code == null ? '' : String(raw.code);
-    const unidentified = !!(raw.unidentified || raw.frame_unidentified);
+    const skipped = !!(raw.skipped);
+    const unidentified = !skipped && !!(raw.unidentified || raw.frame_unidentified);
     const titleOnly =
-      unidentified ||
-      !rawCode ||
-      rawCode === 'TITLE-SEARCH' ||
-      rawCode.toLowerCase() === 'null' ||
-      !parseCodeParts(rawCode);
-    const code = unidentified
-      ? '未辨識'
-      : titleOnly
-        ? rawCode === 'TITLE-SEARCH' || !rawCode
-          ? '片名搜尋'
-          : formatDisplayCode(rawCode)
-        : formatDisplayCode(rawCode);
+      !skipped &&
+      (unidentified ||
+        !rawCode ||
+        rawCode === 'TITLE-SEARCH' ||
+        rawCode.toLowerCase() === 'null' ||
+        !parseCodeParts(rawCode));
+    const code = skipped
+      ? ''
+      : unidentified
+        ? '未辨識'
+        : titleOnly
+          ? rawCode === 'TITLE-SEARCH' || !rawCode
+            ? '片名搜尋'
+            : formatDisplayCode(rawCode)
+          : formatDisplayCode(rawCode);
     const lineOut = line || raw.line || 'main';
     const relatedSlide = isRelatedCarouselLine(lineOut);
     const preview = String(raw.user_preview || raw.userPreview || '').trim();
@@ -946,14 +964,17 @@
       cover = '';
     }
     // The query image is not the main cover. A cid restores the catalog jacket.
-    if (!cover && cid && !isNowPrintingUrl(cid)) {
+    if (!skipped && !cover && cid && !isNowPrintingUrl(cid)) {
       cover = coverUrl(cid);
       if (!isCatalogMediaUrl(cover)) cover = '';
     }
+    if (skipped) cover = '';
     let stills = Array.isArray(raw.stills) && raw.stills.length
       ? raw.stills.map((u) => String(u || '')).filter((u) => isCatalogMediaUrl(u) && u !== preview)
       : [];
-    if (!stills.length && cid && !isNowPrintingUrl(cid)) {
+    if (skipped) {
+      stills = [];
+    } else if (!stills.length && cid && !isNowPrintingUrl(cid)) {
       stills = stillUrls(cid, 10);
     }
     let relatedByTitle = [];
@@ -978,6 +999,7 @@
       stills,
       titleOnly,
       unidentified,
+      skipped,
       userPreview: relatedSlide ? '' : String(raw.user_preview || raw.userPreview || '').trim(),
       fromImageIndex: raw.from_image_index || raw.fromImageIndex || null,
       relatedByTitle,
@@ -1006,6 +1028,12 @@
   let progressCollapsed = false;
   let progressCurrentLine = '準備中…';
   let progressFinished = false;
+  let activeIdentifyJobId = '';
+  let identifyImageTotal = 0;
+  let slotUploadFiles = [];
+  let lastIdentifyPayload = null;
+  let historySavePromise = null;
+  let skipRequestBusy = false;
 
   function setProgressCollapsed(collapsed) {
     progressCollapsed = !!collapsed;
@@ -1091,6 +1119,15 @@
     }
   }
 
+  function setSkipSlotVisible(on) {
+    const show = !!on;
+    if (progressSkipRow) progressSkipRow.hidden = !show;
+    if (btnSkipSlot) {
+      btnSkipSlot.hidden = !show;
+      if (!show) btnSkipSlot.disabled = false;
+    }
+  }
+
   function hideProgress() {
     if (!progressPanel) return;
     progressPanel.classList.add('hidden');
@@ -1098,6 +1135,8 @@
     progressPanel.setAttribute('aria-busy', 'false');
     setProgressCollapsed(false);
     progressFinished = false;
+    activeIdentifyJobId = '';
+    setSkipSlotVisible(false);
   }
 
   // High-water mark for one identify run. SSE and job polls can arrive out of
@@ -1328,6 +1367,7 @@
     progressPct.textContent = '0%';
     updateProgressSummary('處理中：準備中…');
     setProgressCollapsed(false);
+    setSkipSlotVisible(false);
     progressPanel.classList.remove('hidden');
     progressPanel.setAttribute('aria-busy', 'true');
   }
@@ -1392,6 +1432,47 @@
       }
     }
     commitProgressHigh(evt);
+    const skipUi = skipControlState(evt, identifyImageTotal, activeIdentifyJobId);
+    setSkipSlotVisible(!progressFinished && skipUi.visible);
+  }
+
+  async function requestSkipCurrentSlot() {
+    if (!activeIdentifyJobId || skipRequestBusy || !btnSkipSlot) return;
+    skipRequestBusy = true;
+    btnSkipSlot.disabled = true;
+    const previous = btnSkipSlot.textContent;
+    btnSkipSlot.textContent = '跳過中…';
+    try {
+      const res = await fetch(
+        '/api/identify/jobs/' + encodeURIComponent(activeIdentifyJobId) + '/skip',
+        { method: 'POST' }
+      );
+      let data = null;
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = null;
+      }
+      if (!data || data.ok === false) {
+        showToast((data && data.message) || '目前無法跳過這張');
+        return;
+      }
+      const total = Number(data.image_count) || identifyImageTotal;
+      const index = Number(data.skipped_index) || 0;
+      if (index && total) {
+        const line = '已跳過第 ' + index + '/' + total + ' 張';
+        if (progressDetailEl) progressDetailEl.textContent = line;
+        updateProgressSummary('處理中：' + line);
+      }
+    } catch (_) {
+      showToast('目前無法跳過這張');
+    } finally {
+      skipRequestBusy = false;
+      if (btnSkipSlot) {
+        btnSkipSlot.disabled = false;
+        btnSkipSlot.textContent = previous || '跳過這張';
+      }
+    }
   }
 
   function toggleProgressCollapsed() {
@@ -1525,12 +1606,15 @@
     throw err;
   }
 
-  async function apiIdentifyStream({ images, image, code, title } = {}, onProgress) {
+  async function apiIdentifyStream({ images, image, code, title } = {}, onProgress, options) {
+    options = options || {};
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
     appendImagesToFormData(fd, imgs);
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
+    if (options.slotIndex) fd.append('slot_index', String(options.slotIndex));
+    if (options.sessionId) fd.append('session_id', String(options.sessionId));
 
     let res;
     try {
@@ -1579,18 +1663,23 @@
           continue;
         }
         if (evt.type === 'job' && evt.job_id) {
-          jobId = String(evt.job_id);
-          bindIdentifyJob(jobId);
-          if (evt.image_count) noteProgressImageCount(evt.image_count);
-        } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
-          showProgress(evt.steps);
-        } else if (evt.type === 'progress') {
-          if (progressRunSuperseded(epoch, jobId)) {
-            return { status: 0, data: null, superseded: true };
+          if (!options.quiet) {
+            jobId = String(evt.job_id);
+            bindIdentifyJob(jobId);
+            if (evt.image_count) noteProgressImageCount(evt.image_count);
+            activeIdentifyJobId = jobId;
           }
-          if (jobId) evt.jobId = jobId;
-          if (onProgress) onProgress(evt);
-          else applyProgressEvent(evt);
+        } else if (evt.type === 'steps' && Array.isArray(evt.steps)) {
+          if (!options.quiet) showProgress(evt.steps, progressHigh.runImageCount || undefined);
+        } else if (evt.type === 'progress') {
+          if (!options.quiet) {
+            if (progressRunSuperseded(epoch, jobId)) {
+              return { status: 0, data: null, superseded: true };
+            }
+            if (jobId) evt.jobId = jobId;
+            if (onProgress) onProgress(evt);
+            else applyProgressEvent(evt);
+          }
         } else if (evt.type === 'result') {
           finalData = evt.data;
           if (typeof evt.status === 'number') httpStatus = evt.status;
@@ -1679,6 +1768,78 @@
     const msg = data && data.message ? String(data.message) : '';
     if (msg && msg !== String(notice || '')) return honestRelatedNotice(msg, items);
     return null;
+  }
+
+  /**
+   * Put a single-image identify result back into one multi-batch slot.
+   * Other slots, including their related lists, stay the same objects.
+   */
+  function mergeSlotRetryIntoIdentify(data, slotIndex, single) {
+    const base = data && typeof data === 'object' ? data : {};
+    const results = Array.isArray(base.results) ? base.results.slice() : [];
+    const index = Number(slotIndex);
+    let at = results.findIndex((r) => r && Number(r.from_image_index) === index);
+    if (at < 0) at = index - 1;
+    if (at < 0 || at >= results.length) return base;
+    const prev = results[at] || {};
+    const src =
+      single && Array.isArray(single.results) && single.results[0] ? single.results[0] : single || {};
+    const next = Object.assign({}, src);
+    next.from_image_index = prev.from_image_index || index;
+    next.line = at === 0 ? 'main' : 'multi';
+    next.skipped = false;
+    next.ok = src.ok !== false;
+    if (!next.user_preview && prev.user_preview) next.user_preview = prev.user_preview;
+    const preview = String(next.user_preview || prev.user_preview || '');
+    const cover = String(next.cover || '');
+    if (!cover || cover === preview || /^(data:|blob:)/i.test(cover)) {
+      next.cover = null;
+    }
+    results[at] = next;
+    const out = Object.assign({}, base, { results: results });
+    if (at === 0) {
+      out.code = next.code || '';
+      out.title = next.title || '';
+      out.cover = next.cover || '';
+      out.related_by_title = next.related_by_title || [];
+    }
+    return out;
+  }
+
+  function replaceHistorySessionWorks(recId, works) {
+    if (!recId) return false;
+    const list = loadHistory();
+    const i = list.findIndex((x) => x && x.id === recId);
+    if (i < 0) return false;
+    const prev = list[i];
+    const first = (works && works[0]) || {};
+    list[i] = Object.assign({}, prev, {
+      works: works,
+      code: first.code || '',
+      title: first.title || '',
+      title_zh: first.title_zh || '',
+      cover: first.cover || '',
+      stills: first.stills || [],
+      actress: first.actress || '',
+      related: first.related || [],
+    });
+    saveHistory(list);
+    return true;
+  }
+
+  /** Show 跳過這張 only for the active vision/search slot, with the original N. */
+  function skipControlState(evt, imageTotal, jobId) {
+    const total = Number(imageTotal) || 0;
+    const hidden = { visible: false, index: 0, total: total };
+    if (!jobId || total < 2 || !evt || evt.status !== 'active') return hidden;
+    if (evt.step !== 'vision' && evt.step !== 'search') return hidden;
+    const detail = String(evt.detail || '');
+    if (/時間不夠|尚未查完|尚未鎖定/.test(detail)) return hidden;
+    const matched = detail.match(/第\s*(\d+)\s*\/\s*(\d+)\s*張/);
+    const index = matched ? Number(matched[1]) : Number(evt.image_index) || 0;
+    const denom = matched ? Number(matched[2]) : Number(evt.image_count) || 0;
+    if (!index || denom !== total) return hidden;
+    return { visible: true, index: index, total: denom };
   }
 
   function galleryFromIdentify(data) {
@@ -1814,6 +1975,10 @@
     runId += 1;
     identifyBusy = false;
     batchFiles = [];
+    slotUploadFiles = [];
+    lastIdentifyPayload = null;
+    historySavePromise = null;
+    identifyImageTotal = 0;
     setStatus('');
     hideProgress();
     hideOcrPrompt();
@@ -1861,15 +2026,26 @@
     const preview = String((w && w.userPreview) || '').trim();
     // Main cover is the catalog jacket. The query image stays in the upload strip.
     const catalog = isCatalogMediaUrl(url) && url !== preview;
-    if (!catalog) {
+    if (w.skipped || !catalog) {
       coverWrap.classList.add('is-empty');
+      if (w.skipped) coverWrap.classList.add('is-skipped');
       const ph = document.createElement('div');
       ph.className = 'cover-placeholder';
-      ph.innerHTML = w.unidentified
-        ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
-        : w.titleOnly
-          ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
-          : '<strong>暫無封面</strong><span>請確認番號</span>';
+      if (w.skipped && preview && /^(data:|blob:)/i.test(preview)) {
+        coverWrap.classList.add('has-upload-preview');
+        const shot = document.createElement('img');
+        shot.className = 'skipped-upload-preview';
+        shot.alt = '已跳過的上傳圖';
+        shot.src = preview;
+        coverWrap.appendChild(shot);
+      }
+      ph.innerHTML = w.skipped
+        ? '<strong>已跳過</strong><span>這張先略過，可按重新辨識</span>'
+        : w.unidentified
+          ? '<strong>未辨識</strong><span>未讀到番號或片名，已保留這張</span>'
+          : w.titleOnly
+            ? '<strong>尚未解析番號</strong><span>無法載入 CDN 封面 — 請手動輸入番號</span>'
+            : '<strong>暫無封面</strong><span>請確認番號</span>';
       coverWrap.appendChild(ph);
       return;
     }
@@ -1981,7 +2157,7 @@
       );
       meta.appendChild(noteEl);
     }
-    const badge = opts.badgeLabel || lineLabel(w.line);
+    const badge = w.skipped ? '已跳過' : (opts.badgeLabel || lineLabel(w.line));
     const hitKeywords =
       badge === '關鍵字'
         ? normalizeKeywordList(w.matchedKeywords || w.matched_keywords || w.hitKeywords || w.hit_keywords)
@@ -2010,13 +2186,33 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    card.appendChild(buildWorkActions(w, coverWrap));
+    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
+    if (w.skipped) card.appendChild(buildReidentifyButton(w));
     if (workNeedsManualFix(w)) {
       card.appendChild(buildManualFixPanel(w, card));
     }
-    appendStillsScroll(card, w, '劇照（橫滑）');
+    if (!w.skipped) appendStillsScroll(card, w, '劇照（橫滑）');
+    if (w.skipped) card.classList.add('is-skipped');
     return card;
+  }
+
+  function buildReidentifyButton(w) {
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'btn btn-reidentify';
+    retry.textContent = '重新辨識';
+    bindWorkAction(retry, () => {
+      if (retry.disabled) return;
+      retry.disabled = true;
+      retry.textContent = '重新辨識中…';
+      reidentifySkippedSlot(w).finally(() => {
+        if (!retry.isConnected && retry.parentNode == null) return;
+        retry.disabled = false;
+        retry.textContent = '重新辨識';
+      });
+    });
+    return retry;
   }
 
   let manualFixFileCb = null;
@@ -3676,9 +3872,9 @@
   }
 
   async function appendHistoryFromIdentify(data, userFiles) {
-    if (!data || !data.ok) return;
+    if (!data || !data.ok) return null;
     const works = sessionWorksFromIdentify(data);
-    if (!works.length) return;
+    if (!works.length) return null;
 
     const userShots = await buildUserShotThumbs(userFiles || []);
     const first = works[0];
@@ -3703,6 +3899,7 @@
     list = backfillHistoryTitleZh(list, data);
     if (list.length > HISTORY_MAX) list = list.slice(0, HISTORY_MAX);
     saveHistory(list);
+    return rec.id;
   }
 
   function formatTs(ts) {
@@ -3760,7 +3957,7 @@
       } else {
         thumbHtml = '<div class="history-thumb placeholder">無圖</div>';
       }
-      const codeLabel = rec.code || first.code || (rec.ok === false ? '未找到' : '—');
+      const codeLabel = rec.code || first.code || (first.skipped ? '已跳過' : rec.ok === false ? '未找到' : '—');
       const titleJa = rec.title || first.title || '';
       const titleZh = rec.title_zh || first.title_zh || first.titleZh || '';
       let titleText = formatDisplayTitle(titleJa, titleZh);
@@ -3848,6 +4045,9 @@
         visual_mismatch: !!(w.visual_mismatch || w.visualMismatch),
         visual_note: String(w.visual_note || w.visualNote || '').trim(),
         unidentified: !!w.unidentified,
+        skipped: !!w.skipped,
+        user_preview: w.user_preview || '',
+        ok: !w.skipped,
         from_image_index: w.from_image_index || null,
         line: i === 0 ? 'main' : (w.line || 'multi'),
       })),
@@ -4027,6 +4227,7 @@
     const works = historySessionWorks(rec);
     const paintWorks = works.filter((w) => {
       if (!w) return false;
+      if (w.skipped) return true;
       const code = String(w.code || '').trim();
       if (code && code !== '片名搜尋') return true;
       if (String(w.title || '').trim()) return true;
@@ -4087,10 +4288,65 @@
     return true;
   }
 
+  async function reidentifySkippedSlot(work) {
+    const idx = Number(work && (work.fromImageIndex || work.from_image_index));
+    const file = idx > 0 ? slotUploadFiles[idx - 1] : null;
+    if (!file) {
+      showToast('這張原圖不在了，請重新選取');
+      return { ok: false, reason: 'missing-file' };
+    }
+    setStatus('重新辨識第 ' + idx + ' 張…', 'busy');
+    let single = null;
+    const sessionId = lastIdentifyPayload && lastIdentifyPayload.session_id;
+    try {
+      try {
+        const streamed = await apiIdentifyStream(
+          { images: [file] },
+          null,
+          { quiet: true, slotIndex: idx, sessionId: sessionId || '' }
+        );
+        single = streamed && streamed.data;
+      } catch (_) {
+        const classic = await apiIdentify({ images: [file] });
+        single = classic && classic.data;
+      }
+    } catch (err) {
+      setStatus('');
+      showToast((err && err.message) || '重新辨識失敗');
+      return { ok: false, reason: 'fetch' };
+    }
+    const identified =
+      single &&
+      (single.ok || single.code || single.title || (Array.isArray(single.results) && single.results.length));
+    if (!identified) {
+      setStatus('');
+      showToast((single && single.message) || '重新辨識失敗');
+      return { ok: false, reason: 'miss' };
+    }
+    const patched = mergeSlotRetryIntoIdentify(lastIdentifyPayload, idx, single);
+    lastIdentifyPayload = patched;
+    const result = galleryFromIdentify(patched);
+    renderGallery(result);
+    try {
+      const recId = historySavePromise ? await historySavePromise : null;
+      if (recId) replaceHistorySessionWorks(recId, sessionWorksFromIdentify(patched));
+    } catch (_) {}
+    setStatus('');
+    showToast('已重新辨識這張');
+    return { ok: true };
+  }
+
   async function runIdentify({ images, image, code, title } = {}, myRun) {
     const imgs = images && images.length ? images : image ? [image] : [];
     identifyBusy = true;
-    if (imgs.length > 1) batchFiles = imgs.slice();
+    activeIdentifyJobId = '';
+    if (imgs.length > 1) {
+      batchFiles = imgs.slice();
+      slotUploadFiles = imgs.slice();
+      identifyImageTotal = imgs.length;
+    } else {
+      identifyImageTotal = 0;
+    }
     const busyMsg = imgs.length > 1
       ? '多圖辨識中（' + imgs.length + ' 張）…'
       : imgs.length
@@ -4179,9 +4435,10 @@
           progressPanel.setAttribute('aria-busy', 'false');
         }
         const result = galleryFromIdentify(data);
+        lastIdentifyPayload = data;
         renderGallery(result);
         // Persist history (async thumbs)
-        appendHistoryFromIdentify(data, imgs).catch(() => {});
+        historySavePromise = appendHistoryFromIdentify(data, imgs).catch(() => null);
         // Clear pending selection but keep sticky shots until 重新開始
         clearPending(false);
         // Auto-hide progress so it cannot permanently cover gallery bottom/footer
@@ -4370,6 +4627,13 @@
     progressToggle.addEventListener('click', (e) => {
       e.preventDefault();
       toggleProgressCollapsed();
+    });
+  }
+  if (btnSkipSlot) {
+    btnSkipSlot.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      requestSkipCurrentSlot();
     });
   }
 
@@ -4608,6 +4872,9 @@
       resumePayloadFromJob,
       followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
+      mergeSlotRetryIntoIdentify,
+      skipControlState,
+      replaceHistorySessionWorks,
       workNeedsTitleZh,
       workNeedsManualFix,
       batchQueryKeepsFrames,
