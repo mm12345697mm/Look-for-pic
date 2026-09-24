@@ -212,10 +212,16 @@
   }
 
   function workNeedsThemeKeywords(work) {
+    const raw = (work && (work.theme_keywords || work.themeKeywords)) || [];
+    const items = Array.isArray(raw)
+      ? raw
+      : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
+    // BOD / VOL stored on an old card is not a theme. Refresh from the title.
+    if (items.some((item) => isEditionKeyword(item))) return true;
     const related = (work && work.related) || [];
     const hasKw = related.some((r) => relatedLineFromRaw(r) === 'keyword');
     if (!hasKw) return false;
-    return !normalizeKeywordList(work.theme_keywords || work.themeKeywords).length;
+    return !normalizeKeywordList(raw).length;
   }
 
   function relatedBucketsNeedFill(related, opts) {
@@ -521,8 +527,30 @@
   // One-character kinship chips from patterns like 彼女の妹. Other 1-char scraps stay out.
   const RELATION_CHIP = { '妹': 1, '姉': 1, '兄': 1, '弟': 1, '私': 1, '僕': 1, '俺': 1, '君': 1 };
 
+  function foldEditionKey(s) {
+    return String(s || '')
+      .trim()
+      .replace(/[Ａ-Ｚａ-ｚ]/g, (ch) => String.fromCharCode(ch.charCodeAt(0) - 0xfee0))
+      .replace(/[\s.．·・‐－\-]+/g, '')
+      .toLowerCase();
+  }
+
+  /** Disc/edition junk. Never a chip. OL and VR are not in this set.
+   * A glued pair such as 交尾BOD is junk too. BD inside BDSM is not.
+   */
+  function isEditionKeyword(s) {
+    const raw = String(s || '').trim();
+    if (!raw) return false;
+    if (/第\s*[0-9０-９一二三四五六七八九十百千〇零]+\s*[巻話章集回]/.test(raw)) return true;
+    if (/blu[\s\-‐－]?ray/i.test(raw)) return true;
+    if (/ブルーレイ/.test(raw)) return true;
+    const key = foldEditionKey(raw);
+    return /(?:^|[^a-z0-9])(?:vol(?:ume)?|ep(?:isode)?|bod|bd|dvd|uhd|bluray|4k)[0-9]*(?:[^a-z0-9]|$)/.test(key);
+  }
+
   function keywordTokenOk(s) {
     if (!s || s.length > 24) return false;
+    if (isEditionKeyword(s)) return false;
     if (s.length >= 2) return true;
     return !!RELATION_CHIP[s];
   }

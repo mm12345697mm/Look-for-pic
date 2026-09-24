@@ -2652,5 +2652,164 @@ class TestTitleCutAndMultiVisual(unittest.TestCase):
         self.assertTrue(any(c["image"] == img2 and "NHDTC-235" in c["codes"] for c in rank_calls))
 
 
+class TestJur881ThemeChips(unittest.TestCase):
+    """Rich JP titles yield theme chips. BOD / Blu-ray never do.
+
+    JUR-881 is the screenshot case: the UI showed only BOD and 中出し.
+    Tutor-title regression stays in TestKinshipRoleAndEditionMarkers
+    (息子の家庭教師 / 10秒挿入 / 肉欲教育, VOL stripped, OL not invented).
+    """
+
+    JUR = (
+        "毎晩旦那とヤリまくる絶倫叔母と一泊二日の搾精旅行 "
+        "ヌカれまくって性に目覚めた童貞の僕は…すべて忘れて連続中出し交尾にハマってしまった。 "
+        "三比菜々美 (BOD)"
+    )
+    EXPECTED = [
+        "搾精旅行",
+        "毎晩",
+        "絶倫",
+        "叔母",
+        "一泊二日",
+        "童貞",
+        "連続中出し",
+        "交尾",
+        "搾精",
+        "中出し",
+    ]
+
+    def test_jur881_theme_chips_and_no_bod(self):
+        for actress in ("三比菜々美", None):
+            kws = S._extract_title_theme_keywords(self.JUR, actress=actress)
+            self.assertEqual(kws, self.EXPECTED, (actress, kws))
+        for tok in ("叔母", "一泊二日", "搾精旅行", "連続中出し", "交尾"):
+            self.assertIn(tok, self.EXPECTED)
+        for absent in (
+            "BOD",
+            "bod",
+            "(BOD)",
+            "BD",
+            "DVD",
+            "Blu-ray",
+            "ブルーレイ",
+            "VOL",
+            "榨精旅行",
+            "榨精",
+            "連續中出",
+            "三比菜々美",
+            "旦那",
+        ):
+            self.assertNotIn(absent, self.EXPECTED)
+        self.assertLess(self.EXPECTED.index("搾精旅行"), self.EXPECTED.index("搾精"))
+        self.assertLess(self.EXPECTED.index("連続中出し"), self.EXPECTED.index("中出し"))
+        self.assertFalse(S._is_weak_theme_token("叔母"))
+        self.assertTrue(S._is_auto_theme_keyword("叔母"))
+        self.assertTrue(S._is_auto_theme_keyword("搾精旅行"))
+        self.assertTrue(S._is_auto_theme_keyword("一泊二日"))
+        self.assertTrue(S._is_auto_theme_keyword("連続中出し"))
+        self.assertTrue(S._is_auto_theme_keyword("交尾"))
+        self.assertTrue(S._is_weak_theme_token("中出し"))
+        qs = S._keyword_search_queries(self.JUR, self.EXPECTED)
+        blob = " ".join(qs).casefold()
+        self.assertNotIn("bod", blob, qs)
+        self.assertNotIn("blu", blob, qs)
+        for tok in ("叔母", "一泊二日", "搾精旅行", "連続中出し", "交尾"):
+            self.assertIn(tok, qs, qs)
+        selected = S._keyword_search_queries(
+            self.JUR, ["BOD", "叔母", "交尾"], selected_only=True
+        )
+        self.assertIn("叔母", selected)
+        self.assertIn("交尾", selected)
+        self.assertTrue(all("bod" not in q.casefold() for q in selected), selected)
+        self.assertEqual(
+            S._keyword_search_queries(self.JUR, ["BOD"], selected_only=True),
+            [],
+        )
+        self.assertEqual(S._keyword_hit_count("絶倫叔母 (BOD)", ["BOD"]), 0)
+        self.assertEqual(S._keyword_hit_count("絶倫叔母 (BOD)", ["叔母", "BOD"]), 1)
+        self.assertEqual(
+            S._find_related_by_keywords(self.JUR, keywords=["BOD"], max_n=5, budget_sec=1),
+            [],
+        )
+
+    def test_format_tags_stripped_and_ol_kept(self):
+        for title in (
+            "美人OL (BOD)",
+            "美人OL（BOD）",
+            "美人OL（ＢＯＤ）",
+            "美人OL [BOD]",
+            "美人OL【BOD】",
+            "美人OL BOD",
+            "美人OL（Blu-ray）",
+            "美人OL (Blu-ray)",
+            "美人OL (BD)",
+            "美人OL (DVD)",
+            "美人OL (4K)",
+            "美人OL ブルーレイ",
+            "美人OLの物語VOL.2",
+        ):
+            kws = S._extract_title_theme_keywords(title)
+            self.assertIn("OL", kws, (title, kws))
+            self.assertIn("美人", kws, (title, kws))
+            blob = " ".join(kws).casefold()
+            for junk in ("bod", "blu", "dvd", "vol", "ブルーレイ"):
+                self.assertNotIn(junk, blob, (title, kws))
+        mixed = S._extract_title_theme_keywords("物語（中出し BOD）")
+        self.assertIn("中出し", mixed)
+        self.assertNotIn("BOD", mixed)
+        bare = S._extract_title_theme_keywords("シリーズ新作 (BD)")
+        self.assertNotIn("BD", bare)
+        self.assertNotIn("OL", bare)
+        self.assertEqual(S._extract_title_theme_keywords("(BOD)"), [])
+        self.assertEqual(S._extract_title_theme_keywords("Blu-ray"), [])
+        # Occupation OL and theme VR are not format tags.
+        self.assertIn("OL", S._extract_title_theme_keywords("美人OL"))
+        self.assertIn("VR", S._extract_title_theme_keywords("VRで巨乳"))
+        self.assertFalse(S._contains_edition_marker("OL"))
+        self.assertFalse(S._contains_edition_marker("VR"))
+        self.assertFalse(S._contains_edition_marker("BDSM"))
+        self.assertTrue(S._contains_edition_marker("交尾BOD"))
+
+    def test_cached_bod_list_regenerates_from_title(self):
+        stale = {
+            "title": self.JUR,
+            "actress": "三比菜々美",
+            "theme_keywords": ["BOD", "中出し"],
+            "keyword_queries": ["BOD", "中出し"],
+        }
+        for fn in (S._recompute_theme_keywords, S._stamp_theme_keywords):
+            payload = fn(dict(stale))
+            self.assertEqual(payload["theme_keywords"], self.EXPECTED, fn.__name__)
+            self.assertNotIn("BOD", payload["theme_keywords"])
+            self.assertTrue(
+                all("bod" not in str(q).casefold() for q in payload["keyword_queries"]),
+                payload["keyword_queries"],
+            )
+        kept = S._stamp_theme_keywords(
+            {"title": "地味な眼鏡", "theme_keywords": ["眼鏡", "地味"]}
+        )
+        self.assertEqual(kept["theme_keywords"], ["眼鏡", "地味"])
+        self.assertEqual(
+            S._normalize_keyword_list(
+                ["BOD", "叔母", "VOL", "VOL.2", "Blu-ray", "中出し", "OL", "交尾BOD"]
+            ),
+            ["叔母", "中出し", "OL"],
+        )
+
+    def test_stay_and_kinship_patterns_on_other_titles(self):
+        stay = S._extract_title_theme_keywords("二泊三日の温泉旅行")
+        self.assertEqual(stay[0], "温泉旅行", stay)
+        self.assertIn("二泊三日", stay)
+        self.assertIn("温泉", stay)
+        self.assertLess(stay.index("温泉旅行"), stay.index("温泉"))
+        kin = S._extract_title_theme_keywords("叔母の家庭教師")
+        self.assertEqual(kin[0], "叔母の家庭教師", kin)
+        self.assertIn("叔母", kin)
+        self.assertIn("家庭教師", kin)
+        # 叔母 is a theme noun, not weak kinship, so it stays ahead of 家庭教師.
+        self.assertLess(kin.index("叔母の家庭教師"), kin.index("叔母"))
+        self.assertLess(kin.index("叔母"), kin.index("家庭教師"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
