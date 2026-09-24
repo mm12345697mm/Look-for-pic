@@ -62,6 +62,9 @@
   let pendingFiles = [];
   let batchFiles = [];
   let identifyBusy = false;
+  let promoteBusy = false;
+  let lastPromoteTask = null;
+  let promoteEpoch = 0;
 
   function batchQueryKeepsFrames(fileCount, busy, openFrame) {
     return fileCount > 1 && !!(busy || openFrame);
@@ -2459,16 +2462,435 @@
     btn.addEventListener('click', (e) => {
       stopCarouselBubble(e);
       if (e && e.preventDefault) e.preventDefault();
+      if (e && !e.currentTarget) e.currentTarget = btn;
       handler(e);
     });
+  }
+
+  /** A related card can be extended only when it already has a real 品番. */
+  function reliablePromoteCode(work) {
+    const raw = String((work && work.code) || '').trim();
+    if (!raw || raw === '片名搜尋' || raw === '未辨識' || raw === 'TITLE-SEARCH') return '';
+    if (raw.toLowerCase() === 'null') return '';
+    if (!parseCodeParts(raw)) return '';
+    return formatDisplayCode(raw);
+  }
+
+  function slotLineForPromote(parent) {
+    return String((parent && parent.line) || '') === 'multi' ? 'multi' : 'main';
+  }
+
+  function catalogOnlyUrl(url, cid) {
+    let cover = String(url || '').trim();
+    if (!isCatalogMediaUrl(cover)) cover = '';
+    if (!cover && cid) {
+      const restored = coverUrl(cid);
+      if (isCatalogMediaUrl(restored)) cover = restored;
+    }
+    return cover;
+  }
+
+  function sameCodeGloss(prior, code, fieldZh, fieldSnake) {
+    if (!prior || !code || !prior.code || !codesMatch(String(prior.code), String(code))) return '';
+    return String(prior[fieldZh] || prior[fieldSnake] || '').trim();
+  }
+
+  /**
+   * Code-identify payload as the replacement main for one carousel.
+   * Cover/stills stay catalog jackets. Chinese gloss is this 品番's own
+   * (identify response, else the related card). The previous main's title_zh
+   * is never copied onto a different code.
+   */
+  function promotedGalleryWork(identifyData, parent, priorRelated) {
+    if (!identifyData) return null;
+    const built = galleryFromIdentify(identifyData);
+    const first = built && built.items && built.items[0];
+    if (!first || !reliablePromoteCode(first)) return null;
+    const work = Object.assign({}, first);
+    work.line = slotLineForPromote(parent);
+    work.userPreview = '';
+    work.cover = catalogOnlyUrl(work.cover, work.cid);
+    work.stills = (Array.isArray(work.stills) ? work.stills : []).filter((u) => isCatalogMediaUrl(u));
+    if (!String(work.titleZh || '').trim()) {
+      work.titleZh = sameCodeGloss(priorRelated, work.code, 'titleZh', 'title_zh');
+    }
+    if (!String(work.actressZh || '').trim()) {
+      const zh = sameCodeGloss(priorRelated, work.code, 'actressZh', 'actress_zh');
+      if (zh) work.actressZh = zh;
+    }
+    if (!String(work.studioZh || '').trim()) {
+      const zh = sameCodeGloss(priorRelated, work.code, 'studioZh', 'studio_zh');
+      if (zh) work.studioZh = zh;
+    }
+    if (Array.isArray(work.relatedByTitle)) {
+      work.relatedByTitle = work.relatedByTitle.map((r) => {
+        if (!r) return r;
+        const next = Object.assign({}, r);
+        next.userPreview = '';
+        next.cover = catalogOnlyUrl(next.cover, next.cid);
+        next.stills = (Array.isArray(next.stills) ? next.stills : []).filter((u) => isCatalogMediaUrl(u));
+        return next;
+      });
+    }
+    return work;
+  }
+
+  function galleryWorkToHistoryWork(work) {
+    const line = slotLineForPromote(work);
+    const related = (work.relatedByTitle || []).map((r) => ({
+      code: (r && r.code) || '',
+      title: (r && r.title) || '',
+      title_zh: (r && (r.titleZh || r.title_zh)) || '',
+      cover: catalogOnlyUrl(r && r.cover, r && r.cid),
+      cid: (r && r.cid) || '',
+      stills: (Array.isArray(r && r.stills) ? r.stills : []).filter((u) => isCatalogMediaUrl(u)),
+      why: (r && r.why) || '',
+      line: (r && r.line) || relatedLineFromRaw(r),
+      actress: (r && r.actress) || '',
+      actress_zh: (r && (r.actressZh || r.actress_zh)) || '',
+      studio: (r && r.studio) || '',
+      studio_zh: (r && (r.studioZh || r.studio_zh)) || '',
+      matched_keywords: (r && (r.matchedKeywords || r.matched_keywords)) || [],
+    }));
+    return slimWorkForHistory(
+      {
+        code: work.code,
+        title: work.title,
+        title_zh: work.titleZh || work.title_zh || '',
+        cover: catalogOnlyUrl(work.cover, work.cid),
+        cid: work.cid || '',
+        stills: (work.stills || []).filter((u) => isCatalogMediaUrl(u)),
+        actress: work.actress || '',
+        actress_zh: work.actressZh || work.actress_zh || '',
+        studio: work.studio || '',
+        studio_zh: work.studioZh || work.studio_zh || '',
+        related_by_title: related,
+        theme_keywords: work.themeKeywords || work.theme_keywords || [],
+        keyword_queries: work.keywordQueries || work.keyword_queries || [],
+        line: line,
+      },
+      {},
+      line
+    );
+  }
+
+  function historyWorkToGallery(w, index) {
+    if (!w) return null;
+    const line = w.line || (index === 0 ? 'main' : 'multi');
+    return workFromApi(
+      Object.assign({}, w, {
+        related_by_title:
+          Array.isArray(w.related_by_title) && w.related_by_title.length
+            ? w.related_by_title
+            : w.related || [],
+        title_zh: w.title_zh || w.titleZh || '',
+        theme_keywords: w.theme_keywords || w.themeKeywords,
+        keyword_queries: w.keyword_queries || w.keywordQueries,
+      }),
+      line
+    );
+  }
+
+  function codesOrTitlesMatch(a, b) {
+    const ac = String((a && a.code) || '');
+    const bc = String((b && b.code) || '');
+    if (parseCodeParts(ac) && parseCodeParts(bc)) return codesMatch(ac, bc);
+    if (ac && bc && ac !== bc) return false;
+    const at = String((a && a.title) || '');
+    const bt = String((b && b.title) || '');
+    if (at || bt) return at === bt;
+    return ac === bc;
+  }
+
+  function findGalleryHistoryIndex(list, items) {
+    const rows = Array.isArray(list) ? list : [];
+    const gallery = Array.isArray(items) ? items : [];
+    for (let i = 0; i < rows.length; i++) {
+      const works = historySessionWorks(rows[i]);
+      if (works.length !== gallery.length || !works.length) continue;
+      let ok = true;
+      for (let j = 0; j < works.length; j++) {
+        if (!codesOrTitlesMatch(works[j], gallery[j])) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) return i;
+    }
+    return -1;
+  }
+
+  function elHasClass(el, name) {
+    if (!el || !name) return false;
+    if (el.classList && typeof el.classList.contains === 'function' && el.classList.contains(name)) {
+      return true;
+    }
+    return (' ' + String(el.className || '') + ' ').indexOf(' ' + name + ' ') !== -1;
+  }
+
+  function closestEl(node, className) {
+    let el = node;
+    while (el) {
+      if (elHasClass(el, className)) return el;
+      el = el.parentNode || el.parentElement || null;
+    }
+    return null;
+  }
+
+  function surfaceForCard(card) {
+    let el = card;
+    while (el) {
+      if (el.id === 'history-detail' || elHasClass(el, 'history-detail')) return 'history';
+      if (el.id === 'gallery-cards') return 'gallery';
+      el = el.parentNode || el.parentElement || null;
+    }
+    return viewingHistoryId ? 'history' : 'gallery';
+  }
+
+  function carouselSlotIndex(block) {
+    const parent = block && (block.parentNode || block.parentElement);
+    if (!parent || !parent.children) return 0;
+    let idx = 0;
+    const kids = parent.children;
+    for (let i = 0; i < kids.length; i++) {
+      const kid = kids[i];
+      if (kid === block) return idx;
+      if (elHasClass(kid, 'work-carousel-block')) idx += 1;
+    }
+    return 0;
+  }
+
+  function blockAtSlot(root, index) {
+    if (!root || !root.children || index < 0) return null;
+    let idx = 0;
+    const kids = root.children;
+    for (let i = 0; i < kids.length; i++) {
+      if (!elHasClass(kids[i], 'work-carousel-block')) continue;
+      if (idx === index) return kids[i];
+      idx += 1;
+    }
+    return null;
+  }
+
+  function replaceNode(oldNode, newNode) {
+    if (!oldNode || !newNode || oldNode === newNode) return false;
+    if (typeof oldNode.replaceWith === 'function') {
+      oldNode.replaceWith(newNode);
+      return true;
+    }
+    const parent = oldNode.parentNode || oldNode.parentElement;
+    if (parent && typeof parent.replaceChild === 'function') {
+      parent.replaceChild(newNode, oldNode);
+      return true;
+    }
+    if (parent && parent.children) {
+      const kids = parent.children;
+      for (let i = 0; i < kids.length; i++) {
+        if (kids[i] !== oldNode) continue;
+        if (typeof kids.splice !== 'function') return false;
+        kids.splice(i, 1, newNode);
+        newNode.parentNode = parent;
+        oldNode.parentNode = null;
+        return true;
+      }
+    }
+    return false;
+  }
+
+  function writePromotedHistorySlot(listIndex, slotIndex, histWork) {
+    const list = loadHistory();
+    if (listIndex < 0 || listIndex >= list.length) return null;
+    const rec = list[listIndex];
+    const works = historySessionWorks(rec).slice();
+    const at = slotIndex >= 0 && slotIndex < works.length ? slotIndex : 0;
+    works[at] = histWork;
+    const next = Object.assign({}, rec, { works: works });
+    if (at === 0) {
+      next.code = histWork.code || '';
+      next.title = histWork.title || '';
+      next.title_zh = histWork.title_zh || '';
+      next.cover = histWork.cover || '';
+      next.stills = histWork.stills || [];
+      next.actress = histWork.actress || '';
+      next.related = histWork.related || [];
+    }
+    list[listIndex] = next;
+    saveHistory(list);
+    return next;
+  }
+
+  function rememberPromotedSession(itemsBefore, slotIndex, histWork, surface) {
+    const list = loadHistory();
+    let idx = -1;
+    if (surface === 'history' && viewingHistoryId) {
+      idx = list.findIndex((x) => x && x.id === viewingHistoryId);
+    }
+    if (idx < 0) idx = findGalleryHistoryIndex(list, itemsBefore);
+    if (idx >= 0) {
+      const next = writePromotedHistorySlot(idx, slotIndex, histWork);
+      if (surface === 'history' && next && viewingHistoryId && next.id === viewingHistoryId) {
+        paintHistoryDetail(next);
+      }
+      return next && next.id;
+    }
+    const gallery = (itemsBefore || []).slice();
+    const works = gallery.map((w, i) => (i === slotIndex ? histWork : galleryWorkToHistoryWork(w)));
+    if (!works.length) works.push(histWork);
+    const first = works[0] || histWork;
+    const rec = {
+      id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      ts: Date.now(),
+      kind: 'session',
+      ok: true,
+      code: first.code || '',
+      title: first.title || '',
+      title_zh: first.title_zh || '',
+      cover: first.cover || '',
+      stills: first.stills || [],
+      actress: first.actress || '',
+      related: first.related || [],
+      userShots: [],
+      works: works,
+    };
+    const nextList = loadHistory();
+    nextList.unshift(rec);
+    saveHistory(nextList.slice(0, HISTORY_MAX));
+    return rec.id;
+  }
+
+  /**
+   * Replace one vertical slot — the carousel this related card belongs to —
+   * with a code identify of that 品番. Sibling uploads stay. The query image
+   * is not sent and is not used as the catalog jacket.
+   */
+  function applyPromotedMain(identifyData, priorRelated, slotIndex, surface) {
+    const onHistory = surface === 'history' && !!viewingHistoryId;
+    let parent = null;
+    let beforeItems = [];
+    if (onHistory) {
+      const rec = loadHistory().find((x) => x && x.id === viewingHistoryId);
+      const works = historySessionWorks(rec);
+      if (slotIndex < 0 || slotIndex >= works.length) slotIndex = 0;
+      parent = historyWorkToGallery(works[slotIndex], slotIndex);
+      beforeItems = works.map((w, i) => historyWorkToGallery(w, i));
+    } else {
+      beforeItems = (lastGalleryItems || []).slice();
+      if (!beforeItems.length) slotIndex = 0;
+      else if (slotIndex < 0 || slotIndex >= beforeItems.length) slotIndex = 0;
+      parent = beforeItems[slotIndex] || null;
+    }
+    const work = promotedGalleryWork(identifyData, parent, priorRelated);
+    if (!work) return null;
+    const hist = galleryWorkToHistoryWork(work);
+    if (!onHistory) {
+      const items = beforeItems.slice();
+      if (!items.length) items.push(work);
+      else items[slotIndex] = work;
+      lastGalleryItems = items;
+      const block = blockAtSlot(galleryCards, slotIndex);
+      const nextBlock = buildWorkCarousel(work);
+      if (!block || !replaceNode(block, nextBlock)) {
+        const notice = galleryNotice && !galleryNotice.hidden ? galleryNotice.textContent : null;
+        renderGallery({ items: items, notice: notice });
+      } else if (galleryCount) {
+        galleryCount.textContent = String(items.length) + ' 部';
+      }
+    } else {
+      const live = (lastGalleryItems || []).slice();
+      const liveParent = live[slotIndex];
+      if (
+        liveParent &&
+        parent &&
+        liveParent.code &&
+        parent.code &&
+        codesMatch(String(liveParent.code), String(parent.code))
+      ) {
+        live[slotIndex] = work;
+        lastGalleryItems = live;
+        const block = blockAtSlot(galleryCards, slotIndex);
+        if (block) replaceNode(block, buildWorkCarousel(work));
+      }
+    }
+    rememberPromotedSession(beforeItems, slotIndex, hist, onHistory ? 'history' : 'gallery');
+    return work;
+  }
+
+  async function identifyCodeForPromote(code) {
+    const payload = { code: code };
+    // A new code identify is its own run. A later upload supersedes it, and a
+    // stale multi-image poll must not paint over this one.
+    beginIdentifyProgress(0);
+    promoteEpoch = progressEpoch;
+    try {
+      const streamed = await apiIdentifyStream(payload, applyProgressEvent);
+      if (streamed && streamed.superseded) {
+        const err = new Error('superseded');
+        err.superseded = true;
+        throw err;
+      }
+      return streamed && streamed.data;
+    } catch (streamErr) {
+      if (streamErr && (streamErr.followed || streamErr.superseded)) throw streamErr;
+      if (streamErr && streamErr.jobId) return followIdentifyJob(streamErr.jobId, applyProgressEvent);
+      const classic = await apiIdentify(payload);
+      return classic && classic.data;
+    }
+  }
+
+  function settlePromoteProgress() {
+    if ((progressHigh.epoch || 0) !== promoteEpoch) return;
+    if (!progressPanel || progressPanel.classList.contains('hidden')) return;
+    hideProgress();
+  }
+
+  /**
+   * 「以此為主」: identify that related 品番 by code and make it the main of
+   * this carousel (cover, stills, related buckets, keyword chips). Other
+   * uploads in the session stay on the vertical axis.
+   */
+  async function promoteRelatedToMain(relatedWork, card, opts) {
+    opts = opts || {};
+    const code = reliablePromoteCode(relatedWork);
+    if (!code) {
+      showToast('這部沒有可用番號，無法設為主作品');
+      return { ok: false, reason: 'nocode' };
+    }
+    if (promoteBusy) {
+      showToast('正在設為主作品…');
+      return { ok: false, reason: 'busy' };
+    }
+    promoteBusy = true;
+    const surface = opts.surface || surfaceForCard(card);
+    const block = closestEl(card, 'work-carousel-block');
+    const slotIndex = typeof opts.slotIndex === 'number' ? opts.slotIndex : carouselSlotIndex(block);
+    showToast('正在以 ' + code + ' 延伸…', { persist: true });
+    try {
+      const data = await identifyCodeForPromote(code);
+      const work = applyPromotedMain(data, relatedWork, slotIndex, surface);
+      settlePromoteProgress();
+      if (!work) {
+        showToast((data && data.message) || '找不到這部作品');
+        return { ok: false, reason: 'miss', data: data };
+      }
+      showToast('已以 ' + formatDisplayCode(work.code) + ' 為主作品');
+      return { ok: true, work: work, slotIndex: slotIndex };
+    } catch (err) {
+      if (err && err.superseded) return { ok: false, reason: 'superseded' };
+      settlePromoteProgress();
+      showToast((err && err.message) || '延伸失敗');
+      return { ok: false, reason: 'error' };
+    } finally {
+      promoteBusy = false;
+    }
   }
 
   function buildWorkActions(w, coverWrap) {
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
-    bar.setAttribute('aria-label', '複製與下載');
     const displayTitle = formatDisplayTitle(w.title, w.titleZh);
+    const canPromote = isRelatedCarouselLine(String((w && w.line) || '')) && !!reliablePromoteCode(w);
+    bar.setAttribute('aria-label', canPromote ? '複製、下載與以此為主' : '複製與下載');
     const specs = [
       { mark: '番', icon: ICON_COPY, label: '複製番號', run: () => copyWorkField(w.code, '已複製') },
       { mark: '名', icon: ICON_COPY, label: '複製名稱', run: () => copyWorkField(displayTitle, '已複製') },
@@ -2491,13 +2913,25 @@
           }),
       },
     ];
+    if (canPromote) {
+      specs.push({
+        text: '以此為主',
+        label: '以此為主',
+        extraClass: ' work-action-promote',
+        run: (e) => {
+          const host = (e && (e.currentTarget || e.target)) || null;
+          lastPromoteTask = promoteRelatedToMain(w, host);
+        },
+      });
+    }
     specs.forEach((spec) => {
       const btn = document.createElement('button');
       btn.type = 'button';
-      btn.className = 'work-action' + (spec.mark ? '' : ' work-action-dl');
+      btn.className = 'work-action' + (spec.extraClass || (spec.mark ? '' : ' work-action-dl'));
       btn.setAttribute('aria-label', spec.label);
       btn.title = spec.label;
-      btn.innerHTML = spec.icon + (spec.mark ? '<span class="work-action-mark">' + spec.mark + '</span>' : '');
+      if (spec.text) btn.textContent = spec.text;
+      else btn.innerHTML = spec.icon + (spec.mark ? '<span class="work-action-mark">' + spec.mark + '</span>' : '');
       bindWorkAction(btn, spec.run);
       bar.appendChild(btn);
     });
@@ -4893,6 +5327,11 @@
       shareReadyMessage,
       downloadWorkMedia,
       offerSaveImageFiles,
+      reliablePromoteCode,
+      promotedGalleryWork,
+      promoteRelatedToMain,
+      promoteTask: () => lastPromoteTask,
+      renderGallery,
     };
   } catch (_) {}
 })();
