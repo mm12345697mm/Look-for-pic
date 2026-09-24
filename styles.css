@@ -1235,7 +1235,14 @@ body.lightbox-open {
   display: none !important;
 }
 
-/* Keyword chips + a second row under the 主作品 block, not inside each card */
+/* Keyword chips sit under the whole 主作品 section, outside the card chrome. */
+.work-main-section {
+  display: block;
+}
+.work-carousel-block > .kw-related-panel,
+.work-carousel-block > .kw-research-block {
+  margin-top: 8px;
+}
 .kw-related-panel {
   padding: 2px 2px 8px;
 }

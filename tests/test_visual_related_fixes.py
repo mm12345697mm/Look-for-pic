@@ -663,9 +663,11 @@ class TestDistinctiveThemeKeywords(unittest.TestCase):
         self.assertLessEqual(len(qs), 8)
         self.assertEqual(qs[0], "ノーブラ誘惑", qs)
         self.assertIn("巨乳", qs[:4])
+        self.assertIn("彼女の妹", qs)
+        self.assertGreater(qs.index("彼女の妹"), qs.index("巨乳"))
+        self.assertGreater(qs.index("彼女の妹"), qs.index("ノーブラ誘惑"))
         self.assertNotIn("彼女", qs)
         self.assertNotIn("妹", qs)
-        self.assertNotIn("彼女の妹", qs)
         self.assertNotIn("誘惑", qs)
         selected = S._keyword_search_queries(
             self.MIDA, ["彼女の妹", "妹"], selected_only=True
@@ -809,7 +811,7 @@ class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
         kws = S._extract_title_theme_keywords(self.DANDYA, actress="大浦真奈美")
         self.assertEqual(
             kws,
-            ["家庭教師", "10秒挿入", "肉欲教育", "息子の家庭教師", "息子", "ママ"],
+            ["息子の家庭教師", "家庭教師", "10秒挿入", "肉欲教育", "息子", "ママ"],
             kws,
         )
         # This title has VOL.2 and no occupation OL, so neither is a chip.
@@ -835,12 +837,13 @@ class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
         self.assertNotIn("挿入", kws)
         qs = S._keyword_search_queries(self.DANDYA, kws)
         self.assertTrue(qs, qs)
-        self.assertEqual(qs[0], "家庭教師", qs)
+        self.assertEqual(qs[0], "息子の家庭教師", qs)
         self.assertIn("肉欲教育", qs)
         self.assertIn("10秒挿入", qs)
         self.assertIn("10秒で挿入", qs)
-        self.assertGreater(qs.index("肉欲教育"), 0)
-        for absent in ("息子", "ママ", "息子の家庭教師", "VOL", "OL"):
+        self.assertLess(qs.index("息子の家庭教師"), qs.index("10秒挿入"))
+        self.assertLess(qs.index("息子の家庭教師"), qs.index("肉欲教育"))
+        for absent in ("息子", "ママ", "家庭教師", "VOL", "OL"):
             self.assertNotIn(absent, qs, qs)
         selected = S._keyword_search_queries(self.DANDYA, ["息子", "ママ"], selected_only=True)
         self.assertIn("息子", selected)
@@ -926,21 +929,22 @@ class TestKinshipRoleAndEditionMarkers(unittest.TestCase):
         bare = S._extract_title_theme_keywords("教育ママ")
         self.assertEqual(bare, ["ママ"], bare)
 
-    def test_kinship_occupation_exposes_parts_without_leading(self):
+    def test_kinship_occupation_puts_compound_before_parts(self):
         kws = S._extract_title_theme_keywords("妹の家庭教師")
-        self.assertEqual(kws[0], "家庭教師", kws)
-        for rel in ("妹の家庭教師", "妹"):
-            self.assertIn(rel, kws, kws)
-            self.assertGreater(kws.index(rel), kws.index("家庭教師"))
+        self.assertEqual(kws[0], "妹の家庭教師", kws)
+        self.assertLess(kws.index("妹の家庭教師"), kws.index("家庭教師"))
+        self.assertLess(kws.index("家庭教師"), kws.index("妹"))
         qs = S._keyword_search_queries("妹の家庭教師", kws)
-        self.assertEqual(qs[0], "家庭教師", qs)
+        self.assertEqual(qs[0], "妹の家庭教師", qs)
+        self.assertNotIn("家庭教師", qs)
         self.assertNotIn("妹", qs)
 
         secret = S._extract_title_theme_keywords("彼女の秘書")
-        self.assertEqual(secret[0], "秘書", secret)
-        self.assertIn("彼女の秘書", secret)
+        self.assertEqual(secret[0], "彼女の秘書", secret)
+        self.assertIn("秘書", secret)
         self.assertIn("彼女", secret)
-        self.assertGreater(secret.index("彼女"), secret.index("秘書"))
+        self.assertLess(secret.index("彼女の秘書"), secret.index("秘書"))
+        self.assertLess(secret.index("秘書"), secret.index("彼女"))
 
         # Clothing / body / pronouns stay out of the occupation pattern.
         nobra = S._extract_title_theme_keywords("妹のノーブラ")
@@ -995,7 +999,7 @@ class TestDandyCodeLookupAndVisualLock(unittest.TestCase):
         "「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! "
         "息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2"
     )
-    EXPECTED_KEYWORDS = ["家庭教師", "10秒挿入", "肉欲教育", "息子の家庭教師", "息子", "ママ"]
+    EXPECTED_KEYWORDS = ["息子の家庭教師", "家庭教師", "10秒挿入", "肉欲教育", "息子", "ママ"]
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -1932,7 +1936,7 @@ class TestTutorTitleKeywordChips(unittest.TestCase):
 class TestKeywordSingleFallback(unittest.TestCase):
     """DANDYA-001: multi-hit / compound miss must still fill 關鍵字 from singles.
 
-    Chips: 家庭教師 · 10秒挿入 · 肉欲教育 · 息子の家庭教師 · 息子 · ママ.
+    Chips: 息子の家庭教師 · 家庭教師 · 10秒挿入 · 肉欲教育 · 息子 · ママ.
     Caps stay maxima (關鍵字 ≤5). Two or more multi-hits are not padded.
     """
 
@@ -1940,7 +1944,7 @@ class TestKeywordSingleFallback(unittest.TestCase):
         "「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! "
         "息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2"
     )
-    CHIPS = ["家庭教師", "10秒挿入", "肉欲教育", "息子の家庭教師", "息子", "ママ"]
+    CHIPS = ["息子の家庭教師", "家庭教師", "10秒挿入", "肉欲教育", "息子", "ママ"]
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -2019,11 +2023,16 @@ class TestKeywordSingleFallback(unittest.TestCase):
         kws = S._extract_title_theme_keywords(self.DANDYA, actress="大浦真奈美")
         self.assertEqual(kws, self.CHIPS, kws)
         leading = S._keyword_search_queries(self.DANDYA, kws)
-        for absent in ("息子", "ママ", "息子の家庭教師"):
+        self.assertEqual(leading[0], "息子の家庭教師", leading)
+        self.assertLess(leading.index("息子の家庭教師"), leading.index("10秒挿入"))
+        for absent in ("息子", "ママ", "家庭教師"):
             self.assertNotIn(absent, leading, leading)
         singles = S._keyword_fallback_singles(kws)
         for tok in ("家庭教師", "肉欲教育", "10秒挿入", "10秒で挿入", "息子の家庭教師", "息子", "ママ"):
             self.assertIn(tok, singles, singles)
+        self.assertLess(singles.index("息子の家庭教師"), singles.index("家庭教師"))
+        self.assertLess(singles.index("10秒挿入"), singles.index("家庭教師"))
+        self.assertLess(singles.index("肉欲教育"), singles.index("家庭教師"))
         self.assertLess(singles.index("家庭教師"), singles.index("息子"))
         self.assertLess(singles.index("肉欲教育"), singles.index("ママ"))
         self.assertLess(singles.index("息子の家庭教師"), singles.index("息子"))
@@ -2114,6 +2123,60 @@ class TestKeywordSingleFallback(unittest.TestCase):
         self.assertGreaterEqual(int(kin.get("keyword_hits") or 0), 2)
         self.assertIn("息子の家庭教師", kin.get("matched_keywords") or [])
         self.assertIn("家庭教師", kin.get("matched_keywords") or [])
+
+    def test_compound_fills_before_substring_flood(self):
+        """息子の家庭教師 is searched and ranked before 家庭教師 / 息子.
+
+        Two or more phrase hits cover the theme, so generic tutor titles do
+        not fill the rest of the 關鍵字 cap.
+        """
+        table = {
+            "息子の家庭教師": [
+                {"code": "KIN-001", "title": "今日も息子の家庭教師", "score": 0.2},
+                {"code": "KIN-002", "title": "隣の息子の家庭教師", "score": 0.15},
+            ],
+            "家庭教師": [
+                {"code": "TUT-001", "title": "新人家庭教師の初授業", "score": 9},
+                {"code": "TUT-002", "title": "家庭教師と息子の日常", "score": 8},
+                {"code": "TUT-003", "title": "ベテラン家庭教師", "score": 7},
+                {"code": "TUT-004", "title": "家庭教師の午後", "score": 6},
+                {"code": "TUT-005", "title": "家庭教師日誌", "score": 5},
+            ],
+            "息子": [{"code": "SON-001", "title": "息子との約束", "score": 9}],
+            "ママ": [{"code": "MOM-001", "title": "ママは忙しい", "score": 9}],
+        }
+        rows, queries = self._run_keywords(table)
+        codes = [r["code"] for r in rows]
+        self.assertEqual(queries[0], "息子の家庭教師", queries)
+        self.assertLess(queries.index("息子の家庭教師"), queries.index("10秒挿入"))
+        self.assertNotIn("家庭教師", queries, queries)
+        self.assertNotIn("息子", queries)
+        self.assertEqual(codes, ["KIN-001", "KIN-002"], codes)
+        self.assertLessEqual(len(rows), 5)
+        self.assertNotIn("TUT-001", codes)
+        self.assertNotIn("TUT-002", codes)
+        self.assertNotIn("SON-001", codes)
+        for row in rows:
+            self.assertIn("息子の家庭教師", row.get("matched_keywords") or [])
+            self.assertEqual(row.get("line"), "keyword")
+
+    def test_one_compound_then_substring_singles_follow(self):
+        """Zero extra phrase hits: substring singles still fill, after the phrase."""
+        table = self._singles()
+        table["息子の家庭教師"] = [
+            {"code": "KIN-001", "title": "今日の息子の家庭教師", "score": 0.1}
+        ]
+        rows, queries = self._run_keywords(table)
+        codes = [r["code"] for r in rows]
+        self.assertEqual(codes[0], "KIN-001", codes)
+        self.assertLessEqual(len(rows), 5)
+        self.assertIn("TUT-001", codes)
+        self.assertIn("EDU-001", codes)
+        self.assertGreater(queries.index("家庭教師"), queries.index("息子の家庭教師"))
+        self.assertGreater(queries.index("家庭教師"), queries.index("10秒挿入"))
+        self.assertLess(codes.index("KIN-001"), codes.index("TUT-001"))
+        if "SON-001" in codes:
+            self.assertLess(codes.index("TUT-001"), codes.index("SON-001"))
 
     def test_two_multihits_do_not_pad_with_singles(self):
         table = {
