@@ -1929,6 +1929,325 @@ class TestTutorTitleKeywordChips(unittest.TestCase):
         self.assertIn("actress", top_lines)
 
 
+class TestKeywordSingleFallback(unittest.TestCase):
+    """DANDYA-001: multi-hit / compound miss must still fill 關鍵字 from singles.
+
+    Chips: 家庭教師 · 10秒挿入 · 肉欲教育 · 息子の家庭教師 · 息子 · ママ.
+    Caps stay maxima (關鍵字 ≤5). Two or more multi-hits are not padded.
+    """
+
+    DANDYA = (
+        "「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! "
+        "息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2"
+    )
+    CHIPS = ["家庭教師", "10秒挿入", "肉欲教育", "息子の家庭教師", "息子", "ママ"]
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self._prev_cache = S._OFFLINE_CACHE_PATH
+        S._OFFLINE_CACHE_PATH = Path(self.tmp.name) / "offline-cache.json"
+
+    def tearDown(self):
+        S._OFFLINE_CACHE_PATH = self._prev_cache
+        self.tmp.cleanup()
+
+    def _enrich(self, c, why="片名候選"):
+        item = dict(c)
+        item["why"] = why
+        item.setdefault("stills", [])
+        if "title_zh" not in item:
+            item["title_zh"] = None
+        return item
+
+    def _install_catalog(self, table):
+        queries: list[str] = []
+
+        def fake_avbase(q, actress=None):
+            queries.append(q)
+            return [dict(row) for row in table.get(q, [])]
+
+        patches = [
+            mock.patch.object(S, "fetch_avbase_title_results", side_effect=fake_avbase),
+            mock.patch.object(S, "fetch_jav321_title_results", return_value=[]),
+            mock.patch.object(S, "fetch_javlibrary_title_results", return_value=[]),
+            mock.patch.object(S, "enrich_title_candidate", side_effect=self._enrich),
+        ]
+        return queries, patches
+
+    def _singles(self):
+        return {
+            "家庭教師": [
+                {
+                    "code": "TUT-001",
+                    "title": "新人家庭教師の初授業",
+                    "title_zh": "新人家教的第一堂課",
+                    "score": 0.1,
+                }
+            ],
+            "肉欲教育": [
+                {"code": "EDU-001", "title": "放課後の肉欲教育", "score": 0.3}
+            ],
+            "10秒挿入": [
+                {"code": "SEC-001", "title": "会議室で10秒挿入", "score": 0.2}
+            ],
+            "息子": [
+                {"code": "SON-001", "title": "息子との約束", "score": 9.0},
+                {"code": "JUNK-001", "title": "無関係な日常", "score": 9.0},
+            ],
+            "ママ": [
+                {"code": "MOM-001", "title": "ママは忙しい", "score": 9.0},
+                {"code": "MOM-002", "title": "ママの休日", "score": 8.0},
+            ],
+        }
+
+    def _run_keywords(self, table, **kwargs):
+        queries, patches = self._install_catalog(table)
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            rows = S._find_related_by_keywords(
+                self.DANDYA,
+                exclude_code="DANDYA-001",
+                actress="大浦真奈美",
+                max_n=kwargs.pop("max_n", 5),
+                budget_sec=kwargs.pop("budget_sec", 20.0),
+                **kwargs,
+            )
+        return rows, queries
+
+    def test_fallback_singles_follow_chip_rank_and_leading_queries_stay_distinctive(self):
+        kws = S._extract_title_theme_keywords(self.DANDYA, actress="大浦真奈美")
+        self.assertEqual(kws, self.CHIPS, kws)
+        leading = S._keyword_search_queries(self.DANDYA, kws)
+        for absent in ("息子", "ママ", "息子の家庭教師"):
+            self.assertNotIn(absent, leading, leading)
+        singles = S._keyword_fallback_singles(kws)
+        for tok in ("家庭教師", "肉欲教育", "10秒挿入", "10秒で挿入", "息子の家庭教師", "息子", "ママ"):
+            self.assertIn(tok, singles, singles)
+        self.assertLess(singles.index("家庭教師"), singles.index("息子"))
+        self.assertLess(singles.index("肉欲教育"), singles.index("ママ"))
+        self.assertLess(singles.index("息子の家庭教師"), singles.index("息子"))
+        self.assertFalse(
+            S._auto_keyword_needs_single_fallback(
+                explicit=False, min_hits=2, strict_n=2, max_n=5
+            )
+        )
+        self.assertTrue(
+            S._auto_keyword_needs_single_fallback(
+                explicit=False, min_hits=2, strict_n=0, max_n=5
+            )
+        )
+        self.assertTrue(
+            S._auto_keyword_needs_single_fallback(
+                explicit=False, min_hits=2, strict_n=1, max_n=5
+            )
+        )
+        self.assertFalse(
+            S._auto_keyword_needs_single_fallback(
+                explicit=True, min_hits=2, strict_n=0, max_n=10
+            )
+        )
+
+    def test_zero_multihit_singles_fill_keyword_bucket_up_to_five(self):
+        rows, queries = self._run_keywords(self._singles())
+        codes = [r["code"] for r in rows]
+        self.assertEqual(
+            codes,
+            ["EDU-001", "SEC-001", "TUT-001", "SON-001", "MOM-001"],
+            codes,
+        )
+        self.assertNotIn("MOM-002", codes)
+        self.assertNotIn("JUNK-001", codes)
+        self.assertNotIn("DANDYA-001", codes)
+        self.assertLessEqual(len(rows), 5)
+        self.assertTrue(all(r.get("line") == "keyword" for r in rows))
+        self.assertTrue(all(int(r.get("keyword_hits") or 0) >= 1 for r in rows))
+        tut = next(r for r in rows if r["code"] == "TUT-001")
+        edu = next(r for r in rows if r["code"] == "EDU-001")
+        self.assertEqual(tut.get("title_zh"), "新人家教的第一堂課")
+        self.assertFalse(edu.get("title_zh"))
+        self.assertIn("家庭教師", tut.get("matched_keywords") or [])
+        self.assertEqual(queries.count("息子"), 1)
+        self.assertIn("ママ", queries)
+        self.assertIn("肉欲教育", queries)
+        self.assertIn("10秒挿入", queries)
+        # Distinctive singles stay ahead of weak kinship even when ママ scores higher.
+        self.assertLess(codes.index("TUT-001"), codes.index("SON-001"))
+        self.assertLess(codes.index("EDU-001"), codes.index("MOM-001"))
+
+    def test_weak_singles_still_fill_when_distinctive_queries_miss(self):
+        table = {
+            "息子": [{"code": "SON-001", "title": "息子との約束", "score": 0.4}],
+            "ママ": [{"code": "MOM-001", "title": "ママは忙しい", "score": 0.5}],
+        }
+        rows, queries = self._run_keywords(table)
+        codes = [r["code"] for r in rows]
+        self.assertEqual(codes, ["MOM-001", "SON-001"], codes)
+        self.assertLessEqual(len(rows), 5)
+        self.assertIn("息子", queries)
+        self.assertIn("ママ", queries)
+        self.assertTrue(all(r.get("line") == "keyword" for r in rows))
+        self.assertTrue(all(int(r.get("keyword_hits") or 0) == 1 for r in rows))
+
+    def test_one_compound_is_too_few_singles_follow_it(self):
+        table = self._singles()
+        table["息子の家庭教師"] = [
+            {
+                "code": "KIN-001",
+                "title": "今日の息子の家庭教師",
+                "score": 0.1,
+            }
+        ]
+        rows, _queries = self._run_keywords(table)
+        codes = [r["code"] for r in rows]
+        self.assertEqual(codes[0], "KIN-001", codes)
+        self.assertLessEqual(len(rows), 5)
+        self.assertIn("EDU-001", codes)
+        self.assertIn("TUT-001", codes)
+        self.assertIn("SON-001", codes)
+        distinctive = [c for c in codes if c in {"EDU-001", "SEC-001", "TUT-001"}]
+        self.assertGreaterEqual(len(distinctive), 1)
+        self.assertLess(codes.index("KIN-001"), codes.index(distinctive[0]))
+        if "SON-001" in codes and distinctive:
+            self.assertLess(codes.index(distinctive[-1]), codes.index("SON-001"))
+        kin = rows[0]
+        self.assertGreaterEqual(int(kin.get("keyword_hits") or 0), 2)
+        self.assertIn("息子の家庭教師", kin.get("matched_keywords") or [])
+        self.assertIn("家庭教師", kin.get("matched_keywords") or [])
+
+    def test_two_multihits_do_not_pad_with_singles(self):
+        table = {
+            "家庭教師": [
+                {"code": "BOTH-001", "title": "家庭教師の肉欲教育", "score": 0.4},
+                {"code": "BOTH-002", "title": "10秒で挿入する家庭教師", "score": 0.3},
+                {"code": "TUT-001", "title": "新人家庭教師の初授業", "score": 0.2},
+                {"code": "MOM-001", "title": "ママは忙しい", "score": 8},
+            ]
+        }
+        # Every primary query sees the same catalog page, including pairs.
+        rows, queries = self._run_keywords(defaultdict_table(table))
+        codes = [r["code"] for r in rows]
+        self.assertCountEqual(codes, ["BOTH-001", "BOTH-002"])
+        self.assertNotIn("TUT-001", codes)
+        self.assertNotIn("MOM-001", codes)
+        self.assertLess(len(rows), 5)
+        self.assertNotIn("ママ", queries)
+        self.assertNotIn("息子", queries)
+        self.assertTrue(all(int(r.get("keyword_hits") or 0) >= 2 for r in rows))
+
+    def test_initial_identify_stamps_keyword_bucket_from_singles(self):
+        catalog = {
+            "code": "DANDYA-001",
+            "title": self.DANDYA,
+            "actress": "大浦真奈美",
+            "studio": "DANDY",
+            "source": "avbase",
+            "cid": "1dandya00001",
+            "cover": "https://example.com/c.jpg",
+        }
+        hit = {
+            "code": "DANDYA-001",
+            "title": self.DANDYA,
+            "actress": "大浦真奈美",
+            "studio": "DANDY",
+            "source": "avbase",
+            "score": 0.9,
+            "candidates": [
+                {
+                    "code": "DANDYA-001",
+                    "title": self.DANDYA,
+                    "actress": "大浦真奈美",
+                    "score": 0.9,
+                }
+            ],
+        }
+        queries, patches = self._install_catalog(self._singles())
+
+        def passthrough(payload, **kwargs):
+            return payload
+
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            stack.enter_context(mock.patch.object(S, "fetch_avbase_by_code", return_value=catalog))
+            stack.enter_context(mock.patch.object(S, "search_by_title", return_value=hit))
+            stack.enter_context(mock.patch.object(S, "resolve_chinese_title", return_value=None))
+            stack.enter_context(mock.patch.object(S, "attach_chinese_titles", side_effect=passthrough))
+            stack.enter_context(
+                mock.patch.object(
+                    S,
+                    "sanitize_cover_fields",
+                    return_value=(
+                        "1dandya00001",
+                        "https://example.com/c.jpg",
+                        ["https://example.com/s.jpg"],
+                    ),
+                )
+            )
+            coded, code_status = S.run_identify_pipeline(user_code="DANDYA-001")
+            titled, title_status = S.run_identify_pipeline(user_title=self.DANDYA)
+            attached = S.attach_related_by_title(
+                {
+                    "ok": True,
+                    "code": "DANDYA-001",
+                    "title": self.DANDYA,
+                    "actress": "大浦真奈美",
+                    "studio": "DANDY",
+                    "cover": "https://example.com/c.jpg",
+                    "stills": ["https://example.com/s.jpg"],
+                },
+                budget_sec=8,
+            )
+
+        for label, result, status in (
+            ("code", coded, code_status),
+            ("title", titled, title_status),
+        ):
+            self.assertEqual(status, 200, label)
+            self.assertEqual(result.get("theme_keywords"), self.CHIPS, (label, result.get("theme_keywords")))
+            rel = result.get("related_by_title") or []
+            kw = [r for r in rel if r.get("line") == "keyword"]
+            self.assertGreaterEqual(len(kw), 1, (label, rel))
+            self.assertLessEqual(len(kw), 5, label)
+            self.assertLessEqual(sum(1 for r in rel if r.get("line") == "theme"), 5, label)
+            self.assertLessEqual(sum(1 for r in rel if r.get("line") == "actress"), 3, label)
+            codes = [r.get("code") for r in kw]
+            self.assertIn("EDU-001", codes, (label, codes))
+            self.assertNotIn("JUNK-001", codes, label)
+            tut = next(r for r in kw if r.get("code") == "TUT-001")
+            self.assertEqual(tut.get("title"), "新人家庭教師の初授業")
+            self.assertEqual(tut.get("title_zh"), "新人家教的第一堂課")
+            edu = next(r for r in kw if r.get("code") == "EDU-001")
+            self.assertFalse(edu.get("title_zh"), (label, edu.get("title_zh")))
+            note = result.get("related_note") or ""
+            self.assertNotIn("僅顯示主作品", note, (label, note))
+            if label == "code":
+                # Code lookup says the actress bucket missed; keyword cards
+                # must not be described as「僅顯示主作品」.
+                self.assertIn("未取得同女優", note, (label, note))
+
+        rel = attached.get("related_by_title") or []
+        kw = [r for r in rel if r.get("line") == "keyword"]
+        self.assertGreaterEqual(len(kw), 1, rel)
+        self.assertLessEqual(len(kw), 5)
+        self.assertEqual(attached.get("theme_keywords"), self.CHIPS)
+        self.assertIn("EDU-001", [r.get("code") for r in kw])
+        # Leading list still omits weak chips; fallback searched them anyway.
+        self.assertNotIn("息子", attached.get("keyword_queries") or [])
+        self.assertIn("息子", queries)
+        self.assertIn("ママ", queries)
+
+
+def defaultdict_table(seed):
+    """Return the same rows for every query key, including pair concatenations."""
+
+    class _Any(dict):
+        def get(self, key, default=None):
+            return seed.get(key, seed.get("家庭教師", default))
+
+    return _Any(seed)
+
+
 class TestActressQueryKeep(unittest.TestCase):
     def test_is_actress_query_detection_via_score_path(self):
         # Unit-level: compact JP name without particles looks like actress query

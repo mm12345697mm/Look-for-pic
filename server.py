@@ -3261,8 +3261,34 @@ def _cap_related_buckets(items) -> list[dict]:
             keyword.append(item)
         elif ln == "actress" and len(actress) < RELATED_ACTRESS_CAP:
             actress.append(item)
-    keyword.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
+    keyword.sort(key=_keyword_related_sort_key, reverse=True)
     return theme + keyword[:RELATED_KEYWORD_CAP] + actress
+
+
+def _keyword_related_sort_key(item: dict | None) -> tuple:
+    """Order inside the keyword bucket: distinctive theme, then hit count.
+
+    A ママ-only row must not outrank 家庭教師 / 肉欲教育 / 10秒挿入 just because
+    the catalog score was high. More hits still win among the same tier.
+    Relation phrases sit ahead of bare kinship when theme hits are tied at zero.
+    """
+    if not isinstance(item, dict):
+        return (0, 0, 0)
+    hits = int(item.get("keyword_hits") or 0)
+    matched = item.get("matched_keywords") or item.get("hit_keywords") or []
+    if not isinstance(matched, list):
+        matched = []
+    theme = 0
+    compound = 0
+    for raw in matched:
+        tok = str(raw or "").strip()
+        if not tok:
+            continue
+        if _is_auto_theme_keyword(tok):
+            theme += 1
+        if _is_relation_phrase(tok):
+            compound += 1
+    return (1 if theme else 0, hits, 1 if compound else 0)
 
 
 def _merge_unique_urls(primary, secondary, *, cap: int = 20) -> list[str]:
@@ -5692,6 +5718,8 @@ def _keyword_search_queries(
     Default bucket: distinctive compounds and theme nouns lead (cap 8). Weak
     relationship/action tokens are queried only when the title has no stronger
     term, or when there are just 1–2 keywords total. They must not lead.
+    When a ≥3-keyword multi-hit pass finds nothing usable, `_find_related_by_keywords`
+    asks `_keyword_fallback_singles` for 息子 / ママ and the other chips alone.
     """
     title = title or ""
     queries: list[str] = []
@@ -5788,6 +5816,51 @@ def _keyword_search_queries(
             include_weak=True,
         )
     return queries[:8]
+
+
+def _keyword_fallback_singles(keywords: list[str] | None) -> list[str]:
+    """One-token queries for when multi-hit / compound search is empty or thin.
+
+    Chip rank order: distinctive nouns, then relation phrases, then weak
+    kinship tokens. Aliases follow their chip (10秒挿入 also searches 10秒で挿入).
+    Kept off `_keyword_search_queries`, which must not lead with 息子 / ママ.
+    """
+    queries: list[str] = []
+
+    def _add(q: str) -> None:
+        q = (q or "").strip()
+        if _keyword_token_ok(q) and q not in queries:
+            queries.append(q)
+
+    for kw in keywords or []:
+        tok = str(kw or "").strip()
+        if not tok:
+            continue
+        _add(tok)
+        for alias in _theme_keyword_aliases(tok):
+            if alias != tok:
+                _add(alias)
+    return queries[:12]
+
+
+def _auto_keyword_needs_single_fallback(
+    *,
+    explicit: bool,
+    min_hits: int,
+    strict_n: int,
+    max_n: int,
+) -> bool:
+    """True when the multi-hit pass found nothing usable, or only one work.
+
+    Two or more multi-hits are enough — do not pad the cap with singles.
+    Zero or one is too few for a ≥3-keyword title: individual chips may fill
+    the remaining slots, up to max_n. Interactive re-search never falls back.
+    """
+    if explicit or min_hits <= 1 or max_n <= 0:
+        return False
+    if strict_n >= 2 or strict_n >= max_n:
+        return False
+    return True
 
 
 def _stamp_theme_keywords(payload: dict) -> dict:
@@ -5892,12 +5965,18 @@ def _find_related_by_keywords(
     """Up to max_n works matching title theme keywords; more hits rank higher.
 
     Default (keywords is None): extract from the title.
-    If the title yields ≥3 keywords, require ≥2 hits (no single weak pad).
-    If it yields only 1–2 keywords, those may define the bucket (≤5, no invent).
+    If the title yields ≥3 keywords, prefer ≥2 hits. When that multi-hit /
+    compound pass finds nothing or only one usable work, fall back to
+    individual chips (家庭教師, 肉欲教育, 10秒挿入, then 息子 / ママ) so the
+    bucket is not left empty. Caps stay maxima: do not pad once two or more
+    multi-hits exist, and never invent a non-matching row.
+
+    If the title yields only 1–2 keywords, those may define the bucket.
 
     Explicit keywords (interactive re-search): match only that set.
     ≥2 selected → require ≥2 hits among them (multi-hit / AND-style).
     Exactly 1 selected → that keyword may fill the row (up to max_n, no junk pad).
+    Re-search does not fall back to unselected singles.
     """
     import time as _time
 
@@ -5916,6 +5995,7 @@ def _find_related_by_keywords(
             min_hits = _selected_keyword_min_hits(keywords)
     elif min_hits is None:
         min_hits = _keyword_min_hits(keywords)
+    min_hits = int(min_hits or 0)
     t0 = _time.monotonic()
     budget = float(budget_sec) if budget_sec and budget_sec > 0 else 6.0
     exclude = ""
@@ -5926,11 +6006,55 @@ def _find_related_by_keywords(
         seen.add(exclude)
 
     queries = _keyword_search_queries(title, keywords, selected_only=explicit)
+    # Leave a slice for single-keyword fallback. Distinctive singles are already
+    # first in `queries`; this reserve is for weak chips the leading list omits
+    # (息子 / ママ) when the multi-hit pass comes back empty.
+    primary_end = t0 + budget
+    if not explicit and min_hits > 1 and budget > 1.5:
+        primary_end = t0 + (budget * 0.65)
 
-    ranked: dict[str, tuple[float, dict]] = {}
-    for q in queries:
+    strict: dict[str, tuple[float, dict]] = {}
+    loose: dict[str, tuple[float, dict]] = {}
+    fetched: set[str] = set()
+
+    def _remember(bucket: dict[str, tuple[float, dict]], code: str, sc: float, row: dict) -> None:
+        prev = bucket.get(code)
+        if prev is None or sc > prev[0]:
+            bucket[code] = (sc, row)
+
+    def _ingest(rows: list[dict]) -> None:
+        for c in rows[:12]:
+            code_raw = str(c.get("code") or "").strip()
+            if not code_raw or not parse_code_parts(code_raw):
+                continue
+            code = format_display_code(code_raw)
+            if code in seen:
+                continue
+            hits, base, _matched, theme_hits = _keyword_overlap(
+                str(c.get("title") or ""), keywords
+            )
+            if hits < 1:
+                continue
+            sc = base + float(c.get("score") or 0)
+            weak_only = theme_hits < 1 and any(
+                _is_auto_theme_keyword(k) for k in keywords
+            )
+            # Keep single-keyword rows aside. They fill the bucket only when
+            # the multi-hit pass is empty or too thin.
+            if not explicit and min_hits > 1:
+                _remember(loose, code, sc, c)
+            if hits < min_hits:
+                continue
+            if not explicit and weak_only:
+                continue
+            _remember(strict, code, sc, c)
+
+    def _fetch_query(q: str) -> list[dict]:
+        if not q or q in fetched:
+            return []
+        fetched.add(q)
         if _time.monotonic() - t0 > budget:
-            break
+            return []
         rows: list[dict] = []
         for fetch in (
             fetch_avbase_title_results,
@@ -5945,39 +6069,72 @@ def _find_related_by_keywords(
                 pass
             if rows:
                 break
-        for c in rows[:12]:
-            code_raw = str(c.get("code") or "").strip()
-            if not code_raw or not parse_code_parts(code_raw):
-                continue
-            code = format_display_code(code_raw)
-            if code in seen:
-                continue
-            hits, base, _matched, theme_hits = _keyword_overlap(
-                str(c.get("title") or ""), keywords
-            )
-            if hits < min_hits:
-                continue
-            if not explicit and theme_hits < 1 and any(
-                _is_auto_theme_keyword(k) for k in keywords
-            ):
-                continue
-            sc = base + float(c.get("score") or 0)
-            prev = ranked.get(code)
-            if prev is None or sc > prev[0]:
-                ranked[code] = (sc, c)
+        return rows
 
-    ordered_rows = sorted(ranked.values(), key=lambda x: x[0], reverse=True)
-    out: list[dict] = []
-    for sc, c in ordered_rows:
+    for q in queries:
+        if _time.monotonic() >= min(primary_end, t0 + budget):
+            break
+        _ingest(_fetch_query(q))
+
+    if _auto_keyword_needs_single_fallback(
+        explicit=explicit,
+        min_hits=min_hits,
+        strict_n=len(strict),
+        max_n=max_n,
+    ):
+        for q in _keyword_fallback_singles(keywords):
+            if _time.monotonic() - t0 > budget:
+                break
+            if q in fetched:
+                continue
+            _ingest(_fetch_query(q))
+
+    use_singles = _auto_keyword_needs_single_fallback(
+        explicit=explicit,
+        min_hits=min_hits,
+        strict_n=len(strict),
+        max_n=max_n,
+    )
+
+    def _loose_rank(pair: tuple[float, dict]) -> tuple:
+        sc, c = pair
         hits, _base, matched, theme_hits = _keyword_overlap(
             str(c.get("title") or ""), keywords
         )
-        if hits < min_hits:
+        compound = 1 if any(_is_relation_phrase(k) for k in matched) else 0
+        return (1 if theme_hits else 0, compound, hits, sc)
+
+    if use_singles:
+        ordered_rows: list[tuple[float, dict]] = sorted(
+            strict.values(), key=lambda x: x[0], reverse=True
+        )
+        used = {
+            format_display_code(str(c.get("code") or ""))
+            for _sc, c in ordered_rows
+            if c.get("code")
+        }
+        rest = [pair for code, pair in loose.items() if code not in used]
+        rest.sort(key=_loose_rank, reverse=True)
+        ordered_rows.extend(rest)
+        emit_floor = 1
+        allow_weak = True
+    else:
+        ordered_rows = sorted(strict.values(), key=lambda x: x[0], reverse=True)
+        emit_floor = min_hits
+        allow_weak = explicit
+
+    out: list[dict] = []
+    for _sc, c in ordered_rows:
+        hits, _base, matched, theme_hits = _keyword_overlap(
+            str(c.get("title") or ""), keywords
+        )
+        if hits < emit_floor:
             continue
         # Theme terms lead the automatic bucket. Relationship-only overlap
-        # still scores lower, but does not pad ahead of ノーブラ / 巨乳.
-        # Explicit re-search counts every selected token.
-        if not explicit and theme_hits < 1 and any(
+        # still scores lower, but does not pad ahead of ノーブラ / 巨乳 when
+        # multi-hit rows already exist. Single-keyword fallback may keep
+        # 息子 / ママ so the bucket is not empty.
+        if not allow_weak and theme_hits < 1 and any(
             _is_auto_theme_keyword(k) for k in keywords
         ):
             continue
@@ -6393,8 +6550,8 @@ def find_related_by_title(
         for x in normalized
         if x.get("line") not in {"theme", "keyword", "actress"}
     ]
-    # Within keyword tier: more hits first
-    keyword_items.sort(key=lambda x: int(x.get("keyword_hits") or 0), reverse=True)
+    # Within keyword tier: distinctive theme hits, then more keyword hits.
+    keyword_items.sort(key=_keyword_related_sort_key, reverse=True)
     return theme_items + keyword_items + actress_items + other_items
 
 
