@@ -741,6 +741,25 @@ def _longest_common_substr_len(a: str, b: str) -> int:
     return best
 
 
+def _title_cover_ratio(query: str | None, catalog: str | None) -> float:
+    """How much of the longer string is the shorter one, when one contains the other.
+
+    1.0 is an exact title. A shared series line plus a long extra slogan is lower
+    than the same line plus only a short name.
+    """
+    q = re.sub(r"\s+", "", normalize_ocr_title(query) or (query or ""))
+    c = re.sub(r"\s+", "", normalize_ocr_title(catalog) or (catalog or ""))
+    if not q or not c:
+        return 0.0
+    if q == c:
+        return 1.0
+    if q in c:
+        return len(q) / len(c)
+    if c in q:
+        return len(c) / len(q)
+    return 0.0
+
+
 def title_similarity(a: str | None, b: str | None) -> float:
     a = normalize_ocr_title(a) or (a or "").strip()
     b = normalize_ocr_title(b) or (b or "").strip()
@@ -749,7 +768,18 @@ def title_similarity(a: str | None, b: str | None) -> float:
     if a == b:
         return 1.0
     if a in b or b in a:
-        return 0.92
+        # A long query that is almost the whole catalog title is the same work.
+        # A short hook (夜行バス) inside a different title is not.
+        cover = _title_cover_ratio(a, b)
+        short_len = min(
+            len(re.sub(r"\s+", "", a)),
+            len(re.sub(r"\s+", "", b)),
+        )
+        if short_len >= 12 and cover >= 0.8:
+            return 0.92
+        if short_len >= 12:
+            return 0.5 + 0.4 * cover
+        return 0.25 + 0.35 * cover
     # Long shared prefix (vision OCR often drifts only on the tail)
     n = 0
     lim = min(len(a), len(b))
@@ -2868,7 +2898,8 @@ def _fetch_javbus_title_results(title: str, actress: str | None = None) -> list[
                 code = format_display_code(date_m.group(1))
             rtitle = (title_m.group(1).strip() if title_m else "") or title
             score = title_similarity(title, rtitle)
-            if title and title[: min(8, len(title))] and title[:8] in rtitle:
+            compact_q = re.sub(r"\s+", "", title)
+            if len(compact_q) >= 12 and title[:8] in rtitle:
                 score = max(score, 0.85)
             q_code = format_display_code(title) if parse_code_parts(title) else ""
             if q_code and codes_numeric_equal(q_code, code):
@@ -2893,13 +2924,14 @@ def _fetch_javbus_title_results(title: str, actress: str | None = None) -> list[
                     "href": f"https://www.javbus.com/{code}",
                     "source": "javbus",
                     "score": float(score),
+                    "title_fit": _title_cover_ratio(title, rtitle),
                 }
             )
             if len(out) >= 24:
                 break
     except Exception:
         out = []
-    out.sort(key=lambda x: (-(x.get("score") or 0), x.get("code") or ""))
+    out.sort(key=lambda x: (-(x.get("score") or 0), -(x.get("title_fit") or 0)))
     _JAVBUS_SEARCH_MEMO[memo_key] = [dict(row) for row in out]
     return out
 
@@ -3607,7 +3639,8 @@ def filter_title_candidates(candidates: list[dict], min_score: float = 0.25) -> 
         label = (parts[0] if parts else "").upper()
         pref = 1 if label in PREFERRED_LABELS else 0
         src = 1 if c.get("source") in ("javlibrary", "avbase", "jav321") else 0
-        return (c.get("score") or 0, src, pref)
+        fit = float(c.get("title_fit") or 0)
+        return (c.get("score") or 0, fit, src, pref)
 
     ranked.sort(key=rank, reverse=True)
     return ranked
@@ -3681,16 +3714,23 @@ def _boost_title_score(item: dict, *phrases: str) -> dict:
     item = dict(item)
     score = float(item.get("score") or 0)
     catalog = str(item.get("title") or "")
+    fit = float(item.get("title_fit") or 0)
     for phrase in phrases:
         phrase = (phrase or "").strip()
         if not phrase or not catalog:
             continue
+        compact = re.sub(r"\s+", "", phrase)
         score = max(score, title_similarity(phrase, catalog))
-        if phrase in catalog or catalog in phrase:
-            score = max(score, 0.92)
-        elif len(phrase) >= 4 and phrase[:8] in catalog:
+        fit = max(fit, _title_cover_ratio(phrase, catalog))
+        # Only a long phrase may count as the title itself. A 4-char hook
+        # that happens to occur inside another work stays a weak clue.
+        if len(compact) >= 12 and (phrase in catalog or catalog in phrase):
+            cover = _title_cover_ratio(phrase, catalog)
+            score = max(score, 0.92 if cover >= 0.8 else 0.5 + 0.4 * cover)
+        elif len(compact) >= 12 and phrase[:8] in catalog:
             score = max(score, 0.85)
     item["score"] = score
+    item["title_fit"] = fit
     return item
 
 
@@ -3829,11 +3869,17 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
     if not early_av or (early_av and (early_av[0].get("score") or 0) < 0.45):
         try:
             short_qs: list[str] = []
+            # The full string can miss (length / a censored glyph). The head of
+            # that same string is still the title; a bare theme word is not.
+            raw = normalize_ocr_title(original_title) or original_title
+            raw_compact = re.sub(r"\s+", "", raw)
+            for n in (40, 32, 24, 18):
+                if len(raw_compact) > n + 6:
+                    short_qs.append(raw_compact[:n])
             for q in _title_related_keyword_queries(original_title):
                 if q and 4 <= len(q) <= 16 and q not in short_qs:
                     short_qs.append(q)
             # Prefer mid-title chunks that OCR usually gets right (bus/seat etc.)
-            raw = normalize_ocr_title(original_title) or original_title
             for n in (6, 8, 10, 12):
                 if len(raw) >= n + 4:
                     mid = raw[len(raw) // 4 : len(raw) // 4 + n]

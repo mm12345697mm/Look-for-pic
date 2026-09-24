@@ -190,6 +190,42 @@ class TestApgh012Overlay(unittest.TestCase):
         self.assertFalse(any("だけ" in c for c in chips), blob)
         self.assertTrue(any(c in ("溢れる欲望", "狭い部屋", "食堂", "同僚") for c in chips), blob)
 
+    def test_full_title_beats_a_short_shared_hook(self):
+        """A theme word inside another work must not outrank the typed title."""
+        full = "架空の座席でこっそり発射させる声我慢の長い題名です夜行バスの続きまで書く"
+        right = _work("RIGHT-100", full)
+        wrong = _work("WRONG-200", "別作品の夜行だけの題名で中身は違う")
+
+        def search_rows(title, actress=None):
+            q = re.sub(r"\s+", "", str(title or ""))
+            full_c = re.sub(r"\s+", "", full)
+            if q == full_c:
+                return []
+            if q.startswith(full_c[:12]) and len(q) >= 18:
+                return [dict(right, score=0.2)]
+            if len(q) <= 4:
+                return [dict(wrong, score=0.9)]
+            return []
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=search_rows):
+            hit = S.search_by_title(full)
+        self.assertEqual((hit or {}).get("code"), "RIGHT-100")
+
+    def test_shared_series_line_prefers_the_tighter_title(self):
+        shared = "架空シリーズの同じ題名で巻だけ違う"
+        loose = _work("LOOSE-001", "前置きの標語" + shared + " おまけの長い説明文が続く")
+        tight = _work("TIGHT-002", shared + " 名前")
+        later = _work("LATER-003", shared + " 別名")
+
+        def search_rows(title, actress=None):
+            if shared in str(title or ""):
+                return [dict(loose), dict(tight), dict(later)]
+            return []
+
+        with mock.patch.object(S, "fetch_avbase_title_results", side_effect=search_rows):
+            hit = S.search_by_title(shared)
+        self.assertEqual((hit or {}).get("code"), "TIGHT-002")
+
     def test_alias_labels_and_comparisons_are_not_chips(self):
         title = "架空題は溢れる欲望と自分以上に勢いが凄い！！ (仮名)アキさん"
         chips = S._extract_title_theme_keywords(title)
