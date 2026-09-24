@@ -317,7 +317,7 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         base.update(extra)
         return base
 
-    def _fake_resolve(self, code, title_ja=None, existing_zh=None, user_title=None):
+    def _fake_resolve(self, code, title_ja=None, existing_zh=None, user_title=None, **_kwargs):
         c = str(code or "")
         if c in ("NHDTC-099", "NHDTC-99"):
             return "中文主標"
@@ -819,7 +819,7 @@ class TestRelatedByTitleApi(unittest.TestCase):
         seed = self._full_related(with_zh=False)
         resolved = []
 
-        def fake_resolve(code, title_ja=None, existing_zh=None, user_title=None):
+        def fake_resolve(code, title_ja=None, existing_zh=None, user_title=None, **_kwargs):
             resolved.append(str(code or ""))
             return "補中文"
 

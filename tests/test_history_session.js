@@ -2054,6 +2054,8 @@ function walkNodes(node, acc) {
               code: 'REL-001',
               title: '巨乳の合宿',
               title_zh: '巨乳集訓',
+              actress: '福田ゆあ',
+              actress_zh: '福田由愛',
               line: 'keyword',
               why: '關鍵字',
               cover: cover,
@@ -2072,8 +2074,9 @@ function walkNodes(node, acc) {
     assert.ok(titles[0].indexOf(ja) === 0, titles[0]);
     assert.ok(titles[0].indexOf('（' + zh + '）') !== -1, titles[0]);
     assert.ok(titles[1].indexOf('巨乳の合宿（巨乳集訓）') !== -1, titles[1]);
-    const actress = walkNodes(block).find((n) => n.className === 'card-actress');
-    assert.ok(actress && actress.textContent.indexOf('福田ゆあ（福田由愛）') !== -1, actress && actress.textContent);
+    const actresses = walkNodes(block).filter((n) => n.className === 'card-actress');
+    assert.ok(actresses.length >= 2, actresses.map((n) => n.textContent).join('|'));
+    assert.ok(actresses.every((n) => n.textContent.indexOf('福田ゆあ（福田由愛）') !== -1), actresses.map((n) => n.textContent).join('|'));
     const hits = walkNodes(block).filter((n) => n.className === 'card-hit-kw').map((n) => n.textContent);
     assert.ok(hits.indexOf('ノーブラ（無胸罩）') !== -1, hits.join('|'));
     assert.ok(hits.indexOf('誘惑（誘惑）') !== -1, hits.join('|'));
