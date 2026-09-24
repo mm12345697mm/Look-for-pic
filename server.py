@@ -61,10 +61,17 @@ VISION_TIMEOUT = 45
 # Multi-image identify must return before gunicorn's worker wall (240s).
 # 150s leaves room for one in-flight vision/catalog call, then partial slots.
 MULTI_IDENTIFY_BUDGET_S = 150.0
+# 2–3 uploads still finish vision + catalog + a visual lock. The 150s
+# partial-stop stays for a large batch that would hit the worker wall.
+MULTI_SMALL_BATCH_N = 3
+MULTI_SMALL_IDENTIFY_BUDGET_S = 210.0
 # Do not start another slot when less than this remains — flush the response.
 MULTI_SLOT_RESERVE_S = 4.0
 # Do not start a shortened vision call. Below this, the frame is retryable.
 MULTI_VISION_START_S = 15.0
+# A 2–3 image batch may start one Gemini cover batch below the 40s tournament
+# budget. A jacket compare that was cut off still must not guess a volume.
+MULTI_SMALL_VISUAL_START_S = 12.0
 # Related carousels share this wall after identify. It is not the leftover
 # of the identify clock: a finished catalog hit still gets a real attempt
 # while the worker wall (gunicorn 240s, identify ~150s) has room.
@@ -954,10 +961,16 @@ def get_gemini_api_key() -> str:
 
 
 def is_usable_title(title: str | None) -> bool:
-    """Title usable for search: len>=4 and mostly JP/CJK."""
+    """Title usable for search: len>=4 and mostly JP/CJK.
+
+    An OCR line with ASCII junk (a quote, a `<`, or a latin crumb that is
+    not a real theme word) is not a catalog title.
+    """
     if not title:
         return False
     t = str(title).strip()
+    if _title_has_ocr_garbage(t):
+        return False
     if len(t) < 4:
         return False
     cjk = 0
@@ -1678,6 +1691,46 @@ def _ocr_line_is_clean(text: str | None) -> bool:
     return cjk >= len(t) * 0.7
 
 
+_OCR_JUNK_PUNCT_RE = re.compile(r"[\"'`<>«»]")
+
+
+def _is_known_latin_theme(tok: str) -> bool:
+    """Latin theme words we actually chip (OL, VR, NTR, SEX, CA).
+
+    A two-letter OCR crumb such as EY is not one of these.
+    """
+    key = (tok or "").strip().upper()
+    if not re.fullmatch(r"[A-Z0-9]{2,6}", key):
+        return False
+    for name in ("_THEME_KEYWORD_LEXICON", "_WEAK_THEME_TOKENS", "_SHORT_THEME_NOUNS"):
+        for item in globals().get(name) or ():
+            if str(item).upper() == key and re.fullmatch(r"[A-Za-z0-9]+", str(item)):
+                return True
+    return False
+
+
+def _title_has_ocr_garbage(title: str | None) -> bool:
+    """True when a read glued ASCII junk onto a title.
+
+    Quotes, angle brackets, and latin crumbs that are not theme words
+    (EY, ey) are junk. OL / VR / NTR stay. Edition tags (VOL.2, BOD,
+    Blu-ray) and a printed 品番 are catalog text, not crumbs.
+    """
+    t = str(title or "")
+    if not t:
+        return False
+    if _OCR_JUNK_PUNCT_RE.search(t):
+        return True
+    scanned = AV_CODE_RE.sub(" ", t)
+    strip = globals().get("_strip_edition_markers")
+    if strip is not None:
+        scanned = strip(scanned)
+    for match in re.finditer(r"[A-Za-z]+", scanned):
+        if not _is_known_latin_theme(match.group(0)):
+            return True
+    return False
+
+
 def _focused_cjk_queries(blob: str | None) -> list[str]:
     """A few readable phrases from one frame, not every line on a page."""
     raw = str(blob or "")
@@ -2170,7 +2223,10 @@ def call_gemini_vision(
     limit = float(VISION_TIMEOUT if timeout is None else timeout)
     if limit < 2.0:
         raise RuntimeError("vision budget too small")
-    models = GEMINI_MODELS if not max_models else GEMINI_MODELS[: max(1, int(max_models))]
+    # A 2–3 image batch sets _model_cap so one frame cannot walk every model.
+    # Callers and tests pass the usual (bytes, mime, key) arguments.
+    cap = max_models if max_models is not None else getattr(call_gemini_vision, "_model_cap", None)
+    models = GEMINI_MODELS if not cap else GEMINI_MODELS[: max(1, int(cap))]
     b64 = base64.b64encode(image_bytes).decode("ascii")
     payload_base = {
         "contents": [
@@ -5975,14 +6031,15 @@ def _jacket_front_views(cover: Image.Image, user: Image.Image) -> list[Image.Ima
 _BATCH = threading.local()
 
 
-def _enter_batch_ctx(deadline: float) -> None:
+def _enter_batch_ctx(deadline: float, *, small_batch: bool = False) -> None:
     _BATCH.active = True
     _BATCH.deadline = deadline
     _BATCH.jacket_incomplete = False
+    _BATCH.small_batch = bool(small_batch)
 
 
 def _leave_batch_ctx() -> None:
-    for name in ("active", "deadline", "jacket_incomplete"):
+    for name in ("active", "deadline", "jacket_incomplete", "small_batch"):
         if hasattr(_BATCH, name):
             delattr(_BATCH, name)
 
@@ -5997,6 +6054,35 @@ def _seconds_left(deadline: float | None) -> float:
     if deadline is None:
         return 1e9
     return float(deadline) - time.monotonic()
+
+
+def _visual_rank_blocked(n_coded: int, deadline: float | None = None) -> bool:
+    """True when a multi-candidate picture lock must not start.
+
+    A large batch keeps the full compare budget: a short tournament can copy
+    the wrong volume. A 2–3 image batch still starts one cover batch when a
+    normal slot's worth of time remains. A jacket compare that was cut off
+    never continues into a guess.
+    """
+    if deadline is None:
+        deadline = _batch_deadline()
+    if not getattr(_BATCH, "active", False) and deadline is None:
+        return False
+    if getattr(_BATCH, "jacket_incomplete", False):
+        return True
+    remain = _seconds_left(deadline)
+    if getattr(_BATCH, "small_batch", False) and int(n_coded) <= 4:
+        return remain < float(MULTI_SMALL_VISUAL_START_S)
+    return remain < float(VISUAL_COMPARE_BUDGET)
+
+
+def _visual_compare_budget_s() -> float:
+    """Cap a compare at the time this batch actually has left."""
+    budget = float(VISUAL_COMPARE_BUDGET)
+    if not getattr(_BATCH, "active", False):
+        return budget
+    remain = _seconds_left(_batch_deadline())
+    return min(budget, max(1.0, remain - 0.5))
 
 
 def _aligned_jacket_scores(user: Image.Image, cover: Image.Image) -> tuple[float, float]:
@@ -6415,11 +6501,10 @@ def apply_visual_rank_to_hit(
         return out
     if deadline is None:
         deadline = _batch_deadline()
-    jacket_cut = bool(getattr(_BATCH, "jacket_incomplete", False))
-    remain = _seconds_left(deadline)
     # A short tournament plus the unlocked promotion can copy the wrong volume.
-    # Run the full compare, or mark the slot retryable.
-    if jacket_cut or remain < float(VISUAL_COMPARE_BUDGET):
+    # Run the full compare, or mark the slot retryable. A 2–3 image batch
+    # still starts one cover batch when a normal slot's worth of time remains.
+    if _visual_rank_blocked(len(coded), deadline):
         if len(coded) >= 2:
             return _mark_lock_incomplete(hit, coded)
         return hit
@@ -6427,7 +6512,7 @@ def apply_visual_rank_to_hit(
         user_image_bytes,
         coded,
         api_key=api_key,
-        budget_s=VISUAL_COMPARE_BUDGET,
+        budget_s=_visual_compare_budget_s(),
     )
     if not meta.get("visual_ranked"):
         hit = dict(hit)
@@ -7671,6 +7756,8 @@ def _keyword_token_ok(tok: str) -> bool:
     t = (tok or "").strip()
     if not t or len(t) > 24:
         return False
+    if _title_has_ocr_garbage(t):
+        return False
     if _is_censored_keyword(t):
         return False
     if _contains_edition_marker(t):
@@ -8184,6 +8271,9 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     for m in re.finditer(r"[A-Za-z]{2,6}", t):
         if _is_edition_marker_span(t, m.start(), m.end()):
+            continue
+        # OL / VR / NTR are theme words. EY and other OCR crumbs are not.
+        if not _is_known_latin_theme(m.group(0)):
             continue
         _add(m.group(0).upper())
 
@@ -9911,14 +10001,12 @@ def verify_work_against_image(
     out = dict(result)
     key = (api_key or get_gemini_api_key() or "").strip()
     if getattr(_BATCH, "active", False):
-        remain = _seconds_left(_batch_deadline())
-        jacket_cut = bool(getattr(_BATCH, "jacket_incomplete", False))
         already_locked = bool(out.get("visual_lock")) or _hit_visually_locked(out)
+        pool = _collect_visual_pool([out], out.get("candidates"))
         # A finished jacket lock stays. Do not spend a second pass undoing it.
-        if already_locked and (jacket_cut or remain < float(VISUAL_COMPARE_BUDGET)):
+        if already_locked and _visual_rank_blocked(len(pool)):
             return out
-        if jacket_cut or remain < float(VISUAL_COMPARE_BUDGET):
-            pool = _collect_visual_pool([out], out.get("candidates"))
+        if _visual_rank_blocked(len(pool)):
             # One printed code is not a volume choice. Two or more is.
             if len(pool) >= 2 and not already_locked:
                 return _mark_lock_incomplete(out, pool)
@@ -9938,7 +10026,7 @@ def verify_work_against_image(
         image_bytes,
         pool,
         api_key=key,
-        budget_s=VISUAL_COMPARE_BUDGET,
+        budget_s=_visual_compare_budget_s(),
     )
     locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not locked:
@@ -9959,7 +10047,7 @@ def verify_work_against_image(
                 image_bytes,
                 wider,
                 api_key=key,
-                budget_s=VISUAL_COMPARE_BUDGET,
+                budget_s=_visual_compare_budget_s(),
             )
             locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not (meta or {}).get("visual_ranked"):
@@ -10227,6 +10315,54 @@ def _full_text_search_queries(blob: str | None, *, actress: str | None = None) -
         if len(queries) >= 6:
             break
     return queries[:6]
+
+
+def _strip_ocr_garbage_title(title: str | None) -> str | None:
+    """Drop ASCII junk. Keep a repaired Japanese line when it is still a title.
+
+    特別な補習 "< ey  strips to a short fragment and is not a catalog query.
+    A longer line that only grew a junk tail is kept. OL / VR stay.
+    """
+    raw = str(title or "").strip()
+    if not raw:
+        return None
+
+    def _keep_latin(match: re.Match) -> str:
+        return match.group(0) if _is_known_latin_theme(match.group(0)) else " "
+
+    cleaned = _OCR_JUNK_PUNCT_RE.sub(" ", raw)
+    cleaned = re.sub(r"[A-Za-z]+", _keep_latin, cleaned)
+    cleaned = re.sub(r"[\s　]+", " ", cleaned).strip(" -/|・.,;:!?！？　\"'`<>")
+    cleaned = (normalize_ocr_title(cleaned) or "").strip()
+    if not cleaned or _title_has_ocr_garbage(cleaned) or not is_usable_title(cleaned):
+        return None
+    if _is_decorative_overlay(cleaned):
+        return None
+    return cleaned
+
+
+def _best_search_title(blob: str | None, actress: str | None = None) -> str | None:
+    """Longest readable title line in a cover read. Skips slogans and junk."""
+    for query in _full_text_search_queries(blob, actress=actress):
+        if _title_has_ocr_garbage(query) or _is_decorative_overlay(query):
+            continue
+        return query
+    return None
+
+
+def _replace_garbage_title(
+    title: str | None,
+    blob: str | None,
+    *,
+    actress: str | None = None,
+    allow_blob: bool = True,
+) -> str | None:
+    """Prefer a clean line from the same cover over an OCR-garbage title."""
+    if allow_blob:
+        best = _best_search_title(blob, actress=actress)
+        if best:
+            return best
+    return _strip_ocr_garbage_title(title)
 
 
 def _ordered_title_queries(primary: str | None, extras: list[str] | None) -> list[str]:
@@ -10890,9 +11026,13 @@ def _slot_needs_related(row: dict | None) -> bool:
 def _keep_time_for_related(results: list, deadline: float | None) -> bool:
     """Stop new identify slots once a catalog hit exists and related needs the clock.
 
-    The first slot still searches. After that, leftover identify time is for
-    carousels, not for another frame that would come back with an empty one.
+    The first slot still searches. After that, leftover identify time on a
+    large batch is for carousels, not for another frame that would come back
+    empty. A 2–3 image batch does not do this: related already has its own
+    clock after identify, and the remaining covers still need a normal search.
     """
+    if getattr(_BATCH, "small_batch", False):
+        return False
     if not any(_slot_needs_related(r) for r in results):
         return False
     return _seconds_left(deadline) < float(MULTI_RELATED_BUDGET_S)
@@ -10921,7 +11061,9 @@ def _fill_related_for_finished_slots(
     rel_end = now + max(0.0, window)
     if identify_deadline is not None:
         # 80s past the 150s identify mark is still inside the 240s worker.
-        rel_end = min(rel_end, float(identify_deadline) + 80.0)
+        # A 2–3 image identify uses a later mark, so that slack is smaller.
+        slack = 20.0 if getattr(_BATCH, "small_batch", False) else 80.0
+        rel_end = min(rel_end, float(identify_deadline) + slack)
     total_rel = 0
     floor = float(MULTI_RELATED_SLOT_FLOOR_S)
     for i, row in enumerate(results):
@@ -10995,20 +11137,42 @@ def run_multi_identify_pipeline(
         return attach_related_by_title(result, budget_sec=14.0), status
 
     n = len(images)
+    small_batch = n <= MULTI_SMALL_BATCH_N
     if deadline is None:
-        deadline = time.monotonic() + float(MULTI_IDENTIFY_BUDGET_S)
+        budget_s = MULTI_SMALL_IDENTIFY_BUDGET_S if small_batch else MULTI_IDENTIFY_BUDGET_S
+        deadline = time.monotonic() + float(budget_s)
     else:
         deadline = float(deadline)
-    _enter_batch_ctx(deadline)
+    _enter_batch_ctx(deadline, small_batch=small_batch)
     try:
         api_key = get_gemini_api_key()
         _progress(on_progress, "receive", "active", f"正在接收 {n} 張圖片…", 0.02)
         _progress(on_progress, "receive", "done", f"已接收 {n} 張圖片", 1 / 7)
 
+        # Read 2–3 covers together. Sequential vision was spending the whole
+        # identify clock before the second frame's catalog search started.
+        prefetched: list | None = None
+        if api_key and small_batch and _seconds_left(deadline) >= MULTI_VISION_START_S:
+            def _prefetch_vision(i: int):
+                img_bytes, fname = images[i]
+                mime = detect_image_mime(img_bytes, fname)
+                try:
+                    return call_gemini_vision(img_bytes, mime, api_key)
+                except Exception as exc:
+                    return exc
+
+            call_gemini_vision._model_cap = 2
+            try:
+                with ThreadPoolExecutor(max_workers=n) as pool:
+                    prefetched = list(pool.map(_prefetch_vision, range(n)))
+            finally:
+                call_gemini_vision._model_cap = None
+
         vision_rows: list[dict] = []
         for i, (img_bytes, fname) in enumerate(images):
             idx = i + 1
-            if _seconds_left(deadline) < MULTI_VISION_START_S:
+            prefetched_here = prefetched[i] if prefetched is not None else None
+            if prefetched_here is None and _seconds_left(deadline) < MULTI_VISION_START_S:
                 vision_rows.append(
                     {
                         "index": idx,
@@ -11048,15 +11212,22 @@ def run_multi_identify_pipeline(
                 "image_bytes": img_bytes,
             }
             ocr_text = ""
+            vision_title_raw = None
             mime = detect_image_mime(img_bytes, fname)
             if api_key:
                 try:
-                    vm = call_gemini_vision(img_bytes, mime, api_key)
+                    if prefetched_here is not None:
+                        if isinstance(prefetched_here, Exception):
+                            raise prefetched_here
+                        vm = prefetched_here
+                    else:
+                        vm = call_gemini_vision(img_bytes, mime, api_key)
                     row["vision_used"] = True
                     if vm.get("code"):
                         row["code"] = str(vm.get("code"))
                     if vm.get("title"):
                         row["title"] = str(vm.get("title"))
+                        vision_title_raw = row["title"]
                     if vm.get("actress"):
                         row["actress"] = str(vm.get("actress"))
                     if vm.get("studio"):
@@ -11183,6 +11354,31 @@ def run_multi_identify_pipeline(
                     if pref not in merged_pref:
                         merged_pref.append(pref)
                 row["text_queries"] = merged_pref[:8]
+            # ASCII junk ("< ey) is not a title and must not be searched.
+            # A readable line on the same cover replaces it. A short fragment
+            # left after the junk is stripped is not a catalog query either,
+            # unless a particle repair already produced one.
+            if _title_has_ocr_garbage(vision_title_raw) or _title_has_ocr_garbage(row.get("title")):
+                current = str(row.get("title") or "")
+                repair_kept = bool(current) and current in (repairs or []) and not _title_has_ocr_garbage(current)
+                if not repair_kept and (
+                    not current
+                    or _title_has_ocr_garbage(current)
+                    or (
+                        _title_has_ocr_garbage(vision_title_raw)
+                        and _is_decorative_overlay(current)
+                    )
+                ):
+                    allow_blob = not _listing_chrome_in_text(read_blob)
+                    row["title"] = _replace_garbage_title(
+                        vision_title_raw or current,
+                        read_blob,
+                        actress=row.get("actress"),
+                        allow_blob=allow_blob,
+                    )
+            row["text_queries"] = [
+                q for q in (row.get("text_queries") or []) if q and not _title_has_ocr_garbage(q)
+            ]
             # This cover may already have succeeded on its own. A multi pass that
             # reads nothing must reuse that image's cached 番號 and 作品名稱,
             # instead of leaving the frame to be merged into another upload.
@@ -11941,6 +12137,7 @@ def run_identify_pipeline(
     ocr_text = ""
     vision_used = False
     vision_meta: dict | None = None
+    raw_vision_title: str | None = None
     extra_msg: str | None = None
     ambiguous_codes: list[str] = []
     text_queries: list[str] = []
@@ -12060,8 +12257,9 @@ def run_identify_pipeline(
                 vision_meta = call_gemini_vision(image_bytes, mime, api_key)
                 vision_used = True
                 if isinstance(vision_meta, dict) and vision_meta.get("title"):
-                    sole_in_title, cleaned_title = _split_title_and_code(vision_meta.get("title"))
-                    _ignored, title_codes = _sole_product_code(str(vision_meta.get("title") or ""))
+                    raw_vision_title = str(vision_meta.get("title"))
+                    sole_in_title, cleaned_title = _split_title_and_code(raw_vision_title)
+                    _ignored, title_codes = _sole_product_code(raw_vision_title)
                     vision_meta = dict(vision_meta)
                     vision_meta["title"] = cleaned_title
                     if sole_in_title and not vision_meta.get("code"):
@@ -12190,6 +12388,25 @@ def run_identify_pipeline(
                 extra_msg = (extra_msg + " " if extra_msg else "") + "已改搜封面上其餘文字。"
         else:
             text_queries = []
+        if vision_meta and (
+            _title_has_ocr_garbage(raw_vision_title) or _title_has_ocr_garbage(vision_meta.get("title"))
+        ):
+            current = str(vision_meta.get("title") or "")
+            if (
+                not current
+                or _title_has_ocr_garbage(current)
+                or (_title_has_ocr_garbage(raw_vision_title) and _is_decorative_overlay(current))
+            ):
+                allow_blob = not _listing_chrome_in_text(read_blob)
+                vision_meta = dict(vision_meta)
+                vision_meta["title"] = _replace_garbage_title(
+                    raw_vision_title or current,
+                    read_blob,
+                    actress=vision_meta.get("actress"),
+                    allow_blob=allow_blob,
+                )
+                if vision_meta.get("title"):
+                    extra_msg = (extra_msg + " " if extra_msg else "") + "已丟棄辨識雜訊，改用封面上的片名。"
 
     # A dashed OCR token is not the 品番 until its jacket is this picture.
     # Several tokens, or a token glued to the next number, are scored the
