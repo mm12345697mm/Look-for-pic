@@ -290,8 +290,15 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         # Cache hits with no actress must not call the live catalog in these tests.
         self._avbase = mock.patch.object(S, "fetch_avbase_by_code", return_value=None)
         self._avbase.start()
+        self._public = mock.patch.object(
+            S,
+            "fetch_public_zh_catalog",
+            return_value={"genres": [], "series": None, "cover": None},
+        )
+        self._public.start()
 
     def tearDown(self):
+        self._public.stop()
         self._avbase.stop()
         S._OFFLINE_CACHE_PATH = None
         self.tmp.cleanup()
@@ -762,6 +769,10 @@ class TestIncrementalRelatedBackfill(unittest.TestCase):
             hit = S.offline_cache_get(code="NHDTC-099")
             with mock.patch.object(S, "find_related_by_title", side_effect=fake_find), mock.patch.object(
                 S, "resolve_chinese_title", side_effect=AssertionError("zh already present")
+            ), mock.patch.object(
+                S,
+                "fetch_public_zh_catalog",
+                return_value={"genres": [], "series": None, "cover": None},
             ):
                 out = S.enrich_offline_cache_hit(hit)
             codes = [r["code"] for r in out["related_by_title"]]
@@ -825,7 +836,11 @@ class TestRelatedByTitleApi(unittest.TestCase):
 
         with mock.patch.object(
             S, "find_related_by_title", side_effect=AssertionError("buckets full — no search")
-        ), mock.patch.object(S, "resolve_chinese_title", side_effect=fake_resolve):
+        ), mock.patch.object(S, "resolve_chinese_title", side_effect=fake_resolve), mock.patch.object(
+            S,
+            "fetch_public_zh_catalog",
+            return_value={"genres": [], "series": None, "cover": None},
+        ):
             client = S.app.test_client()
             res = client.post(
                 "/api/related-by-title",

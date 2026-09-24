@@ -587,7 +587,7 @@ class TestZhCatalogByCode(unittest.TestCase):
     """品番 pages on MissAV /cn/ and Jable fill 日文（中文）. No invented gloss."""
 
     def test_missav_cn_fills_title_and_actress(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if url == "https://missav.ai/cn/mida-616":
                 return MISSAV_CN_HTML
             raise AssertionError(url)
@@ -600,7 +600,7 @@ class TestZhCatalogByCode(unittest.TestCase):
         self.assertNotEqual(meta["title_zh"], "無胸罩")
 
     def test_japanese_page_omits_parentheses_sources(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if "javlibrary" in url:
                 return None
             if "mida-616" in url and "missav.ai/cn/" in url:
@@ -615,7 +615,7 @@ class TestZhCatalogByCode(unittest.TestCase):
     def test_jable_when_missav_misses(self):
         seen = []
 
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             seen.append(url)
             if url == "https://jable.tv/videos/mida-100/":
                 return JABLE_HTML
@@ -629,7 +629,7 @@ class TestZhCatalogByCode(unittest.TestCase):
         self.assertFalse(any("javlibrary" in u for u in seen))
 
     def test_same_han_name_is_not_a_second_billing(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if "missav.ai/cn/" in url:
                 return MISSAV_CN_HTML
             return None
@@ -640,7 +640,7 @@ class TestZhCatalogByCode(unittest.TestCase):
         self.assertIsNone(meta["actress_zh"])
 
     def test_attach_fills_main_and_related_without_inventing(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if url == "https://missav.ai/cn/mida-616":
                 return MISSAV_CN_HTML
             if url == "https://jable.tv/videos/mida-100/":
@@ -670,7 +670,7 @@ class TestZhCatalogByCode(unittest.TestCase):
         self.assertEqual(rel["actress_zh"], "福田由愛")
 
     def test_existing_chinese_title_is_not_replaced(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             raise AssertionError(url)
 
         payload = {
@@ -690,7 +690,7 @@ class TestZhCatalogByCode(unittest.TestCase):
         self.assertFalse(out["related_by_title"][0].get("actress_zh"))
 
     def test_resolve_returns_title_and_reports_actress(self):
-        def fake_get(url, timeout=8.0, headers=None):
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if "missav.ai/cn/mida-616" in url:
                 return MISSAV_CN_HTML
             return None

@@ -1706,10 +1706,18 @@
       detail: (data && data.message) || '搜尋完成',
       progress: 0.72,
     });
+    const coverSource = data && String(data.cover_source || '').toLowerCase();
+    const coverDetail = !data || !data.cover
+      ? '無封面'
+      : coverSource === 'missav'
+        ? '封面就緒（MissAV）'
+        : coverSource === 'jable'
+          ? '封面就緒（Jable）'
+          : 'CDN 封面就緒';
     applyProgressEvent({
       step: 'cover',
       status: data && data.cover ? 'done' : 'skipped',
-      detail: data && data.cover ? 'CDN 封面就緒' : '無封面',
+      detail: coverDetail,
       progress: 0.88,
     });
     applyProgressEvent({
