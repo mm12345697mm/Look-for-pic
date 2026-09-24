@@ -1178,6 +1178,16 @@ def _restore_helper_defaults() -> None:
 
 _restore_helper_defaults()
 
+# Tests import this module on Python 3.12, where the 3.13 marshal blob is skipped.
+# Production still uses the recovered header helper when that blob loaded.
+if not callable(globals().get("_avbase_headers")):
+    def _avbase_headers() -> dict[str, str]:
+        return {
+            "User-Agent": UA,
+            "Accept-Language": "ja,en;q=0.8,zh-TW;q=0.6",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+
 
 _CDN_UA_IOS = (
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) "
@@ -2883,7 +2893,13 @@ def search_by_title(title: str, actress: str | None = None) -> dict | None:
     # 0b) Chinese title → Gemini map to JP title + code
     gemini_hit: dict | None = None
     query_title_zh: str | None = None
-    if is_chinese_heavy_title(title):
+    try:
+        chinese_heavy = bool(is_chinese_heavy_title(title))
+    except Exception:
+        # Helper lives in the 3.13 marshal blob. A missing name must not abort
+        # a Japanese title that AVBase already had a chance to resolve.
+        chinese_heavy = False
+    if chinese_heavy:
         query_title_zh = _clean_title_zh(title) or title.strip()
         try:
             gemini_hit = gemini_map_chinese_title(title)
@@ -3087,6 +3103,38 @@ def _titles_are_same_phrase(a: str | None, b: str | None) -> bool:
     return len(shorter) >= 8 and longer.startswith(shorter)
 
 
+def _vision_only_adds_cast_or_edition(catalog: str, vision: str) -> bool:
+    """True when vision is the catalog line plus a cast name and/or BOD/VOL.
+
+    「正式題名 三比菜々美 (BOD)」 is the same work, not a longer title.
+    A longer read of the sentence itself (more plot text) is not this case.
+    """
+    cat = _title_stem(re.sub(r"\s+", " ", (catalog or "").strip()))
+    body = _title_stem(re.sub(r"\s+", " ", _strip_edition_markers(vision or "")).strip())
+    if not cat or not body:
+        return False
+    cat_c = re.sub(r"\s+", "", cat)
+    body_c = re.sub(r"\s+", "", body)
+    if body_c == cat_c:
+        return True
+    if not body_c.startswith(cat_c):
+        return False
+    extra = body_c[len(cat_c) :]
+    if not extra or len(extra) > 16:
+        return False
+    if re.search(r"[をにでがはもとからまでへの「」！？。…]", extra):
+        return False
+    parts = [p for p in re.split(r"[、,，・·／/|]+", extra) if p]
+    if not parts or len(parts) > 3:
+        return False
+    for part in parts:
+        if not (2 <= len(part) <= 12):
+            return False
+        if not re.fullmatch(r"[\u3040-\u30ff\u4e00-\u9fff\u3005A-Za-z]+", part):
+            return False
+    return True
+
+
 def choose_display_title(catalog: str | None, vision: str | None) -> str | None:
     """Pick the on-card Japanese title. Never invent Chinese.
 
@@ -3095,7 +3143,9 @@ def choose_display_title(catalog: str | None, vision: str | None) -> str | None:
     就寝中の夜行バスで指マン…). Vision is used only when there is no catalog
     title, or when it is the same phrase: a trailing cut keeps the longer
     catalog line, and a longer read of that same line may extend it.
-    An official title that only contains an internal … is kept whole.
+    A cast name or edition tag glued on the end — 三比菜々美 (BOD), VOL.2 —
+    does not replace the catalog title. An official title that only contains
+    an internal … is kept whole.
     """
     cat = re.sub(r"\s+", " ", (catalog or "").strip())
     vis = re.sub(r"\s+", " ", (vision or "").strip())
@@ -3103,16 +3153,23 @@ def choose_display_title(catalog: str | None, vision: str | None) -> str | None:
         return cat or None
     if not cat:
         return vis
-    if not _titles_are_same_phrase(cat, vis):
+    vis_body = re.sub(r"\s+", " ", _strip_edition_markers(vis)).strip() or vis
+    same = _titles_are_same_phrase(cat, vis) or _titles_are_same_phrase(cat, vis_body)
+    if not same:
         return cat
+    if _vision_only_adds_cast_or_edition(cat, vis):
+        return cat
+    use = vis
+    if vis_body != vis and _titles_are_same_phrase(cat, vis_body) and not _title_is_cut(vis_body):
+        use = vis_body
     cat_cut = _title_is_cut(cat)
-    vis_cut = _title_is_cut(vis)
+    vis_cut = _title_is_cut(use)
     if vis_cut and not cat_cut:
         return cat
-    if cat_cut and not vis_cut and len(vis) > len(_title_stem(cat)):
-        return vis
-    if len(vis) > len(cat) + 3 and not vis_cut:
-        return vis
+    if cat_cut and not vis_cut and len(use) > len(_title_stem(cat)):
+        return use
+    if len(use) > len(cat) + 3 and not vis_cut:
+        return use
     return cat
 
 
@@ -8551,6 +8608,15 @@ def run_identify_pipeline(
                 pass
     else:
         _progress(on_progress, "vision", "skipped", "無圖片，略過看圖辨識", 2 / 6)
+
+    # A still with almost no print: vision often returns nothing, while OCR
+    # still has a short distinctive phrase the catalog can search.
+    if image_bytes is not None and not is_usable_title((vision_meta or {}).get("title")):
+        ocr_title = _title_from_ocr_text(ocr_preview)
+        if ocr_title:
+            vision_meta = dict(vision_meta or {})
+            vision_meta["title"] = ocr_title
+            extra_msg = (extra_msg + " " if extra_msg else "") + "看圖未讀到片名，已用 OCR 補片名。"
 
     # Step 3: parse code/title
     _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
