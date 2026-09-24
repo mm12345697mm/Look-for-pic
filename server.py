@@ -2812,6 +2812,7 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
                     if dig:
                         cover = dig
                 seen.add(code)
+                editions = sum(1 for p in products if isinstance(p, dict)) if isinstance(products, list) else 0
                 out.append(
                     {
                         "code": code,
@@ -2823,6 +2824,8 @@ def fetch_avbase_title_results(title: str, actress: str | None = None) -> list[d
                         "href": f"https://www.avbase.net/works/{w.get('id')}" if w.get("id") else None,
                         "source": "avbase",
                         "score": float(score),
+                        "product_count": editions,
+                        "fame": _avbase_work_fame(w, products),
                     }
                 )
                 if len(out) >= 24:
@@ -6442,10 +6445,11 @@ _WEAK_THEME_TOKENS = frozenset(
 )
 
 # Productive title suffixes. Noun + suffix is one theme when the noun is glued
-# on (ノーブラ誘惑, 巨乳沼, 肉欲教育, 羞恥教育, 搾精旅行). Bare 誘惑 / 沼 / 教育
-# / 旅行 are not chips. The noun window is the same 2–8 kanji/katakana run
-# (性教育 is one kanji short of that window, so it is not minted from a single 性).
-_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼", "教育", "旅行")
+# on (ノーブラ誘惑, 巨乳沼, 肉欲教育, 羞恥教育, 搾精旅行, 媚薬漬け). Bare 誘惑 / 沼
+# / 教育 / 旅行 / 漬け are not chips. The noun window is the same 2–8
+# kanji/katakana run (性教育 is one kanji short of that window, so it is not
+# minted from a single 性).
+_COMPOUND_SUFFIXES: tuple[str, ...] = ("誘惑", "沼", "教育", "旅行", "漬け")
 
 # Kinship / pronoun nouns that form selectable XのY chips (彼女の妹).
 # One-character members are chips only as part of such a phrase, not as leftovers.
@@ -6550,6 +6554,7 @@ _THEME_KEYWORD_LEXICON = (
     "マッサージ",
     "エステ",
     "温泉",
+    "合宿",
     "寝取",
     "義妹",
     "義母",
@@ -6621,6 +6626,7 @@ _SHORT_THEME_NOUNS = frozenset(
         "満員",
         "滿員",
         "温泉",
+        "合宿",
         "秘書",
         "女医",
         "痴女",
@@ -6648,8 +6654,21 @@ _SHORT_THEME_NOUNS = frozenset(
     }
 )
 
+# Body-size words are real chips, but they are generic. When the title also
+# has a setting, a club role, or a non-body compound, they rank after those
+# themes. They are not weak tokens: 彼女の妹 still sits behind 巨乳.
+_BODY_GENERIC_TOKENS = frozenset({"巨乳", "美乳", "爆乳"})
+
+# Circle / star glyphs catalogs use to censor a word (レ●プ, チ〇ポ).
+# A chip that still contains one is not a theme we surface.
+_CENSORED_GLYPH_RE = re.compile(r"[●○◯◎〇＊]")
+
 # Search/hit aliases so 眼鏡 titles match メガネ / 眼鏡っ娘 catalog rows.
 _THEME_KEYWORD_ALIASES: dict[str, tuple[str, ...]] = {
+    # Catalog titles use both shinjitai and the traditional form. The chip
+    # stays in the spelling the title used; search treats them as one theme.
+    "媚薬": ("媚薬", "媚藥"),
+    "媚藥": ("媚薬", "媚藥"),
     "眼鏡": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
     "メガネ": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
     "眼鏡っ娘": ("眼鏡", "メガネ", "眼鏡っ娘", "メガネっ娘"),
@@ -7074,6 +7093,28 @@ def _is_weak_theme_token(tok: str) -> bool:
     return t in _WEAK_THEME_TOKENS or t.upper() in _WEAK_THEME_TOKENS
 
 
+def _is_body_generic_token(tok: str) -> bool:
+    """巨乳 / 美乳 / 爆乳. Selectable, but not the lead when a richer theme exists."""
+    return (tok or "").strip() in _BODY_GENERIC_TOKENS
+
+
+def _is_censored_keyword(tok: str) -> bool:
+    """True when the token still contains a censorship glyph (レ●プ, チ〇ポ)."""
+    return _CENSORED_GLYPH_RE.search(tok or "") is not None
+
+
+def _is_role_or_setting_theme(tok: str) -> bool:
+    """Club role (水泳部員 / 陸上部) or a short setting noun (合宿)."""
+    t = (tok or "").strip()
+    if not t:
+        return False
+    if t in {"合宿"}:
+        return True
+    if re.fullmatch(r"[\u4e00-\u9fff]{2,6}部員", t):
+        return True
+    return re.fullmatch(r"[\u4e00-\u9fff]{2,4}部", t) is not None
+
+
 def _is_relation_noun(tok: str) -> bool:
     return (tok or "").strip() in _RELATION_NOUN_SET
 
@@ -7115,6 +7156,8 @@ def _keyword_token_ok(tok: str) -> bool:
     """
     t = (tok or "").strip()
     if not t or len(t) > 24:
+        return False
+    if _is_censored_keyword(t):
         return False
     if _contains_edition_marker(t):
         return False
@@ -7270,6 +7313,74 @@ def _extract_title_compounds(title: str) -> list[tuple[str, str]]:
     return out
 
 
+def _extract_club_role_themes(title: str) -> list[str]:
+    """In-title club/team roles (水泳部員, 陸上部). Not a hardcoded title.
+
+    The role is the kanji noun glued to 部員, or to 部 when 員 does not
+    follow. A leading lexicon word stays its own chip (巨乳水泳部員 → 水泳部員
+    plus 巨乳), and a 1-kanji prefix is not a role (全部, 部屋). 水泳部 is
+    dropped when 水泳部員 is already the longer chip.
+    """
+    t = re.sub(r"\s+", "", title or "")
+    if "部" not in t:
+        return []
+    lexicon = sorted(
+        {n for n in _THEME_KEYWORD_LEXICON if len(n) >= 2},
+        key=len,
+        reverse=True,
+    )
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def _peel(prefix: str) -> str:
+        # Drop a leading theme word only while a real role noun remains
+        # (巨乳 + 水泳部員). Do not peel the role noun itself down to nothing.
+        guard = 0
+        while prefix and guard < 6:
+            guard += 1
+            peeled = False
+            for kw in lexicon:
+                if prefix.startswith(kw) and len(prefix) - len(kw) >= 2:
+                    prefix = prefix[len(kw) :]
+                    peeled = True
+                    break
+            if not peeled:
+                break
+        return prefix
+
+    for m in re.finditer(r"部員|部", t):
+        suf = m.group(0)
+        if suf == "部" and t.startswith("員", m.end()):
+            continue
+        i = m.start()
+        while i > 0 and "\u4e00" <= t[i - 1] <= "\u9fff":
+            i -= 1
+        prefix = t[i : m.start()]
+        if len(prefix) > 6:
+            prefix = prefix[-6:]
+        prefix = _peel(prefix)
+        if _is_body_generic_token(prefix) or _is_weak_theme_token(prefix):
+            continue
+        if suf == "部員":
+            if not re.fullmatch(r"[\u4e00-\u9fff]{2,6}", prefix):
+                continue
+        elif not re.fullmatch(r"[\u4e00-\u9fff]{2,4}", prefix):
+            continue
+        phrase = prefix + suf
+        if phrase in seen or _is_censored_keyword(phrase):
+            continue
+        seen.add(phrase)
+        found.append(phrase)
+    return [
+        phrase
+        for phrase in found
+        if not any(
+            other != phrase and other.startswith(phrase) and other.endswith("部員")
+            for other in found
+        )
+    ]
+
+
 def _chip_contains_part(compound: str, part: str) -> bool:
     """True when `part` is a shorter chip covered by `compound`.
 
@@ -7384,13 +7495,22 @@ def _rank_theme_keywords(
 
     The noun half of a kept compound stays (ノーブラ under ノーブラ誘惑) but
     ranks after strong nouns that are not already covered by that compound,
-    so 巨乳 is not pushed behind a duplicate of the same head. A phrase that
-    contains another chip then moves to just before that chip (息子の家庭教師
-    before 家庭教師 / 息子) without passing unrelated theme nouns.
+    so 巨乳 is not pushed behind a duplicate of the same head. When the title
+    also has a setting, a club role, or a non-body compound, 巨乳 / 美乳 / 爆乳
+    sit after the other chips in their tier (水泳部員 and 合宿 before 巨乳).
+    A phrase that contains another chip then moves to just before that chip
+    (息子の家庭教師 before 家庭教師 / 息子) without passing unrelated theme nouns.
     """
     compact = re.sub(r"\s+", "", title or "")
     compound_head = {comp: noun for comp, noun in compounds}
     heads = {noun for noun in compound_head.values() if noun}
+    # A setting, club role, or non-body compound means 巨乳 must not lead.
+    richer_theme = any(_is_role_or_setting_theme(tok) for tok in found) or any(
+        noun
+        and not _is_body_generic_token(noun)
+        and not _is_body_generic_token(comp)
+        for comp, noun in compounds
+    )
 
     def _tier(tok: str) -> int:
         # 一泊二日 / 連続中出し are productive theme chips, beside lexicon nouns.
@@ -7418,7 +7538,10 @@ def _rank_theme_keywords(
 
     def _key(tok: str) -> tuple:
         pos = _keyword_surface_pos(compact, tok)
-        return (_tier(tok), pos, -len(tok))
+        # Same tier only: 水泳部員 / 合宿 / 媚薬漬け stay ahead of 巨乳.
+        # Does not push 巨乳 behind a later tier (ノーブラ, 彼女の妹).
+        demote = 1 if richer_theme and _is_body_generic_token(tok) else 0
+        return (_tier(tok), demote, pos, -len(tok))
 
     return _order_compounds_before_parts(sorted(found, key=_key))
 
@@ -7470,8 +7593,12 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     """Discrete theme keywords from a title (満員/電車/媚薬/巨乳/眼鏡/地味 …).
 
     Prefer lexicon + Latin tokens and in-title compounds (ノーブラ誘惑, 巨乳沼,
-    肉欲教育). Keep the distinctive noun half of a lexicon compound (ノーブラ),
-    and keep high-signal 2-char look tokens (眼鏡/地味/美人).
+    肉欲教育, 媚薬漬け). A club role glued to 部員 / 部 (水泳部員, 陸上部) and a
+    short setting (合宿) are themes even when they are not body-size words.
+    Keep the distinctive noun half of a lexicon compound (ノーブラ, 媚薬),
+    and keep high-signal 2-char look tokens (眼鏡/地味/美人). Body generics
+    (巨乳) stay selectable but rank after those richer themes. A censorship
+    glyph (レ●プ) is never a chip.
 
     Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
     彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
@@ -7524,6 +7651,8 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
 
     for comp, _noun in compounds:
         _add(comp)
+    for role in _extract_club_role_themes(t):
+        _add(role)
     for phrase, left, right in relations:
         _add(phrase)
         _add(left)
@@ -8328,6 +8457,76 @@ def _find_related_by_keywords(
     return out[:max_n]
 
 
+_FAME_FIELD_KEYS: tuple[str, ...] = (
+    "fame",
+    "popularity",
+    "views",
+    "view_count",
+    "favorites",
+    "favorite_count",
+    "rating",
+    "review_count",
+    "like_count",
+)
+
+
+def _as_positive_float(val) -> float | None:
+    if isinstance(val, bool) or val is None:
+        return None
+    if isinstance(val, (int, float)):
+        num = float(val)
+    elif isinstance(val, str):
+        try:
+            num = float(val.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    if num <= 0:
+        return None
+    return num
+
+
+def _avbase_work_fame(work: dict | None, products) -> float:
+    """Higher-is-better notability from an avbase work, else edition count.
+
+    Search-result order is not fame. A view / favorite / rating field wins;
+    a work reissued as more products is the fallback when those are absent.
+    """
+    sources: list[dict] = []
+    if isinstance(work, dict):
+        sources.append(work)
+    if isinstance(products, list):
+        sources.extend(p for p in products if isinstance(p, dict))
+    pop = 0.0
+    for src in sources:
+        for key in _FAME_FIELD_KEYS:
+            num = _as_positive_float(src.get(key))
+            if num is not None and num > pop:
+                pop = num
+    editions = 0
+    if isinstance(products, list):
+        editions = sum(1 for p in products if isinstance(p, dict))
+    if pop > 0:
+        return pop * 1000.0 + float(editions)
+    return float(editions)
+
+
+def _candidate_fame(row: dict | None) -> float:
+    """Notability of one catalog row. Missing fields are 0, not list position."""
+    if not isinstance(row, dict):
+        return 0.0
+    best = 0.0
+    for key in _FAME_FIELD_KEYS:
+        num = _as_positive_float(row.get(key))
+        if num is not None and num > best:
+            best = num
+    if best > 0:
+        return best
+    editions = _as_positive_float(row.get("product_count"))
+    return editions or 0.0
+
+
 def _actress_name_matches(query: str, candidate: str) -> bool:
     """True when the catalog billing contains the queried actress name.
 
@@ -8356,8 +8555,15 @@ def _find_related_by_actress(
     max_n: int = 3,
     budget_sec: float = 6.0,
     already: set[str] | None = None,
+    keywords: list[str] | None = None,
 ) -> list[dict]:
-    """Same-actress bucket: up to max_n other works (cap 3). No junk pad."""
+    """Same-actress bucket: up to max_n other works (cap 3). No junk pad.
+
+    Prefer other works by this actress that share theme keywords with the
+    main title. Do not fill the remaining slots with unrelated titles when
+    any keyword-similar work exists. When nothing overlaps, fall back to
+    more notable works (fame / edition count), not catalog-list order.
+    """
     import time as _time
 
     name = (actress or "").strip()
@@ -8378,7 +8584,7 @@ def _find_related_by_actress(
     if compact and compact not in queries:
         queries.append(compact)
 
-    ranked: list[tuple[float, dict]] = []
+    held: list[dict] = []
     for q in queries:
         if _time.monotonic() - t0 > budget:
             break
@@ -8396,14 +8602,59 @@ def _find_related_by_actress(
             act = str(c.get("actress") or "")
             if not _actress_name_matches(name, act):
                 continue
-            sc = float(c.get("score") or 0) * 0.5 + 1.0
-            ranked.append((sc, c))
             seen.add(code)
+            held.append(c)
 
-    ranked.sort(key=lambda x: x[0], reverse=True)
+    theme_keywords = [k for k in (keywords or []) if str(k or "").strip()]
+
+    def _pack(c: dict) -> dict:
+        if theme_keywords:
+            hits, overlap, matched, theme_hits = _keyword_overlap(
+                str(c.get("title") or ""), theme_keywords
+            )
+        else:
+            hits, overlap, matched, theme_hits = 0, 0.0, [], 0
+        rich = sum(
+            1
+            for tok in matched
+            if _is_auto_theme_keyword(tok) and not _is_body_generic_token(tok)
+        )
+        return {
+            "hits": hits,
+            "rich": rich,
+            "theme": theme_hits,
+            "overlap": overlap,
+            "fame": _candidate_fame(c),
+            "catalog": float(c.get("score") or 0),
+            "row": c,
+        }
+
+    packed = [_pack(c) for c in held]
+    overlapped = [p for p in packed if p["hits"] > 0]
+    if overlapped:
+        # Keyword-similar works only. A famous unrelated title must not pad.
+        overlapped.sort(
+            key=lambda p: (
+                p["rich"],
+                p["hits"],
+                p["theme"],
+                p["overlap"],
+                p["fame"],
+                p["catalog"],
+            ),
+            reverse=True,
+        )
+        pool = overlapped
+    else:
+        # No keyword overlap in this result set: notable works, not list order.
+        # Catalog score only breaks ties when no fame field was supplied.
+        packed.sort(key=lambda p: (p["fame"], p["catalog"]), reverse=True)
+        pool = packed
+
     # Cap only — never pad; return however many real same-actress hits we found (≤ max_n)
     target = max(0, min(int(max_n), 3))
-    for _sc, c in ranked[:target]:
+    for packed_row in pool[:target]:
+        c = packed_row["row"]
         item = enrich_title_candidate(c, why="同演員")
         item["line"] = "actress"
         item["why"] = "同演員"
@@ -8427,7 +8678,7 @@ def find_related_by_title(
 
     1. Same title / series / name-similarity — up to 5
     2. Kanji keyword matches from JP title — up to 5 (separate, not a top-up)
-    3. Same actress — up to 3
+    3. Same actress — up to 3 (keyword overlap first; else notable works)
 
     Order: title → keyword → actress. Deduplicate by code. Never pad with junk;
     empty/short buckets are fine. Soft deadline for identify.
@@ -8453,6 +8704,7 @@ def find_related_by_title(
                     exclude_code=exclude_code,
                     max_n=actress_cap - a_n,
                     budget_sec=min(5.0, float(budget_sec) if budget_sec else 5.0),
+                    keywords=_extract_title_theme_keywords(title, actress=actress),
                 )
                 seeded = _cap_related_buckets(list(seeded) + list(extra or []))
             except Exception:
@@ -8677,6 +8929,7 @@ def find_related_by_title(
                 max_n=actress_cap,
                 budget_sec=4.0,
                 already=seen,
+                keywords=keywords,
             ):
                 _push(r, why=str(r.get("why") or "同演員"), line="actress")
                 if sum(1 for x in out if str(x.get("line")) == "actress") >= actress_cap:
