@@ -24,15 +24,15 @@ ACTRESS = "架空花子"
 
 
 class TestRichTitleThemeChips(unittest.TestCase):
-    def test_swim_camp_title_keeps_compounds_and_demotes_body_generic(self):
+    def test_swim_camp_title_keeps_kyonyu_and_the_missing_themes(self):
         kws = S._extract_title_theme_keywords(SWIM)
-        self.assertEqual(kws, ["媚薬漬け", "水泳部員", "合宿", "巨乳", "媚薬"], kws)
+        # Compound first, then 巨乳 in title order. It is not demoted off the list.
+        self.assertEqual(kws, ["媚薬漬け", "巨乳", "水泳部員", "合宿", "媚薬"], kws)
         self.assertLess(kws.index("媚薬漬け"), kws.index("巨乳"))
-        self.assertLess(kws.index("水泳部員"), kws.index("巨乳"))
-        self.assertLess(kws.index("合宿"), kws.index("巨乳"))
+        self.assertLess(kws.index("巨乳"), kws.index("水泳部員"))
         self.assertLess(kws.index("媚薬漬け"), kws.index("媚薬"))
-        # Still selectable. Not erased, and not a weak-token wipe.
         self.assertFalse(S._is_weak_theme_token("巨乳"))
+        self.assertTrue(S._is_auto_theme_keyword("巨乳"))
         self.assertIn("巨乳", kws)
         for absent in ("スク水", "レ●プ", "レ○プ", "レイプ", "水泳部", "漬け", "BOD"):
             self.assertNotIn(absent, kws, kws)
@@ -68,10 +68,10 @@ class TestRichTitleThemeChips(unittest.TestCase):
         self.assertNotIn("BOD", kws)
         self.assertTrue(all("bod" not in tok.casefold() for tok in kws), kws)
 
-    def test_queries_lead_with_compounds_not_the_body_generic(self):
+    def test_queries_lead_with_the_compound_and_keep_kyonyu(self):
         kws = S._extract_title_theme_keywords(SWIM)
         qs = S._keyword_search_queries(SWIM, kws)
-        self.assertEqual(qs[:4], ["媚薬漬け", "水泳部員", "合宿", "巨乳"], qs)
+        self.assertEqual(qs[:4], ["媚薬漬け", "巨乳", "水泳部員", "合宿"], qs)
         self.assertLessEqual(len(qs), 8)
         for absent in ("スク水", "レ●プ", "レ○プ", "レイプ"):
             self.assertNotIn(absent, qs, qs)
@@ -146,6 +146,127 @@ class TestSameActressKeywordThenFame(unittest.TestCase):
         with mock.patch.object(S, "fetch_avbase_title_results", return_value=catalog):
             rows = S._find_related_by_actress(ACTRESS, keywords=kws, max_n=3)
         self.assertEqual([r["code"] for r in rows], ["HIGH-002", "MID-003", "LOW-001"])
+
+    def test_theme_less_bestof_loses_to_featured_works(self):
+        """ハイパーベスト / 総集編 with no shared theme and no 劇照 is filler.
+
+        The shape is a 2-disc hyper-best (blurry jacket, empty stills), not a
+        hardcoded product code. Keyword overlap still wins when a best-of
+        actually shares a theme.
+        """
+        kws = S._extract_title_theme_keywords(SWIM)
+        self.assertFalse(S._is_compilation_title(SWIM))
+        best_title = f"{ACTRESS} 2枚組ハイパーベスト4時間59分"
+        omnibus = f"{ACTRESS} 総集編"
+        self.assertTrue(S._is_compilation_title(best_title))
+        self.assertTrue(S._is_compilation_title(omnibus))
+        self.assertTrue(S._is_compilation_title("8時間ベスト"))
+        self.assertFalse(S._is_compilation_title("巨乳水泳部員の合宿"))
+        catalog = [
+            {
+                "code": "BEST-774",
+                "title": best_title,
+                "actress": ACTRESS,
+                "score": 0.99,
+                "fame": 100,
+                "cover": "https://example.com/blurry.jpg",
+                "stills": [],
+            },
+            {
+                "code": "OMNI-001",
+                "title": omnibus,
+                "actress": ACTRESS,
+                "score": 0.9,
+                "fame": 90,
+                "cover": "https://example.com/omni.jpg",
+                "stills": [],
+            },
+            {
+                "code": "FEAT-010",
+                "title": "水泳部員の媚薬漬け合宿",
+                "actress": ACTRESS,
+                "score": 0.2,
+                "fame": 3,
+                "cid": "feat010",
+                "cover": "https://example.com/feat.jpg",
+            },
+            {
+                "code": "FEAT-011",
+                "title": "別の巨乳物語",
+                "actress": ACTRESS,
+                "score": 0.4,
+                "fame": 8,
+                "cid": "feat011",
+                "cover": "https://example.com/feat2.jpg",
+            },
+        ]
+        with mock.patch.object(S, "fetch_avbase_title_results", return_value=catalog):
+            rows = S._find_related_by_actress(ACTRESS, keywords=kws, max_n=3)
+        codes = [r["code"] for r in rows]
+        self.assertEqual(codes, ["FEAT-010", "FEAT-011"], codes)
+        self.assertNotIn("BEST-774", codes)
+        self.assertNotIn("OMNI-001", codes)
+        self.assertLessEqual(len(rows), 3)
+
+        # No theme overlap at all: notable featured works, not the best-of.
+        plain = [
+            {
+                "code": "BEST-774",
+                "title": best_title,
+                "actress": ACTRESS,
+                "score": 0.99,
+                "fame": 100,
+                "cover": "https://example.com/blurry.jpg",
+                "stills": [],
+            },
+            {
+                "code": "FEAT-002",
+                "title": "話題の単体作品",
+                "actress": ACTRESS,
+                "score": 0.2,
+                "fame": 6,
+                "cid": "feat002",
+                "cover": "https://example.com/feat.jpg",
+                "stills": ["https://example.com/s1.jpg"],
+            },
+            {
+                "code": "FEAT-003",
+                "title": "もう一本の単体作品",
+                "actress": ACTRESS,
+                "score": 0.3,
+                "fame": 4,
+                "cid": "feat003",
+                "cover": "https://example.com/feat3.jpg",
+            },
+        ]
+        with mock.patch.object(S, "fetch_avbase_title_results", return_value=plain):
+            fame_rows = S._find_related_by_actress(ACTRESS, keywords=kws, max_n=3)
+        self.assertEqual([r["code"] for r in fame_rows], ["FEAT-002", "FEAT-003"])
+
+        # A best-of that actually shares the theme still beats an unrelated feature.
+        themed = [
+            {
+                "code": "BEST-100",
+                "title": "水泳部員ハイパーベスト",
+                "actress": ACTRESS,
+                "score": 0.2,
+                "fame": 1,
+                "cover": "https://example.com/b.jpg",
+                "stills": [],
+            },
+            {
+                "code": "FEAT-900",
+                "title": "無関係な単体作",
+                "actress": ACTRESS,
+                "score": 0.99,
+                "fame": 80,
+                "cid": "feat900",
+                "cover": "https://example.com/f.jpg",
+            },
+        ]
+        with mock.patch.object(S, "fetch_avbase_title_results", return_value=themed):
+            themed_rows = S._find_related_by_actress(ACTRESS, keywords=kws, max_n=3)
+        self.assertEqual([r["code"] for r in themed_rows], ["BEST-100"])
 
     def test_edition_count_is_fame_when_no_popularity_field(self):
         self.assertGreater(

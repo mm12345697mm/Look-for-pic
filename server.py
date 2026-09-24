@@ -6654,9 +6654,9 @@ _SHORT_THEME_NOUNS = frozenset(
     }
 )
 
-# Body-size words are real chips, but they are generic. When the title also
-# has a setting, a club role, or a non-body compound, they rank after those
-# themes. They are not weak tokens: 彼女の妹 still sits behind 巨乳.
+# Body-size words are first-class theme chips when the title says them.
+# They are not weak and are not pushed behind other themes. They are only
+# special here so 巨乳部員 is not minted as a club role (水泳部員 is).
 _BODY_GENERIC_TOKENS = frozenset({"巨乳", "美乳", "爆乳"})
 
 # Circle / star glyphs catalogs use to censor a word (レ●プ, チ〇ポ).
@@ -7094,25 +7094,13 @@ def _is_weak_theme_token(tok: str) -> bool:
 
 
 def _is_body_generic_token(tok: str) -> bool:
-    """巨乳 / 美乳 / 爆乳. Selectable, but not the lead when a richer theme exists."""
+    """巨乳 / 美乳 / 爆乳. Real chips; not a club-role stem."""
     return (tok or "").strip() in _BODY_GENERIC_TOKENS
 
 
 def _is_censored_keyword(tok: str) -> bool:
     """True when the token still contains a censorship glyph (レ●プ, チ〇ポ)."""
     return _CENSORED_GLYPH_RE.search(tok or "") is not None
-
-
-def _is_role_or_setting_theme(tok: str) -> bool:
-    """Club role (水泳部員 / 陸上部) or a short setting noun (合宿)."""
-    t = (tok or "").strip()
-    if not t:
-        return False
-    if t in {"合宿"}:
-        return True
-    if re.fullmatch(r"[\u4e00-\u9fff]{2,6}部員", t):
-        return True
-    return re.fullmatch(r"[\u4e00-\u9fff]{2,4}部", t) is not None
 
 
 def _is_relation_noun(tok: str) -> bool:
@@ -7495,22 +7483,15 @@ def _rank_theme_keywords(
 
     The noun half of a kept compound stays (ノーブラ under ノーブラ誘惑) but
     ranks after strong nouns that are not already covered by that compound,
-    so 巨乳 is not pushed behind a duplicate of the same head. When the title
-    also has a setting, a club role, or a non-body compound, 巨乳 / 美乳 / 爆乳
-    sit after the other chips in their tier (水泳部員 and 合宿 before 巨乳).
-    A phrase that contains another chip then moves to just before that chip
-    (息子の家庭教師 before 家庭教師 / 息子) without passing unrelated theme nouns.
+    so 巨乳 is not pushed behind a duplicate of the same head. 巨乳 / 美乳 /
+    爆乳 stay in that same strong tier when the title says them; a richer
+    compound does not demote them off the list. A phrase that contains
+    another chip then moves to just before that chip (息子の家庭教師 before
+    家庭教師 / 息子) without passing unrelated theme nouns.
     """
     compact = re.sub(r"\s+", "", title or "")
     compound_head = {comp: noun for comp, noun in compounds}
     heads = {noun for noun in compound_head.values() if noun}
-    # A setting, club role, or non-body compound means 巨乳 must not lead.
-    richer_theme = any(_is_role_or_setting_theme(tok) for tok in found) or any(
-        noun
-        and not _is_body_generic_token(noun)
-        and not _is_body_generic_token(comp)
-        for comp, noun in compounds
-    )
 
     def _tier(tok: str) -> int:
         # 一泊二日 / 連続中出し are productive theme chips, beside lexicon nouns.
@@ -7538,10 +7519,7 @@ def _rank_theme_keywords(
 
     def _key(tok: str) -> tuple:
         pos = _keyword_surface_pos(compact, tok)
-        # Same tier only: 水泳部員 / 合宿 / 媚薬漬け stay ahead of 巨乳.
-        # Does not push 巨乳 behind a later tier (ノーブラ, 彼女の妹).
-        demote = 1 if richer_theme and _is_body_generic_token(tok) else 0
-        return (_tier(tok), demote, pos, -len(tok))
+        return (_tier(tok), pos, -len(tok))
 
     return _order_compounds_before_parts(sorted(found, key=_key))
 
@@ -7596,9 +7574,9 @@ def _extract_title_theme_keywords(title: str, actress: str | None = None) -> lis
     肉欲教育, 媚薬漬け). A club role glued to 部員 / 部 (水泳部員, 陸上部) and a
     short setting (合宿) are themes even when they are not body-size words.
     Keep the distinctive noun half of a lexicon compound (ノーブラ, 媚薬),
-    and keep high-signal 2-char look tokens (眼鏡/地味/美人). Body generics
-    (巨乳) stay selectable but rank after those richer themes. A censorship
-    glyph (レ●プ) is never a chip.
+    and keep high-signal 2-char look tokens (眼鏡/地味/美人). 巨乳 stays a
+    first-class chip whenever the title says it. A censorship glyph (レ●プ)
+    is never a chip.
 
     Relationship pattern 彼女の妹 adds three selectable chips: 彼女, 妹, and
     彼女の妹. Kinship + occupation (息子の家庭教師) does the same for the phrase
@@ -8512,6 +8490,48 @@ def _avbase_work_fame(work: dict | None, products) -> float:
     return float(editions)
 
 
+# Best-of / omnibus titles. Not a product-code list: ハイパーベスト, 総集編,
+# ○時間ベスト, and a bare BEST marker. A normal title that merely contains
+# 部 or 巨乳 does not match.
+_COMPILATION_TITLE_RE = re.compile(
+    r"ハイパーベスト|プレミアムベスト|コンプリートベスト|メモリアルベスト|"
+    r"ゴールデンベスト|スーパーベスト|ベスト盤|ベストコレクション|"
+    r"総集編|総集|(?:時間|枚組).{0,8}ベスト|ベスト(?:\d+時間|\d+枚)"
+)
+_COMPILATION_BEST_RE = re.compile(r"(?i)(?<![A-Za-z])best(?![A-Za-z])")
+
+
+def _is_compilation_title(title: str | None) -> bool:
+    """True for best-of / 総集編 titles (ハイパーベスト, 4時間ベスト, BEST)."""
+    raw = title or ""
+    compact = re.sub(r"\s+", "", raw)
+    if _COMPILATION_TITLE_RE.search(compact):
+        return True
+    return _COMPILATION_BEST_RE.search(raw) is not None
+
+
+def _row_has_usable_gallery(row: dict | None) -> bool:
+    """True when a row can show a real cover plus 劇照, not a jacket-only best-of.
+
+    now_printing is not usable. A cover URL with no cid and no stills leaves
+    the still slots empty. A cid is enough: stills are built from it.
+    """
+    if not isinstance(row, dict):
+        return False
+    cover = str(row.get("cover") or row.get("cover_url") or "").strip()
+    if cover and is_now_printing_url(cover):
+        cover = ""
+    cid = str(row.get("cid") or "").strip()
+    stills = row.get("stills") if isinstance(row.get("stills"), list) else None
+    if stills and any(
+        str(u or "").startswith("http") and not is_now_printing_url(str(u)) for u in stills
+    ):
+        return True
+    if cid:
+        return True
+    return False
+
+
 def _candidate_fame(row: dict | None) -> float:
     """Notability of one catalog row. Missing fields are 0, not list position."""
     if not isinstance(row, dict):
@@ -8562,7 +8582,9 @@ def _find_related_by_actress(
     Prefer other works by this actress that share theme keywords with the
     main title. Do not fill the remaining slots with unrelated titles when
     any keyword-similar work exists. When nothing overlaps, fall back to
-    more notable works (fame / edition count), not catalog-list order.
+    more notable featured works (fame / edition count, usable cover/stills),
+    not catalog-list order. A best-of / 総集編 / ハイパーベスト that shares no
+    theme is filler: it does not take a slot while any other work exists.
     """
     import time as _time
 
@@ -8609,36 +8631,41 @@ def _find_related_by_actress(
 
     def _pack(c: dict) -> dict:
         if theme_keywords:
-            hits, overlap, matched, theme_hits = _keyword_overlap(
+            hits, overlap, _matched, theme_hits = _keyword_overlap(
                 str(c.get("title") or ""), theme_keywords
             )
         else:
             hits, overlap, matched, theme_hits = 0, 0.0, [], 0
-        rich = sum(
-            1
-            for tok in matched
-            if _is_auto_theme_keyword(tok) and not _is_body_generic_token(tok)
-        )
+        compilation = _is_compilation_title(str(c.get("title") or ""))
         return {
             "hits": hits,
-            "rich": rich,
             "theme": theme_hits,
             "overlap": overlap,
+            "compilation": compilation,
+            # Theme-less best-of (no keyword overlap). Not filler when it is
+            # the only thing this actress search returned.
+            "filler": compilation and hits <= 0,
+            "gallery": 1 if _row_has_usable_gallery(c) else 0,
             "fame": _candidate_fame(c),
             "catalog": float(c.get("score") or 0),
             "row": c,
         }
 
     packed = [_pack(c) for c in held]
-    overlapped = [p for p in packed if p["hits"] > 0]
+    featured = [p for p in packed if not p["filler"]]
+    # Drop theme-less compilations when any other same-actress work exists.
+    pool_src = featured if featured else packed
+    overlapped = [p for p in pool_src if p["hits"] > 0]
     if overlapped:
-        # Keyword-similar works only. A famous unrelated title must not pad.
+        # Keyword-similar works only. 巨乳 counts. A famous unrelated title,
+        # including a ハイパーベスト with an empty still list, must not pad.
         overlapped.sort(
             key=lambda p: (
-                p["rich"],
                 p["hits"],
                 p["theme"],
                 p["overlap"],
+                0 if p["compilation"] else 1,
+                p["gallery"],
                 p["fame"],
                 p["catalog"],
             ),
@@ -8646,10 +8673,13 @@ def _find_related_by_actress(
         )
         pool = overlapped
     else:
-        # No keyword overlap in this result set: notable works, not list order.
+        # No keyword overlap: notable featured works, then usable gallery.
         # Catalog score only breaks ties when no fame field was supplied.
-        packed.sort(key=lambda p: (p["fame"], p["catalog"]), reverse=True)
-        pool = packed
+        pool_src.sort(
+            key=lambda p: (p["gallery"], p["fame"], p["catalog"]),
+            reverse=True,
+        )
+        pool = pool_src
 
     # Cap only — never pad; return however many real same-actress hits we found (≤ max_n)
     target = max(0, min(int(max_n), 3))
@@ -8678,7 +8708,7 @@ def find_related_by_title(
 
     1. Same title / series / name-similarity — up to 5
     2. Kanji keyword matches from JP title — up to 5 (separate, not a top-up)
-    3. Same actress — up to 3 (keyword overlap first; else notable works)
+    3. Same actress — up to 3 (keyword overlap first; else notable featured works, not a theme-less best-of)
 
     Order: title → keyword → actress. Deduplicate by code. Never pad with junk;
     empty/short buckets are fine. Soft deadline for identify.
