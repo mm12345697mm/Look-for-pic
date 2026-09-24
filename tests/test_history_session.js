@@ -888,8 +888,10 @@ function walkNodes(node, acc) {
   assert.strictEqual(stillChips.map((c) => c.textContent).join('・'), kws.join('・'));
 }
 
-// Title display keeps the full Japanese string. Footer keywords do not split
-// mid-token. Every gallery main (including multi slot 2) has its own chips.
+// Title display keeps the full Japanese string, including an official internal
+// ellipsis. Footer keywords do not split mid-token. Every gallery main
+// (including multi slot 2) has its own chips. The night-bus card uses the
+// stored NHDTC-254 catalog title, not the vision sentence that searched it.
 {
   const ja =
     '息子からの母親不倫NTR告白 ママ不倫してるよ？可憐な妻が息子の家庭教師の絶倫チ●ポにナマでイカされて何度も何度も中出しに溺れて… 弥生みづき';
@@ -897,6 +899,7 @@ function walkNodes(node, acc) {
   const shown = H.formatDisplayTitle(ja, zh);
   assert.strictEqual(shown, ja + '（' + zh + '）');
   assert.ok(shown.indexOf(ja) === 0, 'do not cut the Japanese title before （中文）');
+  assert.ok(shown.indexOf('…') > 0 && shown.indexOf('…') < shown.indexOf('（'));
   assert.strictEqual(H.formatDisplayTitle(ja, ''), ja);
   assert.ok(H.formatDisplayTitle(ja, '').indexOf('（）') === -1);
   const busAtoms = H.segmentDisplayText('關鍵字相關（夜行バス）', ['夜行バス']);
@@ -909,18 +912,23 @@ function walkNodes(node, acc) {
   );
   assert.ok(!verbAtoms.some((s) => s.text === 'イ' || s.text === 'カ'));
 
-  const cover = 'https://pics.dmm.co.jp/digital/video/hmn00419/hmn00419pl.jpg';
+  const tutorJa =
+    '「今日も息子の家庭教師とセックスしています」2人きりになったら10秒で挿入 ? ! 息子がすぐ隣にいるのにイケメン家庭教師のチ〇ポを握る肉欲教育ママVOL.2';
+  const busJa =
+    '就寝中の夜行バスで指マンされた恐怖に目を開けられず寝たふりしながらイキまくる気弱女子5 増量中出しSP';
+  const busZh =
+    '五個膽小的女孩在夜間巴士上睡覺時被人猥褻，嚇得睜不開眼，卻在假裝睡覺的同時失控地達到高潮——超大噴射特輯';
+  const cover = 'https://pics.dmm.co.jp/digital/video/1nhdtc00254/1nhdtc00254pl.jpg';
   const tutorKws = ['息子の家庭教師', '家庭教師', '息子'];
-  const busKws = ['夜行バス', '小悪魔'];
+  const busKws = ['夜行バス', '指マン', 'SP', '中出し'];
   H.paintHistoryDetail({
     id: 'multi-two-mains',
     works: [
       {
-        code: 'HMN-419',
-        title: ja,
-        title_zh: zh,
-        actress: '弥生みづき',
-        studio: '本中',
+        code: 'DANDYA-001',
+        title: tutorJa,
+        actress: '大浦真奈美',
+        studio: 'DANDY',
         line: 'main',
         cover: cover,
         theme_keywords: tutorKws,
@@ -931,7 +939,8 @@ function walkNodes(node, acc) {
       },
       {
         code: 'NHDTC-254',
-        title: '夜行バスで激ヤバ合体ロングスカート内でこっそり挿入しちゃう小悪魔女子',
+        title: busJa,
+        title_zh: busZh,
         actress: '中城葵',
         studio: 'ナチュラルハイ',
         line: 'multi',
@@ -940,7 +949,7 @@ function walkNodes(node, acc) {
         visual_mismatch: true,
         visual_note: '未核對圖片（人物／衣服／姿勢與這張上傳圖不符）',
         related: [
-          { code: 'BUS-001', title: '夜行バスの別作品', line: 'theme', why: '片名相近', cover: cover },
+          { code: 'NHDTC-235', title: '夜行バス逆NTR', line: 'theme', why: '片名相近', cover: cover },
           { code: 'BUS-002', title: '夜行バスで挿入', line: 'keyword', why: '關鍵字', cover: cover },
         ],
       },
@@ -978,11 +987,13 @@ function walkNodes(node, acc) {
     });
   });
   const title0 = walkNodes(blocks[0]).find((n) => n.className === 'card-title');
-  assert.strictEqual(title0 && title0.textContent, ja + '（' + zh + '）');
-  assert.ok(title0.textContent.indexOf('…') > 0 && title0.textContent.indexOf('…') < title0.textContent.indexOf('（'));
+  assert.strictEqual(title0 && title0.textContent, tutorJa);
+  const title1 = walkNodes(blocks[1]).find((n) => n.className === 'card-title');
+  assert.strictEqual(title1 && title1.textContent, busJa + '（' + busZh + '）');
+  assert.ok(title1.textContent.indexOf('小悪魔') === -1);
   assert.ok(
-    walkNodes(title0).some((n) => n.className === 'cjk-atom' && n.textContent.indexOf('イカされて') !== -1),
-    'katakana word stays in one atom'
+    walkNodes(title1).some((n) => n.className === 'cjk-atom' && n.textContent === '夜行バス'),
+    '夜行バス stays one atom in the title'
   );
   const hint1 = walkNodes(blocks[1]).find((n) => n.className === 'work-carousel-hint');
   assert.ok(hint1 && hint1.textContent.indexOf('夜行バス') !== -1, hint1 && hint1.textContent);
@@ -990,6 +1001,7 @@ function walkNodes(node, acc) {
     walkNodes(hint1).some((n) => n.className === 'cjk-atom' && n.textContent === '夜行バス'),
     hint1 && hint1.textContent
   );
+  assert.ok(!walkNodes(hint1).some((n) => n.className === 'cjk-atom' && n.textContent === '夜行バ'));
   const note = walkNodes(blocks[1]).find((n) => n.className === 'card-visual-note');
   assert.ok(note && note.textContent.indexOf('未核對圖片') !== -1, note && note.textContent);
   assert.ok(!walkNodes(blocks[0]).some((n) => n.className === 'card-visual-note'));

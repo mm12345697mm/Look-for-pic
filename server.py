@@ -2989,12 +2989,35 @@ def _title_is_cut(title: str | None) -> bool:
     return bool(_TITLE_CUT_TAIL.search((title or "").strip()))
 
 
+def _title_stem(title: str) -> str:
+    return _TITLE_CUT_TAIL.sub("", (title or "").strip()).strip()
+
+
+def _titles_are_same_phrase(a: str | None, b: str | None) -> bool:
+    """One title, not two scenes that only share a keyword such as 夜行バス.
+
+    Equal, or one stem is a real prefix of the other (OCR cut or a longer
+    read of the same line). A trailing … is ignored; an internal … is not.
+    """
+    left = _title_stem(re.sub(r"\s+", " ", (a or "").strip()))
+    right = _title_stem(re.sub(r"\s+", " ", (b or "").strip()))
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    shorter, longer = (left, right) if len(left) <= len(right) else (right, left)
+    return len(shorter) >= 8 and longer.startswith(shorter)
+
+
 def choose_display_title(catalog: str | None, vision: str | None) -> str | None:
     """Pick the on-card Japanese title. Never invent Chinese.
 
-    A vision/OCR read often stops mid-phrase and ends with …. That cut must
-    not replace a longer catalog title before （中文） is appended. An official
-    title that only contains an internal … (溺れて… 弥生みづき) is kept whole.
+    The resolved work's catalog title stays when the vision/OCR string is a
+    different phrase (夜行バスで激ヤバ…小悪魔女子は must not replace
+    就寝中の夜行バスで指マン…). Vision is used only when there is no catalog
+    title, or when it is the same phrase: a trailing cut keeps the longer
+    catalog line, and a longer read of that same line may extend it.
+    An official title that only contains an internal … is kept whole.
     """
     cat = re.sub(r"\s+", " ", (catalog or "").strip())
     vis = re.sub(r"\s+", " ", (vision or "").strip())
@@ -3002,34 +3025,35 @@ def choose_display_title(catalog: str | None, vision: str | None) -> str | None:
         return cat or None
     if not cat:
         return vis
-    if vis == cat:
+    if not _titles_are_same_phrase(cat, vis):
         return cat
-    vis_stem = _TITLE_CUT_TAIL.sub("", vis).strip()
-    vis_cut = _title_is_cut(vis)
     cat_cut = _title_is_cut(cat)
-    if vis_stem and len(cat) > len(vis_stem) and (
-        cat.startswith(vis_stem) or (vis_cut and vis_stem in cat)
-    ):
+    vis_cut = _title_is_cut(vis)
+    if vis_cut and not cat_cut:
         return cat
-    # Shorter ellipsized OCR must not overwrite a complete catalog title.
-    if vis_cut and not cat_cut and vis_stem and len(cat) >= len(vis_stem):
-        return cat
-    if len(vis) + 4 <= len(cat) and cat.startswith(vis):
-        return cat
-    return vis
+    if cat_cut and not vis_cut and len(vis) > len(_title_stem(cat)):
+        return vis
+    if len(vis) > len(cat) + 3 and not vis_cut:
+        return vis
+    return cat
 
 
 def apply_vision_meta(payload: dict, vision_meta: dict | None) -> dict:
-    """Fill missing actress/studio from vision. Keep a full catalog title.
+    """Fill missing actress/studio from vision. Keep the catalog title.
 
-    Vision text wins only when it is a real alternate title, not a mid-phrase
-    cut of the catalog string. title_zh is never invented here.
+    A vision string replaces the Japanese title only when it is the same
+    phrase. title_zh belongs to the catalog title and is cleared when the
+    Japanese title actually changes to a different phrase. Never invent Chinese.
     """
     if not vision_meta:
         return payload
     vt = vision_meta.get("title")
     if vt:
-        payload["title"] = choose_display_title(payload.get("title"), vt)
+        before = str(payload.get("title") or "")
+        chosen = choose_display_title(before, vt)
+        payload["title"] = chosen
+        if before and chosen and not _titles_are_same_phrase(before, str(chosen)):
+            payload["title_zh"] = None
     if vision_meta.get("actress") and not payload.get("actress"):
         payload["actress"] = vision_meta["actress"]
     if vision_meta.get("studio") and not payload.get("studio"):
@@ -4079,7 +4103,9 @@ def identify_code(
         else:
             message = "僅 CDN（無標題）— 已嘗試 AVBase、JAVLibrary、JavBus、DuckDuckGo、Gemini"
 
-    # Prefer a full title. A mid-phrase vision cut must not replace the catalog.
+    # Prefer the catalog title. A different vision phrase must not replace it
+    # or keep that work's Chinese line beside the other sentence.
+    catalog_title = title
     if vision_meta:
         if vision_meta.get("title"):
             title = choose_display_title(title, vision_meta.get("title"))
@@ -4107,6 +4133,12 @@ def identify_code(
         # Prefer Chinese from online meta if present
         if meta and isinstance(meta, dict):
             title_zh = meta.get("title_zh")
+        if (
+            catalog_title
+            and title
+            and not _titles_are_same_phrase(str(catalog_title), str(title))
+        ):
+            title_zh = None
         title_zh = resolve_chinese_title(
             display,
             title_ja=title,
