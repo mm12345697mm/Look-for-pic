@@ -200,17 +200,32 @@ class TestSmallBatchDoesNotFalseTimeout(unittest.TestCase):
             }
         ]
 
+        seen: dict = {}
+
         def fake_rank(*args, **kwargs):
+            seen["budget"] = kwargs.get("budget_s")
+            seen["n"] = len(args[1]) if len(args) > 1 else None
             return ranked, {"visual_ranked": True, "visual_lock": True, "compared": 2}
 
-        S._enter_batch_ctx(time.monotonic() + 20)
+        jacket_calls: list = []
+
+        def fake_jacket(*args, **kwargs):
+            jacket_calls.append(args)
+            return None
+
+        # Five seconds is far under the old 40s gate. The compare still runs
+        # at the full #25 budget, after the jacket lock, and is not shortened.
+        S._enter_batch_ctx(time.monotonic() + 5)
         try:
             self.assertFalse(S._visual_rank_blocked(2))
             self.assertFalse(S._visual_rank_blocked(8))
-            with mock.patch.object(S, "_jacket_lock_winner", return_value=None), mock.patch.object(
+            with mock.patch.object(S, "_jacket_lock_winner", side_effect=fake_jacket), mock.patch.object(
                 S, "rank_candidates_by_visual", side_effect=fake_rank
             ):
                 out = S.apply_visual_rank_to_hit(dict(hit), front, api_key="k")
+            self.assertEqual(len(jacket_calls), 1)
+            self.assertEqual(seen.get("budget"), S.VISUAL_COMPARE_BUDGET)
+            self.assertEqual(seen.get("n"), 2)
             self.assertFalse(out.get("lock_incomplete"))
             self.assertEqual(out.get("code"), "SER-002")
         finally:

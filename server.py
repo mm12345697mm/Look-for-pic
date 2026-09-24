@@ -6051,15 +6051,6 @@ def _visual_rank_blocked(n_coded: int, deadline: float | None = None) -> bool:
     return bool(getattr(_BATCH, "jacket_incomplete", False))
 
 
-def _visual_compare_budget_s() -> float:
-    """Cap a compare at the time this batch actually has left."""
-    budget = float(VISUAL_COMPARE_BUDGET)
-    if not getattr(_BATCH, "active", False):
-        return budget
-    remain = _seconds_left(_batch_deadline())
-    return min(budget, max(1.0, remain - 0.5))
-
-
 def _aligned_jacket_scores(user: Image.Image, cover: Image.Image) -> tuple[float, float]:
     """Frame score, then the person/clothes score at that same window.
 
@@ -6476,8 +6467,9 @@ def apply_visual_rank_to_hit(
         return out
     if deadline is None:
         deadline = _batch_deadline()
-    # A jacket compare that was cut off must not guess a volume.
-    # A shared identify clock is not a reason to skip this lock.
+    # #25 lock stays: jacket winner first, then the full visual compare.
+    # A shared clock must not skip that path or shorten it. A compare that
+    # was cut off still must not guess a volume.
     if _visual_rank_blocked(len(coded), deadline):
         if len(coded) >= 2:
             return _mark_lock_incomplete(hit, coded)
@@ -6486,7 +6478,7 @@ def apply_visual_rank_to_hit(
         user_image_bytes,
         coded,
         api_key=api_key,
-        budget_s=_visual_compare_budget_s(),
+        budget_s=VISUAL_COMPARE_BUDGET,
     )
     if not meta.get("visual_ranked"):
         hit = dict(hit)
@@ -10000,7 +9992,7 @@ def verify_work_against_image(
         image_bytes,
         pool,
         api_key=key,
-        budget_s=_visual_compare_budget_s(),
+        budget_s=VISUAL_COMPARE_BUDGET,
     )
     locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not locked:
@@ -10021,7 +10013,7 @@ def verify_work_against_image(
                 image_bytes,
                 wider,
                 api_key=key,
-                budget_s=_visual_compare_budget_s(),
+                budget_s=VISUAL_COMPARE_BUDGET,
             )
             locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not (meta or {}).get("visual_ranked"):
