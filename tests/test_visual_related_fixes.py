@@ -2660,7 +2660,9 @@ class TestTitleCutAndMultiVisual(unittest.TestCase):
         bus = results[1]
         self.assertEqual(bus.get("code"), "NHDTC-235")
         self.assertEqual(bus.get("title"), self.SIBLING_TITLE)
-        self.assertFalse(bus.get("title_zh"))
+        # The locked sibling must not keep NHDTC-254's Chinese title.
+        # Its own catalog title, when a source has one, is a different string.
+        self.assertNotEqual(bus.get("title_zh") or "", self.NHDTC_ZH)
         self.assertTrue(bus.get("visual_lock"))
         self.assertFalse(bus.get("visual_mismatch"))
         self.assertNotIn("家庭教師", bus.get("theme_keywords") or [])

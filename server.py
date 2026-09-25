@@ -5122,6 +5122,8 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "code": format_display_code(str(code)) if code and parse_code_parts(str(code)) else code,
                 "title": it.get("title"),
                 "title_zh": it.get("title_zh"),
+                "search_elapsed_ms": _elapsed_ms_value(it.get("search_elapsed_ms")),
+                "work_elapsed_ms": _elapsed_ms_value(it.get("work_elapsed_ms")),
                 "actress": it.get("actress"),
                 "actress_zh": it.get("actress_zh"),
                 "cover": it.get("cover"),
@@ -5549,6 +5551,8 @@ def _merge_related_for_cache(prev_items, new_items) -> list:
             "why",
             "keyword_hits",
             "matched_keywords",
+            "search_elapsed_ms",
+            "work_elapsed_ms",
         ):
             if not merged.get(field) and incoming.get(field):
                 merged[field] = incoming[field]
@@ -5566,6 +5570,306 @@ def _item_needs_title_zh(item: dict | None) -> bool:
     if not code or str(code) in ("TITLE-SEARCH", "片名搜尋") or not parse_code_parts(str(code)):
         return False
     return not str(item.get("title_zh") or "").strip()
+
+
+def _title_zh_code_key(code) -> str:
+    raw = str(code or "").strip()
+    if not raw or raw in ("TITLE-SEARCH", "片名搜尋") or not parse_code_parts(raw):
+        return ""
+    return format_display_code(raw)
+
+
+class _JobZhState:
+    def __init__(self) -> None:
+        self.depth = 0
+        self.memo: dict[str, str] = {}
+        self.fetched: set[str] = set()
+
+
+_JOB_ZH = threading.local()
+_SEARCH_ELAPSED = threading.local()
+
+
+def _job_zh_state() -> _JobZhState:
+    st = getattr(_JOB_ZH, "st", None)
+    if st is None:
+        st = _JobZhState()
+        _JOB_ZH.st = st
+    return st
+
+
+def _job_zh_begin() -> None:
+    """Outermost identify owns the Chinese-title memo. Nested slots keep it."""
+    st = _job_zh_state()
+    if st.depth == 0:
+        st.memo.clear()
+        st.fetched.clear()
+    st.depth += 1
+
+
+def _job_zh_end() -> None:
+    st = _job_zh_state()
+    st.depth = max(0, st.depth - 1)
+    if st.depth == 0:
+        st.memo.clear()
+        st.fetched.clear()
+
+
+def _remember_title_zh(code, zh, title_ja=None) -> str | None:
+    """Remember a real Chinese title for this 品番. Never store a translation we made up."""
+    key = _title_zh_code_key(code)
+    cleaned = _clean_title_zh(None if zh is None else str(zh), title_ja=title_ja, code=key or code)
+    if not key or not cleaned:
+        return cleaned
+    if _job_zh_state().depth > 0:
+        _job_zh_state().memo[key] = cleaned
+    return cleaned
+
+
+def _note_title_zh_fetched(code, zh, title_ja=None) -> str | None:
+    key = _title_zh_code_key(code)
+    cleaned = _remember_title_zh(code, zh, title_ja)
+    if key and _job_zh_state().depth > 0:
+        _job_zh_state().fetched.add(key)
+    return cleaned
+
+
+def _memo_title_zh(code) -> str | None:
+    key = _title_zh_code_key(code)
+    if not key or _job_zh_state().depth <= 0:
+        return None
+    return _job_zh_state().memo.get(key)
+
+
+def _title_zh_already_fetched(code) -> bool:
+    key = _title_zh_code_key(code)
+    if not key or _job_zh_state().depth <= 0:
+        return False
+    return key in _job_zh_state().fetched
+
+
+def _cached_title_zh(code) -> str | None:
+    """Chinese title already stored for this 品番. Does not scrape."""
+    key = _title_zh_code_key(code)
+    if not key:
+        return None
+    memo = _memo_title_zh(key)
+    if memo:
+        return memo
+    try:
+        cached = offline_cache_get(code=key)
+    except Exception:
+        cached = None
+    if not isinstance(cached, dict):
+        return None
+    return _remember_title_zh(key, cached.get("title_zh"), cached.get("title"))
+
+
+def _collect_title_zh_items(payload: dict) -> list[dict]:
+    out: list[dict] = []
+    seen: set[int] = set()
+
+    def add(item) -> None:
+        if not isinstance(item, dict):
+            return
+        marker = id(item)
+        if marker in seen:
+            return
+        seen.add(marker)
+        out.append(item)
+
+    add(payload)
+    for key in ("related_by_title", "related", "results", "candidates"):
+        for item in payload.get(key) or []:
+            add(item)
+            if not isinstance(item, dict):
+                continue
+            for subkey in ("related_by_title", "related"):
+                for sub in item.get(subkey) or []:
+                    add(sub)
+    return out
+
+
+def harmonize_batch_title_zh(payload: dict, *, use_cache: bool = False) -> dict:
+    """Give every same-code row in this payload the same Chinese title.
+
+    Sources are titles already on the payload and, during an identify job,
+    fetches from that job. use_cache also reads the offline cache. Nothing
+    is translated or invented.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    items = _collect_title_zh_items(payload)
+    found: dict[str, str] = {}
+    for item in items:
+        key = _title_zh_code_key(item.get("code"))
+        if not key:
+            continue
+        zh = _clean_title_zh(item.get("title_zh"), title_ja=item.get("title"), code=key)
+        if not zh:
+            continue
+        item["title_zh"] = zh
+        found.setdefault(key, zh)
+        _remember_title_zh(key, zh, item.get("title"))
+    pending: list[tuple[dict, str]] = []
+    for item in items:
+        key = _title_zh_code_key(item.get("code"))
+        if not key or not _item_needs_title_zh(item):
+            continue
+        if key in found:
+            item["title_zh"] = found[key]
+            continue
+        pending.append((item, key))
+    for item, key in pending:
+        if str(item.get("title_zh") or "").strip():
+            continue
+        zh = found.get(key) or _memo_title_zh(key)
+        if not zh and use_cache:
+            zh = _cached_title_zh(key)
+        if not zh:
+            continue
+        found[key] = zh
+        item["title_zh"] = zh
+    for item, key in pending:
+        zh = found.get(key)
+        if zh and not str(item.get("title_zh") or "").strip():
+            item["title_zh"] = zh
+    return payload
+
+
+def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
+    """One fetch per 品番 this job has not tried yet, then copy that result."""
+    import time as _time
+
+    if not isinstance(payload, dict):
+        return payload
+    harmonize_batch_title_zh(payload, use_cache=True)
+    t0 = _time.monotonic()
+    seen: set[str] = set()
+    # Mains first, then related slides, so a batch of works is not starved by the carousel.
+    ordered = _collect_title_zh_items(payload)
+    for item in ordered:
+        if not _item_needs_title_zh(item):
+            continue
+        key = _title_zh_code_key(item.get("code"))
+        if not key or key in seen or _title_zh_already_fetched(key):
+            continue
+        if budget_sec and (_time.monotonic() - t0) > float(budget_sec):
+            break
+        seen.add(key)
+        deadline = t0 + float(budget_sec) if budget_sec else None
+        try:
+            zh = resolve_chinese_title(
+                key,
+                title_ja=item.get("title"),
+                existing_zh=item.get("title_zh"),
+                actress_ja=item.get("actress"),
+                deadline=deadline,
+            )
+        except Exception:
+            zh = None
+        _note_title_zh_fetched(key, zh, item.get("title"))
+        if zh:
+            item["title_zh"] = zh
+    return harmonize_batch_title_zh(payload, use_cache=True)
+
+
+def _stamp_multi_batch(payload: dict, job_t0: float, slot_used: dict | None) -> dict:
+    """One Chinese title per 品番, then whole-batch and per-slot elapsed.
+
+    work_elapsed_ms is vision + catalog + jacket lock for that upload.
+    job_elapsed_ms is the whole multi run, including related search.
+    """
+    if not isinstance(payload, dict):
+        return payload
+    try:
+        _fill_unfetched_title_zh(payload, budget_sec=8.0)
+    except Exception:
+        pass
+    try:
+        harmonize_batch_title_zh(payload)
+    except Exception:
+        pass
+    job_ms = max(0, int((time.monotonic() - float(job_t0)) * 1000))
+    payload["job_elapsed_ms"] = job_ms
+    used = slot_used if isinstance(slot_used, dict) else {}
+    rows = payload.get("results") if isinstance(payload.get("results"), list) else []
+    by_index: dict[int, dict] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        idx = row.get("from_image_index")
+        slot_sec = used.get(idx) if isinstance(idx, int) else None
+        if isinstance(slot_sec, (int, float)) and slot_sec >= 0:
+            row["work_elapsed_ms"] = max(0, int(float(slot_sec) * 1000))
+        elif _elapsed_ms_value(row.get("work_elapsed_ms")) is None:
+            row["work_elapsed_ms"] = job_ms
+        row["job_elapsed_ms"] = job_ms
+        if isinstance(idx, int):
+            by_index[idx] = row
+    if rows and isinstance(rows[0], dict):
+        if not payload.get("title_zh") and rows[0].get("title_zh"):
+            payload["title_zh"] = rows[0].get("title_zh")
+        payload["work_elapsed_ms"] = rows[0].get("work_elapsed_ms")
+    elif _elapsed_ms_value(payload.get("work_elapsed_ms")) is None:
+        payload["work_elapsed_ms"] = job_ms
+    for item in payload.get("related") or []:
+        if not isinstance(item, dict):
+            continue
+        src = by_index.get(item.get("from_image_index")) if isinstance(item.get("from_image_index"), int) else None
+        if not isinstance(src, dict):
+            continue
+        if not item.get("title_zh") and src.get("title_zh"):
+            item["title_zh"] = src.get("title_zh")
+        if _elapsed_ms_value(item.get("work_elapsed_ms")) is None:
+            copied = _elapsed_ms_value(src.get("work_elapsed_ms"))
+            if copied is not None:
+                item["work_elapsed_ms"] = copied
+        item["job_elapsed_ms"] = job_ms
+    return payload
+
+
+def _elapsed_ms_value(raw) -> int | None:
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if n < 0:
+        return None
+    return n
+
+
+def _note_search_elapsed(started: float) -> None:
+    ms = max(0, int((time.monotonic() - started) * 1000))
+    _SEARCH_ELAPSED.ms = ms if ms > 0 else 0
+
+
+def _clear_search_elapsed() -> None:
+    _SEARCH_ELAPSED.ms = 0
+
+
+def _current_search_elapsed_ms() -> int | None:
+    ms = getattr(_SEARCH_ELAPSED, "ms", 0) or 0
+    try:
+        n = int(ms)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _stamp_search_elapsed(item: dict, raw: dict | None = None) -> None:
+    if not isinstance(item, dict):
+        return
+    if _elapsed_ms_value(item.get("search_elapsed_ms")) is not None:
+        return
+    src = raw if isinstance(raw, dict) else {}
+    existing = _elapsed_ms_value(src.get("search_elapsed_ms"))
+    if existing is None:
+        existing = _elapsed_ms_value(src.get("work_elapsed_ms"))
+    if existing is None:
+        existing = _current_search_elapsed_ms()
+    if existing is not None:
+        item["search_elapsed_ms"] = existing
 
 
 def _payload_needs_title_zh(payload: dict) -> bool:
@@ -5826,6 +6130,8 @@ def _offline_cache_build_value(payload: dict) -> dict:
         "code": display,
         "title": payload.get("title"),
         "title_zh": payload.get("title_zh"),
+        "job_elapsed_ms": _elapsed_ms_value(payload.get("job_elapsed_ms")),
+        "work_elapsed_ms": _elapsed_ms_value(payload.get("work_elapsed_ms")),
         "actress": payload.get("actress"),
         "actress_zh": payload.get("actress_zh"),
         "studio": payload.get("studio"),
@@ -6005,6 +6311,8 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                     for field in (
                         "title",
                         "title_zh",
+                        "job_elapsed_ms",
+                        "work_elapsed_ms",
                         "actress",
                         "studio",
                         "cid",
@@ -6331,6 +6639,9 @@ def identify_code(
         ):
             title_zh = None
             actress_zh = None
+        known_zh = _memo_title_zh(display)
+        if known_zh and not title_zh:
+            title_zh = known_zh
         title_zh = resolve_chinese_title(
             display,
             title_ja=title,
@@ -6338,6 +6649,7 @@ def identify_code(
             actress_ja=actress,
             catalog_out=catalog_zh,
         )
+        _note_title_zh_fetched(display, title_zh, title)
         if not str(actress_zh or "").strip():
             actress_zh = catalog_zh.get("actress_zh")
     except Exception:
@@ -7517,6 +7829,7 @@ def fetch_public_zh_catalog(
     title_ja: str | None = None,
     page_limit: int | None = None,
     timeout: float = 8.0,
+    deadline: float | None = None,
 ) -> dict:
     """品番 lookup for a Chinese title, actress name, genre tags, series, and cover.
 
@@ -7557,13 +7870,21 @@ def fetch_public_zh_catalog(
             break
         if fetches >= _ZH_CATALOG_FETCH_CAP:
             break
+        remain = None
+        if deadline is not None:
+            remain = float(deadline) - time.monotonic()
+            if remain < 0.4:
+                break
         fetches += 1
         if "/cn/" in url:
             saw_cn = True
         if "jable.tv" in url:
             saw_jable = True
+        req_timeout = float(timeout)
+        if remain is not None:
+            req_timeout = min(req_timeout, remain)
         try:
-            html = http_get(url, timeout=timeout, connect_timeout=min(2.0, timeout))
+            html = http_get(url, timeout=req_timeout, connect_timeout=min(2.0, req_timeout))
         except Exception:
             html = None
         if not html:
@@ -7786,6 +8107,7 @@ def enrich_related_public_catalog(
 
     if not isinstance(payload, dict):
         return payload
+    harmonize_batch_title_zh(payload)
     t0 = _time.monotonic()
     fetches = 0
     rows: list[dict] = [payload]
@@ -7801,21 +8123,33 @@ def enrich_related_public_catalog(
             if isinstance(rel, dict):
                 rows.append(rel)
     seen: set[str] = set()
+    donors: dict[str, dict] = {}
     for item in rows:
-        if fetches >= max_fetches:
-            break
-        if budget_sec and (_time.monotonic() - t0) > float(budget_sec):
-            break
         code = str(item.get("code") or "").strip()
-        if code and parse_code_parts(code):
-            disp = format_display_code(code)
-            if disp in seen:
-                continue
-        if not enrich_coded_work_from_public_catalog(item):
+        disp = format_display_code(code) if code and parse_code_parts(code) else ""
+        if disp and disp in donors and _item_needs_title_zh(item):
+            donor_zh = donors[disp].get("title_zh")
+            if donor_zh:
+                item["title_zh"] = donor_zh
+        if disp and str(item.get("title_zh") or "").strip():
+            donors.setdefault(disp, item)
+            _remember_title_zh(disp, item.get("title_zh"), item.get("title"))
+        over_budget = bool(budget_sec and (_time.monotonic() - t0) > float(budget_sec))
+        if fetches >= max_fetches or over_budget:
             continue
-        if code and parse_code_parts(code):
-            seen.add(format_display_code(code))
+        if disp and disp in seen:
+            continue
+        if not enrich_coded_work_from_public_catalog(item):
+            if disp and str(item.get("title_zh") or "").strip():
+                donors[disp] = item
+            continue
+        if disp:
+            seen.add(disp)
+            if str(item.get("title_zh") or "").strip():
+                donors[disp] = item
+                _remember_title_zh(disp, item.get("title_zh"), item.get("title"))
         fetches += 1
+    harmonize_batch_title_zh(payload)
     rows = payload.get("related_by_title")
     if isinstance(rows, list):
         if bucket_cap:
@@ -7833,6 +8167,7 @@ def resolve_chinese_title(
     user_title: str | None = None,
     actress_ja: str | None = None,
     catalog_out: dict | None = None,
+    deadline: float | None = None,
 ) -> str | None:
     """Resolve a Chinese title from public catalogs.
 
@@ -7855,7 +8190,10 @@ def resolve_chinese_title(
         if isinstance(catalog_out, dict) and code and parse_code_parts(str(code)):
             try:
                 meta = fetch_public_zh_catalog(
-                    str(code), actress_ja=actress_ja, title_ja=title_ja
+                    str(code),
+                    actress_ja=actress_ja,
+                    title_ja=title_ja,
+                    deadline=deadline,
                 )
             except Exception:
                 meta = {}
@@ -7870,9 +8208,14 @@ def resolve_chinese_title(
         return None  # caller already showing Chinese as main title
     if not code or not parse_code_parts(str(code)):
         return None
+    if deadline is not None and (float(deadline) - time.monotonic()) < 0.4:
+        return None
     try:
         meta = fetch_public_zh_catalog(
-            str(code), actress_ja=actress_ja, title_ja=title_ja
+            str(code),
+            actress_ja=actress_ja,
+            title_ja=title_ja,
+            deadline=deadline,
         )
     except Exception:
         meta = {}
@@ -7901,6 +8244,8 @@ def attach_chinese_titles(
 
     related_network=True: also try related slides, but with a hard wall-clock
     budget so MissAV/Jable/JAVLibrary stalls cannot wipe the whole identify.
+    The budget stops new scrapes. It does not skip a 品番 whose Chinese title
+    was already fetched for another row in this payload or job.
     The same page's genre tags and series name are stored for theme chips.
     Nothing is invented when a page has no Chinese title, billing, or tags.
     """
@@ -7908,29 +8253,46 @@ def attach_chinese_titles(
 
     if not isinstance(payload, dict):
         return payload
+    # Spread titles already on this payload before any scrape.
+    harmonize_batch_title_zh(payload)
     code = payload.get("code")
     if code and (str(code) == "TITLE-SEARCH" or not parse_code_parts(str(code))):
         code = None
-    if not payload.get("title_zh"):
-        catalog_out: dict = {}
-        try:
-            zh = resolve_chinese_title(
-                str(code) if code else None,
-                title_ja=payload.get("title"),
-                existing_zh=payload.get("title_zh"),
-                user_title=payload.get("user_title") or payload.get("query_title"),
-                actress_ja=payload.get("actress"),
-                catalog_out=catalog_out,
-            )
-        except Exception:
-            zh = None
-            catalog_out = {}
+
+    def _apply_resolved(item: dict, zh, catalog_out: dict) -> None:
         if zh:
-            payload["title_zh"] = zh
-        _apply_catalog_actress(payload, catalog_out)
-        _merge_public_catalog_theme(payload, catalog_out)
-        _apply_public_cover_fallback(payload, catalog_out)
+            item["title_zh"] = zh
+            _note_title_zh_fetched(item.get("code"), zh, item.get("title"))
+        elif item.get("code"):
+            _note_title_zh_fetched(item.get("code"), None, item.get("title"))
+        _apply_catalog_actress(item, catalog_out)
+        _merge_public_catalog_theme(item, catalog_out)
+        _apply_public_cover_fallback(item, catalog_out)
+
+    if not payload.get("title_zh"):
+        known = _memo_title_zh(code) if code else None
+        if known:
+            payload["title_zh"] = known
+        else:
+            catalog_out: dict = {}
+            try:
+                zh = resolve_chinese_title(
+                    str(code) if code else None,
+                    title_ja=payload.get("title"),
+                    existing_zh=payload.get("title_zh"),
+                    user_title=payload.get("user_title") or payload.get("query_title"),
+                    actress_ja=payload.get("actress"),
+                    catalog_out=catalog_out,
+                )
+            except Exception:
+                zh = None
+                catalog_out = {}
+            _apply_resolved(payload, zh, catalog_out)
+    else:
+        _remember_title_zh(payload.get("code"), payload.get("title_zh"), payload.get("title"))
     t_rel0 = _time.monotonic()
+    deadline = (t_rel0 + float(related_budget_sec)) if related_budget_sec else None
+    network_open = True
     for key in ("related_by_title", "related"):
         items = payload.get(key)
         if not isinstance(items, list):
@@ -7938,20 +8300,31 @@ def attach_chinese_titles(
         for item in items:
             if not isinstance(item, dict):
                 continue
-            # Normalize passthrough
             if item.get("title_zh"):
                 item["title_zh"] = _clean_title_zh(
                     str(item.get("title_zh")),
                     title_ja=item.get("title"),
                     code=item.get("code"),
                 ) or item.get("title_zh")
+                _remember_title_zh(item.get("code"), item.get("title_zh"), item.get("title"))
+                continue
+            known = _memo_title_zh(item.get("code"))
+            if known:
+                item["title_zh"] = known
+                continue
+            # A sibling row in this payload may already have carried the title.
+            harmonize_batch_title_zh(payload)
+            if str(item.get("title_zh") or "").strip():
                 continue
             if not related_network:
                 continue
-            if related_budget_sec and (_time.monotonic() - t_rel0) > float(related_budget_sec):
-                break
             icode = item.get("code")
             if not icode or not parse_code_parts(str(icode)):
+                continue
+            if not network_open:
+                continue
+            if deadline is not None and _time.monotonic() > deadline:
+                network_open = False
                 continue
             catalog_out = {}
             try:
@@ -7961,16 +8334,13 @@ def attach_chinese_titles(
                     existing_zh=item.get("title_zh"),
                     actress_ja=item.get("actress"),
                     catalog_out=catalog_out,
+                    deadline=deadline,
                 )
             except Exception:
                 zh = None
                 catalog_out = {}
-            if zh:
-                item["title_zh"] = zh
-            _apply_catalog_actress(item, catalog_out)
-            _merge_public_catalog_theme(item, catalog_out)
-            _apply_public_cover_fallback(item, catalog_out)
-    return payload
+            _apply_resolved(item, zh, catalog_out)
+    return harmonize_batch_title_zh(payload)
 
 
 def _title_related_keyword_queries(title: str) -> list[str]:
@@ -10846,6 +11216,7 @@ def find_related_by_title(
         item = enrich_title_candidate(raw, why=why)
         item["line"] = line
         item["why"] = why
+        _stamp_search_elapsed(item, raw)
         if line == "keyword":
             matched = raw.get("matched_keywords") or raw.get("hit_keywords")
             if not isinstance(matched, list) or not matched:
@@ -10862,10 +11233,12 @@ def find_related_by_title(
     # --- 1) Title / same-series (cap 5, no pad) ---
     hit = None
     if fill_theme and _left_title() > 1.0:
+        _search_t = time.monotonic()
         try:
             hit = search_by_title(title, actress=actress)
         except Exception:
             hit = None
+        _note_search_elapsed(_search_t)
     if hit:
         cands = list(hit.get("candidates") or [])
         if hit.get("code") and parse_code_parts(str(hit["code"])):
@@ -10907,8 +11280,10 @@ def find_related_by_title(
             _push(c, why="片名相近", line="theme")
             if sum(1 for x in out if str(x.get("line")) == "theme") >= title_cap:
                 break
+        _clear_search_elapsed()
 
     # Sibling phrase catalog search (series templates / mid-title hooks)
+    _clear_search_elapsed()
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
     if fill_theme and theme_n < title_cap and _left_title() > 1.2:
         queries: list[str] = []
@@ -10922,6 +11297,7 @@ def find_related_by_title(
             if q and q not in queries:
                 queries.append(q)
         ranked2: list[tuple[float, dict]] = []
+        _phrase_t = time.monotonic()
         for q in queries[:10]:
             if theme_n >= title_cap or _left_title() < 0.8:
                 break
@@ -10949,11 +11325,13 @@ def find_related_by_title(
         if ranked2:
             top = ranked2[0][0]
             ranked2 = [x for x in ranked2 if x[0] >= max(0.48, top - 0.22)]
+        _note_search_elapsed(_phrase_t)
         for _sc, c in ranked2:
             _push(c, why="片名相近", line="theme")
             theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
             if theme_n >= title_cap:
                 break
+        _clear_search_elapsed()
 
     # Demo theme package ONLY for the MIDA-616 offline demo path
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
@@ -10980,7 +11358,8 @@ def find_related_by_title(
     if fill_keyword and keywords and keyword_have < keyword_cap:
         try:
             kw_budget = max(RELATED_KEYWORD_BUDGET, min(6.0, max(0.0, _left())))
-            for r in _find_related_by_keywords(
+            _kw_t = time.monotonic()
+            _kw_rows = _find_related_by_keywords(
                 title,
                 exclude_code=exclude or None,
                 actress=actress,
@@ -10989,7 +11368,9 @@ def find_related_by_title(
                 already=seen,
                 auto_keywords=keywords,
                 series=series_s or None,
-            ):
+            )
+            _note_search_elapsed(_kw_t)
+            for r in _kw_rows:
                 # Keep this bucket independent. A fragment such as 肉欲教育ママ used
                 # to be relabeled 片名相近 because containment similarity is ~0.92,
                 # which emptied 關鍵字 on the DANDY tutor-title path (hint became
@@ -10998,8 +11379,9 @@ def find_related_by_title(
                 keyword_items_added += 1
                 if keyword_items_added >= keyword_cap:
                     break
+            _clear_search_elapsed()
         except Exception:
-            pass
+            _clear_search_elapsed()
 
     theme_n = sum(1 for x in out if str(x.get("line")) == "theme")
     keyword_n = sum(1 for x in out if str(x.get("line")) == "keyword")
@@ -11008,18 +11390,22 @@ def find_related_by_title(
     # Dedicated budget: title/keyword overruns must not skip 同女優.
     if fill_actress and (actress or "").strip():
         try:
-            for r in _find_related_by_actress(
+            _act_t = time.monotonic()
+            _act_rows = _find_related_by_actress(
                 actress,
                 exclude_code=exclude or None,
                 max_n=actress_cap,
                 budget_sec=4.0,
                 already=seen,
-            ):
+            )
+            _note_search_elapsed(_act_t)
+            for r in _act_rows:
                 _push(r, why=str(r.get("why") or "同演員"), line="actress")
                 if sum(1 for x in out if str(x.get("line")) == "actress") >= actress_cap:
                     break
+            _clear_search_elapsed()
         except Exception:
-            pass
+            _clear_search_elapsed()
 
     # Demo actress siblings for MIDA when online actress search is empty
     if (
@@ -11377,7 +11763,13 @@ def verify_work_against_image(
     if prev and new and prev != new:
         winner = ranked[0] if ranked else {}
         # Do not keep the rejected work's Chinese title, stills, or related row.
-        out["title_zh"] = (winner.get("title_zh") if isinstance(winner, dict) else None) or None
+        # A title already resolved for the winning 品番 is kept. Nothing is invented.
+        zh = None
+        if isinstance(winner, dict):
+            zh = _clean_title_zh(winner.get("title_zh"), title_ja=winner.get("title"), code=new)
+        if not zh:
+            zh = _memo_title_zh(new)
+        out["title_zh"] = zh
         out["stills"] = list((winner.get("stills") if isinstance(winner, dict) else None) or [])
         out["related_by_title"] = []
         out["related"] = []
@@ -12327,6 +12719,34 @@ def run_multi_identify_pipeline(
         return _lock_identify_payload_media(result), status
 
     n = len(images)
+    job_t0 = time.monotonic()
+    # One memo for every slot. Each slot's pipeline nests and must not clear it.
+    _job_zh_begin()
+    try:
+        return _run_multi_identify_pipeline_inner(
+            images,
+            user_code=user_code,
+            user_title=user_title,
+            on_progress=on_progress,
+            job_id=job_id,
+            job_t0=job_t0,
+        )
+    finally:
+        _job_zh_end()
+
+
+def _run_multi_identify_pipeline_inner(
+    images: list[tuple[bytes, str | None]],
+    *,
+    user_code: str = "",
+    user_title: str = "",
+    on_progress=None,
+    job_id: str | None = None,
+    job_t0: float | None = None,
+) -> tuple[dict, int]:
+    n = len(images)
+    if job_t0 is None:
+        job_t0 = time.monotonic()
     api_key = get_gemini_api_key()
     # Active seconds spent on each image (vision + catalog + jacket lock).
     # Other images do not spend this clock. Related uses the remainder of
@@ -12971,9 +13391,13 @@ def run_multi_identify_pipeline(
         _progress(on_progress, "search", "error", "查詢後無有效作品", 0.8)
         _progress(on_progress, "done", "error", "失敗", 1.0)
         return (
-            empty_identify(
-                message=f"已看 {n} 張圖，查詢後無有效作品",
-                vision_used=any(r.get("vision_used") for r in vision_rows),
+            _stamp_multi_batch(
+                empty_identify(
+                    message=f"已看 {n} 張圖，查詢後無有效作品",
+                    vision_used=any(r.get("vision_used") for r in vision_rows),
+                ),
+                job_t0,
+                slot_used,
             ),
             200,
         )
@@ -13019,6 +13443,7 @@ def run_multi_identify_pipeline(
             {
                 "code": r.get("code"),
                 "title": r.get("title"),
+                "title_zh": r.get("title_zh"),
                 "actress": r.get("actress"),
                 "studio": r.get("studio"),
                 "cid": r.get("cid"),
@@ -13043,6 +13468,7 @@ def run_multi_identify_pipeline(
         "result_count": len(results),
         "code": main.get("code"),
         "title": main.get("title"),
+        "title_zh": main.get("title_zh"),
         "actress": main.get("actress"),
         "studio": main.get("studio"),
         "cid": main.get("cid"),
@@ -13120,6 +13546,7 @@ def run_multi_identify_pipeline(
     _progress(on_progress, "done", "done", done_detail, 1.0)
     _lock_identify_payload_media(payload)
     _attach_saved_session(payload, _frames_from_multi(vision_rows, results))
+    _stamp_multi_batch(payload, job_t0, slot_used)
     return payload, 200
 
 
@@ -13172,6 +13599,7 @@ def _progress(
             "status": status,
             "detail": detail or "",
             "progress": round(float(progress), 3),
+            "t_ms": int(time.monotonic() * 1000),
         }
         if phase:
             evt["phase"] = phase
@@ -13194,6 +13622,7 @@ def _payload_as_visual_candidate(payload: dict) -> dict | None:
     return {
         "code": format_display_code(code),
         "title": payload.get("title"),
+        "title_zh": payload.get("title_zh"),
         "actress": payload.get("actress"),
         "studio": payload.get("studio"),
         "cid": payload.get("cid"),
@@ -13400,6 +13829,32 @@ def run_identify_pipeline(
     on_progress=None,
     skip_related: bool = False,
 ) -> tuple[dict, int]:
+    """Shared identify entry. Nested multi slots keep one Chinese-title memo."""
+    _job_zh_begin()
+    try:
+        return _run_identify_pipeline_inner(
+            image_bytes=image_bytes,
+            filename=filename,
+            user_code=user_code,
+            user_title=user_title,
+            user_actress=user_actress,
+            on_progress=on_progress,
+            skip_related=skip_related,
+        )
+    finally:
+        _job_zh_end()
+
+
+def _run_identify_pipeline_inner(
+    *,
+    image_bytes: bytes | None = None,
+    filename: str | None = None,
+    user_code: str = "",
+    user_title: str = "",
+    user_actress: str = "",
+    on_progress=None,
+    skip_related: bool = False,
+) -> tuple[dict, int]:
     """
     Shared identify logic for JSON and SSE endpoints.
     Returns (payload_dict, http_status).
@@ -13450,7 +13905,7 @@ def run_identify_pipeline(
     def _finish(payload: dict, extras: list | None = None) -> dict:
         remaining = SLOT_WORK_BUDGET_S - (time.monotonic() - slot_t0)
         budget = remaining if remaining > 16.0 else 16.0
-        return _complete_identify_result(
+        done = _complete_identify_result(
             payload,
             image_bytes=image_bytes,
             api_key=api_key,
@@ -13459,6 +13914,23 @@ def run_identify_pipeline(
             image_hash=img_hash,
             related_budget_sec=budget,
         )
+        if isinstance(done, dict) and not skip_related:
+            try:
+                _fill_unfetched_title_zh(done, budget_sec=6.0)
+            except Exception:
+                pass
+        if isinstance(done, dict):
+            ms = max(0, int((time.monotonic() - slot_t0) * 1000))
+            done["work_elapsed_ms"] = ms
+            done["job_elapsed_ms"] = ms
+        return done
+
+    def _stamp_elapsed(payload):
+        if isinstance(payload, dict):
+            ms = max(0, int((time.monotonic() - slot_t0) * 1000))
+            payload["work_elapsed_ms"] = ms
+            payload["job_elapsed_ms"] = ms
+        return payload
     # Same screenshot may reuse catalog fields, but must re-check cover + stills
     # against this upload. A previous 僅排序未鎖定 must not be replayed as-is.
     if img_hash and not code and not user_title:
@@ -13489,7 +13961,7 @@ def run_identify_pipeline(
                     5 / 6,
                 )
                 _progress(on_progress, "done", "done", "完成（同圖視覺重核）", 1.0)
-                return refreshed, 200
+                return _stamp_elapsed(refreshed), 200
             if not (api_key or "").strip() and _upload_matches_cached_cover(image_bytes, cached_img):
                 # No vision key: keep the cache only when the jacket still matches.
                 _progress(on_progress, "vision", "skipped", "離線快取（同圖）", 2 / 6)
@@ -13497,7 +13969,7 @@ def run_identify_pipeline(
                 _progress(on_progress, "search", "done", "離線快取", 4 / 6)
                 _progress(on_progress, "cover", "done" if cached_img.get("cover") else "skipped", "封面（快取）", 5 / 6)
                 _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
-                return cached_img, 200
+                return _stamp_elapsed(cached_img), 200
             # Key present but this cached row did not lock: search again.
 
     # Manual code: try offline cache before vision/network (fast path)
@@ -13521,7 +13993,7 @@ def run_identify_pipeline(
             cached_code.setdefault("related_by_title", cached_code.get("related_by_title") or [])
             cached_code = enrich_offline_cache_hit(cached_code)
             _progress(on_progress, "done", "done", "完成（離線快取）", 1.0)
-            return cached_code, 200
+            return _stamp_elapsed(cached_code), 200
 
     # Step 2: vision (or skip)
     if image_bytes is not None:

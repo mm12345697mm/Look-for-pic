@@ -160,6 +160,8 @@
       matched_keywords: normalizeKeywordList(
         r.matched_keywords || r.matchedKeywords || r.hit_keywords || r.hitKeywords
       ),
+      search_elapsed_ms: elapsedMsValue(r.search_elapsed_ms != null ? r.search_elapsed_ms : r.searchElapsedMs),
+      work_elapsed_ms: elapsedMsValue(r.work_elapsed_ms != null ? r.work_elapsed_ms : r.workElapsedMs),
     }));
   }
 
@@ -589,6 +591,10 @@
       skipped: skippedSlot,
       user_preview: String(src.user_preview || src.userPreview || '').trim(),
       from_image_index: src.from_image_index || src.fromImageIndex || null,
+      job_elapsed_ms: skippedSlot
+        ? null
+        : firstElapsed(src.job_elapsed_ms, src.jobElapsedMs, fb.job_elapsed_ms, fb.jobElapsedMs),
+      work_elapsed_ms: skippedSlot ? null : firstElapsed(src.work_elapsed_ms, src.workElapsedMs),
     };
   }
 
@@ -1198,7 +1204,37 @@
       ),
       visualMismatch: !!(raw.visual_mismatch || raw.visualMismatch),
       visualNote: String(raw.visual_note || raw.visualNote || '').trim(),
+      jobElapsedMs: elapsedMsValue(raw.job_elapsed_ms != null ? raw.job_elapsed_ms : raw.jobElapsedMs),
+      workElapsedMs: elapsedMsValue(raw.work_elapsed_ms != null ? raw.work_elapsed_ms : raw.workElapsedMs),
+      searchElapsedMs: elapsedMsValue(
+        raw.search_elapsed_ms != null ? raw.search_elapsed_ms : raw.searchElapsedMs
+      ),
     };
+  }
+
+  function elapsedMsValue(raw) {
+    if (raw == null || raw === '') return null;
+    const n = Number(raw);
+    if (!Number.isFinite(n) || n < 0) return null;
+    return Math.floor(n);
+  }
+
+  function firstElapsed() {
+    for (let i = 0; i < arguments.length; i++) {
+      const n = elapsedMsValue(arguments[i]);
+      if (n != null) return n;
+    }
+    return null;
+  }
+
+  function formatHms(ms) {
+    const n = Math.max(0, Math.floor(Number(ms) || 0));
+    const total = Math.floor(n / 1000);
+    const h = Math.floor(total / 3600);
+    const m = Math.floor((total % 3600) / 60);
+    const s = total % 60;
+    const pad = (x) => (x < 10 ? '0' : '') + x;
+    return pad(Math.min(h, 99)) + ':' + pad(m) + ':' + pad(s);
   }
 
   const DEFAULT_STEPS = [
@@ -1212,6 +1248,9 @@
   ];
 
   let progressState = {};
+  let stepClocks = {};
+  let stepClockTimer = 0;
+  let clientJobStartedAt = 0;
   let progressLabels = {};
   let progressCollapsed = false;
   let progressCurrentLine = '準備中…';
@@ -1379,6 +1418,95 @@
     resetProgressHigh('');
     progressHigh.epoch = progressEpoch;
     progressHigh.runImageCount = count > 0 ? count : 0;
+    clientJobStartedAt = Date.now();
+  }
+
+  function findStepTimer(li) {
+    if (!li) return null;
+    if (li.querySelector) {
+      const hit = li.querySelector('.step-timer');
+      if (hit) return hit;
+    }
+    return (
+      Array.from(li.children || []).find((n) => {
+        if (!n) return false;
+        if (n.classList && n.classList.contains('step-timer')) return true;
+        return String(n.className || '').indexOf('step-timer') !== -1;
+      }) || null
+    );
+  }
+
+  function paintStepTimer(stepId) {
+    const li = findStepRow(progressStepsEl, stepId);
+    const el = findStepTimer(li);
+    if (!el) return;
+    const clock = stepClocks[stepId];
+    let ms = 0;
+    if (clock && clock.state === 'running') ms = Math.max(0, Date.now() - clock.startedAt);
+    else if (clock && clock.state === 'frozen') ms = clock.frozenMs || 0;
+    el.textContent = formatHms(ms);
+  }
+
+  function startStepClock(stepId, evt) {
+    const clock = stepClocks[stepId];
+    if (clock && (clock.state === 'running' || clock.state === 'frozen')) return;
+    stepClocks[stepId] = {
+      state: 'running',
+      startedAt: Date.now(),
+      frozenMs: 0,
+      serverMark: evt && typeof evt.t_ms === 'number' ? evt.t_ms : null,
+    };
+    ensureStepClockTicker();
+  }
+
+  function freezeStepClock(stepId, evt) {
+    const clock = stepClocks[stepId];
+    if (clock && clock.state === 'frozen') return;
+    let ms = 0;
+    if (clock && clock.state === 'running') {
+      const serverEnd = evt && typeof evt.t_ms === 'number' ? evt.t_ms : null;
+      if (clock.serverMark != null && serverEnd != null && serverEnd >= clock.serverMark) {
+        ms = serverEnd - clock.serverMark;
+      } else {
+        ms = Math.max(0, Date.now() - clock.startedAt);
+      }
+    }
+    stepClocks[stepId] = { state: 'frozen', frozenMs: ms, startedAt: 0, serverMark: null };
+  }
+
+  function tickStepClocks() {
+    Object.keys(stepClocks).forEach((id) => {
+      if (stepClocks[id] && stepClocks[id].state === 'running') paintStepTimer(id);
+    });
+  }
+
+  function ensureStepClockTicker() {
+    if (stepClockTimer) return;
+    if (typeof setInterval !== 'function') return;
+    stepClockTimer = setInterval(tickStepClocks, 1000);
+  }
+
+  function stampLiveJobElapsed(data) {
+    if (!data || typeof data !== 'object') return;
+    const live = clientJobStartedAt > 0 ? Math.max(0, Date.now() - clientJobStartedAt) : null;
+    if (live == null) return;
+    if (elapsedMsValue(data.job_elapsed_ms) == null && elapsedMsValue(data.jobElapsedMs) == null) {
+      data.job_elapsed_ms = live;
+    }
+    const job = elapsedMsValue(data.job_elapsed_ms);
+    const rows = Array.isArray(data.results) ? data.results : null;
+    if (rows && rows.length) {
+      rows.forEach((row) => {
+        if (!row || typeof row !== 'object') return;
+        if (elapsedMsValue(row.job_elapsed_ms) == null) row.job_elapsed_ms = job;
+        if (rows.length === 1 && elapsedMsValue(row.work_elapsed_ms) == null) row.work_elapsed_ms = job;
+      });
+      if (elapsedMsValue(data.work_elapsed_ms) == null && rows[0]) {
+        data.work_elapsed_ms = rows[0].work_elapsed_ms;
+      }
+    } else if (elapsedMsValue(data.work_elapsed_ms) == null && job != null) {
+      data.work_elapsed_ms = job;
+    }
   }
 
   function bindIdentifyJob(jobId) {
@@ -1534,6 +1662,7 @@
     progressHigh.runImageCount = passed > 0 ? passed : fromSteps > 0 ? fromSteps : 0;
     const list = steps && steps.length ? steps : DEFAULT_STEPS;
     progressState = {};
+    stepClocks = {};
     progressLabels = {};
     progressFinished = false;
     progressPanel.classList.remove('is-complete', 'is-failed');
@@ -1547,7 +1676,24 @@
       li.innerHTML =
         '<span class="step-mark" aria-hidden="true"></span>' +
         '<span class="step-label">' + escapeHtml(s.label) + '</span>' +
+        '<span class="step-timer">00:00:00</span>' +
         '<span class="step-phase" hidden></span>';
+      const mark = document.createElement('span');
+      mark.className = 'step-mark';
+      mark.setAttribute('aria-hidden', 'true');
+      const label = document.createElement('span');
+      label.className = 'step-label';
+      label.textContent = s.label;
+      const timer = document.createElement('span');
+      timer.className = 'step-timer';
+      timer.textContent = '00:00:00';
+      const phase = document.createElement('span');
+      phase.className = 'step-phase';
+      phase.hidden = true;
+      li.appendChild(mark);
+      li.appendChild(label);
+      li.appendChild(timer);
+      li.appendChild(phase);
       progressStepsEl.appendChild(li);
     });
     progressDetailEl.textContent = '';
@@ -1576,20 +1722,38 @@
         if (row !== li) setStepPhase(row, '');
       });
     }
-    if (status === 'active' || status === 'done') {
+    if (status === 'active' || status === 'done' || status === 'skipped') {
       const ids = listStepRows(progressStepsEl).map((n) => n.dataset.step);
       const idx = ids.indexOf(step);
       for (let i = 0; i < idx; i++) {
-        if (progressState[ids[i]] === 'pending') {
-          progressState[ids[i]] = 'done';
-          const prev = findStepRow(progressStepsEl, ids[i]);
+        const prevId = ids[i];
+        const prevState = progressState[prevId];
+        if (prevState === 'error' || prevState === 'skipped') continue;
+        if (prevState === 'pending') {
+          progressState[prevId] = 'done';
+          const prev = findStepRow(progressStepsEl, prevId);
           if (prev) {
             prev.className = 'progress-step is-done';
             setStepPhase(prev, '');
           }
         }
+        const clock = stepClocks[prevId];
+        if (!clock || clock.state === 'running') {
+          // Freeze a step that already started. Leave its phase label alone:
+          // 封面鎖定 stays beside that row after the batch moves on.
+          if (clock && clock.state === 'running') {
+            freezeStepClock(prevId, evt);
+            paintStepTimer(prevId);
+          } else if (prevState === 'pending') {
+            freezeStepClock(prevId, evt);
+            paintStepTimer(prevId);
+          }
+        }
       }
     }
+    if (status === 'active') startStepClock(step, evt);
+    else if (status === 'done' || status === 'skipped' || status === 'error') freezeStepClock(step, evt);
+    paintStepTimer(step);
     if (evt.detail) {
       progressDetailEl.textContent = String(evt.detail);
     }
@@ -1985,6 +2149,8 @@
     next.line = at === 0 ? 'main' : 'multi';
     next.skipped = false;
     next.ok = src.ok !== false;
+    const batchJob = firstElapsed(prev.job_elapsed_ms, prev.jobElapsedMs, base.job_elapsed_ms, base.jobElapsedMs);
+    if (batchJob != null) next.job_elapsed_ms = batchJob;
     if (!next.user_preview && prev.user_preview) next.user_preview = prev.user_preview;
     const preview = String(next.user_preview || prev.user_preview || '');
     const cover = String(next.cover || '');
@@ -2038,6 +2204,31 @@
     return { visible: true, index: index, total: denom };
   }
 
+  function titleZhKey(code) {
+    const raw = String(code || '').trim();
+    if (!raw || !parseCodeParts(raw)) return '';
+    return formatDisplayCode(raw);
+  }
+
+  function harmonizeGalleryTitleZh(items) {
+    const found = {};
+    function remember(work) {
+      if (!work) return;
+      const key = titleZhKey(work.code);
+      const zh = String(work.titleZh || work.title_zh || '').trim();
+      if (key && zh && !found[key]) found[key] = zh;
+      (work.relatedByTitle || []).forEach(remember);
+    }
+    (items || []).forEach(remember);
+    function fill(work) {
+      if (!work) return;
+      const key = titleZhKey(work.code);
+      if (key && found[key] && !String(work.titleZh || '').trim()) work.titleZh = found[key];
+      (work.relatedByTitle || []).forEach(fill);
+    }
+    (items || []).forEach(fill);
+  }
+
   function galleryFromIdentify(data) {
     const seenCodes = new Set();
 
@@ -2066,6 +2257,7 @@
         copyKeywordFields(w, (data.results && data.results[i]) || null);
         if (i === 0) copyKeywordFields(w, data);
       });
+      harmonizeGalleryTitleZh(items);
       let notice = data.related_note || data.message || null;
       return { items: items, notice: noticeForGallery(data, items, notice), source: 'api' };
     }
@@ -2100,6 +2292,7 @@
     if (main.titleOnly && items.length < 2) {
       notice = (notice ? notice + ' ' : '') + '尚無封面；請手動輸入正確番號。';
     }
+    harmonizeGalleryTitleZh(items);
     return {
       items,
       notice: noticeForGallery(data, items, notice),
@@ -2382,15 +2575,57 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap));
+    const retryBtn = w.skipped || originalSlotFile(w) ? buildReidentifyButton(w) : null;
+    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap, retryBtn));
+    else if (retryBtn) {
+      const bar = document.createElement('div');
+      bar.className = 'work-actions';
+      bar.appendChild(retryBtn);
+      card.appendChild(bar);
+    }
     card.appendChild(coverWrap);
     if (workNeedsManualFix(w)) {
       card.appendChild(buildManualFixPanel(w, card));
     }
-    if (w.skipped || originalSlotFile(w)) card.appendChild(buildReidentifyButton(w));
     if (!w.skipped) appendStillsScroll(card, w, '劇照（橫滑）');
+    const times = buildWorkTimes(w);
+    if (times) card.appendChild(times);
     if (w.skipped) card.classList.add('is-skipped');
     return card;
+  }
+
+  function buildTimeChip(label, ms) {
+    const el = document.createElement('p');
+    el.className = 'work-time';
+    const name = document.createElement('span');
+    name.className = 'work-time-label';
+    name.textContent = label;
+    const val = document.createElement('span');
+    val.className = 'work-time-value';
+    val.textContent = formatHms(ms);
+    el.appendChild(name);
+    el.appendChild(val);
+    return el;
+  }
+
+  function buildWorkTimes(w) {
+    if (!w || w.skipped) return null;
+    const row = document.createElement('div');
+    row.className = 'work-times';
+    if (isRelatedCarouselLine(String(w.line || ''))) {
+      const search = elapsedMsValue(w.searchElapsedMs);
+      const single = elapsedMsValue(w.workElapsedMs);
+      const show = search != null ? search : single;
+      if (show == null) return null;
+      row.appendChild(buildTimeChip('過去識別＋搜索時間', show));
+      return row;
+    }
+    const job = elapsedMsValue(w.jobElapsedMs);
+    const single = elapsedMsValue(w.workElapsedMs);
+    if (job == null && single == null) return null;
+    if (job != null) row.appendChild(buildTimeChip('總時間', job));
+    if (single != null) row.appendChild(buildTimeChip('單一作品時間', single));
+    return row;
   }
 
   function originalSlotFile(w) {
@@ -3047,6 +3282,8 @@
       studio: (r && r.studio) || '',
       studio_zh: (r && (r.studioZh || r.studio_zh)) || '',
       matched_keywords: (r && (r.matchedKeywords || r.matched_keywords)) || [],
+      search_elapsed_ms: elapsedMsValue(r && (r.searchElapsedMs != null ? r.searchElapsedMs : r.search_elapsed_ms)),
+      work_elapsed_ms: elapsedMsValue(r && (r.workElapsedMs != null ? r.workElapsedMs : r.work_elapsed_ms)),
     }));
     return slimWorkForHistory(
       {
@@ -3064,6 +3301,8 @@
         theme_keywords: work.themeKeywords || work.theme_keywords || [],
         keyword_queries: work.keywordQueries || work.keyword_queries || [],
         line: line,
+        job_elapsed_ms: elapsedMsValue(work.jobElapsedMs != null ? work.jobElapsedMs : work.job_elapsed_ms),
+        work_elapsed_ms: elapsedMsValue(work.workElapsedMs != null ? work.workElapsedMs : work.work_elapsed_ms),
       },
       {},
       line
@@ -3428,7 +3667,7 @@
     }
   }
 
-  function buildWorkActions(w, coverWrap) {
+  function buildWorkActions(w, coverWrap, retryBtn) {
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
@@ -3479,6 +3718,7 @@
       bindWorkAction(btn, spec.run);
       bar.appendChild(btn);
     });
+    if (retryBtn) bar.appendChild(retryBtn);
     return bar;
   }
 
@@ -5028,6 +5268,8 @@
         ok: !w.skipped,
         from_image_index: w.from_image_index || null,
         line: i === 0 ? 'main' : (w.line || 'multi'),
+        job_elapsed_ms: elapsedMsValue(w.job_elapsed_ms != null ? w.job_elapsed_ms : w.jobElapsedMs),
+        work_elapsed_ms: elapsedMsValue(w.work_elapsed_ms != null ? w.work_elapsed_ms : w.workElapsedMs),
       })),
     };
   }
@@ -5412,6 +5654,7 @@
           progressPanel.classList.add('is-complete');
           progressPanel.setAttribute('aria-busy', 'false');
         }
+        stampLiveJobElapsed(data);
         const result = galleryFromIdentify(data);
         lastIdentifyPayload = data;
         renderGallery(result);

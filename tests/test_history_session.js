@@ -3574,6 +3574,144 @@ function walkNodes(node, acc) {
     }
   }
 
+  // Step clocks freeze on the server mark. They are display-only.
+  {
+    H.showProgress();
+    const steps = getEl('progress-steps').children;
+    function row(id) {
+      return steps.find((n) => n.dataset && n.dataset.step === id);
+    }
+    function timerOf(id) {
+      return (row(id).children || []).find((n) => String(n.className || '').indexOf('step-timer') !== -1);
+    }
+    assert.strictEqual(timerOf('receive').textContent, '00:00:00');
+    assert.strictEqual(timerOf('search').textContent, '00:00:00');
+    H.applyProgressEvent({
+      step: 'vision',
+      status: 'active',
+      detail: '辨識第 1/4 張…',
+      progress: 0.2,
+      t_ms: 10000,
+    });
+    H.applyProgressEvent({
+      step: 'vision',
+      status: 'done',
+      detail: '已看完 4 張',
+      progress: 0.42,
+      t_ms: 12500,
+    });
+    assert.strictEqual(timerOf('vision').textContent, '00:00:02');
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      detail: '搜尋第 1/4 張…',
+      progress: 0.55,
+      t_ms: 13000,
+    });
+    assert.strictEqual(timerOf('vision').textContent, '00:00:02');
+    assert.strictEqual(timerOf('search').textContent, '00:00:00');
+    const blob = timerOf('vision').textContent + timerOf('search').textContent;
+    assert.ok(blob.indexOf('時間不夠') === -1);
+  }
+
+  // Gallery times sit under stills. Reidentify stays a compact action. Batch 總時間 survives a slot retry.
+  {
+    const cover = 'https://pics.dmm.co.jp/digital/video/real00852/real00852pl.jpg';
+    const data = {
+      ok: true,
+      code: 'REAL-852',
+      title: '巨乳水泳部',
+      title_zh: '巨乳泳社',
+      cover: cover,
+      job_elapsed_ms: 125000,
+      work_elapsed_ms: 40000,
+      results: [
+        {
+          ok: true,
+          code: 'REAL-852',
+          title: '巨乳水泳部',
+          title_zh: '巨乳泳社',
+          cover: cover,
+          line: 'main',
+          from_image_index: 1,
+          job_elapsed_ms: 125000,
+          work_elapsed_ms: 40000,
+          related_by_title: [
+            {
+              code: 'SONE-387',
+              title: '狙われた巨乳',
+              line: 'theme',
+              why: '片名相近',
+              cover: cover,
+              search_elapsed_ms: 8000,
+            },
+          ],
+        },
+        {
+          ok: true,
+          code: 'REAL-852',
+          title: '巨乳水泳部',
+          cover: cover,
+          line: 'multi',
+          from_image_index: 2,
+          job_elapsed_ms: 125000,
+          work_elapsed_ms: 22000,
+        },
+      ],
+    };
+    const gallery = H.galleryFromIdentify(data);
+    assert.strictEqual(gallery.items[1].titleZh, '巨乳泳社');
+    assert.strictEqual(gallery.items[0].jobElapsedMs, 125000);
+    assert.strictEqual(gallery.items[0].workElapsedMs, 40000);
+    assert.strictEqual(gallery.items[0].relatedByTitle[0].searchElapsedMs, 8000);
+    assert.strictEqual(gallery.items[1].workElapsedMs, 22000);
+    H.renderGallery(gallery);
+    const times = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-times');
+    const text = times.map((n) => n.textContent).join('\n');
+    assert.ok(text.indexOf('總時間') !== -1 && text.indexOf('00:02:05') !== -1, text);
+    assert.ok(text.indexOf('單一作品時間') !== -1 && text.indexOf('00:00:40') !== -1, text);
+    assert.ok(text.indexOf('00:00:22') !== -1, text);
+    assert.ok(text.indexOf('過去識別＋搜索時間') !== -1 && text.indexOf('00:00:08') !== -1, text);
+    const skipped = H.galleryFromIdentify({
+      ok: true,
+      results: [
+        {
+          ok: false,
+          skipped: true,
+          from_image_index: 1,
+          line: 'main',
+          user_preview: 'data:image/jpeg;base64,aa',
+        },
+      ],
+    });
+    H.renderGallery(skipped);
+    const retry = walkNodes(getEl('gallery-cards')).find(
+      (n) => String(n.className || '').indexOf('btn-reidentify') !== -1
+    );
+    assert.ok(retry, 'skipped slot keeps 重新辨識');
+    assert.ok(retry.parentNode && String(retry.parentNode.className || '').indexOf('work-actions') !== -1);
+
+    const saved = H.sessionWorksFromIdentify(data);
+    assert.strictEqual(saved[0].job_elapsed_ms, 125000);
+    assert.strictEqual(saved[0].work_elapsed_ms, 40000);
+    assert.strictEqual(saved[0].related[0].search_elapsed_ms, 8000);
+    assert.strictEqual(saved[1].work_elapsed_ms, 22000);
+    const round = H.galleryFromIdentify(
+      H.identifyPayloadFromHistory({ id: 'times', works: saved, code: 'REAL-852', title: '巨乳水泳部' })
+    );
+    assert.strictEqual(round.items[0].jobElapsedMs, 125000);
+    assert.strictEqual(round.items[0].relatedByTitle[0].searchElapsedMs, 8000);
+    assert.strictEqual(round.items[1].workElapsedMs, 22000);
+    const merged = H.mergeSlotRetryIntoIdentify(
+      data,
+      1,
+      { ok: true, code: 'REAL-852', title: '巨乳水泳部', job_elapsed_ms: 9000, work_elapsed_ms: 9000, cover: cover }
+    );
+    assert.strictEqual(merged.results[0].job_elapsed_ms, 125000);
+    assert.strictEqual(merged.results[0].work_elapsed_ms, 9000);
+    assert.strictEqual(merged.results[1].work_elapsed_ms, 22000);
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

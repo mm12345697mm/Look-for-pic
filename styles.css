@@ -566,13 +566,26 @@ label.btn {
 }
 .progress-step {
   display: grid;
-  grid-template-columns: 22px 1fr auto;
+  grid-template-columns: 22px minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: start;
   font-size: 0.86rem;
   color: var(--muted);
   line-height: 1.35;
 }
+.progress-step .step-timer {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.78rem;
+  font-weight: 650;
+  color: var(--muted);
+  white-space: nowrap;
+  padding-top: 1px;
+  min-width: 4.6em;
+  text-align: right;
+}
+.progress-step.is-active .step-timer { color: var(--text); }
+.progress-step.is-done .step-timer { color: var(--ok); }
 .progress-step .step-phase {
   font-size: 0.78rem;
   font-weight: 650;
@@ -659,6 +672,43 @@ label.btn {
 }
 .btn-reidentify {
   margin-top: 8px;
+}
+.work-actions .btn-reidentify {
+  width: auto;
+  min-height: 28px;
+  height: 28px;
+  margin-top: 0;
+  padding: 0 10px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  border-radius: 5px;
+  flex: 0 0 auto;
+}
+.work-times {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 6px 12px;
+  padding: 2px 14px 12px;
+}
+.work-times .work-time:only-child {
+  grid-column: 1 / -1;
+}
+.work-time {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-size: 0.78rem;
+  line-height: 1.35;
+  color: var(--muted);
+}
+.work-time-value {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 650;
+  color: var(--text);
+  white-space: nowrap;
 }
 .card.is-skipped .card-code:empty,
 .card.is-skipped .card-title:empty {
