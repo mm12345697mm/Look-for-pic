@@ -4050,6 +4050,102 @@ function walkNodes(node, acc) {
     }
   }
 
+  // 重新辨識 must not replace a coded slot with an unlocked distant 品番.
+  {
+    const apghCover = 'https://pics.dmm.co.jp/digital/video/apgh00015/apgh00015pl.jpg';
+    const siblingCover = 'https://pics.dmm.co.jp/digital/video/apgh00012/apgh00012pl.jpg';
+    const otherCover = 'https://pics.dmm.co.jp/digital/video/ccc00003/ccc00003pl.jpg';
+    const tyvmCover = 'https://pics.dmm.co.jp/digital/video/tyvm00349/tyvm00349pl.jpg';
+    const upload = 'data:image/jpeg;base64,frame';
+    const data = {
+      ok: true,
+      code: 'APGH-015',
+      title: '先生が2人',
+      title_zh: '兩位老師',
+      cover: apghCover,
+      results: [
+        {
+          ok: true,
+          code: 'APGH-015',
+          title: '先生が2人',
+          title_zh: '兩位老師',
+          cover: apghCover,
+          stills: ['https://pics.dmm.co.jp/digital/video/apgh00015/apgh00015jp-1.jpg'],
+          from_image_index: 1,
+          line: 'main',
+          visual_mismatch: true,
+          user_preview: upload,
+          related_by_title: [
+            { code: 'APGH-012', title: '鄰卷', line: 'theme', why: '片名相近', cover: siblingCover },
+          ],
+        },
+        {
+          ok: true,
+          code: 'CCC-003',
+          title: '別張',
+          cover: otherCover,
+          from_image_index: 2,
+          line: 'multi',
+        },
+      ],
+    };
+    const drifted = {
+      ok: true,
+      code: 'TYVM-349',
+      title: '社內不倫',
+      cover: tyvmCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/tyvm00349/tyvm00349jp-1.jpg'],
+      visual_lock: false,
+      visual_meta: { visual_lock: false },
+      user_preview: upload,
+    };
+    const merged = H.mergeSlotRetryIntoIdentify(data, 1, drifted);
+    assert.strictEqual(merged.results.length, 2, 're-id does not add or drop a slot');
+    assert.strictEqual(merged.results[0].code, 'APGH-015');
+    assert.strictEqual(merged.results[0].cover, apghCover);
+    assert.strictEqual(merged.results[0].title, '先生が2人');
+    assert.strictEqual(merged.results[0].title_zh, '兩位老師');
+    assert.strictEqual(merged.results[0].related_by_title[0].code, 'APGH-012');
+    assert.strictEqual(merged.results[1].code, 'CCC-003');
+    assert.strictEqual(merged.results[1].cover, otherCover);
+    assert.notStrictEqual(merged.code, 'TYVM-349');
+    assert.ok(String(merged.results[0].cover).indexOf('data:') !== 0);
+
+    const pasted = {
+      ok: true,
+      code: 'TYVM-349',
+      cover: tyvmCover,
+      visual_lock: false,
+      results: [
+        { code: 'CCC-009', title: '別格', cover: otherCover, from_image_index: 2 },
+        {
+          code: 'TYVM-349',
+          title: '社內不倫',
+          cover: tyvmCover,
+          from_image_index: 1,
+          visual_lock: false,
+        },
+      ],
+    };
+    const kept = H.mergeSlotRetryIntoIdentify(data, 1, pasted);
+    assert.strictEqual(kept.results[0].code, 'APGH-015', 'batch row for this index is not crowned when unlocked');
+    assert.strictEqual(kept.results[1].code, 'CCC-003');
+
+    const lockedSibling = {
+      ok: true,
+      code: 'APGH-012',
+      title: '正しい巻',
+      cover: siblingCover,
+      visual_lock: true,
+      visual_meta: { visual_lock: true },
+    };
+    const moved = H.mergeSlotRetryIntoIdentify(data, 1, lockedSibling);
+    assert.strictEqual(moved.results[0].code, 'APGH-012');
+    assert.strictEqual(moved.results[0].cover, siblingCover);
+    assert.notStrictEqual(moved.results[0].title_zh, '兩位老師');
+    assert.strictEqual(moved.results[1].code, 'CCC-003');
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

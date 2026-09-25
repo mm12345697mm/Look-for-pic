@@ -1970,13 +1970,14 @@
     throw err;
   }
 
-  async function apiIdentifyStream({ images, image, code, title } = {}, onProgress, options) {
+  async function apiIdentifyStream({ images, image, code, title, priorCode } = {}, onProgress, options) {
     options = options || {};
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
     appendImagesToFormData(fd, imgs);
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
+    if (priorCode) fd.append('prior_code', priorCode);
     if (options.slotIndex) fd.append('slot_index', String(options.slotIndex));
     if (options.sessionId) fd.append('session_id', String(options.sessionId));
 
@@ -2072,12 +2073,13 @@
     return { status: httpStatus, data: finalData };
   }
 
-  async function apiIdentify({ images, image, code, title } = {}) {
+  async function apiIdentify({ images, image, code, title, priorCode } = {}) {
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
     appendImagesToFormData(fd, imgs);
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
+    if (priorCode) fd.append('prior_code', priorCode);
     const res = await fetch('/api/identify', { method: 'POST', body: fd });
     let data;
     try {
@@ -2134,6 +2136,47 @@
     return null;
   }
 
+  function payloadVisuallyLocked(src) {
+    if (!src || typeof src !== 'object') return false;
+    if (src.visual_lock === true || src.visualLock === true) return true;
+    const meta = src.visual_meta || src.visualMeta;
+    return !!(meta && meta.visual_lock === true);
+  }
+
+  /**
+   * A one-image retry payload. A multi-row `results` list is the whole batch,
+   * so only the row for this upload index is this slot. Otherwise results[0]
+   * would paste another frame's work into the card being retried.
+   */
+  function retrySourceForSlot(single, slotIndex) {
+    if (!single || typeof single !== 'object') return {};
+    const rows = Array.isArray(single.results)
+      ? single.results.filter((r) => r && typeof r === 'object')
+      : [];
+    if (rows.length > 1) {
+      const hit = rows.find(
+        (r) => Number(r.from_image_index || r.fromImageIndex) === Number(slotIndex)
+      );
+      return hit || single;
+    }
+    if (rows.length === 1) return rows[0];
+    return single;
+  }
+
+  /**
+   * A coded slot keeps its 品番 unless the retry visually locks a different one.
+   * An empty/skipped slot can still take the new code. An unlocked distant hit
+   * (APGH → TYVM) does not replace the card.
+   */
+  function retryMayReplaceCode(prev, src) {
+    const prior = reliablePromoteCode(prev);
+    const incoming = reliablePromoteCode(src);
+    if (!prior) return true;
+    if (!incoming) return false;
+    if (codesMatch(prior, incoming)) return true;
+    return payloadVisuallyLocked(src);
+  }
+
   /**
    * Put a single-image identify result back into one multi-batch slot.
    * Other slots, including their related lists, stay the same objects.
@@ -2146,26 +2189,47 @@
     if (at < 0) at = index - 1;
     if (at < 0 || at >= results.length) return base;
     const prev = results[at] || {};
-    const src =
-      single && Array.isArray(single.results) && single.results[0] ? single.results[0] : single || {};
+    const src = retrySourceForSlot(single, index);
+    if (!retryMayReplaceCode(prev, src)) return base;
     const next = Object.assign({}, src);
     next.from_image_index = prev.from_image_index || index;
     next.line = at === 0 ? 'main' : 'multi';
     next.skipped = false;
     next.ok = src.ok !== false;
+    const sameCodeEarly = !!(
+      reliablePromoteCode(prev) &&
+      reliablePromoteCode(next) &&
+      codesMatch(prev.code, next.code)
+    );
     if (!String(next.title_zh || next.titleZh || '').trim()) {
-      const kept =
-        String(prev.title_zh || prev.titleZh || '').trim() ||
-        knownTitleZhForCode(next.code || prev.code);
-      if (kept) next.title_zh = kept;
+      const kept = sameCodeEarly ? String(prev.title_zh || prev.titleZh || '').trim() : '';
+      const looked = kept || knownTitleZhForCode(next.code || '');
+      if (looked) next.title_zh = looked;
     }
     const batchJob = firstElapsed(prev.job_elapsed_ms, prev.jobElapsedMs, base.job_elapsed_ms, base.jobElapsedMs);
     if (batchJob != null) next.job_elapsed_ms = batchJob;
     if (!next.user_preview && prev.user_preview) next.user_preview = prev.user_preview;
     const preview = String(next.user_preview || prev.user_preview || '');
     const cover = String(next.cover || '');
+    const sameCode = sameCodeEarly;
     if (!cover || cover === preview || /^(data:|blob:)/i.test(cover)) {
-      next.cover = null;
+      const prevCover = String(prev.cover || '').trim();
+      if (sameCode && isCatalogMediaUrl(prevCover) && prevCover !== preview) next.cover = prevCover;
+      else next.cover = null;
+    }
+    if (sameCode) {
+      if ((!next.stills || !next.stills.length) && Array.isArray(prev.stills) && prev.stills.length) {
+        next.stills = prev.stills.slice();
+      }
+      const rel = next.related_by_title || next.related;
+      if (!rel || !rel.length) {
+        next.related_by_title = prev.related_by_title || prev.related || [];
+      }
+      if (!String(next.title || '').trim() && prev.title) next.title = prev.title;
+      if (!String(next.title_zh || next.titleZh || '').trim()) {
+        const keptZh = String(prev.title_zh || prev.titleZh || '').trim();
+        if (keptZh) next.title_zh = keptZh;
+      }
     }
     results[at] = next;
     const out = Object.assign({}, base, { results: results });
@@ -5825,16 +5889,17 @@
     setStatus('重新辨識第 ' + idx + ' 張…', 'busy');
     let single = null;
     const sessionId = lastIdentifyPayload && lastIdentifyPayload.session_id;
+    const priorCode = reliablePromoteCode(work);
     try {
       try {
         const streamed = await apiIdentifyStream(
-          { images: [file] },
+          { images: [file], priorCode: priorCode },
           null,
           { quiet: true, slotIndex: idx, sessionId: sessionId || '' }
         );
         single = streamed && streamed.data;
       } catch (_) {
-        const classic = await apiIdentify({ images: [file] });
+        const classic = await apiIdentify({ images: [file], priorCode: priorCode });
         single = classic && classic.data;
       }
     } catch (err) {

@@ -11908,6 +11908,111 @@ def verify_work_against_image(
     return out
 
 
+def _code_label(code: str | None) -> str:
+    parts = parse_code_parts(str(code or ""))
+    return (parts[0] if parts else "").upper()
+
+
+def _payload_visual_lock(payload: dict | None) -> bool:
+    """True only when this payload's own compare locked person and clothes.
+
+    ``visual_confident`` alone is not enough: an unlocked reorder can still
+    carry a code. A lock flag or a same_work + clothes verdict is required.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("visual_lock") is True:
+        return True
+    meta = payload.get("visual_meta")
+    if isinstance(meta, dict) and meta.get("visual_lock") is True:
+        return True
+    vm = payload.get("visual")
+    return _visual_is_lock(vm if isinstance(vm, dict) else None)
+
+
+def _adopt_locked_retry_candidate(result: dict, winner: dict) -> dict:
+    """Use a same-label candidate the upload actually locked. Never an upload URL."""
+    out = dict(result)
+    for field in ("code", "title", "actress", "studio", "cover", "cid"):
+        if winner.get(field):
+            out[field] = winner.get(field)
+    stills = winner.get("stills") if isinstance(winner.get("stills"), list) else []
+    clean = [
+        str(u)
+        for u in stills
+        if u and not is_now_printing_url(str(u)) and not _is_upload_media_url(u)
+    ]
+    if clean:
+        out["stills"] = clean
+    out["ok"] = True
+    out["visual_lock"] = True
+    out["visual_mismatch"] = False
+    out["visual_note"] = ""
+    out["reidentify_kept_prior"] = False
+    _lock_identify_payload_media(out)
+    return out
+
+
+def anchor_reidentify_to_prior(
+    result: dict | None,
+    prior_code: str | None,
+    image_bytes: bytes | None = None,
+) -> dict | None:
+    """Keep 重新辨識 on the prior 品番 unless the upload locks a new one.
+
+    The retry sends the same frame and no typed 番號, so vision/title search
+    can adopt an unlocked distant hit and crown it. A different code is kept
+    only when that result visually locks. Otherwise the prior code stays and
+    the card is marked 未核對. A same-label candidate that does lock (a nearer
+    volume) may replace the number. The upload is never the jacket.
+    """
+    if not isinstance(result, dict) or not image_bytes:
+        return result
+    if not prior_code or not parse_code_parts(str(prior_code)):
+        return result
+    prior = format_display_code(str(prior_code))
+    new = _catalog_code_of(result)
+    if new and _payload_visual_lock(result):
+        out = dict(result)
+        out["visual_lock"] = True
+        _lock_identify_payload_media(out)
+        return out
+    label = _code_label(prior)
+    for row in result.get("candidates") or []:
+        if not isinstance(row, dict):
+            continue
+        code = _catalog_code_of(row)
+        if not code or _code_label(code) != label or codes_numeric_equal(code, prior):
+            continue
+        if not _payload_visual_lock(row):
+            continue
+        return _adopt_locked_retry_candidate(result, row)
+    if new and codes_numeric_equal(new, prior):
+        kept: dict = dict(result)
+    else:
+        kept = {
+            "ok": True,
+            "code": prior,
+            "title": "",
+            "title_zh": None,
+            "cover": None,
+            "stills": [],
+            "related_by_title": [],
+            "related": [],
+            "candidates": [],
+            "search_mode": "code",
+        }
+    kept["code"] = prior
+    kept["ok"] = True
+    kept["visual_lock"] = False
+    kept["reidentify_kept_prior"] = True
+    if new and not codes_numeric_equal(new, prior):
+        kept["reidentify_rejected_code"] = new
+    _mark_visual_mismatch(kept, "未核對圖片（人物／衣服／姿勢與這張上傳圖不符）")
+    _lock_identify_payload_media(kept)
+    return kept
+
+
 def _catalog_code_of(payload: dict | None) -> str:
     """Display code, or empty when the slot is title-only / unidentified."""
     code = str((payload or {}).get("code") or "").strip()
@@ -14799,6 +14904,7 @@ def _run_identify_pipeline_inner(
 def identify():
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
+    prior_code = (request.form.get("prior_code") or "").strip()
     images = collect_images_from_request()
 
     if len(images) > 1:
@@ -14814,6 +14920,8 @@ def identify():
             user_code=user_code,
             user_title=user_title,
         )
+        if prior_code:
+            result = anchor_reidentify_to_prior(result, prior_code, images[0][0])
         # related_by_title already attached inside pipeline — do not run twice
     else:
         result, status = run_identify_pipeline(
@@ -15110,6 +15218,7 @@ def identify_stream():
     """
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
+    prior_code = (request.form.get("prior_code") or "").strip()
     session_id = (request.form.get("session_id") or "").strip()
     slot_index_raw = (request.form.get("slot_index") or "").strip()
     images = collect_images_from_request()
@@ -15158,6 +15267,10 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
+                    if prior_code:
+                        result = anchor_reidentify_to_prior(
+                            result, prior_code, images[0][0]
+                        )
                 else:
                     result, status = run_identify_pipeline(
                         image_bytes=None,
