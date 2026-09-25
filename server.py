@@ -7469,6 +7469,44 @@ def health():
 
 
 
+def _is_javrate_url(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return host == "javrate.com" or host.endswith(".javrate.com")
+
+
+def _browser_get_javrate(url: str, timeout: float, headers: dict | None = None) -> str | None:
+    """Javrate answers requests with a Cloudflare challenge. A browser TLS fetch does not.
+
+    Only this host is retried. Other catalogs keep the plain requests path.
+    """
+    if not _is_javrate_url(url):
+        return None
+    try:
+        from curl_cffi import requests as creq
+    except Exception:
+        return None
+    try:
+        h = {"Accept-Language": "zh-TW,zh-CN,zh;q=0.9,ja;q=0.8,en;q=0.5"}
+        if headers:
+            h.update(headers)
+        got = creq.get(
+            url,
+            impersonate="chrome",
+            timeout=timeout,
+            headers=h,
+            verify=False,
+            allow_redirects=True,
+        )
+    except Exception:
+        return None
+    text = getattr(got, "text", None) or ""
+    if getattr(got, "status_code", 400) >= 400 or not text:
+        return None
+    if "Just a moment" in text[:800]:
+        return None
+    return text
+
+
 def http_get(
     url: str,
     *,
@@ -7488,13 +7526,16 @@ def http_get(
             verify=False,
             allow_redirects=True,
         )
-        if r.status_code >= 400 or not r.text:
-            return None
-        if "Just a moment" in r.text[:800]:
-            return None
+        challenged = (
+            r.status_code >= 400
+            or not r.text
+            or "Just a moment" in (r.text or "")[:800]
+        )
+        if challenged:
+            return _browser_get_javrate(url, timeout, h)
         return r.text
     except Exception:
-        return None
+        return _browser_get_javrate(url, timeout, headers)
 
 
 def _looks_chinese_title(s: str | None) -> bool:
@@ -7536,7 +7577,7 @@ _ZH_TOKEN_CHROME_RE = re.compile(
     r"(?i)(?:\buncensored\b|\bleaked\b|\buncen\b|無修正流出|無碼破解|馬賽克破解|高清中字|中文字幕)"
 )
 _ZH_SEARCH_CHROME_RE = re.compile(
-    r"搜尋結果|搜索结果|search result|page not found|找不到網頁",
+    r"搜尋結果|搜索结果|search result|page not found|找不到網頁|部A片|部影片|找到\s*[-–—]?\s*\d*\s*部",
     re.I,
 )
 _BILLING_HAN_RE = re.compile(r"^[\u4e00-\u9fff]{2,5}$")
@@ -7610,6 +7651,12 @@ def _strip_billing_suffix(text: str) -> str:
     """
     t = (text or "").strip()
     for _ in range(3):
+        tilde = re.search(
+            r"\s*[~～]\s*((?:[\u4e00-\u9fff]{2,5})(?:\s+[\u4e00-\u9fff]{2,5}){0,5})\s*$",
+            t,
+        )
+        if tilde and all(_is_billing_name(part) for part in tilde.group(1).split()):
+            t = t[: tilde.start()].strip()
         nxt = re.sub(
             r"\s*[-–—|｜]\s*[A-Za-z][A-Za-z .'\-]{1,40}$",
             "",
@@ -8048,13 +8095,13 @@ def _code_mentioned(text: str | None, code: str) -> bool:
 
 
 # Extra listing pages after MissAV / Jable / JAVLibrary. njav.tv, 123av.com,
-# and njavtv.com answer with a Cloudflare challenge from this network, so
-# they are not fetched. Two working HTML catalogs stay inside this cap.
-_ZH_LISTING_FETCH_CAP = 3
+# njavtv.com, and avple.tv answer with a Cloudflare challenge and no title
+# HTML, so they are not fetched. AVBEBE, UNCEN X, then Javrate stay in this cap.
+_ZH_LISTING_FETCH_CAP = 4
 
 
 def _zh_listing_page_urls(code: str) -> list[str]:
-    """AVBEBE search, then the UNCEN X Traditional Chinese work page."""
+    """AVBEBE search, UNCEN X, then Javrate search."""
     from urllib.parse import quote
 
     disp = format_display_code(str(code))
@@ -8067,6 +8114,7 @@ def _zh_listing_page_urls(code: str) -> list[str]:
     alt = code_stripped_form(disp)
     if alt:
         urls.append(f"https://www.uncenx.com/tw/{alt.lower()}")
+    urls.append(f"https://www.javrate.com/search/{quote(disp)}")
     return urls
 
 
@@ -8110,6 +8158,44 @@ def _parse_uncenx_html(
     return None
 
 
+def _parse_javrate_search_html(
+    html: str | None,
+    *,
+    code: str,
+    title_ja: str | None = None,
+) -> str | None:
+    """Chinese title from a Javrate search card for this 品番.
+
+    The page title is search chrome (「找到 N 部A片」) and is ignored.
+    A card for a different 品番 is ignored.
+    """
+    disp = format_display_code(str(code))
+    page = html or ""
+    seen: list[str] = []
+    for match in re.finditer(
+        r'<a\b(?=[^>]*\bhref=["\'][^"\']*movie/detail/)[^>]*\btitle=["\']([^"\']+)["\']',
+        page,
+        flags=re.I,
+    ):
+        seen.append(unescape(match.group(1)))
+    for match in re.finditer(
+        r'<a\b[^>]*\bhref=["\'][^"\']*movie/detail/[^"\']*["\'][^>]*>(.*?)</a>',
+        page,
+        flags=re.I | re.S,
+    ):
+        raw = unescape(re.sub(r"<[^>]+>", " ", match.group(1)))
+        raw = re.sub(r"\s+", " ", raw).strip()
+        if raw:
+            seen.append(raw)
+    for raw in seen:
+        if not _code_mentioned(raw, disp):
+            continue
+        title = _clean_title_zh(raw, title_ja=title_ja, code=disp, trusted=True)
+        if title:
+            return title
+    return None
+
+
 def _fetch_zh_listing_title(
     code: str,
     *,
@@ -8117,7 +8203,7 @@ def _fetch_zh_listing_title(
     timeout: float = 8.0,
     deadline: float | None = None,
 ) -> str | None:
-    """One cleaned Chinese title from AVBEBE or UNCEN X. Nothing is translated."""
+    """One cleaned Chinese title from AVBEBE, UNCEN X, or Javrate. Nothing is translated."""
     fetches = 0
     for url in _zh_listing_page_urls(code):
         if fetches >= _ZH_LISTING_FETCH_CAP:
@@ -8142,6 +8228,8 @@ def _fetch_zh_listing_title(
             title = _parse_avbebe_search_html(html, code=code, title_ja=title_ja)
         elif "uncenx.com" in host:
             title = _parse_uncenx_html(html, code=code, title_ja=title_ja)
+        elif "javrate.com" in host:
+            title = _parse_javrate_search_html(html, code=code, title_ja=title_ja)
         else:
             title = None
         if title:
@@ -8165,7 +8253,8 @@ def fetch_public_zh_catalog(
     page has one). The same HTML's genre/tag chips, series name, and product
     cover are parsed. MissAV is tried before Jable. JAVLibrary CN is the
     next title fallback. Only when those have no Chinese title, and this is
-    not a short cover/tag fetch, AVBEBE then UNCEN X may supply a title.
+    not a short cover/tag fetch, AVBEBE, then UNCEN X, then Javrate may
+    supply a title.
     Those extra pages do not change genres, series, or the cover. Missing
     fields stay empty — nothing is translated or invented. A data/blob image
     is never a cover.
@@ -8593,7 +8682,7 @@ def resolve_chinese_title(
     """Resolve a Chinese title from public catalogs.
 
     Sources (public HTML only): existing payload → user Chinese query →
-    MissAV /cn/ and Jable by 品番 → JAVLibrary CN → AVBEBE and UNCEN X.
+    MissAV /cn/ and Jable by 品番 → JAVLibrary CN → AVBEBE, UNCEN X, and Javrate.
     No pirate/magnet links. A title is copied from a page that already
     writes it in Chinese. Nothing is translated. When catalog_out is a dict
     and this call scrapes, it receives actress_zh plus that page's genre

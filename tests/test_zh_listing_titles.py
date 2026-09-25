@@ -75,6 +75,7 @@ class ZhListingTitleTests(unittest.TestCase):
             "【高清中字】[SONE-387] 盯上的巨乳游泳部員…從泳裝外露的成長期的胸部被獵奇般地揉捏玩弄… 清原美優": "盯上的巨乳游泳部員…從泳裝外露的成長期的胸部被獵奇般地揉捏玩弄…",
             "REAL-852 巨乳泳社 - MissAV": "巨乳泳社",
             "MIDA-616 女友妹妹的無胸罩誘惑 - MissAV": "女友妹妹的無胸罩誘惑",
+            "NHDTC-235 夜行巴士逆NTR 痴女姐姐從座位縫隙偷偷給我男友打飛機 忍聲做愛直到中出 ~ 小野坂唯香 二羽紗愛 巴煇": "夜行巴士逆NTR 痴女姐姐從座位縫隙偷偷給我男友打飛機 忍聲做愛直到中出",
             "NHDTC-099 五個膽小的女孩在夜間巴士上睡覺時被人猥褻，嚇得睜不開眼，卻在假裝睡覺的同時失控地達到高潮——超大噴射特輯": "五個膽小的女孩在夜間巴士上睡覺時被人猥褻，嚇得睜不開眼，卻在假裝睡覺的同時失控地達到高潮——超大噴射特輯",
         }
         for raw, expected in cases.items():
@@ -145,13 +146,49 @@ class ZhListingTitleTests(unittest.TestCase):
         def fake_get(url, timeout=8.0, headers=None, **kwargs):
             if "avbebe.com" in url:
                 return AVBEBE_HIT
-            if "uncenx.com" in url:
+            if "uncenx.com" in url or "javrate.com" in url:
                 raise AssertionError(url)
             return None
 
         with mock.patch.object(S, "http_get", side_effect=fake_get):
             meta = S.fetch_public_zh_catalog("APGH-012")
         self.assertEqual(meta["title_zh"], APGH_CLEAN)
+
+    def test_javrate_card_title_for_the_matching_code(self):
+        html = """
+        <html><head>
+        <title>nhdtc-235找到 - 1部A片 | </title>
+        <meta property="og:title" content="nhdtc-235找到 - 1部A片 | ">
+        </head><body>
+        <h1>搜索 <label>nhdtc-235</label></h1>
+        <a href="/movie/detail/other.html" title="APGH-099 別的作品 ~ 別人"></a>
+        <a href="/movie/detail/16889a44-2fdf-416c-91fd-ade69b7cd626.html"
+           title="NHDTC-235 &#x591C;&#x884C;&#x5DF4;&#x58EB;&#x9006;NTR &#x75F4;&#x5973;&#x59D0;&#x59D0;&#x5F9E;&#x5EA7;&#x4F4D;&#x7E2B;&#x9699;&#x5077;&#x5077;&#x7D66;&#x6211;&#x7537;&#x53CB;&#x6253;&#x98DB;&#x6A5F; &#x5FCD;&#x8072;&#x505A;&#x611B;&#x76F4;&#x5230;&#x4E2D;&#x51FA; ~ &#x5C0F;&#x91CE;&#x5742;&#x552F;&#x9999; &#x4E8C;&#x7FBD;&#x7D17;&#x611B; &#x5DF4;&#x7147;"
+           class="movie-card-link"></a>
+        </body></html>
+        """
+        self.assertEqual(
+            S._parse_javrate_search_html(html, code="NHDTC-235"),
+            "夜行巴士逆NTR 痴女姐姐從座位縫隙偷偷給我男友打飛機 忍聲做愛直到中出",
+        )
+        self.assertIsNone(S._parse_javrate_search_html(html, code="DAS-034"))
+        self.assertIsNone(
+            S._clean_title_zh("nhdtc-235找到 - 1部A片", code="NHDTC-235", trusted=True)
+        )
+
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
+            if "javrate.com/search/" in url and "NHDTC-235" in url.upper():
+                return html
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("NHDTC-235", title_ja="日文題")
+        self.assertEqual(
+            meta["title_zh"],
+            "夜行巴士逆NTR 痴女姐姐從座位縫隙偷偷給我男友打飛機 忍聲做愛直到中出",
+        )
+        self.assertEqual(meta["genres"], [])
+        self.assertIsNone(meta["cover"])
 
     def test_short_cover_fetch_does_not_call_listings(self):
         def fake_get(url, timeout=8.0, headers=None, **kwargs):
