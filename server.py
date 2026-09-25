@@ -3937,6 +3937,194 @@ def _format_visual_rank_note(meta: dict, best_code: str, best_vm: dict | None) -
     )
 
 
+# Same picture, or a composition crop of it (jacket front, modest trim).
+# Below this, person / clothes / pose stay on the Gemini gate.
+_SAME_CATALOG_FRAME_MIN = 0.84
+_SAME_CATALOG_FIGURE_MIN = 0.78
+_SAME_CATALOG_ZOOMS = (1.0, 1.08, 1.16, 1.28, 1.45, 1.7)
+
+
+def _open_rgb_image(blob: bytes | None):
+    if not blob:
+        return None
+    try:
+        img = Image.open(io.BytesIO(blob))
+        return ImageOps.exif_transpose(img).convert("RGB")
+    except Exception:
+        return None
+
+
+def _is_same_catalog_image(frame: float, figure: float) -> bool:
+    """True only for this catalog picture or a crop of that same composition."""
+    return frame >= _SAME_CATALOG_FRAME_MIN and figure >= _SAME_CATALOG_FIGURE_MIN
+
+
+def _same_catalog_dense_scores(user: Image.Image, catalog: Image.Image) -> tuple[float, float]:
+    """Zoom sweep for a jacket front or a modest crop of that same picture.
+
+    ``_aligned_jacket_scores`` only tries zoom 1.0 and 1.55, so a cover trimmed
+    by roughly 8–15% falls between those windows and looks like a mismatch.
+    This sweep uses the same normalized correlation, including the front panel
+    of a wide package.
+    """
+    uw, uh = user.size
+    if uw < 8 or uh < 8:
+        return 0.0, 0.0
+    user_fig = _figure_crop(user)
+    best_frame = 0.0
+    best_figure = 0.0
+    for src in _jacket_front_views(catalog, user):
+        sw, sh = src.size
+        if sw < 8 or sh < 8:
+            continue
+        for zoom in _SAME_CATALOG_ZOOMS:
+            win_h = 64
+            win_w = max(12, int(round(uw * (win_h / float(uh)))))
+            src_h = max(win_h, int(round(win_h * zoom)))
+            src_w = max(win_w, int(round(sw * (src_h / float(sh)))))
+            src_r = src.resize((src_w, src_h), Image.Resampling.BILINEAR)
+            step_x = max(4, (src_w - win_w) // 6 or 1)
+            step_y = max(4, (src_h - win_h) // 4 or 1)
+            ua = _norm_gray(user.resize((win_w, win_h), Image.Resampling.BILINEAR), 32, 32)
+            uf = _norm_gray(user_fig, 24, 24)
+            for y in range(0, max(1, src_h - win_h + 1), step_y):
+                for x in range(0, max(1, src_w - win_w + 1), step_x):
+                    patch = src_r.crop((x, y, x + win_w, y + win_h))
+                    frame = _gray_corr(ua, _norm_gray(patch, 32, 32))
+                    if frame <= best_frame:
+                        continue
+                    best_frame = frame
+                    best_figure = _gray_corr(uf, _norm_gray(_figure_crop(patch), 24, 24))
+                    if best_frame >= 0.96 and best_figure >= 0.80:
+                        return best_frame, best_figure
+    return best_frame, best_figure
+
+
+def _same_catalog_image_scores(user: Image.Image, catalog: Image.Image) -> tuple[float, float]:
+    """How surely the upload is this catalog picture or a crop of it.
+
+    A near-exact jacket hit reuses ``_aligned_jacket_scores`` and returns.
+    Crops that grid misses get one denser sweep. A different person or a
+    different outfit photograph stays under the same-image bar.
+    """
+    fast_frame, fast_figure = _aligned_jacket_scores(user, catalog)
+    if fast_frame >= 0.92 and fast_figure >= 0.86:
+        return fast_frame, fast_figure
+    dense_frame, dense_figure = _same_catalog_dense_scores(user, catalog)
+    if dense_frame > fast_frame:
+        return dense_frame, dense_figure
+    return fast_frame, fast_figure
+
+
+def _same_catalog_verdict(frame: float, figure: float) -> dict:
+    vm = {
+        "same_work": True,
+        "confidence": float(frame),
+        "reason": "與目錄封面或劇照為同一張圖",
+        "match_person": True,
+        "match_face": True,
+        "match_accessories": True,
+        "match_clothes": True,
+        "match_pose": True,
+    }
+    return enforce_visual_same_work(vm)
+
+
+def _best_same_catalog_picture(
+    user_img: Image.Image, pairs: list[tuple[dict, bytes]]
+) -> tuple[dict, float, float] | None:
+    best: tuple[dict, float, float] | None = None
+    best_key = (-1.0, -1.0)
+    for item, blob in pairs:
+        catalog = _open_rgb_image(blob)
+        if catalog is None:
+            continue
+        frame, figure = _same_catalog_image_scores(user_img, catalog)
+        if not _is_same_catalog_image(frame, figure):
+            continue
+        key = (float(frame), float(figure))
+        if key > best_key:
+            best_key = key
+            best = (item, key[0], key[1])
+    return best
+
+
+def _best_same_catalog_still(
+    user_img: Image.Image, items: list[dict]
+) -> tuple[dict, float, float] | None:
+    """A catalog still that is the upload, when the cover itself is not."""
+    best: tuple[dict, float, float] | None = None
+    best_key = (-1.0, -1.0)
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        for url in _collect_still_urls(item, limit=3):
+            try:
+                blob = download_cover_bytes(url)
+            except Exception:
+                blob = None
+            catalog = _open_rgb_image(blob)
+            if catalog is None:
+                continue
+            frame, figure = _same_catalog_image_scores(user_img, catalog)
+            if not _is_same_catalog_image(frame, figure):
+                continue
+            key = (float(frame), float(figure))
+            if key > best_key:
+                best_key = key
+                best = (item, key[0], key[1])
+            break
+    return best
+
+
+def _ranked_with_same_catalog_lock(
+    candidates: list[dict],
+    winner: dict,
+    frame: float,
+    figure: float,
+    meta: dict,
+) -> tuple[list[dict], dict]:
+    """Lock the work whose catalog cover or still is this upload. No Gemini."""
+    vm = _same_catalog_verdict(frame, figure)
+    best = dict(winner)
+    best["visual"] = {
+        "same_work": vm.get("same_work"),
+        "confidence": vm.get("confidence"),
+        "reason": vm.get("reason"),
+        "match_person": vm.get("match_person"),
+        "match_face": vm.get("match_face"),
+        "match_accessories": vm.get("match_accessories"),
+        "match_clothes": vm.get("match_clothes"),
+        "match_pose": vm.get("match_pose"),
+    }
+    vs = visual_match_score(vm)
+    best["visual_score"] = vs
+    title_sc = float(best.get("title_score") or best.get("score") or 0.0)
+    best["title_score"] = title_sc
+    best["score"] = round(vs * 0.92 + title_sc * 0.08, 4)
+    code = format_display_code(str(best.get("code") or ""))
+    rest: list[dict] = []
+    for raw in candidates:
+        if not isinstance(raw, dict):
+            continue
+        rc = format_display_code(str(raw.get("code") or ""))
+        if not rc or rc == code:
+            continue
+        item = dict(raw)
+        ts = float(item.get("title_score") or item.get("score") or 0.0)
+        item["title_score"] = ts
+        item["visual_score"] = 0.02
+        item["score"] = 0.02
+        rest.append(item)
+    meta["visual_ranked"] = True
+    meta["visual_lock"] = _visual_is_lock(best.get("visual"))
+    meta["compared"] = max(int(meta.get("compared") or 0), 1)
+    meta["mode"] = "same_catalog_image"
+    meta["compared_codes"] = [code]
+    meta["note"] = _format_visual_rank_note(meta, code, best.get("visual") or {})
+    return [best] + rest, meta
+
+
 def rank_candidates_by_visual(
     user_image_bytes: bytes,
     candidates: list[dict],
@@ -3962,7 +4150,7 @@ def rank_candidates_by_visual(
         "compared_codes": [],
     }
     key = (api_key or get_gemini_api_key() or "").strip()
-    if not key or not user_image_bytes:
+    if not user_image_bytes:
         meta["note"] = "no_key_or_image"
         return list(candidates or []), meta
 
@@ -3972,6 +4160,13 @@ def rank_candidates_by_visual(
         if c.get("code") and parse_code_parts(str(c["code"]))
     ]
     if len(coded) < 1:
+        return list(candidates or []), meta
+
+    # No vision key and the upload is not a picture: same as before, do not
+    # fetch catalog jackets. A real image still gets the same-picture pass.
+    user_img = _open_rgb_image(user_image_bytes)
+    if not key and user_img is None:
+        meta["note"] = "no_key_or_image"
         return list(candidates or []), meta
 
     # Preserve original title scores
@@ -4034,6 +4229,21 @@ def rank_candidates_by_visual(
             meta["skipped"] += 1
             continue
         pairs.append((item, blob))
+
+    # Identical jacket / same-composition crop is deterministic. Gemini must
+    # not be able to false-fail it, and a later still with another pose must
+    # not revoke it. A different picture falls through to person/clothes/pose.
+    same_hit = _best_same_catalog_picture(user_img, pairs) if user_img is not None else None
+    if same_hit is None and user_img is not None:
+        still_sources = [item for item, _blob in pairs] or coded
+        same_hit = _best_same_catalog_still(user_img, still_sources)
+    if same_hit is not None:
+        winner, frame, figure = same_hit
+        return _ranked_with_same_catalog_lock(coded, winner, frame, figure, meta)
+
+    if not key:
+        meta["note"] = "no_key_or_image"
+        return list(candidates or []), meta
 
     if len(pairs) < 1:
         meta["note"] = "need_cover"
@@ -12115,6 +12325,190 @@ def find_related_by_title(
 
 
 
+def _card_visual_is_weak(payload: dict | None) -> bool:
+    """True when this card was compared and did not lock.
+
+    A card that never ran visual compare is not weak: manual 品番 lookup
+    keeps its related list. A passed lock is not weak either.
+    """
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return False
+    if payload.get("visual_lock") is True:
+        return False
+    meta = payload.get("visual_meta") if isinstance(payload.get("visual_meta"), dict) else {}
+    if meta.get("visual_lock") is True:
+        return False
+    if payload.get("visual_mismatch"):
+        return True
+    if "未核對" in str(payload.get("visual_note") or ""):
+        return True
+    return bool(meta.get("visual_ranked") and not meta.get("visual_lock"))
+
+
+def _related_support_line(
+    row: dict | None,
+    *,
+    label: str,
+    actress: str,
+    title: str,
+    keywords: list[str],
+    series: str,
+) -> str | None:
+    """Bucket if this row is the same series, actress, or a keyword hit.
+
+    Unrelated titles are None so an unlocked card does not keep them ahead
+    of a volume the user could still recognize.
+    """
+    if not isinstance(row, dict):
+        return None
+    raw_code = str(row.get("code") or "")
+    if not raw_code or not parse_code_parts(raw_code):
+        return None
+    code = format_display_code(raw_code)
+    same_family = bool(label and _code_label(code) == label)
+    row_series = _series_plain_text(row.get("series"))
+    same_series = bool(
+        series and row_series and (series == row_series or series in row_series or row_series in series)
+    )
+    same_act = bool(actress and _actress_name_matches(actress, str(row.get("actress") or "")))
+    row_title = str(row.get("title") or "")
+    hits = _keyword_hit_count(row_title, keywords) if keywords and row_title else 0
+    if hits < 1:
+        hits = len(_matched_keywords_of(row))
+    theme_ok = False
+    if title and row_title and is_usable_title(title):
+        try:
+            theme_ok, _sc = _is_title_theme_match(title, row_title, keywords=keywords)
+        except Exception:
+            theme_ok = False
+    if same_family or same_series or theme_ok:
+        return "theme"
+    if hits >= 1:
+        return "keyword"
+    if same_act:
+        return "actress"
+    return None
+
+
+def _rescue_weak_visual_related(payload: dict | None) -> dict | None:
+    """When the main card did not lock, keep recognizable related works.
+
+    Same code-family, same series, keyword hits, and the same actress stay.
+    Catalog covers sort ahead of coverless rows. Caps stay 5 + 5 + 3.
+    If nothing recoverable exists, the current list is left as it is so the
+    carousel does not go blank. Chinese titles are not invented.
+    """
+    if not _card_visual_is_weak(payload) or not isinstance(payload, dict):
+        return payload
+    main_code = _catalog_code_of(payload)
+    label = _code_label(main_code)
+    actress = str(payload.get("actress") or "").strip()
+    title = str(payload.get("title") or "").strip()
+    series = _series_plain_text(payload.get("series"))
+    try:
+        keywords = _extract_title_theme_keywords(title, actress=actress or None)
+    except Exception:
+        keywords = []
+    ctx = {
+        "label": label,
+        "actress": actress,
+        "title": title,
+        "keywords": keywords,
+        "series": series,
+    }
+    existing = [x for x in (payload.get("related_by_title") or []) if isinstance(x, dict)]
+
+    def _supports(row: dict) -> str | None:
+        return _related_support_line(row, **ctx)
+
+    kept: list[dict] = []
+    seen: set[str] = set()
+    if main_code:
+        seen.add(main_code)
+    for row in existing:
+        raw_code = str(row.get("code") or "")
+        if not raw_code or not parse_code_parts(raw_code):
+            continue
+        code = format_display_code(raw_code)
+        if code in seen:
+            continue
+        if _related_line_of(row) == "theme" and _supports(row) is None:
+            continue
+        seen.add(code)
+        kept.append(row)
+
+    fresh: list[dict] = []
+    for raw in payload.get("candidates") or []:
+        if not isinstance(raw, dict):
+            continue
+        line = _supports(raw)
+        if not line:
+            continue
+        raw_code = str(raw.get("code") or "")
+        if not raw_code or not parse_code_parts(raw_code):
+            continue
+        code = format_display_code(raw_code)
+        if code in seen or (main_code and codes_numeric_equal(code, main_code)):
+            continue
+        seen.add(code)
+        item = _sanitize_related_row(dict(raw))
+        item["code"] = code
+        item["line"] = line
+        row_series = _series_plain_text(raw.get("series"))
+        same_series = bool(
+            series and row_series and (series == row_series or series in row_series or row_series in series)
+        )
+        same_family = bool(label and _code_label(code) == label)
+        hits = _keyword_hit_count(str(raw.get("title") or ""), keywords) if keywords else 0
+        if line == "actress":
+            item["why"] = "同演員"
+        elif line == "keyword":
+            item["why"] = f"關鍵字×{hits}" if hits else "名稱關鍵字"
+            if hits:
+                item["keyword_hits"] = hits
+        elif same_family or same_series:
+            item["why"] = "同系列"
+        else:
+            item["why"] = "片名相近"
+        if not str(raw.get("title_zh") or "").strip():
+            item.pop("title_zh", None)
+        fresh.append(item)
+
+    combined = kept + fresh
+    if not combined:
+        return payload
+
+    def _sort_key(pair: tuple[int, dict]) -> tuple:
+        idx, item = pair
+        code = str(item.get("code") or "")
+        family = 1 if label and _code_label(code) == label else 0
+        cover = 1 if _related_has_real_cover(item) else 0
+        hits = int(item.get("keyword_hits") or 0)
+        line = _related_line_of(item)
+        if line == "theme":
+            return (family, cover, hits, -idx)
+        if line == "keyword":
+            return (cover, hits, family, -idx)
+        return (cover, family, hits, -idx)
+
+    indexed = list(enumerate(combined))
+
+    def _take(line: str, cap: int) -> list[dict]:
+        rows = [(i, it) for i, it in indexed if _related_line_of(it) == line]
+        rows.sort(key=_sort_key, reverse=True)
+        return [it for _i, it in rows[:cap]]
+
+    out = (
+        _take("theme", RELATED_THEME_CAP)
+        + _take("keyword", RELATED_KEYWORD_CAP)
+        + _take("actress", RELATED_ACTRESS_CAP)
+    )
+    if not out:
+        return payload
+    payload["related_by_title"] = _sanitize_related_rows(out)
+    return payload
+
+
 def attach_related_by_title(
     result: dict,
     *,
@@ -12194,6 +12588,7 @@ def attach_related_by_title(
     except Exception:
         pass
 
+    _rescue_weak_visual_related(result)
     _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
     if not per_item:
@@ -12217,6 +12612,7 @@ def attach_related_by_title(
                 )
             except Exception:
                 pass
+            _rescue_weak_visual_related(item)
             _stamp_listed_work_keywords(item)
             continue
         it_title = item.get("title") or title
@@ -12240,11 +12636,13 @@ def attach_related_by_title(
             )
         except Exception:
             item["related_by_title"] = []
+        _rescue_weak_visual_related(item)
         _stamp_listed_work_keywords(item)
     try:
         enrich_related_public_catalog(result)
     except Exception:
         pass
+    _rescue_weak_visual_related(result)
     _stamp_listed_work_keywords(result)
     _finalize_related_note(result)
     return result
@@ -12398,26 +12796,32 @@ def verify_work_against_image(
     """Visually re-check one uploaded image against its own catalog candidates.
 
     Same lock rule as single-image identify: person + clothes (cover, then
-    stills). A locking candidate replaces the slot. A hit that does not lock
-    is not kept as a verified match — another candidate is preferred, otherwise
-    the card stays with an honest 未核對圖片 note. Keywords are restamped from
+    stills). A catalog cover or still that is the same picture, or a
+    composition crop of it, locks on that structural match so a jacket-front
+    upload cannot false-fail. Any other picture still needs person + clothes.
+    A locking candidate replaces the slot. A hit that does not lock is not
+    kept as a verified match — another candidate is preferred, otherwise the
+    card stays with an honest 未核對圖片 note. Keywords are restamped from
     the title that remains, so slots do not share each other's chips.
     """
     if not isinstance(result, dict) or not result.get("ok"):
         return result
     out = dict(result)
-    key = (api_key or get_gemini_api_key() or "").strip()
-    if not image_bytes or not key:
+    if not image_bytes:
         out["visual_lock"] = False
         return out
+    key = (api_key or get_gemini_api_key() or "").strip()
     pool = _collect_visual_pool([out], out.get("candidates"))
     if not pool:
+        if not key:
+            out["visual_lock"] = False
+            return out
         _mark_visual_mismatch(out, "未核對圖片（沒有可比較的封面或劇照）")
         _recompute_theme_keywords(out)
         return out
     ranked, meta = rank_candidates_by_visual(image_bytes, pool, api_key=key)
     locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
-    if not locked:
+    if not locked and key:
         query = str(vision_title or "").strip()
         extras: list[dict] = []
         if is_usable_title(query):
@@ -12434,6 +12838,9 @@ def verify_work_against_image(
             ranked, meta = rank_candidates_by_visual(image_bytes, wider, api_key=key)
             locked = bool((meta or {}).get("visual_ranked") and (meta or {}).get("visual_lock"))
     if not (meta or {}).get("visual_ranked"):
+        if not key:
+            out["visual_lock"] = False
+            return out
         _mark_visual_mismatch(out, "未核對圖片（無法比對封面或劇照）")
         _recompute_theme_keywords(out)
         return out
