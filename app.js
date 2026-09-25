@@ -2377,9 +2377,160 @@
         work.titleZh = found[key] || knownTitleZhForCode(work.code) || '';
         if (work.titleZh && !found[key]) found[key] = work.titleZh;
       }
+      if (work.titleZh && !String(work.title_zh || '').trim()) work.title_zh = work.titleZh;
       (work.relatedByTitle || []).forEach(fill);
     }
     (items || []).forEach(fill);
+  }
+
+  /** Codes on this page that still have no Chinese title. One row per 品番. */
+  function missingTitleZhRequests(items) {
+    const out = [];
+    const seen = {};
+    function add(work) {
+      if (!work) return;
+      const code = titleZhKey(work.code);
+      const nested = work.relatedByTitle || work.related || [];
+      if (!code || seen[code]) {
+        nested.forEach(add);
+        return;
+      }
+      seen[code] = true;
+      if (!String(work.titleZh || work.title_zh || '').trim()) {
+        out.push({
+          code: code,
+          title: String(work.title || '').trim(),
+          line: String(work.line || ''),
+        });
+      }
+      nested.forEach(add);
+    }
+    (items || []).forEach(add);
+    return out.slice(0, 40);
+  }
+
+  /**
+   * Copy a resolved 日文（中文） gloss onto every same-code card.
+   * Does not replace a title that is already present, and does not cross codes.
+   */
+  function applyResolvedTitleZh(items, titles) {
+    const map = titles && typeof titles === 'object' ? titles : {};
+    let changed = false;
+    function touch(work) {
+      if (!work) return;
+      const key = titleZhKey(work.code);
+      const zh = key ? String(map[key] || '').trim() : '';
+      if (zh && !String(work.titleZh || work.title_zh || '').trim()) {
+        work.titleZh = zh;
+        work.title_zh = zh;
+        changed = true;
+      }
+      (work.relatedByTitle || work.related || []).forEach(touch);
+    }
+    (items || []).forEach(touch);
+    return changed;
+  }
+
+  function writeTitleZhOntoPayload(payload, titles) {
+    if (!payload || !titles) return;
+    function touch(row) {
+      if (!row || typeof row !== 'object') return;
+      const key = titleZhKey(row.code);
+      const zh = key ? String(titles[key] || '').trim() : '';
+      if (zh && !String(row.title_zh || row.titleZh || '').trim()) row.title_zh = zh;
+      ['related_by_title', 'related', 'results', 'candidates'].forEach((name) => {
+        const list = row[name];
+        if (Array.isArray(list)) list.forEach(touch);
+      });
+    }
+    touch(payload);
+  }
+
+  /** History rows: one Chinese title per 品番, main and related, both directions. */
+  function shareSessionTitleZh(works) {
+    const found = {};
+    function take(row) {
+      if (!row) return;
+      const key = titleZhKey(row.code);
+      const zh = String(row.title_zh || row.titleZh || '').trim();
+      if (key && zh && !found[key]) found[key] = zh;
+      (row.related || []).forEach(take);
+    }
+    (works || []).forEach(take);
+    let changed = false;
+    function put(row) {
+      if (!row) return row;
+      const key = titleZhKey(row.code);
+      const zh = key && found[key];
+      let next = row;
+      if (zh && !String(row.title_zh || row.titleZh || '').trim()) {
+        next = Object.assign({}, row, { title_zh: zh });
+        changed = true;
+      }
+      if (Array.isArray(row.related) && row.related.length) {
+        const rel = row.related.map(put);
+        if (rel.some((r, i) => r !== row.related[i])) {
+          if (next === row) next = Object.assign({}, row);
+          next.related = rel;
+          changed = true;
+        }
+      }
+      return next;
+    }
+    return { works: (works || []).map(put), changed: changed };
+  }
+
+  function repaintGalleryTitles(items) {
+    if (!galleryCards || typeof galleryCards.querySelectorAll !== 'function') return;
+    const blocks = galleryCards.querySelectorAll('.work-carousel-block');
+    (items || []).forEach((work, i) => {
+      const block = blocks[i];
+      if (!block || typeof block.querySelectorAll !== 'function') return;
+      const slides = block.querySelectorAll('.work-carousel-slide');
+      const cards = [work].concat(Array.isArray(work.relatedByTitle) ? work.relatedByTitle : []);
+      cards.forEach((w, si) => {
+        const slide = slides[si];
+        if (!slide || typeof slide.querySelector !== 'function') return;
+        const card = slide.querySelector('.card');
+        if (!card) return;
+        const titleEl = card.querySelector('.card-title');
+        const nextText = formatDisplayTitle(w && w.title, w && (w.titleZh || w.title_zh));
+        const shown = titleEl ? String(titleEl.textContent || '') : '';
+        if (shown === nextText) return;
+        const badgeEl = card.querySelector('.card-line');
+        const badge = badgeEl ? badgeEl.textContent : lineLabel(w && w.line);
+        card.replaceWith(buildWorkCard(w, { slide: true, badgeLabel: badge }));
+      });
+    });
+  }
+
+  let titleZhFillGen = 0;
+
+  function enrichLiveGalleryTitleZh(payload, items) {
+    const gen = ++titleZhFillGen;
+    const reqs = missingTitleZhRequests(items);
+    if (!reqs.length) return Promise.resolve(false);
+    return fetch('/api/title-zh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: reqs }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (gen !== titleZhFillGen) return false;
+        const titles = data && data.titles;
+        if (!titles || typeof titles !== 'object') return false;
+        if (!applyResolvedTitleZh(items, titles)) return false;
+        writeTitleZhOntoPayload(payload, titles);
+        repaintGalleryTitles(items);
+        const wait = historySavePromise ? historySavePromise : Promise.resolve(null);
+        return Promise.resolve(wait).then((recId) => {
+          if (gen !== titleZhFillGen || !recId) return true;
+          replaceHistorySessionWorks(recId, sessionWorksFromIdentify(payload));
+          return true;
+        });
+      })
+      .catch(() => false);
   }
 
   function galleryFromIdentify(data) {
@@ -5815,8 +5966,11 @@
         const incomingQ = normalizeKeywordList(data.keyword_queries);
         if (incomingQ.length) patch.keyword_queries = incomingQ;
         work = backfillWorkTreeLocal(Object.assign({}, work, patch));
+        const sharedOne = shareSessionTitleZh([work]);
+        if (sharedOne.changed && sharedOne.works[0]) work = sharedOne.works[0];
         patch.stills = work.stills;
         patch.related = work.related;
+        if (work.title_zh) patch.title_zh = work.title_zh;
         persistHistoryWork(recId, workIndex, patch);
       }
     } catch (_) {}
@@ -5904,9 +6058,18 @@
         }
         nextWorks.push(next);
       }
+      const shared = shareSessionTitleZh(nextWorks);
+      if (shared.changed) {
+        changed = true;
+        shared.works.forEach((w, i) => {
+          if (w !== nextWorks[i]) {
+            persistHistoryWork(id, i, { title_zh: w.title_zh || '', related: w.related || [] });
+          }
+        });
+      }
       if (viewingHistoryId !== id) return;
       if (!changed) return;
-      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: nextWorks });
+      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: shared.works });
       paintHistoryDetail(fresh);
     } catch (_) {}
   }
@@ -5974,6 +6137,7 @@
       const recId = historySavePromise ? await historySavePromise : null;
       if (recId) replaceHistorySessionWorks(recId, sessionWorksFromIdentify(patched));
     } catch (_) {}
+    enrichLiveGalleryTitleZh(patched, result.items);
     setStatus('');
     showToast('已重新辨識這張');
     return { ok: true };
@@ -6083,6 +6247,7 @@
         renderGallery(result);
         // Persist history (async thumbs)
         historySavePromise = appendHistoryFromIdentify(data, imgs).catch(() => null);
+        enrichLiveGalleryTitleZh(data, result.items);
         // Clear pending selection but keep sticky shots until 重新開始
         clearPending(false);
         // Auto-hide progress so it cannot permanently cover gallery bottom/footer
@@ -6487,6 +6652,9 @@
       sessionWorksFromIdentify,
       identifyPayloadFromHistory,
       galleryFromIdentify,
+      applyResolvedTitleZh,
+      missingTitleZhRequests,
+      shareSessionTitleZh,
       historySessionWorks,
       isRelatedBucketItem,
       formatDisplayTitle,

@@ -5757,8 +5757,21 @@ def harmonize_batch_title_zh(payload: dict, *, use_cache: bool = False) -> dict:
     return payload
 
 
+def _related_title_slide(item: dict | None) -> bool:
+    """Carousel slides (片名 / 關鍵字 / 同演員), not a 主作品 row."""
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("line") or "") in {"theme", "keyword", "actress", "title"}
+
+
 def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
-    """One fetch per 品番 this job has not tried yet, then copy that result."""
+    """One fetch per 品番 this job has not tried yet, then copy that result.
+
+    Related slides and mains each keep half the budget, then whichever side
+    still lacks a Chinese title may use time the other side did not. A batch
+    of 主作品 must not leave 相關作品 Japanese-only when a catalog source
+    exists. Nothing is translated.
+    """
     import time as _time
 
     if not isinstance(payload, dict):
@@ -5766,9 +5779,9 @@ def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
     harmonize_batch_title_zh(payload, use_cache=True)
     t0 = _time.monotonic()
     seen: set[str] = set()
-    # Mains first, then related slides, so a batch of works is not starved by the carousel.
-    ordered = _collect_title_zh_items(payload)
-    for item in ordered:
+    mains: list[tuple[dict, str]] = []
+    related: list[tuple[dict, str]] = []
+    for item in _collect_title_zh_items(payload):
         if not _item_needs_title_zh(item):
             continue
         key = _title_zh_code_key(item.get("code"))
@@ -5776,23 +5789,46 @@ def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
         # job already stored a Chinese title for the 品番.
         if not key or key in seen or (_title_zh_already_fetched(key) and _memo_title_zh(key)):
             continue
-        if budget_sec and (_time.monotonic() - t0) > float(budget_sec):
-            break
         seen.add(key)
-        deadline = t0 + float(budget_sec) if budget_sec else None
-        try:
-            zh = resolve_chinese_title(
-                key,
-                title_ja=item.get("title"),
-                existing_zh=item.get("title_zh"),
-                actress_ja=item.get("actress"),
-                deadline=deadline,
-            )
-        except Exception:
-            zh = None
-        _note_title_zh_fetched(key, zh, item.get("title"))
-        if zh:
-            item["title_zh"] = zh
+        if _related_title_slide(item):
+            related.append((item, key))
+        else:
+            mains.append((item, key))
+
+    def drain(queue: list[tuple[dict, str]], deadline: float | None) -> None:
+        while queue:
+            if deadline is not None and _time.monotonic() > deadline:
+                return
+            item, key = queue.pop(0)
+            if not _item_needs_title_zh(item):
+                continue
+            known = _memo_title_zh(key)
+            if known:
+                item["title_zh"] = known
+                continue
+            try:
+                zh = resolve_chinese_title(
+                    key,
+                    title_ja=item.get("title"),
+                    existing_zh=item.get("title_zh"),
+                    actress_ja=item.get("actress"),
+                    deadline=deadline,
+                )
+            except Exception:
+                zh = None
+            _note_title_zh_fetched(key, zh, item.get("title"))
+            if zh:
+                item["title_zh"] = zh
+
+    if not budget_sec:
+        drain(related, None)
+        drain(mains, None)
+    else:
+        end = t0 + float(budget_sec)
+        half = t0 + float(budget_sec) / 2.0
+        drain(related, half if mains else end)
+        drain(mains, end)
+        drain(related, end)
     return harmonize_batch_title_zh(payload, use_cache=True)
 
 
@@ -5841,7 +5877,15 @@ def _stamp_multi_batch(payload: dict, job_t0: float, slot_used: dict | None) -> 
         src = by_index.get(item.get("from_image_index")) if isinstance(item.get("from_image_index"), int) else None
         if not isinstance(src, dict):
             continue
-        if not item.get("title_zh") and src.get("title_zh"):
+        src_key = _title_zh_code_key(src.get("code"))
+        item_key = _title_zh_code_key(item.get("code"))
+        # Same 品番 only. A slot's Chinese title must not land on another code.
+        if (
+            not item.get("title_zh")
+            and src.get("title_zh")
+            and src_key
+            and src_key == item_key
+        ):
             item["title_zh"] = src.get("title_zh")
         if _elapsed_ms_value(item.get("work_elapsed_ms")) is None:
             copied = _elapsed_ms_value(src.get("work_elapsed_ms"))
@@ -15252,6 +15296,49 @@ def related_by_title_api():
         "theme_keywords": wrap.get("theme_keywords") or [],
         "keyword_queries": wrap.get("keyword_queries") or [],
     })
+
+
+@app.route("/api/title-zh", methods=["POST"])
+def title_zh_api():
+    """Chinese titles for codes already on screen. Does not add or reorder cards.
+
+    Sources are the payload, the offline cache, and MissAV / Jable / JAVLibrary.
+    A code with no stored Chinese title is omitted. Nothing is translated.
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    payload: dict = {"ok": True, "results": [], "related_by_title": []}
+    for raw in raw_items[:40]:
+        if not isinstance(raw, dict):
+            continue
+        code = str(raw.get("code") or "").strip()
+        if not code or not parse_code_parts(code):
+            continue
+        row = {
+            "code": format_display_code(code),
+            "title": str(raw.get("title") or "").strip(),
+            "title_zh": str(raw.get("title_zh") or raw.get("titleZh") or "").strip(),
+            "line": str(raw.get("line") or "").strip(),
+        }
+        if _related_title_slide(row):
+            payload["related_by_title"].append(row)
+        else:
+            payload["results"].append(row)
+    try:
+        _fill_unfetched_title_zh(payload, budget_sec=8.0)
+    except Exception:
+        pass
+    titles: dict[str, str] = {}
+    for item in _collect_title_zh_items(payload):
+        key = _title_zh_code_key(item.get("code"))
+        zh = str(item.get("title_zh") or "").strip()
+        if key and zh and key not in titles:
+            titles[key] = zh
+    return jsonify({"ok": True, "titles": titles})
 
 
 @app.route("/api/related-by-keywords", methods=["POST"])

@@ -3805,6 +3805,71 @@ function walkNodes(node, acc) {
     );
   }
 
+  // 主作品 and 相關作品 share one Chinese title per 品番. A different code stays Japanese-only.
+  {
+    const data = {
+      ok: true,
+      code: 'APGH-015',
+      title: '十五の題',
+      title_zh: '十五中文',
+      results: [
+        {
+          ok: true,
+          code: 'APGH-015',
+          title: '十五の題',
+          title_zh: '十五中文',
+          line: 'main',
+          related_by_title: [
+            { code: 'APGH-012', title: '十二の題', line: 'theme', title_zh: '十二中文' },
+            { code: 'APGH-015', title: '十五の題', line: 'keyword' },
+            { code: 'TYVM-349', title: '別題', line: 'keyword' },
+          ],
+        },
+        { ok: true, code: 'APGH-012', title: '十二の題', line: 'multi' },
+      ],
+    };
+    const gallery = H.galleryFromIdentify(data);
+    assert.strictEqual(gallery.items[1].titleZh, '十二中文', 'main picks up the related card of the same code');
+    assert.strictEqual(gallery.items[0].relatedByTitle[0].titleZh, '十二中文');
+    assert.strictEqual(gallery.items[0].relatedByTitle[1].titleZh, '十五中文', 'related picks up the main of the same code');
+    assert.strictEqual(gallery.items[0].relatedByTitle[2].titleZh, '');
+    assert.strictEqual(
+      H.formatDisplayTitle(gallery.items[0].relatedByTitle[1].title, gallery.items[0].relatedByTitle[1].titleZh),
+      '十五の題（十五中文）'
+    );
+    assert.strictEqual(
+      H.formatDisplayTitle(gallery.items[0].relatedByTitle[2].title, gallery.items[0].relatedByTitle[2].titleZh),
+      '別題'
+    );
+    const applied = H.applyResolvedTitleZh(gallery.items, { 'TYVM-349': '別的中文', 'APGH-015': '不該覆蓋' });
+    assert.strictEqual(applied, true);
+    assert.strictEqual(gallery.items[0].relatedByTitle[2].titleZh, '別的中文');
+    assert.strictEqual(gallery.items[0].titleZh, '十五中文', 'an existing gloss is not replaced');
+    assert.notStrictEqual(gallery.items[1].titleZh, '別的中文');
+    const missing = H.missingTitleZhRequests([
+      {
+        code: 'AAA-001',
+        title: '有中文',
+        titleZh: '已有',
+        line: 'main',
+        relatedByTitle: [{ code: 'BBB-002', title: '相關日文', line: 'theme', titleZh: '' }],
+      },
+    ]);
+    assert.strictEqual(missing.map((row) => row.code).join(','), 'BBB-002');
+    const session = H.shareSessionTitleZh([
+      {
+        code: 'APGH-015',
+        title: '十五の題',
+        title_zh: '',
+        related: [{ code: 'APGH-012', title: '十二の題', title_zh: '十二中文', line: 'theme' }],
+      },
+      { code: 'APGH-012', title: '十二の題', title_zh: '', related: [] },
+    ]);
+    assert.strictEqual(session.changed, true);
+    assert.strictEqual(session.works[1].title_zh, '十二中文');
+    assert.strictEqual(session.works[0].title_zh, '');
+  }
+
   // 暫無封面 cards offer 重新搜索 and write a found jacket back into that same cell.
   {
     assert.strictEqual(
