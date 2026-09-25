@@ -238,20 +238,12 @@
     const items = Array.isArray(raw)
       ? raw
       : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
-    // BOD / VOL stored on an old card is not a theme. Refresh from the title.
+    // BOD / VOL stored on an old card is not a theme list.
     if (items.some((item) => isEditionKeyword(item))) return true;
     const related = (work && work.related) || [];
     const hasKw = related.some((r) => relatedLineFromRaw(r) === 'keyword');
     if (!hasKw) return false;
     return !normalizeKeywordList(raw).length;
-  }
-
-  /** Saved results-page chips. Gap fill must not replace them.
-   *  Edition junk (BOD / VOL) is not a snapshot and may still refresh.
-   */
-  function themeKeywordSnapshotFrozen(work) {
-    if (!work || workNeedsThemeKeywords(work)) return false;
-    return normalizeKeywordList(work.theme_keywords || work.themeKeywords).length > 0;
   }
 
   function relatedHasPersistedMembership(related) {
@@ -266,21 +258,6 @@
     const hasTitle = !!(opts.title && String(opts.title).trim());
     const hasActress = !!(opts.actress && String(opts.actress).trim());
     return hasTitle || hasActress;
-  }
-
-  function applyTitleZhOntoRelated(existing, incoming) {
-    const byCode = {};
-    (incoming || []).forEach((r) => {
-      if (!r || !r.code) return;
-      byCode[String(r.code)] = r;
-    });
-    return (existing || []).map((r) => {
-      if (!r || !r.code) return r;
-      const hit = byCode[String(r.code)];
-      const zh = hit ? String(hit.title_zh || hit.titleZh || '').trim() : '';
-      if (!zh || String(r.title_zh || r.titleZh || '').trim()) return r;
-      return Object.assign({}, r, { title_zh: zh });
-    });
   }
 
   function workNeedsTitleZh(w) {
@@ -409,32 +386,6 @@
     if (next.userPreview && next.cover === next.userPreview) {
       next.cover = catalogOnlyUrl('', next.cid);
     }
-    return next;
-  }
-
-  function workNeedsStillsFill(w) {
-    if (!w || !String(w.cid || '').trim()) return false;
-    const n = (Array.isArray(w.stills) ? w.stills : []).filter(Boolean).length;
-    return n < 10;
-  }
-
-  function backfillWorkStillsLocal(w) {
-    if (!workNeedsStillsFill(w)) return w;
-    const extra = stillUrls(String(w.cid), 10);
-    return Object.assign({}, w, { stills: mergeStillsKeepExisting(w.stills, extra) });
-  }
-
-  function backfillWorkTreeLocal(w) {
-    if (!w) return w;
-    let next = backfillWorkStillsLocal(w);
-    const rel = next.related || [];
-    let relChanged = false;
-    const nextRel = rel.map((r) => {
-      const fr = backfillWorkStillsLocal(r);
-      if (fr !== r) relChanged = true;
-      return fr;
-    });
-    if (relChanged) next = Object.assign({}, next, { related: nextRel });
     return next;
   }
 
@@ -808,58 +759,6 @@
     });
     const order = {};
     ranked.forEach((tok, i) => {
-      order[tok] = i;
-    });
-    chosen.sort((a, b) => order[a] - order[b]);
-    return chosen;
-  }
-
-  /**
-   * Saved chips first. Append tokens the saved list does not already have.
-   * A recompute must not drop a saved non-junk chip. At the cap, 巨乳 / 美乳 /
-   * 爆乳 may replace a newly appended chip only.
-   */
-  function unionKeywordLists(saved, incoming, limit) {
-    limit = limit || 10;
-    const base = normalizeKeywordList(saved);
-    const extra = normalizeKeywordList(incoming);
-    const seen = {};
-    const merged = [];
-    base.forEach((tok) => {
-      if (seen[tok]) return;
-      seen[tok] = true;
-      merged.push(tok);
-    });
-    extra.forEach((tok) => {
-      if (seen[tok]) return;
-      seen[tok] = true;
-      merged.push(tok);
-    });
-    if (base.length >= limit) return base.slice(0, limit);
-    if (merged.length <= limit) return merged;
-    const chosen = base.slice();
-    const inSaved = {};
-    base.forEach((tok) => {
-      inSaved[tok] = true;
-    });
-    merged.forEach((tok) => {
-      if (chosen.length >= limit || chosen.indexOf(tok) !== -1 || inSaved[tok]) return;
-      chosen.push(tok);
-    });
-    const body = { '巨乳': 1, '美乳': 1, '爆乳': 1 };
-    merged.forEach((tok) => {
-      if (!body[tok] || chosen.indexOf(tok) !== -1) return;
-      let replaced = false;
-      for (let i = chosen.length - 1; i >= 0; i--) {
-        if (inSaved[chosen[i]] || body[chosen[i]]) continue;
-        chosen.splice(i, 1);
-        replaced = true;
-        break;
-      }
-      if ((replaced || chosen.length < limit) && chosen.indexOf(tok) === -1) chosen.push(tok);
-    });
-    const order = {};
-    merged.forEach((tok, i) => {
       order[tok] = i;
     });
     chosen.sort((a, b) => order[a] - order[b]);
@@ -4784,8 +4683,13 @@
     } catch (_) {}
   }
 
-  /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file. */
+  /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file.
+   *  History detail paints the saved snapshot and does not start this fetch.
+   */
+  let paintingHistorySnapshot = false;
+
   function warmCoverFromProxy(img, url) {
+    if (paintingHistorySnapshot) return;
     const u = String(url || '').trim();
     if (!u || isNowPrintingUrl(u)) return;
     const urls = dmmCoverVariantUrls(u);
@@ -6079,79 +5983,9 @@
     return rec.id;
   }
 
-  async function fillWorkRelatedGaps(work, recId, workIndex) {
-    const before = work;
-    work = backfillWorkTreeLocal(work);
-    if (work !== before) {
-      const localPatch = { stills: work.stills, cid: work.cid };
-      if (Array.isArray(work.related)) localPatch.related = work.related;
-      persistHistoryWork(recId, workIndex, localPatch);
-    }
-    const related = work.related || [];
-    const need =
-      relatedNeedsTitleZh(related) ||
-      relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
-      workNeedsTitleZh(work) ||
-      workNeedsThemeKeywords(work);
-    if (!need) return work;
-    try {
-      const res = await fetch('/api/related-by-title', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: work.title || '',
-          code: work.code || '',
-          actress: work.actress || '',
-          seed: related,
-          // So the response echoes this snapshot instead of a title-only rebuild.
-          theme_keywords: normalizeKeywordList(work.theme_keywords || work.themeKeywords),
-          keyword_queries: normalizeKeywordList(work.keyword_queries || work.keywordQueries),
-        }),
-      });
-      const data = await res.json();
-      if (data && data.ok && Array.isArray(data.related_by_title)) {
-        const incoming = data.related_by_title;
-        // A saved related list is frozen. A later search must not shrink 14↔9.
-        // Chinese titles may be copied onto the same rows; membership stays.
-        const frozen = relatedHasPersistedMembership(related);
-        const merged = frozen
-          ? applyTitleZhOntoRelated(related, incoming)
-          : (related && related.length
-            ? mergeRelatedIncremental(related, incoming)
-            : slimRelatedForHistory(incoming));
-        const patch = { related: merged, stills: work.stills, cid: work.cid };
-        const incomingZh = String(data.title_zh || '').trim();
-        if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
-          patch.title_zh = incomingZh;
-        }
-        // Saved chips stay. New distinct chips append; a duplicate is skipped.
-        // A title-only recompute must not clear the snapshot. BOD / VOL, or an
-        // empty list, may still take the response as a whole.
-        if (themeKeywordSnapshotFrozen(work)) {
-          const savedKw = normalizeKeywordList(work.theme_keywords || work.themeKeywords);
-          const mergedKw = unionKeywordLists(savedKw, data.theme_keywords);
-          if (mergedKw.join('\u0001') !== savedKw.join('\u0001')) {
-            patch.theme_keywords = mergedKw;
-          }
-        } else {
-          const incomingKw = normalizeKeywordList(data.theme_keywords);
-          if (incomingKw.length) patch.theme_keywords = incomingKw;
-          const incomingQ = normalizeKeywordList(data.keyword_queries);
-          if (incomingQ.length) patch.keyword_queries = incomingQ;
-        }
-        work = backfillWorkTreeLocal(Object.assign({}, work, patch));
-        const sharedOne = shareSessionTitleZh([work]);
-        if (sharedOne.changed && sharedOne.works[0]) work = sharedOne.works[0];
-        patch.stills = work.stills;
-        patch.related = work.related;
-        if (work.title_zh) patch.title_zh = work.title_zh;
-        persistHistoryWork(recId, workIndex, patch);
-      }
-    } catch (_) {}
-    return work;
-  }
-
   function paintHistoryDetail(rec) {
+    paintingHistorySnapshot = true;
+    try {
     historyDetailEl.innerHTML = '';
     if (rec.ok === false && rec.message) {
       const notice = document.createElement('div');
@@ -6212,51 +6046,20 @@
     (result.items || []).forEach((w) => {
       historyDetailEl.appendChild(buildWorkCarousel(w));
     });
-  }
-
-  async function enrichHistoryDetail(rec, id) {
-    try {
-      const works = historySessionWorks(rec);
-      let changed = false;
-      const nextWorks = [];
-      for (let i = 0; i < works.length; i++) {
-        const next = await fillWorkRelatedGaps(works[i], id, i);
-        if (
-          next !== works[i] ||
-          JSON.stringify(next && next.related) !== JSON.stringify(works[i] && works[i].related) ||
-          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '') ||
-          JSON.stringify((next && next.theme_keywords) || []) !==
-            JSON.stringify((works[i] && works[i].theme_keywords) || [])
-        ) {
-          changed = true;
-        }
-        nextWorks.push(next);
-      }
-      const shared = shareSessionTitleZh(nextWorks);
-      if (shared.changed) {
-        changed = true;
-        shared.works.forEach((w, i) => {
-          if (w !== nextWorks[i]) {
-            persistHistoryWork(id, i, { title_zh: w.title_zh || '', related: w.related || [] });
-          }
-        });
-      }
-      if (viewingHistoryId !== id) return;
-      if (!changed) return;
-      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: shared.works });
-      paintHistoryDetail(fresh);
-    } catch (_) {}
+    } finally {
+      paintingHistorySnapshot = false;
+    }
   }
 
   function openHistoryDetail(id) {
     const rec = loadHistory().find((x) => x.id === id);
     if (!rec) return false;
     viewingHistoryId = id;
+    // Saved snapshot only. Missing or stale fields wait for 重新辨識.
     paintHistoryDetail(rec);
     showScreen('history-detail');
     hideUserShots();
     hideProgress();
-    enrichHistoryDetail(rec, id);
     return true;
   }
 
