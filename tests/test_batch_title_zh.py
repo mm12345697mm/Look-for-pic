@@ -88,6 +88,65 @@ class BatchTitleZhTests(unittest.TestCase):
         for row in kept:
             self.assertEqual(row.get("title_zh"), "電影院中文")
 
+    def test_short_sourced_zh_is_shared_without_inventing(self):
+        payload = {
+            "code": "REAL-852",
+            "title": "巨乳水泳部員",
+            "title_zh": "巨乳泳社",
+            "results": [
+                {"code": "REAL-852", "title": "巨乳水泳部員", "title_zh": "巨乳泳社"},
+                {"code": "REAL-852", "title": "巨乳水泳部員"},
+                {"code": "DAS-034", "title": "別作品"},
+            ],
+        }
+        with mock.patch.object(S, "http_get", side_effect=AssertionError("fetch")):
+            S.harmonize_batch_title_zh(payload)
+        self.assertEqual(payload["results"][1]["title_zh"], "巨乳泳社")
+        self.assertFalse(payload["results"][2].get("title_zh"))
+        self.assertIsNone(S._keep_stored_title_zh("巨乳水泳部員", title_ja="巨乳水泳部員", code="REAL-852"))
+        self.assertIsNone(S._keep_stored_title_zh("彼女の妹", title_ja="別の題"))
+
+    def test_missav_cn_title_without_particle_is_kept(self):
+        html = (
+            "<html><head><meta property=\"og:title\" "
+            "content=\"REAL-852 巨乳泳社 - MissAV\"></head></html>"
+        )
+
+        def fake_get(url, timeout=8.0, headers=None, **kwargs):
+            if "missav.ai/cn/real-852" in url:
+                return html
+            return None
+
+        with mock.patch.object(S, "http_get", side_effect=fake_get):
+            meta = S.fetch_public_zh_catalog("REAL-852", title_ja="巨乳水泳部員")
+        self.assertEqual(meta["title_zh"], "巨乳泳社")
+
+    def test_empty_live_fetch_reuses_stored_or_cached_zh(self):
+        with mock.patch.object(S, "fetch_public_zh_catalog", return_value={"title_zh": None}):
+            with mock.patch.object(S, "offline_cache_get", return_value=None):
+                kept = S.resolve_chinese_title(
+                    "REAL-852",
+                    title_ja="巨乳水泳部員",
+                    existing_zh="巨乳泳社",
+                )
+                empty = S.resolve_chinese_title("DAS-034", title_ja="日文題", existing_zh=None)
+        self.assertEqual(kept, "巨乳泳社")
+        self.assertFalse(empty)
+        payload = {
+            "code": "DAS-034",
+            "title": "日文題",
+            "results": [{"code": "DAS-034", "title": "日文題"}],
+        }
+        with mock.patch.object(
+            S,
+            "offline_cache_get",
+            return_value={"title": "日文題", "title_zh": "巨乳集訓"},
+        ):
+            with mock.patch.object(S, "http_get", side_effect=AssertionError("fetch")):
+                S.harmonize_batch_title_zh(payload, use_cache=True)
+        self.assertEqual(payload["title_zh"], "巨乳集訓")
+        self.assertEqual(payload["results"][0]["title_zh"], "巨乳集訓")
+
     def test_progress_event_carries_monotonic_mark(self):
         seen = []
         S._progress(seen.append, "search", "active", "搜尋第 1/2 張…", 0.55, phase="目錄查詢")

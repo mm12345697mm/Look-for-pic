@@ -1673,11 +1673,6 @@
       const li = document.createElement('li');
       li.className = 'progress-step is-pending';
       li.dataset.step = s.id;
-      li.innerHTML =
-        '<span class="step-mark" aria-hidden="true"></span>' +
-        '<span class="step-label">' + escapeHtml(s.label) + '</span>' +
-        '<span class="step-timer">00:00:00</span>' +
-        '<span class="step-phase" hidden></span>';
       const mark = document.createElement('span');
       mark.className = 'step-mark';
       mark.setAttribute('aria-hidden', 'true');
@@ -2149,6 +2144,12 @@
     next.line = at === 0 ? 'main' : 'multi';
     next.skipped = false;
     next.ok = src.ok !== false;
+    if (!String(next.title_zh || next.titleZh || '').trim()) {
+      const kept =
+        String(prev.title_zh || prev.titleZh || '').trim() ||
+        knownTitleZhForCode(next.code || prev.code);
+      if (kept) next.title_zh = kept;
+    }
     const batchJob = firstElapsed(prev.job_elapsed_ms, prev.jobElapsedMs, base.job_elapsed_ms, base.jobElapsedMs);
     if (batchJob != null) next.job_elapsed_ms = batchJob;
     if (!next.user_preview && prev.user_preview) next.user_preview = prev.user_preview;
@@ -2162,6 +2163,7 @@
     if (at === 0) {
       out.code = next.code || '';
       out.title = next.title || '';
+      out.title_zh = next.title_zh || prev.title_zh || base.title_zh || '';
       out.cover = next.cover || '';
       out.related_by_title = next.related_by_title || [];
     }
@@ -2210,6 +2212,38 @@
     return formatDisplayCode(raw);
   }
 
+  function knownTitleZhForCode(code) {
+    const key = titleZhKey(code);
+    if (!key) return '';
+    let list = [];
+    try {
+      list = loadHistory();
+    } catch (_) {
+      list = [];
+    }
+    function take(row) {
+      if (!row || !row.code || !codesMatch(row.code, code)) return '';
+      return String(row.title_zh || row.titleZh || '').trim();
+    }
+    for (let i = 0; i < list.length; i++) {
+      const rec = list[i];
+      if (!rec) continue;
+      const direct = take(rec);
+      if (direct) return direct;
+      const works = historySessionWorks(rec);
+      for (let j = 0; j < works.length; j++) {
+        const zh = take(works[j]);
+        if (zh) return zh;
+        const rel = (works[j] && works[j].related) || [];
+        for (let k = 0; k < rel.length; k++) {
+          const relZh = take(rel[k]);
+          if (relZh) return relZh;
+        }
+      }
+    }
+    return '';
+  }
+
   function harmonizeGalleryTitleZh(items) {
     const found = {};
     function remember(work) {
@@ -2223,7 +2257,10 @@
     function fill(work) {
       if (!work) return;
       const key = titleZhKey(work.code);
-      if (key && found[key] && !String(work.titleZh || '').trim()) work.titleZh = found[key];
+      if (key && !String(work.titleZh || '').trim()) {
+        work.titleZh = found[key] || knownTitleZhForCode(work.code) || '';
+        if (work.titleZh && !found[key]) found[key] = work.titleZh;
+      }
       (work.relatedByTitle || []).forEach(fill);
     }
     (items || []).forEach(fill);
@@ -2575,23 +2612,33 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    const retryBtn = w.skipped || originalSlotFile(w) ? buildReidentifyButton(w) : null;
-    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap, retryBtn));
-    else if (retryBtn) {
-      const bar = document.createElement('div');
-      bar.className = 'work-actions';
-      bar.appendChild(retryBtn);
-      card.appendChild(bar);
-    }
+    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
     if (workNeedsManualFix(w)) {
       card.appendChild(buildManualFixPanel(w, card));
     }
     if (!w.skipped) appendStillsScroll(card, w, '劇照（橫滑）');
-    const times = buildWorkTimes(w);
-    if (times) card.appendChild(times);
+    const under = buildUnderStillsRow(w);
+    if (under) card.appendChild(under);
     if (w.skipped) card.classList.add('is-skipped');
     return card;
+  }
+
+  function cardCanReidentify(w) {
+    if (!w || isRelatedCarouselLine(String(w.line || ''))) return false;
+    return !!(w.skipped || originalSlotFile(w));
+  }
+
+  /** Compact 重新辨識 sits under 劇照; batch times sit to its right on that row. */
+  function buildUnderStillsRow(w) {
+    const retry = cardCanReidentify(w) ? buildReidentifyButton(w) : null;
+    const times = buildWorkTimes(w);
+    if (!retry && !times) return null;
+    const row = document.createElement('div');
+    row.className = 'work-under-stills';
+    if (retry) row.appendChild(retry);
+    if (times) row.appendChild(times);
+    return row;
   }
 
   function buildTimeChip(label, ms) {
@@ -3667,7 +3714,7 @@
     }
   }
 
-  function buildWorkActions(w, coverWrap, retryBtn) {
+  function buildWorkActions(w, coverWrap) {
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
@@ -3718,7 +3765,6 @@
       bindWorkAction(btn, spec.run);
       bar.appendChild(btn);
     });
-    if (retryBtn) bar.appendChild(retryBtn);
     return bar;
   }
 
@@ -6094,6 +6140,9 @@
       followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
       mergeSlotRetryIntoIdentify,
+      noteSlotUploads: function (files) {
+        slotUploadFiles = Array.isArray(files) ? files.slice() : [];
+      },
       skipControlState,
       replaceHistorySessionWorks,
       workNeedsTitleZh,

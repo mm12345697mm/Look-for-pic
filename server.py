@@ -5615,10 +5615,27 @@ def _job_zh_end() -> None:
         st.fetched.clear()
 
 
+def _keep_stored_title_zh(raw, title_ja=None, code=None) -> str | None:
+    """Keep a Chinese title already stored for this 品番, or parsed from a CN page.
+
+    Strict particle checks drop real MissAV lines such as 巨乳泳社. Kana and a
+    copy of the Japanese title still do not count. Nothing is translated.
+    """
+    return _clean_title_zh(
+        None if raw is None else str(raw),
+        title_ja=title_ja,
+        code=code,
+        trusted=True,
+    )
+
+
 def _remember_title_zh(code, zh, title_ja=None) -> str | None:
     """Remember a real Chinese title for this 品番. Never store a translation we made up."""
     key = _title_zh_code_key(code)
-    cleaned = _clean_title_zh(None if zh is None else str(zh), title_ja=title_ja, code=key or code)
+    raw = None if zh is None else str(zh)
+    cleaned = _clean_title_zh(raw, title_ja=title_ja, code=key or code)
+    if not cleaned:
+        cleaned = _keep_stored_title_zh(raw, title_ja=title_ja, code=key or code)
     if not key or not cleaned:
         return cleaned
     if _job_zh_state().depth > 0:
@@ -5705,7 +5722,10 @@ def harmonize_batch_title_zh(payload: dict, *, use_cache: bool = False) -> dict:
         key = _title_zh_code_key(item.get("code"))
         if not key:
             continue
-        zh = _clean_title_zh(item.get("title_zh"), title_ja=item.get("title"), code=key)
+        raw_zh = item.get("title_zh")
+        zh = _clean_title_zh(raw_zh, title_ja=item.get("title"), code=key)
+        if not zh:
+            zh = _keep_stored_title_zh(raw_zh, title_ja=item.get("title"), code=key)
         if not zh:
             continue
         item["title_zh"] = zh
@@ -5752,7 +5772,9 @@ def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
         if not _item_needs_title_zh(item):
             continue
         key = _title_zh_code_key(item.get("code"))
-        if not key or key in seen or _title_zh_already_fetched(key):
+        # An earlier empty pass must not block this fill. Skip only when this
+        # job already stored a Chinese title for the 品番.
+        if not key or key in seen or (_title_zh_already_fetched(key) and _memo_title_zh(key)):
             continue
         if budget_sec and (_time.monotonic() - t0) > float(budget_sec):
             break
@@ -6625,6 +6647,7 @@ def identify_code(
 
     title_zh = None
     actress_zh = None
+    prior_zh = None
     catalog_zh: dict = {}
     try:
         # Prefer Chinese already on the primary hit. A mismatched vision
@@ -6639,7 +6662,8 @@ def identify_code(
         ):
             title_zh = None
             actress_zh = None
-        known_zh = _memo_title_zh(display)
+        prior_zh = title_zh
+        known_zh = _memo_title_zh(display) or _cached_title_zh(display)
         if known_zh and not title_zh:
             title_zh = known_zh
         title_zh = resolve_chinese_title(
@@ -6649,11 +6673,17 @@ def identify_code(
             actress_ja=actress,
             catalog_out=catalog_zh,
         )
+        if not title_zh:
+            title_zh = _cached_title_zh(display) or _keep_stored_title_zh(
+                prior_zh, title_ja=title, code=display
+            )
         _note_title_zh_fetched(display, title_zh, title)
         if not str(actress_zh or "").strip():
             actress_zh = catalog_zh.get("actress_zh")
     except Exception:
-        title_zh = None
+        title_zh = _cached_title_zh(display) or _keep_stored_title_zh(
+            prior_zh, title_ja=title, code=display
+        )
         actress_zh = None
 
     out = {
@@ -7453,7 +7483,13 @@ def _looks_chinese_title(s: str | None) -> bool:
     return False
 
 
-def _clean_title_zh(raw: str | None, *, title_ja: str | None = None, code: str | None = None) -> str | None:
+def _clean_title_zh(
+    raw: str | None,
+    *,
+    title_ja: str | None = None,
+    code: str | None = None,
+    trusted: bool = False,
+) -> str | None:
     t = re.sub(r"\s+", " ", (raw or "").strip())
     if not t:
         return None
@@ -7487,9 +7523,15 @@ def _clean_title_zh(raw: str | None, *, title_ja: str | None = None, code: str |
         t = re.sub(r"\s+", " ", t).strip(" -\u3000")
     if title_ja and t == title_ja.strip():
         return None
-    if not _looks_chinese_title(t):
+    looks = _looks_chinese_title(t)
+    # A /cn/ catalog title, or a title_zh we already stored, can be Han without 的.
+    if not looks and trusted and not re.search(r"[\u3040-\u30ff]", t):
+        han = len(re.findall(r"[\u4e00-\u9fff]", t))
+        looks = han >= 2
+    if not looks:
         return None
-    if len(t) < 2 or len(t) > 80:
+    limit = 160 if trusted else 80
+    if len(t) < 2 or len(t) > limit:
         return None
     return t
 
@@ -7629,7 +7671,7 @@ def _parse_zh_catalog_html(
 ) -> tuple[str | None, str | None]:
     title_zh = None
     for raw in _html_title_candidates(html):
-        title_zh = _clean_title_zh(raw, title_ja=title_ja, code=code)
+        title_zh = _clean_title_zh(raw, title_ja=title_ja, code=code, trusted=True)
         if title_zh:
             break
     actress_zh = _actress_names_from_html(html, actress_ja=actress_ja, title_zh=title_zh)
@@ -7791,7 +7833,7 @@ def _fetch_javlibrary_zh_pair(
         title_zh = None
         tm = re.search(r'id="video_title".*?<a[^>]*>([^<]+)</a>', html, flags=re.I | re.S)
         if tm:
-            title_zh = _clean_title_zh(tm.group(1), title_ja=title_ja, code=disp)
+            title_zh = _clean_title_zh(tm.group(1), title_ja=title_ja, code=disp, trusted=True)
         if not title_zh:
             for m in re.finditer(
                 r'class="video"[^>]*>.*?title="([^"]+)"', html, flags=re.I | re.S
@@ -7805,7 +7847,7 @@ def _fetch_javlibrary_zh_pair(
                 ):
                     if not re.match(re.escape(disp.split("-")[0]), raw, flags=re.I):
                         continue
-                title_zh = _clean_title_zh(raw, title_ja=title_ja, code=disp)
+                title_zh = _clean_title_zh(raw, title_ja=title_ja, code=disp, trusted=True)
                 if title_zh:
                     break
         if title_zh:
@@ -8220,7 +8262,10 @@ def resolve_chinese_title(
     except Exception:
         meta = {}
     _copy_public_catalog_meta(catalog_out, meta)
-    return meta.get("title_zh")
+    found = meta.get("title_zh") if isinstance(meta, dict) else None
+    if found:
+        return found
+    return _keep_stored_title_zh(existing_zh, title_ja=title_ja, code=code) or _cached_title_zh(code)
 
 
 def _apply_catalog_actress(item: dict, catalog_out: dict | None) -> None:
@@ -11767,8 +11812,10 @@ def verify_work_against_image(
         zh = None
         if isinstance(winner, dict):
             zh = _clean_title_zh(winner.get("title_zh"), title_ja=winner.get("title"), code=new)
+            if not zh:
+                zh = _keep_stored_title_zh(winner.get("title_zh"), title_ja=winner.get("title"), code=new)
         if not zh:
-            zh = _memo_title_zh(new)
+            zh = _memo_title_zh(new) or _cached_title_zh(new)
         out["title_zh"] = zh
         out["stills"] = list((winner.get("stills") if isinstance(winner, dict) else None) or [])
         out["related_by_title"] = []

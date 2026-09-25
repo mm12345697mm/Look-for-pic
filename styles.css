@@ -412,7 +412,7 @@ label.btn {
   gap: 8px;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
-  padding: 4px 14px 14px;
+  padding: 4px 14px 8px;
   scroll-snap-type: x mandatory;
 }
 .stills-scroll img {
@@ -573,6 +573,9 @@ label.btn {
   color: var(--muted);
   line-height: 1.35;
 }
+.progress-step .step-label {
+  min-width: 0;
+}
 .progress-step .step-timer {
   font-variant-numeric: tabular-nums;
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -647,10 +650,12 @@ label.btn {
 .progress-step.is-error .step-mark::after { content: "!"; border: none; animation: none; color: var(--danger); font-weight: 700; }
 .progress-detail {
   margin: 10px 0 0;
-  min-height: 1.2em;
   font-size: 0.8rem;
   color: var(--muted);
   line-height: 1.4;
+}
+.progress-detail:empty {
+  display: none;
 }
 .progress-skip-row {
   padding: 0 14px 12px;
@@ -670,14 +675,18 @@ label.btn {
   color: var(--text);
   border: 1px solid var(--border);
 }
-.btn-reidentify {
-  margin-top: 8px;
+.work-under-stills {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 0 14px 10px;
 }
-.work-actions .btn-reidentify {
+.work-under-stills .btn-reidentify {
   width: auto;
   min-height: 28px;
   height: 28px;
-  margin-top: 0;
+  margin: 0;
   padding: 0 10px;
   font-size: 0.72rem;
   font-weight: 700;
@@ -685,13 +694,14 @@ label.btn {
   flex: 0 0 auto;
 }
 .work-times {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 6px 12px;
-  padding: 2px 14px 12px;
-}
-.work-times .work-time:only-child {
-  grid-column: 1 / -1;
+  display: flex;
+  flex: 1 1 auto;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 14px;
+  margin: 0;
+  padding: 0;
+  min-width: 0;
 }
 .work-time {
   margin: 0;
