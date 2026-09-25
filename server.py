@@ -11713,6 +11713,25 @@ def attach_related_by_title(
 
 
 
+def _form_related_codes() -> list[str]:
+    """Related 品番 hints posted with a slot 重新辨識."""
+    raw: list[str] = []
+    try:
+        raw.extend(request.form.getlist("related_codes"))
+    except Exception:
+        pass
+    one = (request.form.get("related_codes") or "").strip()
+    if one and one not in raw:
+        raw.append(one)
+    out: list[str] = []
+    for item in raw:
+        for part in str(item or "").replace("，", ",").split(","):
+            text = part.strip()
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
 def collect_images_from_request() -> list[tuple[bytes, str | None]]:
     """Accept multiple uploads via `images` and/or repeated `image` fields.
 
@@ -11953,18 +11972,94 @@ def _adopt_locked_retry_candidate(result: dict, winner: dict) -> dict:
     return out
 
 
+def _retry_hint_codes(related_codes: list | None, prior: str) -> list[str]:
+    """Related 品番 from the card, same label first, prior itself omitted."""
+    label = _code_label(prior)
+    same: list[str] = []
+    other: list[str] = []
+    seen: set[str] = set()
+    for raw in related_codes or []:
+        text = str(raw or "").strip()
+        if not text or not parse_code_parts(text):
+            continue
+        disp = format_display_code(text)
+        if disp in seen or codes_numeric_equal(disp, prior):
+            continue
+        seen.add(disp)
+        if _code_label(disp) == label:
+            same.append(disp)
+        else:
+            other.append(disp)
+    return (same + other)[:12]
+
+
+def _retry_candidate_shell(code: str) -> dict:
+    disp = format_display_code(code)
+    cid = code_to_cid(disp) or ""
+    cover = cover_url(cid) if cid else ""
+    return {"code": disp, "cid": cid, "cover": cover or None, "title": "", "stills": []}
+
+
+def _lock_related_retry(
+    image_bytes: bytes | None,
+    prior: str,
+    related_codes: list | None,
+    api_key: str | None,
+) -> dict | None:
+    """Jacket-lock the upload against the card's related codes.
+
+    Same-label volumes are compared with the prior code first. A different
+    series is tried only when that group does not lock. The pipeline's
+    unlocked distant hit is not in this pool.
+    """
+    hints = _retry_hint_codes(related_codes, prior)
+    if not image_bytes or not hints:
+        return None
+    label = _code_label(prior)
+    same = [c for c in hints if _code_label(c) == label]
+    others = [c for c in hints if c not in same]
+    groups: list[list[str]] = []
+    if same:
+        groups.append([prior] + same)
+    if others:
+        groups.append([prior] + others)
+    key = (api_key if api_key is not None else get_gemini_api_key() or "").strip()
+    for group in groups:
+        shells = [_retry_candidate_shell(c) for c in group]
+        winner = None
+        try:
+            winner = _jacket_lock_winner(image_bytes, shells)
+        except Exception:
+            winner = None
+        if isinstance(winner, dict) and _catalog_code_of(winner) and _payload_visual_lock(winner):
+            return winner
+        if not key:
+            continue
+        try:
+            vis = _visual_lock_winner(image_bytes, shells, key)
+        except Exception:
+            vis = None
+        if isinstance(vis, dict) and _catalog_code_of(vis):
+            return vis
+    return None
+
+
 def anchor_reidentify_to_prior(
     result: dict | None,
     prior_code: str | None,
     image_bytes: bytes | None = None,
+    related_codes: list | None = None,
+    *,
+    prior_unverified: bool = False,
+    api_key: str | None = None,
 ) -> dict | None:
-    """Keep 重新辨識 on the prior 品番 unless the upload locks a new one.
+    """Keep 重新辨識 on the prior 品番 unless this upload locks a new one.
 
-    The retry sends the same frame and no typed 番號, so vision/title search
-    can adopt an unlocked distant hit and crown it. A different code is kept
-    only when that result visually locks. Otherwise the prior code stays and
-    the card is marked 未核對. A same-label candidate that does lock (a nearer
-    volume) may replace the number. The upload is never the jacket.
+    The retry is a normal one-image identify of the same file. That pass can
+    still adopt an unlocked title-search hit. A different code is kept only
+    when the upload visually locks it. When the card was 未核對 and already
+    lists related codes, those codes are jacket-checked (same label first)
+    before the prior code is kept. The upload is never the jacket.
     """
     if not isinstance(result, dict) or not image_bytes:
         return result
@@ -11977,6 +12072,10 @@ def anchor_reidentify_to_prior(
         out["visual_lock"] = True
         _lock_identify_payload_media(out)
         return out
+    if prior_unverified or related_codes:
+        winner = _lock_related_retry(image_bytes, prior, related_codes, api_key)
+        if isinstance(winner, dict) and _catalog_code_of(winner):
+            return _adopt_locked_retry_candidate(result, winner)
     label = _code_label(prior)
     for row in result.get("candidates") or []:
         if not isinstance(row, dict):
@@ -13918,9 +14017,8 @@ def reverify_cached_image_hit(
 ) -> dict | None:
     """Re-run cover + stills visual match for a same-image cache hit.
 
-    A locked result (or a multi-candidate sort) is returned. A single cached
-    code that does not lock returns None so identify can search siblings
-    instead of replaying 僅排序未鎖定.
+    Only a visual lock is returned. An unlocked reorder, including one that
+    merely sorts related codes, returns None so the live identify runs.
     """
     if not user_image_bytes or not isinstance(cached, dict) or not cached.get("ok"):
         return None
@@ -13952,7 +14050,10 @@ def reverify_cached_image_hit(
         return None
     best = ranked[0] if ranked else None
     locked = _visual_is_lock((best or {}).get("visual") or {})
-    if not locked and len(cands) < 2:
+    # An unlocked reorder must not replace the live identify. A same-image
+    # retry used to crown whichever related row sorted first (APGH → TYVM)
+    # and skip the pipeline that a fresh 開始辨識 would run.
+    if not locked:
         return None
     out = _apply_visual_winner(cached, ranked, meta, promote_candidates=False)
     out["from_offline_cache"] = True
@@ -14905,6 +15006,12 @@ def identify():
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
     prior_code = (request.form.get("prior_code") or "").strip()
+    prior_unverified = (request.form.get("prior_unverified") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    related_codes = _form_related_codes()
     images = collect_images_from_request()
 
     if len(images) > 1:
@@ -14921,7 +15028,13 @@ def identify():
             user_title=user_title,
         )
         if prior_code:
-            result = anchor_reidentify_to_prior(result, prior_code, images[0][0])
+            result = anchor_reidentify_to_prior(
+                result,
+                prior_code,
+                images[0][0],
+                related_codes,
+                prior_unverified=prior_unverified,
+            )
         # related_by_title already attached inside pipeline — do not run twice
     else:
         result, status = run_identify_pipeline(
@@ -15219,6 +15332,12 @@ def identify_stream():
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
     prior_code = (request.form.get("prior_code") or "").strip()
+    prior_unverified = (request.form.get("prior_unverified") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    related_codes = _form_related_codes()
     session_id = (request.form.get("session_id") or "").strip()
     slot_index_raw = (request.form.get("slot_index") or "").strip()
     images = collect_images_from_request()
@@ -15269,7 +15388,11 @@ def identify_stream():
                     )
                     if prior_code:
                         result = anchor_reidentify_to_prior(
-                            result, prior_code, images[0][0]
+                            result,
+                            prior_code,
+                            images[0][0],
+                            related_codes,
+                            prior_unverified=prior_unverified,
                         )
                 else:
                     result, status = run_identify_pipeline(

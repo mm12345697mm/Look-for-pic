@@ -595,6 +595,7 @@
       theme_keywords: skippedSlot ? [] : normalizeKeywordList(src.theme_keywords || src.themeKeywords),
       keyword_queries: skippedSlot ? [] : normalizeKeywordList(src.keyword_queries || src.keywordQueries),
       visual_mismatch: !!(src.visual_mismatch || src.visualMismatch),
+      visual_lock: !!(src.visual_lock || src.visualLock),
       visual_note: String(src.visual_note || src.visualNote || '').trim(),
       unidentified: skippedSlot ? false : !!(src.unidentified || src.frame_unidentified),
       skipped: skippedSlot,
@@ -1212,6 +1213,7 @@
         raw.matched_keywords || raw.matchedKeywords || raw.hit_keywords || raw.hitKeywords
       ),
       visualMismatch: !!(raw.visual_mismatch || raw.visualMismatch),
+      visualLock: !!(raw.visual_lock || raw.visualLock),
       visualNote: String(raw.visual_note || raw.visualNote || '').trim(),
       jobElapsedMs: elapsedMsValue(raw.job_elapsed_ms != null ? raw.job_elapsed_ms : raw.jobElapsedMs),
       workElapsedMs: elapsedMsValue(raw.work_elapsed_ms != null ? raw.work_elapsed_ms : raw.workElapsedMs),
@@ -1896,6 +1898,43 @@
     });
   }
 
+  function appendRelatedCodes(fd, codes) {
+    const seen = {};
+    (codes || []).forEach((code) => {
+      const text = String(code || '').trim();
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      fd.append('related_codes', text);
+    });
+  }
+
+  function slotRetryUnverified(work) {
+    if (!work) return false;
+    if (work.visualMismatch || work.visual_mismatch) return true;
+    if (work.visualLock === true || work.visual_lock === true) return false;
+    return true;
+  }
+
+  /** Related 品番 already on this card. Same label as the current main comes first. */
+  function relatedCodesForRetry(work) {
+    const prior = reliablePromoteCode(work);
+    const priorParts = prior ? parseCodeParts(prior) : null;
+    const label = priorParts ? String(priorParts.label || '') : '';
+    const rows = (work && (work.relatedByTitle || work.related_by_title || work.related)) || [];
+    const same = [];
+    const other = [];
+    const seen = {};
+    rows.forEach((row) => {
+      const code = reliablePromoteCode(row);
+      if (!code || seen[code] || (prior && codesMatch(code, prior))) return;
+      seen[code] = true;
+      const parts = parseCodeParts(code);
+      if (label && parts && String(parts.label || '') === label) same.push(code);
+      else other.push(code);
+    });
+    return same.concat(other).slice(0, 12);
+  }
+
   function appendImagesToFormData(fd, images) {
     if (!images || !images.length) return;
     // Do not append both `images` and `image` — server merges both and double-counts.
@@ -1970,7 +2009,7 @@
     throw err;
   }
 
-  async function apiIdentifyStream({ images, image, code, title, priorCode } = {}, onProgress, options) {
+  async function apiIdentifyStream({ images, image, code, title, priorCode, relatedCodes, priorUnverified } = {}, onProgress, options) {
     options = options || {};
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
@@ -1978,6 +2017,8 @@
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
     if (priorCode) fd.append('prior_code', priorCode);
+    appendRelatedCodes(fd, relatedCodes);
+    if (priorUnverified) fd.append('prior_unverified', '1');
     if (options.slotIndex) fd.append('slot_index', String(options.slotIndex));
     if (options.sessionId) fd.append('session_id', String(options.sessionId));
 
@@ -2073,13 +2114,15 @@
     return { status: httpStatus, data: finalData };
   }
 
-  async function apiIdentify({ images, image, code, title, priorCode } = {}) {
+  async function apiIdentify({ images, image, code, title, priorCode, relatedCodes, priorUnverified } = {}) {
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
     appendImagesToFormData(fd, imgs);
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
     if (priorCode) fd.append('prior_code', priorCode);
+    appendRelatedCodes(fd, relatedCodes);
+    if (priorUnverified) fd.append('prior_unverified', '1');
     const res = await fetch('/api/identify', { method: 'POST', body: fd });
     let data;
     try {
@@ -5623,6 +5666,7 @@
         theme_keywords: normalizeKeywordList(w.theme_keywords || w.themeKeywords),
         keyword_queries: normalizeKeywordList(w.keyword_queries || w.keywordQueries),
         visual_mismatch: !!(w.visual_mismatch || w.visualMismatch),
+        visual_lock: !!(w.visual_lock || w.visualLock),
         visual_note: String(w.visual_note || w.visualNote || '').trim(),
         unidentified: !!w.unidentified,
         skipped: !!w.skipped,
@@ -5890,16 +5934,23 @@
     let single = null;
     const sessionId = lastIdentifyPayload && lastIdentifyPayload.session_id;
     const priorCode = reliablePromoteCode(work);
+    const unverified = slotRetryUnverified(work);
+    const relatedCodes = unverified ? relatedCodesForRetry(work) : [];
     try {
       try {
         const streamed = await apiIdentifyStream(
-          { images: [file], priorCode: priorCode },
+          { images: [file], priorCode: priorCode, relatedCodes: relatedCodes, priorUnverified: unverified },
           null,
           { quiet: true, slotIndex: idx, sessionId: sessionId || '' }
         );
         single = streamed && streamed.data;
       } catch (_) {
-        const classic = await apiIdentify({ images: [file], priorCode: priorCode });
+        const classic = await apiIdentify({
+          images: [file],
+          priorCode: priorCode,
+          relatedCodes: relatedCodes,
+          priorUnverified: unverified,
+        });
         single = classic && classic.data;
       }
     } catch (err) {
@@ -6466,6 +6517,8 @@
       followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
       mergeSlotRetryIntoIdentify,
+      relatedCodesForRetry,
+      slotRetryUnverified,
       noteSlotUploads: function (files) {
         slotUploadFiles = Array.isArray(files) ? files.slice() : [];
       },

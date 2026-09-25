@@ -4144,6 +4144,22 @@ function walkNodes(node, acc) {
     assert.strictEqual(moved.results[0].cover, siblingCover);
     assert.notStrictEqual(moved.results[0].title_zh, '兩位老師');
     assert.strictEqual(moved.results[1].code, 'CCC-003');
+
+    const hints = H.relatedCodesForRetry({
+      code: 'APGH-015',
+      visualMismatch: true,
+      relatedByTitle: [
+        { code: 'TYVM-349', title: '別系列' },
+        { code: 'APGH-012', title: '鄰卷' },
+        { code: 'APGH-015', title: '同一張' },
+      ],
+    });
+    assert.strictEqual(hints.join(','), 'APGH-012,TYVM-349');
+    assert.strictEqual(
+      H.slotRetryUnverified({ code: 'APGH-015', visualMismatch: true, visualLock: false }),
+      true
+    );
+    assert.strictEqual(H.slotRetryUnverified({ code: 'APGH-012', visualLock: true }), false);
   }
 
   console.log('test_history_session.js: ok');
