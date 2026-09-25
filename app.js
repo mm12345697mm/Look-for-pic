@@ -44,6 +44,7 @@
   const galleryCards = $('gallery-cards');
   const galleryCount = $('gallery-count');
   const galleryNotice = $('gallery-notice');
+  const galleryJobTime = $('gallery-job-time');
   const ocrOverlay = $('ocr-overlay');
   const ocrCodeInput = $('ocr-code-input');
   const filePick = $('file-pick');
@@ -1673,11 +1674,6 @@
       const li = document.createElement('li');
       li.className = 'progress-step is-pending';
       li.dataset.step = s.id;
-      li.innerHTML =
-        '<span class="step-mark" aria-hidden="true"></span>' +
-        '<span class="step-label">' + escapeHtml(s.label) + '</span>' +
-        '<span class="step-timer">00:00:00</span>' +
-        '<span class="step-phase" hidden></span>';
       const mark = document.createElement('span');
       mark.className = 'step-mark';
       mark.setAttribute('aria-hidden', 'true');
@@ -2149,6 +2145,12 @@
     next.line = at === 0 ? 'main' : 'multi';
     next.skipped = false;
     next.ok = src.ok !== false;
+    if (!String(next.title_zh || next.titleZh || '').trim()) {
+      const kept =
+        String(prev.title_zh || prev.titleZh || '').trim() ||
+        knownTitleZhForCode(next.code || prev.code);
+      if (kept) next.title_zh = kept;
+    }
     const batchJob = firstElapsed(prev.job_elapsed_ms, prev.jobElapsedMs, base.job_elapsed_ms, base.jobElapsedMs);
     if (batchJob != null) next.job_elapsed_ms = batchJob;
     if (!next.user_preview && prev.user_preview) next.user_preview = prev.user_preview;
@@ -2162,6 +2164,7 @@
     if (at === 0) {
       out.code = next.code || '';
       out.title = next.title || '';
+      out.title_zh = next.title_zh || prev.title_zh || base.title_zh || '';
       out.cover = next.cover || '';
       out.related_by_title = next.related_by_title || [];
     }
@@ -2210,6 +2213,38 @@
     return formatDisplayCode(raw);
   }
 
+  function knownTitleZhForCode(code) {
+    const key = titleZhKey(code);
+    if (!key) return '';
+    let list = [];
+    try {
+      list = loadHistory();
+    } catch (_) {
+      list = [];
+    }
+    function take(row) {
+      if (!row || !row.code || !codesMatch(row.code, code)) return '';
+      return String(row.title_zh || row.titleZh || '').trim();
+    }
+    for (let i = 0; i < list.length; i++) {
+      const rec = list[i];
+      if (!rec) continue;
+      const direct = take(rec);
+      if (direct) return direct;
+      const works = historySessionWorks(rec);
+      for (let j = 0; j < works.length; j++) {
+        const zh = take(works[j]);
+        if (zh) return zh;
+        const rel = (works[j] && works[j].related) || [];
+        for (let k = 0; k < rel.length; k++) {
+          const relZh = take(rel[k]);
+          if (relZh) return relZh;
+        }
+      }
+    }
+    return '';
+  }
+
   function harmonizeGalleryTitleZh(items) {
     const found = {};
     function remember(work) {
@@ -2223,7 +2258,10 @@
     function fill(work) {
       if (!work) return;
       const key = titleZhKey(work.code);
-      if (key && found[key] && !String(work.titleZh || '').trim()) work.titleZh = found[key];
+      if (key && !String(work.titleZh || '').trim()) {
+        work.titleZh = found[key] || knownTitleZhForCode(work.code) || '';
+        if (work.titleZh && !found[key]) found[key] = work.titleZh;
+      }
       (work.relatedByTitle || []).forEach(fill);
     }
     (items || []).forEach(fill);
@@ -2376,6 +2414,7 @@
     galleryCards.innerHTML = '';
     galleryNotice.hidden = true;
     galleryNotice.textContent = '';
+    paintGalleryBatchTotal(null);
     codeInput.value = '';
     showScreen('home');
   }
@@ -2575,23 +2614,33 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    const retryBtn = w.skipped || originalSlotFile(w) ? buildReidentifyButton(w) : null;
-    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap, retryBtn));
-    else if (retryBtn) {
-      const bar = document.createElement('div');
-      bar.className = 'work-actions';
-      bar.appendChild(retryBtn);
-      card.appendChild(bar);
-    }
+    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap));
     card.appendChild(coverWrap);
     if (workNeedsManualFix(w)) {
       card.appendChild(buildManualFixPanel(w, card));
     }
     if (!w.skipped) appendStillsScroll(card, w, '劇照（橫滑）');
-    const times = buildWorkTimes(w);
-    if (times) card.appendChild(times);
+    const under = buildUnderStillsRow(w);
+    if (under) card.appendChild(under);
     if (w.skipped) card.classList.add('is-skipped');
     return card;
+  }
+
+  function cardCanReidentify(w) {
+    if (!w || isRelatedCarouselLine(String(w.line || ''))) return false;
+    return !!(w.skipped || originalSlotFile(w));
+  }
+
+  /** Compact 重新辨識 sits under 劇照; that work’s 單一作品時間 sits to its right. */
+  function buildUnderStillsRow(w) {
+    const retry = cardCanReidentify(w) ? buildReidentifyButton(w) : null;
+    const times = buildWorkTimes(w);
+    if (!retry && !times) return null;
+    const row = document.createElement('div');
+    row.className = 'work-under-stills';
+    if (retry) row.appendChild(retry);
+    if (times) row.appendChild(times);
+    return row;
   }
 
   function buildTimeChip(label, ms) {
@@ -2608,6 +2657,29 @@
     return el;
   }
 
+  function batchJobElapsedMs(items) {
+    const list = items || [];
+    for (let i = 0; i < list.length; i++) {
+      const n = elapsedMsValue(list[i] && list[i].jobElapsedMs);
+      if (n != null) return n;
+    }
+    return null;
+  }
+
+  /** One batch total for the whole gallery. Not repeated on each card. */
+  function paintGalleryBatchTotal(items) {
+    const host = galleryJobTime;
+    if (!host) return;
+    host.innerHTML = '';
+    const ms = batchJobElapsedMs(items);
+    if (ms == null) {
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.appendChild(buildTimeChip('總時間', ms));
+  }
+
   function buildWorkTimes(w) {
     if (!w || w.skipped) return null;
     const row = document.createElement('div');
@@ -2620,11 +2692,9 @@
       row.appendChild(buildTimeChip('過去識別＋搜索時間', show));
       return row;
     }
-    const job = elapsedMsValue(w.jobElapsedMs);
     const single = elapsedMsValue(w.workElapsedMs);
-    if (job == null && single == null) return null;
-    if (job != null) row.appendChild(buildTimeChip('總時間', job));
-    if (single != null) row.appendChild(buildTimeChip('單一作品時間', single));
+    if (single == null) return null;
+    row.appendChild(buildTimeChip('單一作品時間', single));
     return row;
   }
 
@@ -3667,7 +3737,7 @@
     }
   }
 
-  function buildWorkActions(w, coverWrap, retryBtn) {
+  function buildWorkActions(w, coverWrap) {
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
@@ -3718,7 +3788,6 @@
       bindWorkAction(btn, spec.run);
       bar.appendChild(btn);
     });
-    if (retryBtn) bar.appendChild(retryBtn);
     return bar;
   }
 
@@ -4784,6 +4853,7 @@
     }
 
     lastGalleryItems = items || [];
+    paintGalleryBatchTotal(lastGalleryItems);
     // Vertical: each screenshot/main hit. Horizontal: main ↔️ related works.
     for (const w of items) {
       galleryCards.appendChild(buildWorkCarousel(w));
@@ -5466,6 +5536,15 @@
     }
     const payload = identifyPayloadFromHistory(Object.assign({}, rec, { works: paintWorks }));
     const result = galleryFromIdentify(payload);
+    const batchMs = batchJobElapsedMs(result.items);
+    if (batchMs != null) {
+      const batch = document.createElement('div');
+      batch.className = 'gallery-job-time';
+      batch.appendChild(buildTimeChip('總時間', batchMs));
+      const first = historyDetailEl.children && historyDetailEl.children[0];
+      if (first && historyDetailEl.insertBefore) historyDetailEl.insertBefore(batch, first);
+      else historyDetailEl.appendChild(batch);
+    }
     (result.items || []).forEach((w) => {
       historyDetailEl.appendChild(buildWorkCarousel(w));
     });
@@ -6094,6 +6173,9 @@
       followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
       mergeSlotRetryIntoIdentify,
+      noteSlotUploads: function (files) {
+        slotUploadFiles = Array.isArray(files) ? files.slice() : [];
+      },
       skipControlState,
       replaceHistorySessionWorks,
       workNeedsTitleZh,

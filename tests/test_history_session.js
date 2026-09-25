@@ -68,6 +68,14 @@ function makeEl(tag, id) {
       child.parentNode = this;
       return child;
     },
+    insertBefore(child, ref) {
+      const kids = this.children || [];
+      const i = ref ? kids.indexOf(ref) : -1;
+      if (i < 0) kids.push(child);
+      else kids.splice(i, 0, child);
+      child.parentNode = this;
+      return child;
+    },
     addEventListener(type, fn) {
       (this._listeners[type] = this._listeners[type] || []).push(fn);
     },
@@ -625,7 +633,20 @@ function related(n, line) {
   assert.strictEqual(getEl('progress-detail').textContent, '搜尋第 2/7 張…');
   assert.strictEqual(getEl('progress-pct').textContent, Math.round(pct27 * 100) + '%');
   assert.ok(getEl('progress-detail').textContent.indexOf('/4') === -1);
-  assert.ok(receive && String(receive.innerHTML).indexOf('7') !== -1);
+  const receiveLabel = (receive.children || []).find(
+    (n) => String(n.className || '').indexOf('step-label') !== -1
+  );
+  assert.ok(receiveLabel && String(receiveLabel.textContent).indexOf('7') !== -1);
+  steps.forEach((row) => {
+    const timers = (row.children || []).filter(
+      (n) => String(n.className || '').indexOf('step-timer') !== -1
+    );
+    const labels = (row.children || []).filter(
+      (n) => String(n.className || '').indexOf('step-label') !== -1
+    );
+    assert.strictEqual(timers.length, 1, 'one timer per step');
+    assert.strictEqual(labels.length, 1, 'one label per step');
+  });
   // Merged-work related counts are not the upload denominator.
   H.applyProgressEvent({
     step: 'done',
@@ -3614,7 +3635,7 @@ function walkNodes(node, acc) {
     assert.ok(blob.indexOf('時間不夠') === -1);
   }
 
-  // Gallery times sit under stills. Reidentify stays a compact action. Batch 總時間 survives a slot retry.
+  // 總時間 is once at the gallery top. Each main shows 單一作品時間 under 劇照. Related keeps its own time.
   {
     const cover = 'https://pics.dmm.co.jp/digital/video/real00852/real00852pl.jpg';
     const data = {
@@ -3665,13 +3686,50 @@ function walkNodes(node, acc) {
     assert.strictEqual(gallery.items[0].workElapsedMs, 40000);
     assert.strictEqual(gallery.items[0].relatedByTitle[0].searchElapsedMs, 8000);
     assert.strictEqual(gallery.items[1].workElapsedMs, 22000);
+    H.noteSlotUploads([{}, {}]);
     H.renderGallery(gallery);
+    const pageTotal = getEl('gallery-job-time');
+    assert.strictEqual(pageTotal.hidden, false);
+    assert.ok(pageTotal.textContent.indexOf('總時間') !== -1 && pageTotal.textContent.indexOf('00:02:05') !== -1, pageTotal.textContent);
     const times = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-times');
     const text = times.map((n) => n.textContent).join('\n');
-    assert.ok(text.indexOf('總時間') !== -1 && text.indexOf('00:02:05') !== -1, text);
+    assert.ok(text.indexOf('總時間') === -1, text);
     assert.ok(text.indexOf('單一作品時間') !== -1 && text.indexOf('00:00:40') !== -1, text);
     assert.ok(text.indexOf('00:00:22') !== -1, text);
     assert.ok(text.indexOf('過去識別＋搜索時間') !== -1 && text.indexOf('00:00:08') !== -1, text);
+    const cards = walkNodes(getEl('gallery-cards')).filter(
+      (n) => String(n.className || '').indexOf('work-slide-card') !== -1
+    );
+    function cardText(n) {
+      return String(n.textContent || '');
+    }
+    const mainCardNode = cards.find((n) => cardText(n).indexOf('REAL-852') !== -1 && cardText(n).indexOf('00:00:40') !== -1);
+    const secondMain = cards.find((n) => cardText(n).indexOf('00:00:22') !== -1);
+    const relatedCardNode = cards.find((n) => cardText(n).indexOf('SONE-387') !== -1);
+    assert.ok(mainCardNode, 'main card rendered');
+    assert.ok(cardText(mainCardNode).indexOf('總時間') === -1, 'main card does not repeat 總時間');
+    assert.ok(secondMain && cardText(secondMain).indexOf('單一作品時間') !== -1 && cardText(secondMain).indexOf('總時間') === -1);
+    const mainRetry = walkNodes(mainCardNode).find(
+      (n) => String(n.className || '').indexOf('btn-reidentify') !== -1
+    );
+    assert.ok(mainRetry, 'upload slot keeps 重新辨識');
+    assert.ok(
+      mainRetry.parentNode && String(mainRetry.parentNode.className || '').indexOf('work-under-stills') !== -1,
+      '重新辨識 sits on the row under 劇照'
+    );
+    assert.ok(
+      cardText(mainRetry.parentNode).indexOf('總時間') === -1 &&
+        cardText(mainRetry.parentNode).indexOf('單一作品時間') !== -1,
+      'single-work time sits on the same row as 重新辨識'
+    );
+    const mainActions = walkNodes(mainCardNode).find((n) => n.className === 'work-actions');
+    assert.ok(mainActions && cardText(mainActions).indexOf('重新辨識') === -1, 'not in the 番名合 row');
+    assert.ok(relatedCardNode, 'related card rendered');
+    assert.ok(
+      !walkNodes(relatedCardNode).some((n) => String(n.className || '').indexOf('btn-reidentify') !== -1),
+      'related card does not gain 重新辨識'
+    );
+    assert.ok(cardText(relatedCardNode).indexOf('過去識別＋搜索時間') !== -1);
     const skipped = H.galleryFromIdentify({
       ok: true,
       results: [
@@ -3689,7 +3747,7 @@ function walkNodes(node, acc) {
       (n) => String(n.className || '').indexOf('btn-reidentify') !== -1
     );
     assert.ok(retry, 'skipped slot keeps 重新辨識');
-    assert.ok(retry.parentNode && String(retry.parentNode.className || '').indexOf('work-actions') !== -1);
+    assert.ok(retry.parentNode && String(retry.parentNode.className || '').indexOf('work-under-stills') !== -1);
 
     const saved = H.sessionWorksFromIdentify(data);
     assert.strictEqual(saved[0].job_elapsed_ms, 125000);
@@ -3710,6 +3768,41 @@ function walkNodes(node, acc) {
     assert.strictEqual(merged.results[0].job_elapsed_ms, 125000);
     assert.strictEqual(merged.results[0].work_elapsed_ms, 9000);
     assert.strictEqual(merged.results[1].work_elapsed_ms, 22000);
+    assert.strictEqual(merged.results[0].title_zh, '巨乳泳社', 're-identify keeps the Chinese title');
+    const dropped = H.mergeSlotRetryIntoIdentify(
+      data,
+      1,
+      { ok: true, code: 'REAL-852', title: '巨乳水泳部', cover: cover }
+    );
+    assert.strictEqual(dropped.results[0].title_zh, '巨乳泳社');
+    const replaced = H.mergeSlotRetryIntoIdentify(
+      data,
+      1,
+      { ok: true, code: 'REAL-852', title: '巨乳水泳部', title_zh: '新的中文', cover: cover }
+    );
+    assert.strictEqual(replaced.results[0].title_zh, '新的中文');
+    H.saveHistory([
+      {
+        id: 'das-old',
+        code: 'DAS-034',
+        title: '日文題',
+        title_zh: '巨乳集訓',
+        cover: cover,
+        works: [{ code: 'DAS-034', title: '日文題', title_zh: '巨乳集訓', cover: cover, line: 'main' }],
+      },
+    ]);
+    const restored = H.galleryFromIdentify({
+      ok: true,
+      code: 'DAS-034',
+      title: '日文題',
+      cover: cover,
+      results: [{ ok: true, code: 'DAS-034', title: '日文題', cover: cover, line: 'main' }],
+    });
+    assert.strictEqual(restored.items[0].titleZh, '巨乳集訓');
+    assert.strictEqual(
+      H.formatDisplayTitle(restored.items[0].title, restored.items[0].titleZh),
+      '日文題（巨乳集訓）'
+    );
   }
 
   console.log('test_history_session.js: ok');
