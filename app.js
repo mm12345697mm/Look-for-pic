@@ -44,6 +44,7 @@
   const galleryCards = $('gallery-cards');
   const galleryCount = $('gallery-count');
   const galleryNotice = $('gallery-notice');
+  const galleryJobTime = $('gallery-job-time');
   const ocrOverlay = $('ocr-overlay');
   const ocrCodeInput = $('ocr-code-input');
   const filePick = $('file-pick');
@@ -2413,6 +2414,7 @@
     galleryCards.innerHTML = '';
     galleryNotice.hidden = true;
     galleryNotice.textContent = '';
+    paintGalleryBatchTotal(null);
     codeInput.value = '';
     showScreen('home');
   }
@@ -2629,7 +2631,7 @@
     return !!(w.skipped || originalSlotFile(w));
   }
 
-  /** Compact 重新辨識 sits under 劇照; batch times sit to its right on that row. */
+  /** Compact 重新辨識 sits under 劇照; that work’s 單一作品時間 sits to its right. */
   function buildUnderStillsRow(w) {
     const retry = cardCanReidentify(w) ? buildReidentifyButton(w) : null;
     const times = buildWorkTimes(w);
@@ -2655,6 +2657,29 @@
     return el;
   }
 
+  function batchJobElapsedMs(items) {
+    const list = items || [];
+    for (let i = 0; i < list.length; i++) {
+      const n = elapsedMsValue(list[i] && list[i].jobElapsedMs);
+      if (n != null) return n;
+    }
+    return null;
+  }
+
+  /** One batch total for the whole gallery. Not repeated on each card. */
+  function paintGalleryBatchTotal(items) {
+    const host = galleryJobTime;
+    if (!host) return;
+    host.innerHTML = '';
+    const ms = batchJobElapsedMs(items);
+    if (ms == null) {
+      host.hidden = true;
+      return;
+    }
+    host.hidden = false;
+    host.appendChild(buildTimeChip('總時間', ms));
+  }
+
   function buildWorkTimes(w) {
     if (!w || w.skipped) return null;
     const row = document.createElement('div');
@@ -2667,11 +2692,9 @@
       row.appendChild(buildTimeChip('過去識別＋搜索時間', show));
       return row;
     }
-    const job = elapsedMsValue(w.jobElapsedMs);
     const single = elapsedMsValue(w.workElapsedMs);
-    if (job == null && single == null) return null;
-    if (job != null) row.appendChild(buildTimeChip('總時間', job));
-    if (single != null) row.appendChild(buildTimeChip('單一作品時間', single));
+    if (single == null) return null;
+    row.appendChild(buildTimeChip('單一作品時間', single));
     return row;
   }
 
@@ -4830,6 +4853,7 @@
     }
 
     lastGalleryItems = items || [];
+    paintGalleryBatchTotal(lastGalleryItems);
     // Vertical: each screenshot/main hit. Horizontal: main ↔️ related works.
     for (const w of items) {
       galleryCards.appendChild(buildWorkCarousel(w));
@@ -5512,6 +5536,15 @@
     }
     const payload = identifyPayloadFromHistory(Object.assign({}, rec, { works: paintWorks }));
     const result = galleryFromIdentify(payload);
+    const batchMs = batchJobElapsedMs(result.items);
+    if (batchMs != null) {
+      const batch = document.createElement('div');
+      batch.className = 'gallery-job-time';
+      batch.appendChild(buildTimeChip('總時間', batchMs));
+      const first = historyDetailEl.children && historyDetailEl.children[0];
+      if (first && historyDetailEl.insertBefore) historyDetailEl.insertBefore(batch, first);
+      else historyDetailEl.appendChild(batch);
+    }
     (result.items || []).forEach((w) => {
       historyDetailEl.appendChild(buildWorkCarousel(w));
     });

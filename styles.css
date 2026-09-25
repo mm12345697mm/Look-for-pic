@@ -258,6 +258,16 @@ label.btn {
   /* Extra bottom room so carousel hint/pager is scrollable into view */
   padding-bottom: calc(72px + var(--safe-bottom));
 }
+.gallery-job-time {
+  margin: 0 0 10px;
+}
+.gallery-job-time[hidden] {
+  display: none !important;
+}
+.gallery-job-time .work-time {
+  font-size: 0.95rem;
+  font-weight: 650;
+}
 .gallery-top {
   display: flex;
   align-items: center;

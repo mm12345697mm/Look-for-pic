@@ -68,6 +68,14 @@ function makeEl(tag, id) {
       child.parentNode = this;
       return child;
     },
+    insertBefore(child, ref) {
+      const kids = this.children || [];
+      const i = ref ? kids.indexOf(ref) : -1;
+      if (i < 0) kids.push(child);
+      else kids.splice(i, 0, child);
+      child.parentNode = this;
+      return child;
+    },
     addEventListener(type, fn) {
       (this._listeners[type] = this._listeners[type] || []).push(fn);
     },
@@ -3627,7 +3635,7 @@ function walkNodes(node, acc) {
     assert.ok(blob.indexOf('時間不夠') === -1);
   }
 
-  // Gallery times sit under stills. Reidentify stays a compact action. Batch 總時間 survives a slot retry.
+  // 總時間 is once at the gallery top. Each main shows 單一作品時間 under 劇照. Related keeps its own time.
   {
     const cover = 'https://pics.dmm.co.jp/digital/video/real00852/real00852pl.jpg';
     const data = {
@@ -3680,9 +3688,12 @@ function walkNodes(node, acc) {
     assert.strictEqual(gallery.items[1].workElapsedMs, 22000);
     H.noteSlotUploads([{}, {}]);
     H.renderGallery(gallery);
+    const pageTotal = getEl('gallery-job-time');
+    assert.strictEqual(pageTotal.hidden, false);
+    assert.ok(pageTotal.textContent.indexOf('總時間') !== -1 && pageTotal.textContent.indexOf('00:02:05') !== -1, pageTotal.textContent);
     const times = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-times');
     const text = times.map((n) => n.textContent).join('\n');
-    assert.ok(text.indexOf('總時間') !== -1 && text.indexOf('00:02:05') !== -1, text);
+    assert.ok(text.indexOf('總時間') === -1, text);
     assert.ok(text.indexOf('單一作品時間') !== -1 && text.indexOf('00:00:40') !== -1, text);
     assert.ok(text.indexOf('00:00:22') !== -1, text);
     assert.ok(text.indexOf('過去識別＋搜索時間') !== -1 && text.indexOf('00:00:08') !== -1, text);
@@ -3692,9 +3703,12 @@ function walkNodes(node, acc) {
     function cardText(n) {
       return String(n.textContent || '');
     }
-    const mainCardNode = cards.find((n) => cardText(n).indexOf('REAL-852') !== -1 && cardText(n).indexOf('總時間') !== -1);
+    const mainCardNode = cards.find((n) => cardText(n).indexOf('REAL-852') !== -1 && cardText(n).indexOf('00:00:40') !== -1);
+    const secondMain = cards.find((n) => cardText(n).indexOf('00:00:22') !== -1);
     const relatedCardNode = cards.find((n) => cardText(n).indexOf('SONE-387') !== -1);
     assert.ok(mainCardNode, 'main card rendered');
+    assert.ok(cardText(mainCardNode).indexOf('總時間') === -1, 'main card does not repeat 總時間');
+    assert.ok(secondMain && cardText(secondMain).indexOf('單一作品時間') !== -1 && cardText(secondMain).indexOf('總時間') === -1);
     const mainRetry = walkNodes(mainCardNode).find(
       (n) => String(n.className || '').indexOf('btn-reidentify') !== -1
     );
@@ -3704,9 +3718,9 @@ function walkNodes(node, acc) {
       '重新辨識 sits on the row under 劇照'
     );
     assert.ok(
-      cardText(mainRetry.parentNode).indexOf('總時間') !== -1 &&
+      cardText(mainRetry.parentNode).indexOf('總時間') === -1 &&
         cardText(mainRetry.parentNode).indexOf('單一作品時間') !== -1,
-      'times sit on the same row as 重新辨識'
+      'single-work time sits on the same row as 重新辨識'
     );
     const mainActions = walkNodes(mainCardNode).find((n) => n.className === 'work-actions');
     assert.ok(mainActions && cardText(mainActions).indexOf('重新辨識') === -1, 'not in the 番名合 row');
