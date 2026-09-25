@@ -1337,7 +1337,7 @@ function walkNodes(node, acc) {
   );
   assert.ok(jacket, 'code identify becomes a gallery main');
   assert.strictEqual(jacket.code, 'SSIS-123');
-  assert.strictEqual(jacket.line, 'multi');
+  assert.strictEqual(jacket.line, 'main', 'extended section is its own main, not the parent slot');
   assert.strictEqual(jacket.cover, catalog);
   assert.ok(jacket.cover.indexOf('data:') === -1, jacket.cover);
   assert.strictEqual(jacket.userPreview, '');
@@ -2821,7 +2821,7 @@ function walkNodes(node, acc) {
     assert.strictEqual(visionOn.index, 4);
   }
 
-  // 「以此為主」 on a related card: code identify replaces that slot only.
+  // 「以此為主」 appends another main under the current gallery. Prior slots stay.
   {
     const coverA = 'https://pics.dmm.co.jp/digital/video/promo00100/promo00100pl.jpg';
     const coverB = 'https://pics.dmm.co.jp/digital/video/promo00200/promo00200pl.jpg';
@@ -2979,11 +2979,34 @@ function walkNodes(node, acc) {
         const body = opts && opts.body;
         const codePair = body && body.pairs && body.pairs.find((p) => p[0] === 'code');
         const asked = codePair && codePair[1];
+        let data = identifyPayload;
+        if (asked === 'PROMO-110') data = slot0Payload;
+        else if (asked && asked !== 'PROMO-150') {
+          data = {
+            ok: true,
+            code: asked,
+            title: '單張延伸',
+            title_zh: '單張中文',
+            cid: 'solo00009',
+            cover: 'https://pics.dmm.co.jp/digital/video/solo00009/solo00009pl.jpg',
+            user_preview: shot,
+            stills: ['data:image/jpeg;base64,SOLOSTILL', 'https://pics.dmm.co.jp/digital/video/solo00009/solo00009jp-1.jpg'],
+            related_by_title: [
+              {
+                code: 'SOLO-010',
+                title: '單張相關包',
+                line: 'actress',
+                why: '同女優',
+                cover: coverB,
+              },
+            ],
+          };
+        }
         return {
           ok: true,
           status: 200,
           headers: { get: () => 'application/json' },
-          json: async () => (asked === 'PROMO-110' ? slot0Payload : identifyPayload),
+          json: async () => data,
         };
       }
       return { ok: false, status: 404, headers: { get: () => '' }, json: async () => ({}) };
@@ -2999,10 +3022,21 @@ function walkNodes(node, acc) {
       assert.ok(getEl('lfp-toast').textContent.indexOf('沒有可用番號') !== -1);
       assert.strictEqual(forms.length, 0, 'no code means no identify request');
 
+      let scrollN = 0;
+      context.scrollTo = function () {
+        scrollN += 1;
+      };
+      const stepsBefore = (getEl('progress-steps').children || []).length;
+      assert.ok(getEl('screen-gallery').classList.contains('active'));
+
       promoteBtn.click();
       const result = await H.promoteTask();
       assert.strictEqual(result.ok, true, result && result.reason);
-      assert.strictEqual(result.slotIndex, 1);
+      assert.strictEqual(result.slotIndex, 2, 'new main is appended after the two uploads');
+      assert.strictEqual(scrollN, 0, 'extend does not jump back to the top of a new page');
+      assert.strictEqual((getEl('progress-steps').children || []).length, stepsBefore);
+      assert.ok(getEl('screen-gallery').classList.contains('active'));
+      assert.ok(!getEl('screen-home').classList.contains('active'));
       assert.ok(forms.length >= 1, 'identify was called');
       forms.forEach((form) => {
         const keys = form.pairs.map((p) => p[0]);
@@ -3014,47 +3048,66 @@ function walkNodes(node, acc) {
       });
 
       const after = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
-      assert.strictEqual(after.length, 2, 'promoting one related does not drop the other upload');
-      const codes0 = walkNodes(after[0]).filter((n) => n.className === 'card-code').map((n) => n.textContent);
-      const codes1 = walkNodes(after[1]).filter((n) => n.className === 'card-code').map((n) => n.textContent);
+      assert.strictEqual(after.length, 3, 'gallery grows by one main');
+      assert.strictEqual(after[0], blocks[0], 'first carousel stays on the page');
+      assert.strictEqual(after[1], blocks[1], 'second carousel stays on the page');
+      assert.strictEqual(getEl('gallery-count').textContent, '3 部');
+      function cardCodes(block) {
+        return walkNodes(block).filter((n) => n.className === 'card-code').map((n) => n.textContent);
+      }
+      const codes0 = cardCodes(after[0]);
+      const codes1 = cardCodes(after[1]);
+      const codes2 = cardCodes(after[2]);
       assert.strictEqual(codes0[0], 'PROMO-100');
       assert.strictEqual(codes0[1], 'PROMO-110');
-      assert.strictEqual(codes1[0], 'PROMO-150');
-      assert.ok(codes1.indexOf('PROMO-888') !== -1, 'new related bucket is on the promoted main');
+      assert.strictEqual(codes1[0], 'PROMO-200', 'the other upload is not replaced');
+      assert.strictEqual(codes1[1], 'PROMO-150', 'its related card stays in that carousel');
+      assert.strictEqual(codes2[0], 'PROMO-150', 'new main matches the related card');
+      assert.ok(codes2.indexOf('PROMO-888') !== -1, 'new related package sits under the new main');
+      const newImgs = walkNodes(after[2])
+        .filter((n) => n.tagName === 'IMG')
+        .map((n) => String(n.src || ''));
+      assert.ok(newImgs.indexOf(coverNew) !== -1, newImgs.join(','));
+      assert.ok(newImgs.every((u) => u.indexOf('data:') !== 0 && u.indexOf('blob:') !== 0), newImgs.join(','));
       const promotedMainLabels = actionLabels(
-        walkNodes(after[1]).filter((n) => n.className === 'work-carousel-slide')[0]
+        walkNodes(after[2]).filter((n) => n.className === 'work-carousel-slide')[0]
       );
       assert.ok(promotedMainLabels.indexOf('以此為主') === -1);
-      const chipText = walkNodes(after[1]).map((n) => n.textContent || '').join('\n');
+      const chipText = walkNodes(after[2]).map((n) => n.textContent || '').join('\n');
       assert.ok(chipText.indexOf('巨乳（巨乳）') !== -1, chipText);
       assert.ok(chipText.indexOf('水泳部（游泳社）') !== -1, chipText);
       assert.ok(chipText.indexOf('延伸中文') !== -1, chipText);
 
       const stored = H.loadHistory().find((x) => x.id === 'promo-session');
       assert.ok(stored);
-      assert.strictEqual(stored.works.length, 2);
+      assert.strictEqual(stored.works.length, 3);
       assert.strictEqual(stored.works[0].code, 'PROMO-100');
       assert.strictEqual(stored.works[0].related[0].code, 'PROMO-110');
+      assert.strictEqual(stored.works[0].title_zh, '舊主中文');
       assert.strictEqual(stored.code, 'PROMO-100', 'session head stays the first upload');
       assert.strictEqual(stored.cover, coverA);
       assert.strictEqual(stored.userShots.length, 1);
       assert.strictEqual(stored.userShots[0], shot);
-      assert.strictEqual(stored.works[1].code, 'PROMO-150');
-      assert.strictEqual(stored.works[1].title_zh, '延伸中文');
-      assert.notStrictEqual(stored.works[1].title_zh, '第二中文');
-      assert.strictEqual(stored.works[1].cover, coverNew);
-      assert.ok(stored.works[1].cover.indexOf('data:') === -1);
-      assert.ok(stored.works[1].stills.indexOf(stillNew) !== -1);
-      assert.ok(stored.works[1].stills.every((u) => String(u).indexOf('data:') !== 0));
-      assert.ok(stored.works[1].theme_keywords.indexOf('巨乳') !== -1);
-      assert.ok(stored.works[1].theme_keywords.indexOf('水泳部') !== -1);
-      assert.ok(stored.works[1].related.some((r) => r.code === 'PROMO-888'));
+      assert.strictEqual(stored.works[1].code, 'PROMO-200');
+      assert.strictEqual(stored.works[2].code, 'PROMO-150');
+      assert.strictEqual(stored.works[2].title_zh, '延伸中文');
+      assert.notStrictEqual(stored.works[2].title_zh, '第二中文');
+      assert.strictEqual(stored.works[2].cover, coverNew);
+      assert.ok(stored.works[2].cover.indexOf('data:') === -1);
+      assert.ok(stored.works[2].cover.indexOf('blob:') === -1);
+      assert.ok(stored.works[2].stills.indexOf(stillNew) !== -1);
+      assert.ok(stored.works[2].stills.every((u) => String(u).indexOf('data:') !== 0));
+      assert.ok(stored.works[2].theme_keywords.indexOf('巨乳') !== -1);
+      assert.ok(stored.works[2].theme_keywords.indexOf('水泳部') !== -1);
+      assert.ok(stored.works[2].related.some((r) => r.code === 'PROMO-888'));
       const replay = H.sessionWorksFromIdentify(H.identifyPayloadFromHistory(stored));
-      assert.strictEqual(replay.length, 2, 'promoted related stays nested, not a new vertical row');
-      assert.ok(!replay.some((w) => w.code === 'PROMO-888'));
+      assert.strictEqual(replay.length, 3, 'extended main is another vertical row');
+      assert.strictEqual(replay[0].code, 'PROMO-100');
+      assert.strictEqual(replay[2].code, 'PROMO-150');
+      assert.ok(!replay.some((w) => w.code === 'PROMO-888'), 'its related stays nested');
 
       const toast = getEl('lfp-toast').textContent;
-      assert.ok(toast.indexOf('已以 PROMO-150 為主作品') !== -1, toast);
+      assert.ok(toast.indexOf('已在下方加入 PROMO-150') !== -1, toast);
       assert.ok(toast.indexOf('時間不夠') === -1, toast);
       assert.ok(toast.indexOf('尚未查完') === -1, toast);
       assert.ok(toast.indexOf('尚未鎖定') === -1, toast);
@@ -3066,21 +3119,83 @@ function walkNodes(node, acc) {
       firstRelatedBtn.click();
       const slot0 = await H.promoteTask();
       assert.strictEqual(slot0.ok, true);
-      assert.strictEqual(slot0.slotIndex, 0);
+      assert.strictEqual(slot0.slotIndex, 3);
+      const grown = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(grown.length, 4);
+      assert.strictEqual(grown[0], blocks[0]);
+      assert.strictEqual(cardCodes(grown[0])[0], 'PROMO-100');
+      assert.strictEqual(cardCodes(grown[3])[0], 'PROMO-110');
       const head = H.loadHistory().find((x) => x.id === 'promo-session');
-      assert.strictEqual(head.works.length, 2);
-      assert.strictEqual(head.works[0].code, 'PROMO-110');
-      assert.strictEqual(head.works[0].title_zh, '第一延伸');
-      assert.notStrictEqual(head.works[0].title_zh, '舊主中文');
-      assert.strictEqual(head.works[0].cover, cover110);
-      assert.ok(head.works[0].cover.indexOf('data:') === -1);
-      assert.strictEqual(head.works[1].code, 'PROMO-150');
-      assert.strictEqual(head.code, 'PROMO-110');
-      assert.strictEqual(head.cover, cover110);
+      assert.strictEqual(head.works.length, 4);
+      assert.strictEqual(head.works[0].code, 'PROMO-100');
+      assert.strictEqual(head.works[0].title_zh, '舊主中文');
+      assert.strictEqual(head.works[0].related[0].code, 'PROMO-110');
+      assert.strictEqual(head.works[3].code, 'PROMO-110');
+      assert.strictEqual(head.works[3].title_zh, '第一延伸');
+      assert.strictEqual(head.works[3].cover, cover110);
+      assert.ok(head.works[3].cover.indexOf('data:') === -1);
+      assert.strictEqual(head.works[1].code, 'PROMO-200');
+      assert.strictEqual(head.works[2].code, 'PROMO-150');
+      assert.strictEqual(head.code, 'PROMO-100');
+      assert.strictEqual(head.cover, coverA);
       assert.strictEqual(head.userShots.length, 1);
       assert.strictEqual(head.userShots[0], shot);
 
-      // History detail: same button replaces that record's slot and keeps screenshots.
+      // Single identify: the one main stays, and the related work is added below.
+      const soloCover = 'https://pics.dmm.co.jp/digital/video/solo00001/solo00001pl.jpg';
+      H.renderGallery(
+        H.galleryFromIdentify({
+          ok: true,
+          code: 'SOLO-001',
+          title: '單張主',
+          cover: soloCover,
+          user_preview: shot,
+          results: [
+            {
+              ok: true,
+              code: 'SOLO-001',
+              title: '單張主',
+              cover: soloCover,
+              user_preview: shot,
+              line: 'main',
+              related_by_title: [
+                {
+                  code: 'SOLO-009',
+                  title: '單張相關',
+                  line: 'keyword',
+                  why: '關鍵字',
+                  cover: coverB,
+                },
+              ],
+            },
+          ],
+        })
+      );
+      const soloBefore = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(soloBefore.length, 1);
+      const soloBtn = walkNodes(soloBefore[0]).find(
+        (n) => n.getAttribute && n.getAttribute('aria-label') === '以此為主'
+      );
+      assert.ok(soloBtn);
+      scrollN = 0;
+      soloBtn.click();
+      const solo = await H.promoteTask();
+      assert.strictEqual(solo.ok, true, solo && solo.reason);
+      assert.strictEqual(solo.slotIndex, 1);
+      assert.strictEqual(scrollN, 0);
+      const soloAfter = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(soloAfter.length, 2);
+      assert.strictEqual(soloAfter[0], soloBefore[0]);
+      assert.strictEqual(cardCodes(soloAfter[0])[0], 'SOLO-001');
+      assert.strictEqual(cardCodes(soloAfter[1])[0], 'SOLO-009');
+      assert.ok(cardCodes(soloAfter[1]).indexOf('SOLO-010') !== -1);
+      const soloImgs = walkNodes(soloAfter[1])
+        .filter((n) => n.tagName === 'IMG')
+        .map((n) => String(n.src || ''));
+      assert.ok(soloImgs.every((u) => u.indexOf('data:') !== 0 && u.indexOf('blob:') !== 0), soloImgs.join(','));
+      assert.ok(getEl('screen-gallery').classList.contains('active'));
+
+      // History detail: the same button appends under that record and keeps screenshots.
       const histRec = {
         id: 'promo-history',
         ts: Date.now(),
@@ -3107,16 +3222,27 @@ function walkNodes(node, acc) {
       detailBtn.click();
       const histResult = await H.promoteTask();
       assert.strictEqual(histResult.ok, true);
-      assert.strictEqual(histResult.slotIndex, 1);
+      assert.strictEqual(histResult.slotIndex, 2);
       const histStored = H.loadHistory().find((x) => x.id === 'promo-history');
+      assert.strictEqual(histStored.works.length, 3);
       assert.strictEqual(histStored.works[0].code, 'PROMO-100');
-      assert.strictEqual(histStored.works[1].code, 'PROMO-150');
+      assert.strictEqual(histStored.works[1].code, 'PROMO-200');
+      assert.strictEqual(histStored.works[2].code, 'PROMO-150');
+      assert.strictEqual(histStored.works[2].cover, coverNew);
+      assert.ok(histStored.works[2].cover.indexOf('data:') === -1);
       assert.strictEqual(histStored.userShots.length, 1);
       assert.strictEqual(histStored.userShots[0], shot);
       assert.strictEqual(histStored.code, 'PROMO-100');
+      assert.strictEqual(histStored.cover, coverA);
+      const detailAfter = walkNodes(getEl('history-detail')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(detailAfter.length, 3);
+      assert.strictEqual(detailAfter[0], detailBlocks[0]);
+      assert.strictEqual(detailAfter[1], detailBlocks[1]);
+      assert.strictEqual(cardCodes(detailAfter[2])[0], 'PROMO-150');
       const detailText = walkNodes(getEl('history-detail')).map((n) => n.textContent || '').join('\n');
       assert.ok(detailText.indexOf('你的截圖') !== -1);
       assert.ok(detailText.indexOf('PROMO-100') !== -1);
+      assert.ok(detailText.indexOf('PROMO-200') !== -1);
       assert.ok(detailText.indexOf('PROMO-150') !== -1);
       assert.ok(detailText.indexOf('時間不夠') === -1);
       assert.ok(detailText.indexOf('尚未查完') === -1);

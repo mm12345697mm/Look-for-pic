@@ -2990,10 +2990,10 @@
   }
 
   /**
-   * Code-identify payload as the replacement main for one carousel.
+   * Code-identify payload as one more main section under the current results.
    * Cover/stills stay catalog jackets. Chinese gloss is this 品番's own
    * (identify response, else the related card). The previous main's title_zh
-   * is never copied onto a different code.
+   * is never copied onto a different code. The parent slot is not replaced.
    */
   function promotedGalleryWork(identifyData, parent, priorRelated) {
     if (!identifyData) return null;
@@ -3001,7 +3001,9 @@
     const first = built && built.items && built.items[0];
     if (!first || !reliablePromoteCode(first)) return null;
     const work = Object.assign({}, first);
-    work.line = slotLineForPromote(parent);
+    // Own main card (主作品), stacked under the gallery. The source carousel
+    // stays put; this section does not inherit that slot's line.
+    work.line = 'main';
     work.userPreview = '';
     work.cover = catalogOnlyUrl(work.cover, work.cid);
     work.stills = (Array.isArray(work.stills) ? work.stills : []).filter((u) => isCatalogMediaUrl(u));
@@ -3252,71 +3254,118 @@
     return rec.id;
   }
 
+  function galleriesMatch(left, right) {
+    const a = left || [];
+    const b = right || [];
+    if (!a.length || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (!codesOrTitlesMatch(a[i], b[i])) return false;
+    }
+    return true;
+  }
+
+  function appendWorkBlock(root, work) {
+    if (!root || typeof root.appendChild !== 'function' || !work) return false;
+    root.appendChild(buildWorkCarousel(work));
+    return true;
+  }
+
+  /** Push one extended main onto a saved session. The first work stays the head. */
+  function appendExtendedHistoryWork(listIndex, histWork) {
+    const list = loadHistory();
+    if (listIndex < 0 || listIndex >= list.length) return null;
+    const rec = list[listIndex];
+    const works = historySessionWorks(rec).slice();
+    works.push(histWork);
+    const next = Object.assign({}, rec, { works: works });
+    list[listIndex] = next;
+    saveHistory(list);
+    return next;
+  }
+
+  function rememberExtendedSession(itemsBefore, histWork, surface) {
+    const list = loadHistory();
+    let idx = -1;
+    if (surface === 'history' && viewingHistoryId) {
+      idx = list.findIndex((x) => x && x.id === viewingHistoryId);
+    }
+    if (idx < 0) idx = findGalleryHistoryIndex(list, itemsBefore);
+    if (idx >= 0) return appendExtendedHistoryWork(idx, histWork);
+    const gallery = (itemsBefore || []).slice();
+    const works = gallery.map((w) => galleryWorkToHistoryWork(w));
+    works.push(histWork);
+    const first = works[0] || histWork;
+    const rec = {
+      id: 'h_' + Date.now() + '_' + Math.random().toString(36).slice(2, 7),
+      ts: Date.now(),
+      kind: 'session',
+      ok: true,
+      code: first.code || '',
+      title: first.title || '',
+      title_zh: first.title_zh || '',
+      cover: first.cover || '',
+      stills: first.stills || [],
+      actress: first.actress || '',
+      related: first.related || [],
+      userShots: [],
+      works: works,
+    };
+    const nextList = loadHistory();
+    nextList.unshift(rec);
+    saveHistory(nextList.slice(0, HISTORY_MAX));
+    return rec;
+  }
+
   /**
-   * Replace one vertical slot — the carousel this related card belongs to —
-   * with a code identify of that 品番. Sibling uploads stay. The query image
-   * is not sent and is not used as the catalog jacket.
+   * Append one vertical slot under the results already on screen: the related
+   * 品番 becomes its own main carousel, with that work's related package.
+   * Earlier mains stay. No route change, no gallery wipe, no scroll reset.
+   * The query image is not sent and is not used as the catalog jacket.
    */
   function applyPromotedMain(identifyData, priorRelated, slotIndex, surface) {
     const onHistory = surface === 'history' && !!viewingHistoryId;
-    let parent = null;
     let beforeItems = [];
     if (onHistory) {
       const rec = loadHistory().find((x) => x && x.id === viewingHistoryId);
       const works = historySessionWorks(rec);
-      if (slotIndex < 0 || slotIndex >= works.length) slotIndex = 0;
-      parent = historyWorkToGallery(works[slotIndex], slotIndex);
       beforeItems = works.map((w, i) => historyWorkToGallery(w, i));
     } else {
       beforeItems = (lastGalleryItems || []).slice();
-      if (!beforeItems.length) slotIndex = 0;
-      else if (slotIndex < 0 || slotIndex >= beforeItems.length) slotIndex = 0;
-      parent = beforeItems[slotIndex] || null;
     }
+    const parent =
+      slotIndex >= 0 && slotIndex < beforeItems.length ? beforeItems[slotIndex] : beforeItems[0] || null;
     const work = promotedGalleryWork(identifyData, parent, priorRelated);
     if (!work) return null;
     const hist = galleryWorkToHistoryWork(work);
+    const items = beforeItems.concat([work]);
+    const newIndex = items.length - 1;
     if (!onHistory) {
-      const items = beforeItems.slice();
-      if (!items.length) items.push(work);
-      else items[slotIndex] = work;
       lastGalleryItems = items;
-      const block = blockAtSlot(galleryCards, slotIndex);
-      const nextBlock = buildWorkCarousel(work);
-      if (!block || !replaceNode(block, nextBlock)) {
-        const notice = galleryNotice && !galleryNotice.hidden ? galleryNotice.textContent : null;
-        renderGallery({ items: items, notice: notice });
-      } else if (galleryCount) {
-        galleryCount.textContent = String(items.length) + ' 部';
-      }
+      appendWorkBlock(galleryCards, work);
+      if (galleryCount) galleryCount.textContent = String(items.length) + ' 部';
     } else {
       const live = (lastGalleryItems || []).slice();
-      const liveParent = live[slotIndex];
-      if (
-        liveParent &&
-        parent &&
-        liveParent.code &&
-        parent.code &&
-        codesMatch(String(liveParent.code), String(parent.code))
-      ) {
-        live[slotIndex] = work;
+      if (galleriesMatch(live, beforeItems)) {
+        live.push(work);
         lastGalleryItems = live;
-        const block = blockAtSlot(galleryCards, slotIndex);
-        if (block) replaceNode(block, buildWorkCarousel(work));
+        appendWorkBlock(galleryCards, work);
+        if (galleryCount) galleryCount.textContent = String(live.length) + ' 部';
       }
+      appendWorkBlock(historyDetailEl, work);
     }
-    rememberPromotedSession(beforeItems, slotIndex, hist, onHistory ? 'history' : 'gallery');
-    return work;
+    rememberExtendedSession(beforeItems, hist, onHistory ? 'history' : 'gallery');
+    return { work: work, slotIndex: newIndex };
   }
 
   async function identifyCodeForPromote(code) {
     const payload = { code: code };
-    // A new code identify is its own run. A later upload supersedes it, and a
-    // stale multi-image poll must not paint over this one.
+    // Own epoch so a stale upload poll cannot repaint the gallery. Stay quiet:
+    // do not open the identify progress screen or replace this results page.
     beginIdentifyProgress(0);
     promoteEpoch = progressEpoch;
+    const ignoreProgress = function () {};
     try {
-      const streamed = await apiIdentifyStream(payload, applyProgressEvent);
+      const streamed = await apiIdentifyStream(payload, ignoreProgress, { quiet: true });
       if (streamed && streamed.superseded) {
         const err = new Error('superseded');
         err.superseded = true;
@@ -3325,7 +3374,7 @@
       return streamed && streamed.data;
     } catch (streamErr) {
       if (streamErr && (streamErr.followed || streamErr.superseded)) throw streamErr;
-      if (streamErr && streamErr.jobId) return followIdentifyJob(streamErr.jobId, applyProgressEvent);
+      if (streamErr && streamErr.jobId) return followIdentifyJob(streamErr.jobId, ignoreProgress);
       const classic = await apiIdentify(payload);
       return classic && classic.data;
     }
@@ -3338,9 +3387,10 @@
   }
 
   /**
-   * 「以此為主」: identify that related 品番 by code and make it the main of
-   * this carousel (cover, stills, related buckets, keyword chips). Other
-   * uploads in the session stay on the vertical axis.
+   * 「以此為主」: identify that related 品番 by code and append it under the
+   * current results as another main (cover, stills, related buckets, keyword
+   * chips). Earlier mains and their related stay above. The page does not
+   * navigate or restart as a fresh identify.
    */
   async function promoteRelatedToMain(relatedWork, card, opts) {
     opts = opts || {};
@@ -3360,14 +3410,14 @@
     showToast('正在以 ' + code + ' 延伸…', { persist: true });
     try {
       const data = await identifyCodeForPromote(code);
-      const work = applyPromotedMain(data, relatedWork, slotIndex, surface);
+      const placed = applyPromotedMain(data, relatedWork, slotIndex, surface);
       settlePromoteProgress();
-      if (!work) {
+      if (!placed || !placed.work) {
         showToast((data && data.message) || '找不到這部作品');
         return { ok: false, reason: 'miss', data: data };
       }
-      showToast('已以 ' + formatDisplayCode(work.code) + ' 為主作品');
-      return { ok: true, work: work, slotIndex: slotIndex };
+      showToast('已在下方加入 ' + formatDisplayCode(placed.work.code));
+      return { ok: true, work: placed.work, slotIndex: placed.slotIndex };
     } catch (err) {
       if (err && err.superseded) return { ok: false, reason: 'superseded' };
       settlePromoteProgress();
