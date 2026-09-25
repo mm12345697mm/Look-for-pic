@@ -7527,6 +7527,120 @@ def _looks_chinese_title(s: str | None) -> bool:
     return False
 
 
+_ZH_BRACKET_RE = re.compile(r"[\[【［]\s*([^\]】］]{0,32})\s*[\]】］]")
+_ZH_CHROME_INNER_RE = re.compile(
+    r"馬賽克|破解|高清|中字|字幕|無碼|無修正|流出|uncensored|leaked|^uncen$",
+    re.I,
+)
+_ZH_TOKEN_CHROME_RE = re.compile(
+    r"(?i)(?:\buncensored\b|\bleaked\b|\buncen\b|無修正流出|無碼破解|馬賽克破解|高清中字|中文字幕)"
+)
+_ZH_SEARCH_CHROME_RE = re.compile(
+    r"搜尋結果|搜索结果|search result|page not found|找不到網頁",
+    re.I,
+)
+_BILLING_HAN_RE = re.compile(r"^[\u4e00-\u9fff]{2,5}$")
+# 和 / 與 stay allowed: they show up inside billings such as 禰土和歌.
+_BILLING_NOT_A_NAME = ("的", "了", "是", "在", "被", "不", "我", "她", "他", "會", "会")
+
+
+def _zh_code_keys(code: str | None) -> set[str]:
+    """Compact 品番 keys so [APGH-012] and APGH012 match the same work."""
+    keys: set[str] = set()
+    raw = str(code or "").strip()
+    if not raw:
+        return keys
+    keys.add(re.sub(r"[\s\-–—]", "", raw).casefold())
+    if parse_code_parts(raw):
+        disp = format_display_code(raw)
+        keys.add(disp.replace("-", "").casefold())
+        alt = code_stripped_form(disp)
+        if alt:
+            keys.add(alt.replace("-", "").casefold())
+    keys.discard("")
+    return keys
+
+
+def _bracket_is_listing_chrome(inner: str, code_keys: set[str]) -> bool:
+    t = re.sub(r"\s+", "", inner or "")
+    if not t:
+        return True
+    folded = re.sub(r"[\-–—]", "", t).casefold()
+    if folded in code_keys:
+        return True
+    if parse_code_parts(t):
+        return True
+    return bool(_ZH_CHROME_INNER_RE.search(t))
+
+
+def _strip_zh_title_chrome(text: str, code: str | None) -> str:
+    """Drop listing badges. The words the site used as the title stay."""
+    t = unescape(re.sub(r"\s+", " ", (text or "").strip()))
+    if not t:
+        return ""
+    keys = _zh_code_keys(code)
+
+    def repl(match: re.Match) -> str:
+        return " " if _bracket_is_listing_chrome(match.group(1), keys) else match.group(0)
+
+    for _ in range(4):
+        nxt = re.sub(r"\s+", " ", _ZH_BRACKET_RE.sub(repl, t)).strip()
+        if nxt == t:
+            break
+        t = nxt
+    t = _ZH_TOKEN_CHROME_RE.sub(" ", t)
+    # Leftover badge separators (–Uncensored–Leaked —) collapse. A title's
+    # own —— subtitle mark has no space, so it stays.
+    t = re.sub(r"(?:[-–—|｜]\s+){1,}[-–—|｜]", " ", t)
+    return re.sub(r"\s+", " ", t).strip(" -\u3000|｜")
+
+
+def _is_billing_name(token: str) -> bool:
+    t = (token or "").strip()
+    if not _BILLING_HAN_RE.match(t):
+        return False
+    return not any(ch in t for ch in _BILLING_NOT_A_NAME)
+
+
+def _strip_billing_suffix(text: str) -> str:
+    """Drop a trailing actress billing. A title phrase is left in place.
+
+    Clear cases: a short Han name after 。！ or a dash, a romanized name,
+    or a space-separated Han name after a real sentence.
+    """
+    t = (text or "").strip()
+    for _ in range(3):
+        nxt = re.sub(
+            r"\s*[-–—|｜]\s*[A-Za-z][A-Za-z .'\-]{1,40}$",
+            "",
+            t,
+        ).strip()
+        nxt = re.sub(
+            r"\s+[A-Z][a-zA-Z.'\-]+(?:\s+[A-Z][a-zA-Z.'\-]+){0,3}$",
+            "",
+            nxt,
+        ).strip()
+        # Dash / sentence-end names are short billings (柊由紀, 禰土和歌).
+        # A longer dash tail such as ——超大噴射特輯 is still the title.
+        marked = re.search(
+            r"(?:[。．.！!？?]|[-–—])\s*([\u4e00-\u9fff]{2,4})$",
+            nxt,
+        )
+        if marked and _is_billing_name(marked.group(1)):
+            nxt = nxt[: marked.start()].strip()
+        else:
+            spaced = re.search(r"\s+([\u4e00-\u9fff]{3,5})$", nxt)
+            if spaced and _is_billing_name(spaced.group(1)):
+                body = nxt[: spaced.start()]
+                if len(re.findall(r"[\u4e00-\u9fff]", body)) >= 6:
+                    nxt = body.strip()
+        nxt = nxt.strip(" -\u3000")
+        if nxt == t:
+            break
+        t = nxt
+    return t.strip(" -\u3000。．.！!？?")
+
+
 def _clean_title_zh(
     raw: str | None,
     *,
@@ -7534,13 +7648,13 @@ def _clean_title_zh(
     code: str | None = None,
     trusted: bool = False,
 ) -> str | None:
-    t = re.sub(r"\s+", " ", (raw or "").strip())
+    t = _strip_zh_title_chrome(raw or "", code)
     if not t:
         return None
     # Strip site name suffixes only (avoid eating 品番 hyphens like NHDTC-099)
     t = re.sub(r"\s*[\|／/]\s*.{0,40}$", "", t).strip()
     t = re.sub(
-        r"\s+[\-–—]\s*(MissAV|JAVLibrary|JavBus|AVBase|FANZA|DMM|Jable(?:\.TV)?).*$",
+        r"\s+[\-–—]\s*(MissAV|JAVLibrary|JavBus|AVBase|FANZA|DMM|Jable(?:\.TV)?|Avbebe|UNCEN\s*X).*$",
         "",
         t,
         flags=re.I,
@@ -7565,6 +7679,11 @@ def _clean_title_zh(
                 continue
             t = re.sub(re.escape(v), " ", t, flags=re.I)
         t = re.sub(r"\s+", " ", t).strip(" -\u3000")
+    t = _strip_billing_suffix(t)
+    t = re.sub(r"^[\s\-–—|｜·・]+", "", t)
+    t = re.sub(r"\s+", " ", t).strip(" -\u3000「」\"'")
+    if not t or _ZH_SEARCH_CHROME_RE.search(t):
+        return None
     if title_ja and t == title_ja.strip():
         return None
     looks = _looks_chinese_title(t)
@@ -7908,6 +8027,128 @@ def fetch_javlibrary_chinese_title(code: str) -> str | None:
     return title
 
 
+def _code_mentioned(text: str | None, code: str) -> bool:
+    """True when text names this 品番, not a longer code that only shares a prefix."""
+    parts = parse_code_parts(str(code or ""))
+    if not parts or not text:
+        return False
+    lab, num = parts
+    try:
+        bare = str(int(num))
+    except ValueError:
+        bare = num.lstrip("0") or "0"
+    return (
+        re.search(
+            rf"{re.escape(lab)}[-–—_\s]*0*{re.escape(bare)}(?!\d)",
+            text,
+            flags=re.I,
+        )
+        is not None
+    )
+
+
+# Extra listing pages after MissAV / Jable / JAVLibrary. njav.tv, 123av.com,
+# and njavtv.com answer with a Cloudflare challenge from this network, so
+# they are not fetched. Two working HTML catalogs stay inside this cap.
+_ZH_LISTING_FETCH_CAP = 3
+
+
+def _zh_listing_page_urls(code: str) -> list[str]:
+    """AVBEBE search, then the UNCEN X Traditional Chinese work page."""
+    from urllib.parse import quote
+
+    disp = format_display_code(str(code))
+    if not disp:
+        return []
+    urls = [
+        f"https://avbebe.com/?s={quote(disp)}",
+        f"https://www.uncenx.com/tw/{disp.lower()}",
+    ]
+    alt = code_stripped_form(disp)
+    if alt:
+        urls.append(f"https://www.uncenx.com/tw/{alt.lower()}")
+    return urls
+
+
+def _parse_avbebe_search_html(
+    html: str | None,
+    *,
+    code: str,
+    title_ja: str | None = None,
+) -> str | None:
+    """First AVBEBE result whose title contains this 品番. Search chrome is not a title."""
+    disp = format_display_code(str(code))
+    for match in re.finditer(
+        r'class="[^"]*jeg_post_title[^"]*"[^>]*>\s*<a\b[^>]*>(.*?)</a>',
+        html or "",
+        flags=re.I | re.S,
+    ):
+        raw = re.sub(r"<[^>]+>", " ", match.group(1))
+        raw = unescape(re.sub(r"\s+", " ", raw)).strip()
+        if not raw or not _code_mentioned(raw, disp):
+            continue
+        title = _clean_title_zh(raw, title_ja=title_ja, code=disp, trusted=True)
+        if title:
+            return title
+    return None
+
+
+def _parse_uncenx_html(
+    html: str | None,
+    *,
+    code: str,
+    title_ja: str | None = None,
+) -> str | None:
+    """Chinese title from an UNCEN X work page. A page for another 品番 is ignored."""
+    disp = format_display_code(str(code))
+    for raw in _html_title_candidates(html):
+        if not _code_mentioned(raw, disp):
+            continue
+        title = _clean_title_zh(raw, title_ja=title_ja, code=disp, trusted=True)
+        if title:
+            return title
+    return None
+
+
+def _fetch_zh_listing_title(
+    code: str,
+    *,
+    title_ja: str | None = None,
+    timeout: float = 8.0,
+    deadline: float | None = None,
+) -> str | None:
+    """One cleaned Chinese title from AVBEBE or UNCEN X. Nothing is translated."""
+    fetches = 0
+    for url in _zh_listing_page_urls(code):
+        if fetches >= _ZH_LISTING_FETCH_CAP:
+            break
+        remain = None
+        if deadline is not None:
+            remain = float(deadline) - time.monotonic()
+            if remain < 0.4:
+                break
+        fetches += 1
+        req_timeout = float(timeout)
+        if remain is not None:
+            req_timeout = min(req_timeout, remain)
+        try:
+            html = http_get(url, timeout=req_timeout, connect_timeout=min(2.0, req_timeout))
+        except Exception:
+            html = None
+        if not html:
+            continue
+        host = url.lower()
+        if "avbebe.com" in host:
+            title = _parse_avbebe_search_html(html, code=code, title_ja=title_ja)
+        elif "uncenx.com" in host:
+            title = _parse_uncenx_html(html, code=code, title_ja=title_ja)
+        else:
+            title = None
+        if title:
+            return title
+    return None
+
+
 def fetch_public_zh_catalog(
     code: str,
     *,
@@ -7916,14 +8157,18 @@ def fetch_public_zh_catalog(
     page_limit: int | None = None,
     timeout: float = 8.0,
     deadline: float | None = None,
+    listing_fallback: bool = True,
 ) -> dict:
     """品番 lookup for a Chinese title, actress name, genre tags, series, and cover.
 
     MissAV /cn/ and Jable supply 品番 + 中文標題 (and a Chinese billing when the
     page has one). The same HTML's genre/tag chips, series name, and product
     cover are parsed. MissAV is tried before Jable. JAVLibrary CN is the
-    fallback already used for titles. Missing fields stay empty — nothing is
-    translated or invented. A data/blob image is never a cover.
+    next title fallback. Only when those have no Chinese title, and this is
+    not a short cover/tag fetch, AVBEBE then UNCEN X may supply a title.
+    Those extra pages do not change genres, series, or the cover. Missing
+    fields stay empty — nothing is translated or invented. A data/blob image
+    is never a cover.
     """
     empty = {
         "title_zh": None,
@@ -8012,6 +8257,16 @@ def fetch_public_zh_catalog(
         title_zh = jt or title_zh
         if ja_name and not actress_zh:
             actress_zh = ja_name
+    # Short page_limit fetches are cover/tag passes. They stay on MissAV/Jable.
+    if not title_zh and listing_fallback and page_limit is None:
+        try:
+            listed = _fetch_zh_listing_title(
+                disp, title_ja=title_ja, timeout=timeout, deadline=deadline
+            )
+        except Exception:
+            listed = None
+        if listed:
+            title_zh = listed
     return {
         "title_zh": title_zh,
         "actress_zh": actress_zh,
@@ -8338,9 +8593,11 @@ def resolve_chinese_title(
     """Resolve a Chinese title from public catalogs.
 
     Sources (public HTML only): existing payload → user Chinese query →
-    MissAV /cn/ and Jable by 品番 → JAVLibrary CN. No pirate/magnet links.
-    When catalog_out is a dict and this call scrapes, it receives actress_zh
-    plus that page's genre tags and series name. Returns None if no Chinese
+    MissAV /cn/ and Jable by 品番 → JAVLibrary CN → AVBEBE and UNCEN X.
+    No pirate/magnet links. A title is copied from a page that already
+    writes it in Chinese. Nothing is translated. When catalog_out is a dict
+    and this call scrapes, it receives actress_zh plus that page's genre
+    tags and series name from MissAV/Jable. Returns None if no Chinese
     title was found. An existing Chinese title is kept; tags are still read
     from the 品番 page when catalog_out is provided.
     """
@@ -8360,6 +8617,7 @@ def resolve_chinese_title(
                     actress_ja=actress_ja,
                     title_ja=title_ja,
                     deadline=deadline,
+                    listing_fallback=False,
                 )
             except Exception:
                 meta = {}
