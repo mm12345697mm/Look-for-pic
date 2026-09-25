@@ -5757,8 +5757,21 @@ def harmonize_batch_title_zh(payload: dict, *, use_cache: bool = False) -> dict:
     return payload
 
 
+def _related_title_slide(item: dict | None) -> bool:
+    """Carousel slides (片名 / 關鍵字 / 同演員), not a 主作品 row."""
+    if not isinstance(item, dict):
+        return False
+    return str(item.get("line") or "") in {"theme", "keyword", "actress", "title"}
+
+
 def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
-    """One fetch per 品番 this job has not tried yet, then copy that result."""
+    """One fetch per 品番 this job has not tried yet, then copy that result.
+
+    Related slides and mains each keep half the budget, then whichever side
+    still lacks a Chinese title may use time the other side did not. A batch
+    of 主作品 must not leave 相關作品 Japanese-only when a catalog source
+    exists. Nothing is translated.
+    """
     import time as _time
 
     if not isinstance(payload, dict):
@@ -5766,9 +5779,9 @@ def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
     harmonize_batch_title_zh(payload, use_cache=True)
     t0 = _time.monotonic()
     seen: set[str] = set()
-    # Mains first, then related slides, so a batch of works is not starved by the carousel.
-    ordered = _collect_title_zh_items(payload)
-    for item in ordered:
+    mains: list[tuple[dict, str]] = []
+    related: list[tuple[dict, str]] = []
+    for item in _collect_title_zh_items(payload):
         if not _item_needs_title_zh(item):
             continue
         key = _title_zh_code_key(item.get("code"))
@@ -5776,23 +5789,46 @@ def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
         # job already stored a Chinese title for the 品番.
         if not key or key in seen or (_title_zh_already_fetched(key) and _memo_title_zh(key)):
             continue
-        if budget_sec and (_time.monotonic() - t0) > float(budget_sec):
-            break
         seen.add(key)
-        deadline = t0 + float(budget_sec) if budget_sec else None
-        try:
-            zh = resolve_chinese_title(
-                key,
-                title_ja=item.get("title"),
-                existing_zh=item.get("title_zh"),
-                actress_ja=item.get("actress"),
-                deadline=deadline,
-            )
-        except Exception:
-            zh = None
-        _note_title_zh_fetched(key, zh, item.get("title"))
-        if zh:
-            item["title_zh"] = zh
+        if _related_title_slide(item):
+            related.append((item, key))
+        else:
+            mains.append((item, key))
+
+    def drain(queue: list[tuple[dict, str]], deadline: float | None) -> None:
+        while queue:
+            if deadline is not None and _time.monotonic() > deadline:
+                return
+            item, key = queue.pop(0)
+            if not _item_needs_title_zh(item):
+                continue
+            known = _memo_title_zh(key)
+            if known:
+                item["title_zh"] = known
+                continue
+            try:
+                zh = resolve_chinese_title(
+                    key,
+                    title_ja=item.get("title"),
+                    existing_zh=item.get("title_zh"),
+                    actress_ja=item.get("actress"),
+                    deadline=deadline,
+                )
+            except Exception:
+                zh = None
+            _note_title_zh_fetched(key, zh, item.get("title"))
+            if zh:
+                item["title_zh"] = zh
+
+    if not budget_sec:
+        drain(related, None)
+        drain(mains, None)
+    else:
+        end = t0 + float(budget_sec)
+        half = t0 + float(budget_sec) / 2.0
+        drain(related, half if mains else end)
+        drain(mains, end)
+        drain(related, end)
     return harmonize_batch_title_zh(payload, use_cache=True)
 
 
@@ -5841,7 +5877,15 @@ def _stamp_multi_batch(payload: dict, job_t0: float, slot_used: dict | None) -> 
         src = by_index.get(item.get("from_image_index")) if isinstance(item.get("from_image_index"), int) else None
         if not isinstance(src, dict):
             continue
-        if not item.get("title_zh") and src.get("title_zh"):
+        src_key = _title_zh_code_key(src.get("code"))
+        item_key = _title_zh_code_key(item.get("code"))
+        # Same 品番 only. A slot's Chinese title must not land on another code.
+        if (
+            not item.get("title_zh")
+            and src.get("title_zh")
+            and src_key
+            and src_key == item_key
+        ):
             item["title_zh"] = src.get("title_zh")
         if _elapsed_ms_value(item.get("work_elapsed_ms")) is None:
             copied = _elapsed_ms_value(src.get("work_elapsed_ms"))
@@ -8061,6 +8105,84 @@ def _apply_public_cover_fallback(item: dict | None, meta: dict | None) -> None:
     source = str(meta.get("cover_source") or "").lower()
     if source in ("missav", "jable"):
         item["cover_source"] = source
+
+
+def _http_catalog_urls(urls) -> list[str]:
+    """http(s) catalog media only. Uploads and now_printing stay out."""
+    out: list[str] = []
+    for raw in urls or []:
+        clean = _catalog_jacket_url(raw)
+        if not clean or _is_upload_media_url(clean) or clean in out:
+            continue
+        out.append(clean)
+    return out
+
+
+def refresh_catalog_cover(
+    code: str | None,
+    *,
+    title: str | None = None,
+    cid: str | None = None,
+) -> dict:
+    """Look up the jacket again for the code already on one card.
+
+    Does not run identify and does not pick a different 品番. The caller
+    writes the cover back into that same card. A client upload (data: / blob:)
+    is never the jacket. DMM is first; MissAV then Jable only when DMM has
+    no jacket. Sample stills are included only when a DMM cid resolves
+    (those URLs are derived, not a second scrape).
+    """
+    raw_code = str(code or "").strip()
+    raw_title = str(title or "").strip()
+    if not raw_code and raw_title and parse_code_parts(raw_title):
+        raw_code = raw_title
+        raw_title = ""
+    disp = format_display_code(raw_code) if raw_code and parse_code_parts(raw_code) else ""
+    out: dict = {
+        "ok": bool(disp),
+        "code": disp or None,
+        "title": raw_title or None,
+        "cid": None,
+        "cover": None,
+        "stills": [],
+        "cover_source": None,
+    }
+    if not disp:
+        out["message"] = "沒有可搜索的番號"
+        return out
+    cid_in = str(cid or "").strip()
+    if is_now_printing_url(cid_in):
+        cid_in = ""
+    try:
+        rcid, cover, stills = sanitize_cover_fields(disp, cid_in or None, None)
+    except Exception:
+        rcid, cover, stills = None, None, []
+    jacket = _catalog_jacket_url(cover)
+    if jacket and not _is_upload_media_url(jacket):
+        out["cid"] = str(rcid or "") or None
+        out["cover"] = jacket
+        out["stills"] = _http_catalog_urls(stills)
+        if rcid and not out["stills"]:
+            out["stills"] = _http_catalog_urls(still_urls(str(rcid), 10))
+        return out
+    try:
+        meta = fetch_public_zh_catalog(
+            disp,
+            title_ja=raw_title or None,
+            page_limit=2,
+            timeout=6.0,
+        )
+    except Exception:
+        meta = {}
+    item = {"code": disp, "title": raw_title, "cover": None}
+    _apply_public_cover_fallback(item, meta if isinstance(meta, dict) else {})
+    jacket = _catalog_jacket_url(item.get("cover"))
+    if jacket and not _is_upload_media_url(jacket):
+        out["cover"] = jacket
+        source = str(item.get("cover_source") or (meta or {}).get("cover_source") or "").lower()
+        if source in ("missav", "jable"):
+            out["cover_source"] = source
+    return out
 
 
 def _cover_progress_detail(payload: dict | None) -> tuple[str, str]:
@@ -11635,6 +11757,25 @@ def attach_related_by_title(
 
 
 
+def _form_related_codes() -> list[str]:
+    """Related 品番 hints posted with a slot 重新辨識."""
+    raw: list[str] = []
+    try:
+        raw.extend(request.form.getlist("related_codes"))
+    except Exception:
+        pass
+    one = (request.form.get("related_codes") or "").strip()
+    if one and one not in raw:
+        raw.append(one)
+    out: list[str] = []
+    for item in raw:
+        for part in str(item or "").replace("，", ",").split(","):
+            text = part.strip()
+            if text and text not in out:
+                out.append(text)
+    return out
+
+
 def collect_images_from_request() -> list[tuple[bytes, str | None]]:
     """Accept multiple uploads via `images` and/or repeated `image` fields.
 
@@ -11828,6 +11969,191 @@ def verify_work_against_image(
         _mark_visual_mismatch(out, "未核對圖片（人物／衣服／姿勢與這張上傳圖不符）")
     _recompute_theme_keywords(out)
     return out
+
+
+def _code_label(code: str | None) -> str:
+    parts = parse_code_parts(str(code or ""))
+    return (parts[0] if parts else "").upper()
+
+
+def _payload_visual_lock(payload: dict | None) -> bool:
+    """True only when this payload's own compare locked person and clothes.
+
+    ``visual_confident`` alone is not enough: an unlocked reorder can still
+    carry a code. A lock flag or a same_work + clothes verdict is required.
+    """
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("visual_lock") is True:
+        return True
+    meta = payload.get("visual_meta")
+    if isinstance(meta, dict) and meta.get("visual_lock") is True:
+        return True
+    vm = payload.get("visual")
+    return _visual_is_lock(vm if isinstance(vm, dict) else None)
+
+
+def _adopt_locked_retry_candidate(result: dict, winner: dict) -> dict:
+    """Use a same-label candidate the upload actually locked. Never an upload URL."""
+    out = dict(result)
+    for field in ("code", "title", "actress", "studio", "cover", "cid"):
+        if winner.get(field):
+            out[field] = winner.get(field)
+    stills = winner.get("stills") if isinstance(winner.get("stills"), list) else []
+    clean = [
+        str(u)
+        for u in stills
+        if u and not is_now_printing_url(str(u)) and not _is_upload_media_url(u)
+    ]
+    if clean:
+        out["stills"] = clean
+    out["ok"] = True
+    out["visual_lock"] = True
+    out["visual_mismatch"] = False
+    out["visual_note"] = ""
+    out["reidentify_kept_prior"] = False
+    _lock_identify_payload_media(out)
+    return out
+
+
+def _retry_hint_codes(related_codes: list | None, prior: str) -> list[str]:
+    """Related 品番 from the card, same label first, prior itself omitted."""
+    label = _code_label(prior)
+    same: list[str] = []
+    other: list[str] = []
+    seen: set[str] = set()
+    for raw in related_codes or []:
+        text = str(raw or "").strip()
+        if not text or not parse_code_parts(text):
+            continue
+        disp = format_display_code(text)
+        if disp in seen or codes_numeric_equal(disp, prior):
+            continue
+        seen.add(disp)
+        if _code_label(disp) == label:
+            same.append(disp)
+        else:
+            other.append(disp)
+    return (same + other)[:12]
+
+
+def _retry_candidate_shell(code: str) -> dict:
+    disp = format_display_code(code)
+    cid = code_to_cid(disp) or ""
+    cover = cover_url(cid) if cid else ""
+    return {"code": disp, "cid": cid, "cover": cover or None, "title": "", "stills": []}
+
+
+def _lock_related_retry(
+    image_bytes: bytes | None,
+    prior: str,
+    related_codes: list | None,
+    api_key: str | None,
+) -> dict | None:
+    """Jacket-lock the upload against the card's related codes.
+
+    Same-label volumes are compared with the prior code first. A different
+    series is tried only when that group does not lock. The pipeline's
+    unlocked distant hit is not in this pool.
+    """
+    hints = _retry_hint_codes(related_codes, prior)
+    if not image_bytes or not hints:
+        return None
+    label = _code_label(prior)
+    same = [c for c in hints if _code_label(c) == label]
+    others = [c for c in hints if c not in same]
+    groups: list[list[str]] = []
+    if same:
+        groups.append([prior] + same)
+    if others:
+        groups.append([prior] + others)
+    key = (api_key if api_key is not None else get_gemini_api_key() or "").strip()
+    for group in groups:
+        shells = [_retry_candidate_shell(c) for c in group]
+        winner = None
+        try:
+            winner = _jacket_lock_winner(image_bytes, shells)
+        except Exception:
+            winner = None
+        if isinstance(winner, dict) and _catalog_code_of(winner) and _payload_visual_lock(winner):
+            return winner
+        if not key:
+            continue
+        try:
+            vis = _visual_lock_winner(image_bytes, shells, key)
+        except Exception:
+            vis = None
+        if isinstance(vis, dict) and _catalog_code_of(vis):
+            return vis
+    return None
+
+
+def anchor_reidentify_to_prior(
+    result: dict | None,
+    prior_code: str | None,
+    image_bytes: bytes | None = None,
+    related_codes: list | None = None,
+    *,
+    prior_unverified: bool = False,
+    api_key: str | None = None,
+) -> dict | None:
+    """Keep 重新辨識 on the prior 品番 unless this upload locks a new one.
+
+    The retry is a normal one-image identify of the same file. That pass can
+    still adopt an unlocked title-search hit. A different code is kept only
+    when the upload visually locks it. When the card was 未核對 and already
+    lists related codes, those codes are jacket-checked (same label first)
+    before the prior code is kept. The upload is never the jacket.
+    """
+    if not isinstance(result, dict) or not image_bytes:
+        return result
+    if not prior_code or not parse_code_parts(str(prior_code)):
+        return result
+    prior = format_display_code(str(prior_code))
+    new = _catalog_code_of(result)
+    if new and _payload_visual_lock(result):
+        out = dict(result)
+        out["visual_lock"] = True
+        _lock_identify_payload_media(out)
+        return out
+    if prior_unverified or related_codes:
+        winner = _lock_related_retry(image_bytes, prior, related_codes, api_key)
+        if isinstance(winner, dict) and _catalog_code_of(winner):
+            return _adopt_locked_retry_candidate(result, winner)
+    label = _code_label(prior)
+    for row in result.get("candidates") or []:
+        if not isinstance(row, dict):
+            continue
+        code = _catalog_code_of(row)
+        if not code or _code_label(code) != label or codes_numeric_equal(code, prior):
+            continue
+        if not _payload_visual_lock(row):
+            continue
+        return _adopt_locked_retry_candidate(result, row)
+    if new and codes_numeric_equal(new, prior):
+        kept: dict = dict(result)
+    else:
+        kept = {
+            "ok": True,
+            "code": prior,
+            "title": "",
+            "title_zh": None,
+            "cover": None,
+            "stills": [],
+            "related_by_title": [],
+            "related": [],
+            "candidates": [],
+            "search_mode": "code",
+        }
+    kept["code"] = prior
+    kept["ok"] = True
+    kept["visual_lock"] = False
+    kept["reidentify_kept_prior"] = True
+    if new and not codes_numeric_equal(new, prior):
+        kept["reidentify_rejected_code"] = new
+    _mark_visual_mismatch(kept, "未核對圖片（人物／衣服／姿勢與這張上傳圖不符）")
+    _lock_identify_payload_media(kept)
+    return kept
 
 
 def _catalog_code_of(payload: dict | None) -> str:
@@ -13735,9 +14061,8 @@ def reverify_cached_image_hit(
 ) -> dict | None:
     """Re-run cover + stills visual match for a same-image cache hit.
 
-    A locked result (or a multi-candidate sort) is returned. A single cached
-    code that does not lock returns None so identify can search siblings
-    instead of replaying 僅排序未鎖定.
+    Only a visual lock is returned. An unlocked reorder, including one that
+    merely sorts related codes, returns None so the live identify runs.
     """
     if not user_image_bytes or not isinstance(cached, dict) or not cached.get("ok"):
         return None
@@ -13769,7 +14094,10 @@ def reverify_cached_image_hit(
         return None
     best = ranked[0] if ranked else None
     locked = _visual_is_lock((best or {}).get("visual") or {})
-    if not locked and len(cands) < 2:
+    # An unlocked reorder must not replace the live identify. A same-image
+    # retry used to crown whichever related row sorted first (APGH → TYVM)
+    # and skip the pipeline that a fresh 開始辨識 would run.
+    if not locked:
         return None
     out = _apply_visual_winner(cached, ranked, meta, promote_candidates=False)
     out["from_offline_cache"] = True
@@ -14721,6 +15049,13 @@ def _run_identify_pipeline_inner(
 def identify():
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
+    prior_code = (request.form.get("prior_code") or "").strip()
+    prior_unverified = (request.form.get("prior_unverified") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    related_codes = _form_related_codes()
     images = collect_images_from_request()
 
     if len(images) > 1:
@@ -14736,6 +15071,14 @@ def identify():
             user_code=user_code,
             user_title=user_title,
         )
+        if prior_code:
+            result = anchor_reidentify_to_prior(
+                result,
+                prior_code,
+                images[0][0],
+                related_codes,
+                prior_unverified=prior_unverified,
+            )
         # related_by_title already attached inside pipeline — do not run twice
     else:
         result, status = run_identify_pipeline(
@@ -14852,6 +15195,23 @@ def cdn_file():
     )
 
 
+@app.route("/api/cover-refresh", methods=["POST"])
+def cover_refresh_api():
+    """Re-resolve one card's catalog jacket. Does not add a gallery row.
+
+    Body cover is ignored: an upload must not become the jacket.
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    result = refresh_catalog_cover(
+        str(body.get("code") or ""),
+        title=str(body.get("title") or ""),
+        cid=str(body.get("cid") or ""),
+    )
+    return jsonify(result)
+
+
 @app.route("/api/related-by-title", methods=["GET", "POST"])
 def related_by_title_api():
     """Fetch related works: title≤5 + keyword≤5 + actress≤3 (caps; history detail).
@@ -14938,6 +15298,49 @@ def related_by_title_api():
     })
 
 
+@app.route("/api/title-zh", methods=["POST"])
+def title_zh_api():
+    """Chinese titles for codes already on screen. Does not add or reorder cards.
+
+    Sources are the payload, the offline cache, and MissAV / Jable / JAVLibrary.
+    A code with no stored Chinese title is omitted. Nothing is translated.
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    raw_items = body.get("items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    payload: dict = {"ok": True, "results": [], "related_by_title": []}
+    for raw in raw_items[:40]:
+        if not isinstance(raw, dict):
+            continue
+        code = str(raw.get("code") or "").strip()
+        if not code or not parse_code_parts(code):
+            continue
+        row = {
+            "code": format_display_code(code),
+            "title": str(raw.get("title") or "").strip(),
+            "title_zh": str(raw.get("title_zh") or raw.get("titleZh") or "").strip(),
+            "line": str(raw.get("line") or "").strip(),
+        }
+        if _related_title_slide(row):
+            payload["related_by_title"].append(row)
+        else:
+            payload["results"].append(row)
+    try:
+        _fill_unfetched_title_zh(payload, budget_sec=8.0)
+    except Exception:
+        pass
+    titles: dict[str, str] = {}
+    for item in _collect_title_zh_items(payload):
+        key = _title_zh_code_key(item.get("code"))
+        zh = str(item.get("title_zh") or "").strip()
+        if key and zh and key not in titles:
+            titles[key] = zh
+    return jsonify({"ok": True, "titles": titles})
+
+
 @app.route("/api/related-by-keywords", methods=["POST"])
 def related_by_keywords_api():
     """Re-search the keyword bucket using only the chips the user selected.
@@ -15015,6 +15418,13 @@ def identify_stream():
     """
     user_code = (request.form.get("code") or "").strip()
     user_title = (request.form.get("title") or "").strip()
+    prior_code = (request.form.get("prior_code") or "").strip()
+    prior_unverified = (request.form.get("prior_unverified") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    related_codes = _form_related_codes()
     session_id = (request.form.get("session_id") or "").strip()
     slot_index_raw = (request.form.get("slot_index") or "").strip()
     images = collect_images_from_request()
@@ -15063,6 +15473,14 @@ def identify_stream():
                         user_title=user_title,
                         on_progress=on_progress,
                     )
+                    if prior_code:
+                        result = anchor_reidentify_to_prior(
+                            result,
+                            prior_code,
+                            images[0][0],
+                            related_codes,
+                            prior_unverified=prior_unverified,
+                        )
                 else:
                     result, status = run_identify_pipeline(
                         image_bytes=None,

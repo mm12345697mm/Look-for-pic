@@ -3805,6 +3805,428 @@ function walkNodes(node, acc) {
     );
   }
 
+  // 主作品 and 相關作品 share one Chinese title per 品番. A different code stays Japanese-only.
+  {
+    const data = {
+      ok: true,
+      code: 'APGH-015',
+      title: '十五の題',
+      title_zh: '十五中文',
+      results: [
+        {
+          ok: true,
+          code: 'APGH-015',
+          title: '十五の題',
+          title_zh: '十五中文',
+          line: 'main',
+          related_by_title: [
+            { code: 'APGH-012', title: '十二の題', line: 'theme', title_zh: '十二中文' },
+            { code: 'APGH-015', title: '十五の題', line: 'keyword' },
+            { code: 'TYVM-349', title: '別題', line: 'keyword' },
+          ],
+        },
+        { ok: true, code: 'APGH-012', title: '十二の題', line: 'multi' },
+      ],
+    };
+    const gallery = H.galleryFromIdentify(data);
+    assert.strictEqual(gallery.items[1].titleZh, '十二中文', 'main picks up the related card of the same code');
+    assert.strictEqual(gallery.items[0].relatedByTitle[0].titleZh, '十二中文');
+    assert.strictEqual(gallery.items[0].relatedByTitle[1].titleZh, '十五中文', 'related picks up the main of the same code');
+    assert.strictEqual(gallery.items[0].relatedByTitle[2].titleZh, '');
+    assert.strictEqual(
+      H.formatDisplayTitle(gallery.items[0].relatedByTitle[1].title, gallery.items[0].relatedByTitle[1].titleZh),
+      '十五の題（十五中文）'
+    );
+    assert.strictEqual(
+      H.formatDisplayTitle(gallery.items[0].relatedByTitle[2].title, gallery.items[0].relatedByTitle[2].titleZh),
+      '別題'
+    );
+    const applied = H.applyResolvedTitleZh(gallery.items, { 'TYVM-349': '別的中文', 'APGH-015': '不該覆蓋' });
+    assert.strictEqual(applied, true);
+    assert.strictEqual(gallery.items[0].relatedByTitle[2].titleZh, '別的中文');
+    assert.strictEqual(gallery.items[0].titleZh, '十五中文', 'an existing gloss is not replaced');
+    assert.notStrictEqual(gallery.items[1].titleZh, '別的中文');
+    const missing = H.missingTitleZhRequests([
+      {
+        code: 'AAA-001',
+        title: '有中文',
+        titleZh: '已有',
+        line: 'main',
+        relatedByTitle: [{ code: 'BBB-002', title: '相關日文', line: 'theme', titleZh: '' }],
+      },
+    ]);
+    assert.strictEqual(missing.map((row) => row.code).join(','), 'BBB-002');
+    const session = H.shareSessionTitleZh([
+      {
+        code: 'APGH-015',
+        title: '十五の題',
+        title_zh: '',
+        related: [{ code: 'APGH-012', title: '十二の題', title_zh: '十二中文', line: 'theme' }],
+      },
+      { code: 'APGH-012', title: '十二の題', title_zh: '', related: [] },
+    ]);
+    assert.strictEqual(session.changed, true);
+    assert.strictEqual(session.works[1].title_zh, '十二中文');
+    assert.strictEqual(session.works[0].title_zh, '');
+  }
+
+  // 暫無封面 cards offer 重新搜索 and write a found jacket back into that same cell.
+  {
+    assert.strictEqual(
+      H.cardShowsEmptyCover({ code: 'OVVR-635', title: '痴女ヘブン', line: 'theme', cover: '' }),
+      true
+    );
+    assert.strictEqual(
+      H.cardShowsEmptyCover({
+        code: 'OVVR-635',
+        title: '痴女ヘブン',
+        cover: 'https://pics.dmm.co.jp/digital/video/ovvr00635/ovvr00635pl.jpg',
+      }),
+      false
+    );
+    assert.strictEqual(
+      H.cardShowsEmptyCover({ code: 'OVVR-635', title: 'x', cover: 'data:image/jpeg;base64,qq', line: 'theme' }),
+      true
+    );
+    assert.strictEqual(H.cardShowsEmptyCover({ skipped: true, code: '', cover: '' }), false);
+    assert.strictEqual(H.cardShowsEmptyCover({ titleOnly: true, code: '片名搜尋', cover: '' }), false);
+    assert.strictEqual(H.cardShowsEmptyCover({ unidentified: true, code: '未辨識', cover: '' }), false);
+
+    const coverMain = 'https://pics.dmm.co.jp/digital/video/main00100/main00100pl.jpg';
+    const coverKept = 'https://pics.dmm.co.jp/digital/video/bbb00200/bbb00200pl.jpg';
+    const coverFound = 'https://pics.dmm.co.jp/digital/video/ovvr00635/ovvr00635pl.jpg';
+    const stillFound = 'https://pics.dmm.co.jp/digital/video/ovvr00635/ovvr00635jp-1.jpg';
+    const coverOpen = 'https://fourhoi.com/open-300/cover.jpg';
+    const upload = 'data:image/jpeg;base64,usershot';
+    const locked = H.mergeCoverRefreshIntoWork(
+      { code: 'MAIN-100', line: 'main', cover: coverMain, userPreview: upload },
+      { cover: coverFound, cid: 'ovvr00635' }
+    );
+    assert.strictEqual(locked.cover, coverMain, 'catalog jacket already on the card stays');
+    assert.notStrictEqual(locked.cover, upload);
+    const rejected = H.mergeCoverRefreshIntoWork(
+      { code: 'OVVR-635', line: 'theme', cover: '', userPreview: upload },
+      { cover: upload, cid: 'ovvr00635' }
+    );
+    assert.ok(!rejected.cover, 'upload is not written as the jacket');
+    assert.strictEqual(rejected.userPreview, upload);
+
+    const session = {
+      ok: true,
+      code: 'MAIN-100',
+      title: '主作品',
+      cover: coverMain,
+      results: [
+        {
+          ok: true,
+          code: 'MAIN-100',
+          title: '主作品',
+          cover: coverMain,
+          line: 'main',
+          related_by_title: [
+            {
+              code: 'OVVR-635',
+              title: '痴女ヘブン',
+              title_zh: '痴女天堂',
+              line: 'theme',
+              why: '片名相近',
+              cover: '',
+            },
+            {
+              code: 'BBB-200',
+              title: '有封面',
+              line: 'keyword',
+              why: '關鍵字',
+              cover: coverKept,
+            },
+          ],
+        },
+        {
+          ok: true,
+          code: 'OPEN-300',
+          title: '主卡無封面',
+          cover: '',
+          user_preview: upload,
+          line: 'multi',
+        },
+      ],
+    };
+    const gallery = H.galleryFromIdentify(session);
+    assert.strictEqual(gallery.items.length, 2);
+    assert.strictEqual(gallery.items[0].relatedByTitle.length, 2);
+    assert.ok(!gallery.items[0].relatedByTitle[0].cover);
+    const works = H.sessionWorksFromIdentify(session);
+    const savedList = H.loadHistory();
+    savedList.unshift({
+      id: 'cover-research',
+      kind: 'session',
+      ts: Date.now(),
+      code: works[0].code,
+      title: works[0].title,
+      cover: works[0].cover,
+      related: works[0].related,
+      works: works,
+    });
+    H.saveHistory(savedList);
+    H.renderGallery(gallery);
+
+    function carouselBlocks() {
+      return getEl('gallery-cards').children.filter(
+        (n) => String(n.className || '').indexOf('work-carousel-block') !== -1
+      );
+    }
+    function researchButtons(node) {
+      return walkNodes(node).filter(
+        (n) => n.tagName === 'BUTTON' && String(n.className || '').indexOf('btn-cover-research') !== -1
+      );
+    }
+    function cardByCode(code) {
+      return walkNodes(getEl('gallery-cards')).find(
+        (n) =>
+          String(n.className || '').indexOf('work-slide-card') !== -1 &&
+          String(n.textContent || '').indexOf(code) !== -1
+      );
+    }
+    const beforeBlocks = carouselBlocks().length;
+    const beforeSlides = walkNodes(carouselBlocks()[0]).filter((n) => n.className === 'work-carousel-slide').length;
+    assert.strictEqual(beforeBlocks, 2);
+    assert.strictEqual(beforeSlides, 3);
+    const mainCard = cardByCode('MAIN-100');
+    const emptyRelated = cardByCode('OVVR-635');
+    const coveredRelated = cardByCode('BBB-200');
+    const emptyMain = cardByCode('OPEN-300');
+    assert.strictEqual(researchButtons(mainCard).length, 0, 'covered main has no 重新搜索');
+    assert.strictEqual(researchButtons(coveredRelated).length, 0, 'covered related has no 重新搜索');
+    assert.strictEqual(researchButtons(emptyRelated).length, 1);
+    assert.strictEqual(researchButtons(emptyRelated)[0].textContent, '重新搜索');
+    assert.ok(
+      walkNodes(emptyRelated).some((n) => n.tagName === 'BUTTON' && n.textContent === '手動修正'),
+      '手動修正 stays beside 重新搜索'
+    );
+    assert.ok(
+      walkNodes(emptyRelated).some((n) => n.getAttribute && n.getAttribute('aria-label') === '以此為主'),
+      '以此為主 stays'
+    );
+    assert.ok(
+      !walkNodes(emptyRelated).some((n) => String(n.className || '').indexOf('btn-reidentify') !== -1),
+      'related card does not gain 重新辨識'
+    );
+    function placeholderHtml(card) {
+      const ph = walkNodes(card).find((n) => n.className === 'cover-placeholder');
+      return ph ? String(ph.innerHTML || '') : '';
+    }
+    assert.ok(placeholderHtml(emptyRelated).indexOf('暫無封面') !== -1);
+    assert.strictEqual(researchButtons(emptyMain).length, 1);
+    assert.strictEqual(getEl('gallery-count').textContent, '2 部');
+
+    const queue = [];
+    const calls = [];
+    const origFetch = context.fetch;
+    context.fetch = async (url, opts) => {
+      const body = opts && opts.body ? JSON.parse(opts.body) : {};
+      if (url !== '/api/cover-refresh') {
+        return { ok: true, json: async () => ({ ok: true, related_by_title: [] }) };
+      }
+      calls.push({ url: url, body: body });
+      const next = queue.shift();
+      return { ok: true, json: async () => next };
+    };
+    try {
+      queue.push({ ok: true, code: 'OPEN-300', cover: null, stills: [] });
+      researchButtons(emptyMain)[0].click();
+      await H.coverResearchTask();
+      assert.strictEqual(calls[0].url, '/api/cover-refresh');
+      assert.strictEqual(calls[0].body.code, 'OPEN-300');
+      assert.ok(!('cover' in calls[0].body), 'client does not send a cover');
+      assert.strictEqual(carouselBlocks().length, beforeBlocks);
+      assert.ok(placeholderHtml(cardByCode('OPEN-300')).indexOf('暫無封面') !== -1);
+      assert.strictEqual(researchButtons(cardByCode('OPEN-300')).length, 1);
+      assert.strictEqual(researchButtons(cardByCode('OPEN-300'))[0].textContent, '重新搜索');
+
+      queue.push({ ok: true, code: 'OPEN-300', cover: upload });
+      researchButtons(cardByCode('OPEN-300'))[0].click();
+      await H.coverResearchTask();
+      assert.ok(placeholderHtml(cardByCode('OPEN-300')).indexOf('暫無封面') !== -1, 'upload does not replace 暫無封面');
+      assert.ok(
+        !walkNodes(cardByCode('OPEN-300')).some((n) => String(n.src || '').indexOf('data:') === 0),
+        'upload is not the card image'
+      );
+
+      queue.push({
+        ok: true,
+        code: 'OVVR-635',
+        cover: coverFound,
+        cid: 'ovvr00635',
+        stills: [stillFound],
+      });
+      const openCoverBefore = H.loadHistory().find((x) => x.id === 'cover-research').works[1].cover;
+      researchButtons(cardByCode('OVVR-635'))[0].click();
+      await H.coverResearchTask();
+      assert.strictEqual(calls[2].body.code, 'OVVR-635');
+      assert.strictEqual(calls[2].body.title, '痴女ヘブン');
+      assert.ok(!('cover' in calls[2].body));
+      assert.strictEqual(carouselBlocks().length, 2, 'no new gallery row');
+      assert.strictEqual(
+        walkNodes(carouselBlocks()[0]).filter((n) => n.className === 'work-carousel-slide').length,
+        3,
+        'cover lands in the same related cell'
+      );
+      assert.strictEqual(getEl('gallery-count').textContent, '2 部');
+      const filled = cardByCode('OVVR-635');
+      assert.strictEqual(researchButtons(filled).length, 0, 'cover hides 重新搜索');
+      assert.strictEqual(placeholderHtml(filled), '');
+      const imgs = walkNodes(filled).filter((n) => n.tagName === 'IMG');
+      assert.ok(imgs.some((n) => n.src === coverFound), 'same card shows the fetched jacket');
+      assert.ok(imgs.some((n) => n.src === stillFound), 'cheap stills land on the same card');
+      const rec = H.loadHistory().find((x) => x.id === 'cover-research');
+      assert.strictEqual(rec.works.length, 2);
+      assert.strictEqual(rec.works[0].cover, coverMain, 'main jacket unchanged');
+      assert.strictEqual(rec.cover, coverMain);
+      const rel = (rec.works[0].related || []).find((r) => r.code === 'OVVR-635');
+      assert.ok(rel, 'related row was not invented');
+      assert.strictEqual(rel.cover, coverFound);
+      assert.strictEqual(rel.stills[0], stillFound);
+      const kept = (rec.works[0].related || []).find((r) => r.code === 'BBB-200');
+      assert.strictEqual(kept.cover, coverKept);
+      assert.strictEqual(rec.works[1].cover, openCoverBefore, 'other main stays until its own search');
+      assert.ok(!String(rec.works[0].cover).startsWith('data:'));
+
+      queue.push({
+        ok: true,
+        code: 'OPEN-300',
+        cover: coverOpen,
+        stills: [],
+      });
+      researchButtons(cardByCode('OPEN-300'))[0].click();
+      await H.coverResearchTask();
+      assert.strictEqual(carouselBlocks().length, 2);
+      assert.strictEqual(getEl('gallery-count').textContent, '2 部');
+      const openCard = cardByCode('OPEN-300');
+      assert.ok(walkNodes(openCard).some((n) => n.src === coverOpen));
+      assert.strictEqual(researchButtons(openCard).length, 0);
+      const after = H.loadHistory().find((x) => x.id === 'cover-research');
+      assert.strictEqual(after.works.length, 2);
+      assert.strictEqual(after.works[0].cover, coverMain);
+      assert.strictEqual(after.works[1].cover, coverOpen);
+      assert.ok(!String(after.works[1].cover).startsWith('data:'));
+      assert.strictEqual(after.works[1].user_preview, upload);
+    } finally {
+      context.fetch = origFetch;
+    }
+  }
+
+  // 重新辨識 must not replace a coded slot with an unlocked distant 品番.
+  {
+    const apghCover = 'https://pics.dmm.co.jp/digital/video/apgh00015/apgh00015pl.jpg';
+    const siblingCover = 'https://pics.dmm.co.jp/digital/video/apgh00012/apgh00012pl.jpg';
+    const otherCover = 'https://pics.dmm.co.jp/digital/video/ccc00003/ccc00003pl.jpg';
+    const tyvmCover = 'https://pics.dmm.co.jp/digital/video/tyvm00349/tyvm00349pl.jpg';
+    const upload = 'data:image/jpeg;base64,frame';
+    const data = {
+      ok: true,
+      code: 'APGH-015',
+      title: '先生が2人',
+      title_zh: '兩位老師',
+      cover: apghCover,
+      results: [
+        {
+          ok: true,
+          code: 'APGH-015',
+          title: '先生が2人',
+          title_zh: '兩位老師',
+          cover: apghCover,
+          stills: ['https://pics.dmm.co.jp/digital/video/apgh00015/apgh00015jp-1.jpg'],
+          from_image_index: 1,
+          line: 'main',
+          visual_mismatch: true,
+          user_preview: upload,
+          related_by_title: [
+            { code: 'APGH-012', title: '鄰卷', line: 'theme', why: '片名相近', cover: siblingCover },
+          ],
+        },
+        {
+          ok: true,
+          code: 'CCC-003',
+          title: '別張',
+          cover: otherCover,
+          from_image_index: 2,
+          line: 'multi',
+        },
+      ],
+    };
+    const drifted = {
+      ok: true,
+      code: 'TYVM-349',
+      title: '社內不倫',
+      cover: tyvmCover,
+      stills: ['https://pics.dmm.co.jp/digital/video/tyvm00349/tyvm00349jp-1.jpg'],
+      visual_lock: false,
+      visual_meta: { visual_lock: false },
+      user_preview: upload,
+    };
+    const merged = H.mergeSlotRetryIntoIdentify(data, 1, drifted);
+    assert.strictEqual(merged.results.length, 2, 're-id does not add or drop a slot');
+    assert.strictEqual(merged.results[0].code, 'APGH-015');
+    assert.strictEqual(merged.results[0].cover, apghCover);
+    assert.strictEqual(merged.results[0].title, '先生が2人');
+    assert.strictEqual(merged.results[0].title_zh, '兩位老師');
+    assert.strictEqual(merged.results[0].related_by_title[0].code, 'APGH-012');
+    assert.strictEqual(merged.results[1].code, 'CCC-003');
+    assert.strictEqual(merged.results[1].cover, otherCover);
+    assert.notStrictEqual(merged.code, 'TYVM-349');
+    assert.ok(String(merged.results[0].cover).indexOf('data:') !== 0);
+
+    const pasted = {
+      ok: true,
+      code: 'TYVM-349',
+      cover: tyvmCover,
+      visual_lock: false,
+      results: [
+        { code: 'CCC-009', title: '別格', cover: otherCover, from_image_index: 2 },
+        {
+          code: 'TYVM-349',
+          title: '社內不倫',
+          cover: tyvmCover,
+          from_image_index: 1,
+          visual_lock: false,
+        },
+      ],
+    };
+    const kept = H.mergeSlotRetryIntoIdentify(data, 1, pasted);
+    assert.strictEqual(kept.results[0].code, 'APGH-015', 'batch row for this index is not crowned when unlocked');
+    assert.strictEqual(kept.results[1].code, 'CCC-003');
+
+    const lockedSibling = {
+      ok: true,
+      code: 'APGH-012',
+      title: '正しい巻',
+      cover: siblingCover,
+      visual_lock: true,
+      visual_meta: { visual_lock: true },
+    };
+    const moved = H.mergeSlotRetryIntoIdentify(data, 1, lockedSibling);
+    assert.strictEqual(moved.results[0].code, 'APGH-012');
+    assert.strictEqual(moved.results[0].cover, siblingCover);
+    assert.notStrictEqual(moved.results[0].title_zh, '兩位老師');
+    assert.strictEqual(moved.results[1].code, 'CCC-003');
+
+    const hints = H.relatedCodesForRetry({
+      code: 'APGH-015',
+      visualMismatch: true,
+      relatedByTitle: [
+        { code: 'TYVM-349', title: '別系列' },
+        { code: 'APGH-012', title: '鄰卷' },
+        { code: 'APGH-015', title: '同一張' },
+      ],
+    });
+    assert.strictEqual(hints.join(','), 'APGH-012,TYVM-349');
+    assert.strictEqual(
+      H.slotRetryUnverified({ code: 'APGH-015', visualMismatch: true, visualLock: false }),
+      true
+    );
+    assert.strictEqual(H.slotRetryUnverified({ code: 'APGH-012', visualLock: true }), false);
+  }
+
   console.log('test_history_session.js: ok');
 })().catch((err) => {
   console.error(err);

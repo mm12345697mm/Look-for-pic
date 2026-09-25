@@ -66,6 +66,7 @@
   let promoteBusy = false;
   let lastPromoteTask = null;
   let lastManualTask = null;
+  let lastCoverResearchTask = null;
   let promoteEpoch = 0;
 
   function batchQueryKeepsFrames(fileCount, busy, openFrame) {
@@ -290,6 +291,13 @@
     if (!url || isNowPrintingUrl(url) || isLocalCoverUrl(url)) return false;
     if (w && w.titleOnly) return false;
     return isCatalogMediaUrl(url);
+  }
+
+  /** 暫無封面: a coded card with no http(s) catalog jacket. */
+  function cardShowsEmptyCover(w) {
+    if (!w || w.skipped || w.unidentified || w.titleOnly) return false;
+    if (!reliablePromoteCode(w)) return false;
+    return !workHasUsableCover(w);
   }
 
   function workHasUsableTitle(w) {
@@ -587,6 +595,7 @@
       theme_keywords: skippedSlot ? [] : normalizeKeywordList(src.theme_keywords || src.themeKeywords),
       keyword_queries: skippedSlot ? [] : normalizeKeywordList(src.keyword_queries || src.keywordQueries),
       visual_mismatch: !!(src.visual_mismatch || src.visualMismatch),
+      visual_lock: !!(src.visual_lock || src.visualLock),
       visual_note: String(src.visual_note || src.visualNote || '').trim(),
       unidentified: skippedSlot ? false : !!(src.unidentified || src.frame_unidentified),
       skipped: skippedSlot,
@@ -1204,6 +1213,7 @@
         raw.matched_keywords || raw.matchedKeywords || raw.hit_keywords || raw.hitKeywords
       ),
       visualMismatch: !!(raw.visual_mismatch || raw.visualMismatch),
+      visualLock: !!(raw.visual_lock || raw.visualLock),
       visualNote: String(raw.visual_note || raw.visualNote || '').trim(),
       jobElapsedMs: elapsedMsValue(raw.job_elapsed_ms != null ? raw.job_elapsed_ms : raw.jobElapsedMs),
       workElapsedMs: elapsedMsValue(raw.work_elapsed_ms != null ? raw.work_elapsed_ms : raw.workElapsedMs),
@@ -1888,6 +1898,43 @@
     });
   }
 
+  function appendRelatedCodes(fd, codes) {
+    const seen = {};
+    (codes || []).forEach((code) => {
+      const text = String(code || '').trim();
+      if (!text || seen[text]) return;
+      seen[text] = true;
+      fd.append('related_codes', text);
+    });
+  }
+
+  function slotRetryUnverified(work) {
+    if (!work) return false;
+    if (work.visualMismatch || work.visual_mismatch) return true;
+    if (work.visualLock === true || work.visual_lock === true) return false;
+    return true;
+  }
+
+  /** Related 品番 already on this card. Same label as the current main comes first. */
+  function relatedCodesForRetry(work) {
+    const prior = reliablePromoteCode(work);
+    const priorParts = prior ? parseCodeParts(prior) : null;
+    const label = priorParts ? String(priorParts.label || '') : '';
+    const rows = (work && (work.relatedByTitle || work.related_by_title || work.related)) || [];
+    const same = [];
+    const other = [];
+    const seen = {};
+    rows.forEach((row) => {
+      const code = reliablePromoteCode(row);
+      if (!code || seen[code] || (prior && codesMatch(code, prior))) return;
+      seen[code] = true;
+      const parts = parseCodeParts(code);
+      if (label && parts && String(parts.label || '') === label) same.push(code);
+      else other.push(code);
+    });
+    return same.concat(other).slice(0, 12);
+  }
+
   function appendImagesToFormData(fd, images) {
     if (!images || !images.length) return;
     // Do not append both `images` and `image` — server merges both and double-counts.
@@ -1962,13 +2009,16 @@
     throw err;
   }
 
-  async function apiIdentifyStream({ images, image, code, title } = {}, onProgress, options) {
+  async function apiIdentifyStream({ images, image, code, title, priorCode, relatedCodes, priorUnverified } = {}, onProgress, options) {
     options = options || {};
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
     appendImagesToFormData(fd, imgs);
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
+    if (priorCode) fd.append('prior_code', priorCode);
+    appendRelatedCodes(fd, relatedCodes);
+    if (priorUnverified) fd.append('prior_unverified', '1');
     if (options.slotIndex) fd.append('slot_index', String(options.slotIndex));
     if (options.sessionId) fd.append('session_id', String(options.sessionId));
 
@@ -2064,12 +2114,15 @@
     return { status: httpStatus, data: finalData };
   }
 
-  async function apiIdentify({ images, image, code, title } = {}) {
+  async function apiIdentify({ images, image, code, title, priorCode, relatedCodes, priorUnverified } = {}) {
     const fd = new FormData();
     const imgs = images && images.length ? images : image ? [image] : [];
     appendImagesToFormData(fd, imgs);
     if (code) fd.append('code', code);
     if (title) fd.append('title', title);
+    if (priorCode) fd.append('prior_code', priorCode);
+    appendRelatedCodes(fd, relatedCodes);
+    if (priorUnverified) fd.append('prior_unverified', '1');
     const res = await fetch('/api/identify', { method: 'POST', body: fd });
     let data;
     try {
@@ -2126,6 +2179,47 @@
     return null;
   }
 
+  function payloadVisuallyLocked(src) {
+    if (!src || typeof src !== 'object') return false;
+    if (src.visual_lock === true || src.visualLock === true) return true;
+    const meta = src.visual_meta || src.visualMeta;
+    return !!(meta && meta.visual_lock === true);
+  }
+
+  /**
+   * A one-image retry payload. A multi-row `results` list is the whole batch,
+   * so only the row for this upload index is this slot. Otherwise results[0]
+   * would paste another frame's work into the card being retried.
+   */
+  function retrySourceForSlot(single, slotIndex) {
+    if (!single || typeof single !== 'object') return {};
+    const rows = Array.isArray(single.results)
+      ? single.results.filter((r) => r && typeof r === 'object')
+      : [];
+    if (rows.length > 1) {
+      const hit = rows.find(
+        (r) => Number(r.from_image_index || r.fromImageIndex) === Number(slotIndex)
+      );
+      return hit || single;
+    }
+    if (rows.length === 1) return rows[0];
+    return single;
+  }
+
+  /**
+   * A coded slot keeps its 品番 unless the retry visually locks a different one.
+   * An empty/skipped slot can still take the new code. An unlocked distant hit
+   * (APGH → TYVM) does not replace the card.
+   */
+  function retryMayReplaceCode(prev, src) {
+    const prior = reliablePromoteCode(prev);
+    const incoming = reliablePromoteCode(src);
+    if (!prior) return true;
+    if (!incoming) return false;
+    if (codesMatch(prior, incoming)) return true;
+    return payloadVisuallyLocked(src);
+  }
+
   /**
    * Put a single-image identify result back into one multi-batch slot.
    * Other slots, including their related lists, stay the same objects.
@@ -2138,26 +2232,47 @@
     if (at < 0) at = index - 1;
     if (at < 0 || at >= results.length) return base;
     const prev = results[at] || {};
-    const src =
-      single && Array.isArray(single.results) && single.results[0] ? single.results[0] : single || {};
+    const src = retrySourceForSlot(single, index);
+    if (!retryMayReplaceCode(prev, src)) return base;
     const next = Object.assign({}, src);
     next.from_image_index = prev.from_image_index || index;
     next.line = at === 0 ? 'main' : 'multi';
     next.skipped = false;
     next.ok = src.ok !== false;
+    const sameCodeEarly = !!(
+      reliablePromoteCode(prev) &&
+      reliablePromoteCode(next) &&
+      codesMatch(prev.code, next.code)
+    );
     if (!String(next.title_zh || next.titleZh || '').trim()) {
-      const kept =
-        String(prev.title_zh || prev.titleZh || '').trim() ||
-        knownTitleZhForCode(next.code || prev.code);
-      if (kept) next.title_zh = kept;
+      const kept = sameCodeEarly ? String(prev.title_zh || prev.titleZh || '').trim() : '';
+      const looked = kept || knownTitleZhForCode(next.code || '');
+      if (looked) next.title_zh = looked;
     }
     const batchJob = firstElapsed(prev.job_elapsed_ms, prev.jobElapsedMs, base.job_elapsed_ms, base.jobElapsedMs);
     if (batchJob != null) next.job_elapsed_ms = batchJob;
     if (!next.user_preview && prev.user_preview) next.user_preview = prev.user_preview;
     const preview = String(next.user_preview || prev.user_preview || '');
     const cover = String(next.cover || '');
+    const sameCode = sameCodeEarly;
     if (!cover || cover === preview || /^(data:|blob:)/i.test(cover)) {
-      next.cover = null;
+      const prevCover = String(prev.cover || '').trim();
+      if (sameCode && isCatalogMediaUrl(prevCover) && prevCover !== preview) next.cover = prevCover;
+      else next.cover = null;
+    }
+    if (sameCode) {
+      if ((!next.stills || !next.stills.length) && Array.isArray(prev.stills) && prev.stills.length) {
+        next.stills = prev.stills.slice();
+      }
+      const rel = next.related_by_title || next.related;
+      if (!rel || !rel.length) {
+        next.related_by_title = prev.related_by_title || prev.related || [];
+      }
+      if (!String(next.title || '').trim() && prev.title) next.title = prev.title;
+      if (!String(next.title_zh || next.titleZh || '').trim()) {
+        const keptZh = String(prev.title_zh || prev.titleZh || '').trim();
+        if (keptZh) next.title_zh = keptZh;
+      }
     }
     results[at] = next;
     const out = Object.assign({}, base, { results: results });
@@ -2262,9 +2377,160 @@
         work.titleZh = found[key] || knownTitleZhForCode(work.code) || '';
         if (work.titleZh && !found[key]) found[key] = work.titleZh;
       }
+      if (work.titleZh && !String(work.title_zh || '').trim()) work.title_zh = work.titleZh;
       (work.relatedByTitle || []).forEach(fill);
     }
     (items || []).forEach(fill);
+  }
+
+  /** Codes on this page that still have no Chinese title. One row per 品番. */
+  function missingTitleZhRequests(items) {
+    const out = [];
+    const seen = {};
+    function add(work) {
+      if (!work) return;
+      const code = titleZhKey(work.code);
+      const nested = work.relatedByTitle || work.related || [];
+      if (!code || seen[code]) {
+        nested.forEach(add);
+        return;
+      }
+      seen[code] = true;
+      if (!String(work.titleZh || work.title_zh || '').trim()) {
+        out.push({
+          code: code,
+          title: String(work.title || '').trim(),
+          line: String(work.line || ''),
+        });
+      }
+      nested.forEach(add);
+    }
+    (items || []).forEach(add);
+    return out.slice(0, 40);
+  }
+
+  /**
+   * Copy a resolved 日文（中文） gloss onto every same-code card.
+   * Does not replace a title that is already present, and does not cross codes.
+   */
+  function applyResolvedTitleZh(items, titles) {
+    const map = titles && typeof titles === 'object' ? titles : {};
+    let changed = false;
+    function touch(work) {
+      if (!work) return;
+      const key = titleZhKey(work.code);
+      const zh = key ? String(map[key] || '').trim() : '';
+      if (zh && !String(work.titleZh || work.title_zh || '').trim()) {
+        work.titleZh = zh;
+        work.title_zh = zh;
+        changed = true;
+      }
+      (work.relatedByTitle || work.related || []).forEach(touch);
+    }
+    (items || []).forEach(touch);
+    return changed;
+  }
+
+  function writeTitleZhOntoPayload(payload, titles) {
+    if (!payload || !titles) return;
+    function touch(row) {
+      if (!row || typeof row !== 'object') return;
+      const key = titleZhKey(row.code);
+      const zh = key ? String(titles[key] || '').trim() : '';
+      if (zh && !String(row.title_zh || row.titleZh || '').trim()) row.title_zh = zh;
+      ['related_by_title', 'related', 'results', 'candidates'].forEach((name) => {
+        const list = row[name];
+        if (Array.isArray(list)) list.forEach(touch);
+      });
+    }
+    touch(payload);
+  }
+
+  /** History rows: one Chinese title per 品番, main and related, both directions. */
+  function shareSessionTitleZh(works) {
+    const found = {};
+    function take(row) {
+      if (!row) return;
+      const key = titleZhKey(row.code);
+      const zh = String(row.title_zh || row.titleZh || '').trim();
+      if (key && zh && !found[key]) found[key] = zh;
+      (row.related || []).forEach(take);
+    }
+    (works || []).forEach(take);
+    let changed = false;
+    function put(row) {
+      if (!row) return row;
+      const key = titleZhKey(row.code);
+      const zh = key && found[key];
+      let next = row;
+      if (zh && !String(row.title_zh || row.titleZh || '').trim()) {
+        next = Object.assign({}, row, { title_zh: zh });
+        changed = true;
+      }
+      if (Array.isArray(row.related) && row.related.length) {
+        const rel = row.related.map(put);
+        if (rel.some((r, i) => r !== row.related[i])) {
+          if (next === row) next = Object.assign({}, row);
+          next.related = rel;
+          changed = true;
+        }
+      }
+      return next;
+    }
+    return { works: (works || []).map(put), changed: changed };
+  }
+
+  function repaintGalleryTitles(items) {
+    if (!galleryCards || typeof galleryCards.querySelectorAll !== 'function') return;
+    const blocks = galleryCards.querySelectorAll('.work-carousel-block');
+    (items || []).forEach((work, i) => {
+      const block = blocks[i];
+      if (!block || typeof block.querySelectorAll !== 'function') return;
+      const slides = block.querySelectorAll('.work-carousel-slide');
+      const cards = [work].concat(Array.isArray(work.relatedByTitle) ? work.relatedByTitle : []);
+      cards.forEach((w, si) => {
+        const slide = slides[si];
+        if (!slide || typeof slide.querySelector !== 'function') return;
+        const card = slide.querySelector('.card');
+        if (!card) return;
+        const titleEl = card.querySelector('.card-title');
+        const nextText = formatDisplayTitle(w && w.title, w && (w.titleZh || w.title_zh));
+        const shown = titleEl ? String(titleEl.textContent || '') : '';
+        if (shown === nextText) return;
+        const badgeEl = card.querySelector('.card-line');
+        const badge = badgeEl ? badgeEl.textContent : lineLabel(w && w.line);
+        card.replaceWith(buildWorkCard(w, { slide: true, badgeLabel: badge }));
+      });
+    });
+  }
+
+  let titleZhFillGen = 0;
+
+  function enrichLiveGalleryTitleZh(payload, items) {
+    const gen = ++titleZhFillGen;
+    const reqs = missingTitleZhRequests(items);
+    if (!reqs.length) return Promise.resolve(false);
+    return fetch('/api/title-zh', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ items: reqs }),
+    })
+      .then((res) => res.json())
+      .then((data) => {
+        if (gen !== titleZhFillGen) return false;
+        const titles = data && data.titles;
+        if (!titles || typeof titles !== 'object') return false;
+        if (!applyResolvedTitleZh(items, titles)) return false;
+        writeTitleZhOntoPayload(payload, titles);
+        repaintGalleryTitles(items);
+        const wait = historySavePromise ? historySavePromise : Promise.resolve(null);
+        return Promise.resolve(wait).then((recId) => {
+          if (gen !== titleZhFillGen || !recId) return true;
+          replaceHistorySessionWorks(recId, sessionWorksFromIdentify(payload));
+          return true;
+        });
+      })
+      .catch(() => false);
   }
 
   function galleryFromIdentify(data) {
@@ -3110,6 +3376,222 @@
     return { ok: true, work: placed.work, slotIndex: placed.slotIndex };
   }
 
+  /**
+   * Fold a cover-refresh payload into this same card.
+   * A catalog jacket already on the card stays. data: / blob: never become the cover.
+   */
+  function mergeCoverRefreshIntoWork(oldW, data) {
+    const prior = Object.assign({}, oldW || {});
+    const preview = String(prior.userPreview || prior.user_preview || '').trim();
+    if (preview && prior.cover === preview) prior.cover = '';
+    if (isLocalCoverUrl(prior.cover)) prior.cover = '';
+    if (workHasUsableCover(prior)) return prior;
+    const raw = data && typeof data === 'object' ? data : {};
+    const jacket = catalogOnlyUrl(raw.cover || raw.cover_url, '');
+    if (!jacket || isLocalCoverUrl(jacket) || (preview && jacket === preview)) return prior;
+    prior.cover = jacket;
+    const cid = String(raw.cid || '').trim();
+    if (cid && !isNowPrintingUrl(cid)) prior.cid = cid;
+    const stills = (Array.isArray(raw.stills) ? raw.stills : [])
+      .map((u) => String(u || '').trim())
+      .filter((u) => isCatalogMediaUrl(u) && !isLocalCoverUrl(u) && u !== preview);
+    if (stills.length) prior.stills = mergeStillsKeepExisting(prior.stills, stills);
+    prior.line = (oldW && oldW.line) || prior.line;
+    prior.code = (oldW && oldW.code) || prior.code;
+    prior.userPreview = preview;
+    return prior;
+  }
+
+  function sameRelatedSlot(row, oldW) {
+    if (!row || !oldW) return false;
+    if (row === oldW) return true;
+    if (!row.code || !oldW.code || !codesMatch(row.code, oldW.code)) return false;
+    const rl = String(row.line || '');
+    const ol = String(oldW.line || '');
+    if (rl && ol && rl !== ol) return false;
+    return true;
+  }
+
+  function badgeTextOfCard(card) {
+    const found = [];
+    function walk(node) {
+      if (!node) return;
+      if (elHasClass(node, 'card-line')) found.push(node);
+      (node.children || []).forEach(walk);
+    }
+    walk(card);
+    return found.length ? String(found[0].textContent || '') : '';
+  }
+
+  function replaceCardInPlace(card, nextW) {
+    if (!card) return null;
+    const badge = badgeTextOfCard(card);
+    const slide = card.parentNode || card.parentElement;
+    const nextCard = buildWorkCard(nextW, {
+      slide: !!(slide && elHasClass(slide, 'work-carousel-slide')),
+      badgeLabel: badge || undefined,
+    });
+    replaceNode(card, nextCard);
+    return nextCard;
+  }
+
+  /** Write the jacket onto the existing slot. Never appends a gallery row or a related row. */
+  function rememberCoverOnSameSlot(oldW, nextW, card) {
+    const surface = card ? surfaceForCard(card) : 'gallery';
+    const related = card ? !isMainSlideCard(card) : isRelatedCarouselLine(String((oldW && oldW.line) || ''));
+    const block = card ? closestEl(card, 'work-carousel-block') : null;
+    const slotIndex = block ? carouselSlotIndex(block) : 0;
+    if (!related && surface !== 'history') {
+      const items = (lastGalleryItems || []).slice();
+      if (slotIndex >= 0 && slotIndex < items.length) {
+        const prior = items[slotIndex] || {};
+        const priorCode = reliablePromoteCode(prior);
+        const nextCode = reliablePromoteCode(nextW);
+        if (!priorCode || !nextCode || codesMatch(priorCode, nextCode)) {
+          const merged = Object.assign({}, prior, {
+            cover: nextW.cover,
+            cid: nextW.cid || prior.cid || '',
+            stills: nextW.stills && nextW.stills.length ? nextW.stills : prior.stills || [],
+          });
+          const preview = String(merged.userPreview || merged.user_preview || '').trim();
+          if (isLocalCoverUrl(merged.cover) || (preview && merged.cover === preview)) merged.cover = '';
+          items[slotIndex] = merged;
+          lastGalleryItems = items;
+        }
+      }
+    } else if (related && surface !== 'history') {
+      const items = (lastGalleryItems || []).slice();
+      const parent = items[slotIndex];
+      if (parent && Array.isArray(parent.relatedByTitle)) {
+        let hit = false;
+        const rel = parent.relatedByTitle.map((r) => {
+          if (!sameRelatedSlot(r, oldW)) return r;
+          hit = true;
+          return nextW;
+        });
+        if (hit) {
+          items[slotIndex] = Object.assign({}, parent, { relatedByTitle: rel });
+          lastGalleryItems = items;
+        }
+      }
+    }
+    writeCoverIntoHistory(slotIndex, oldW, nextW, related, surface);
+    return slotIndex;
+  }
+
+  function writeCoverIntoHistory(slotIndex, oldW, nextW, isRelated, surface) {
+    const cover = catalogOnlyUrl(nextW && nextW.cover, '');
+    if (!cover || isLocalCoverUrl(cover)) return;
+    const list = loadHistory();
+    let hIdx = -1;
+    if (surface === 'history' && viewingHistoryId) {
+      hIdx = list.findIndex((x) => x && x.id === viewingHistoryId);
+    }
+    if (hIdx < 0 && surface !== 'history') {
+      hIdx = findGalleryHistoryIndex(list, lastGalleryItems);
+    }
+    if (hIdx < 0) return;
+    const rec = list[hIdx];
+    const works = historySessionWorks(rec).slice();
+    if (slotIndex < 0 || slotIndex >= works.length) return;
+    const slot = Object.assign({}, works[slotIndex] || {});
+    const stills = (Array.isArray(nextW.stills) ? nextW.stills : []).filter((u) => isCatalogMediaUrl(u));
+    if (isRelated) {
+      const rows = Array.isArray(slot.related) ? slot.related.slice() : [];
+      let hit = false;
+      const nextRows = rows.map((r) => {
+        if (!sameRelatedSlot(r, oldW)) return r;
+        hit = true;
+        const row = Object.assign({}, r, { cover: cover });
+        if (nextW.cid) row.cid = nextW.cid;
+        if (stills.length) row.stills = stills;
+        return row;
+      });
+      if (!hit) return;
+      slot.related = nextRows;
+      works[slotIndex] = slot;
+      const nextRec = Object.assign({}, rec, { works: works });
+      if (slotIndex === 0) nextRec.related = nextRows;
+      list[hIdx] = nextRec;
+      saveHistory(list);
+      return;
+    }
+    const slotCode = reliablePromoteCode(slot);
+    const nextCode = reliablePromoteCode(nextW);
+    if (slotCode && nextCode && !codesMatch(slotCode, nextCode)) return;
+    slot.cover = cover;
+    if (nextW.cid) slot.cid = nextW.cid;
+    if (stills.length) slot.stills = stills;
+    works[slotIndex] = slot;
+    const nextRec = Object.assign({}, rec, { works: works });
+    if (slotIndex === 0) {
+      nextRec.cover = cover;
+      if (stills.length) nextRec.stills = stills;
+    }
+    list[hIdx] = nextRec;
+    saveHistory(list);
+  }
+
+  async function refreshCardCover(oldW, card) {
+    const code = reliablePromoteCode(oldW);
+    const title = usableManualTitle(oldW && oldW.title);
+    if (!code && !title) {
+      showToast('沒有可搜索的番號或名稱');
+      return { ok: false, reason: 'empty' };
+    }
+    let data = null;
+    try {
+      const res = await fetch('/api/cover-refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: code,
+          title: title,
+          cid: String((oldW && oldW.cid) || ''),
+        }),
+      });
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = null;
+      }
+      if (!res || !res.ok || !data || data.ok === false) {
+        throw new Error((data && data.message) || '重新搜索失敗');
+      }
+    } catch (err) {
+      showToast((err && err.message) || '重新搜索失敗');
+      return { ok: false, reason: 'fetch' };
+    }
+    const next = mergeCoverRefreshIntoWork(oldW, data);
+    if (!workHasUsableCover(next)) {
+      showToast('仍無封面');
+      return { ok: false, reason: 'miss', work: oldW };
+    }
+    rememberCoverOnSameSlot(oldW, next, card);
+    replaceCardInPlace(card, next);
+    showToast('已更新封面');
+    return { ok: true, work: next };
+  }
+
+  function buildCoverResearchButton(w, card) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'manual-fix-toggle btn-cover-research';
+    btn.textContent = '重新搜索';
+    btn.setAttribute('aria-label', '重新搜索');
+    bindWorkAction(btn, () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = '搜索中…';
+      lastCoverResearchTask = refreshCardCover(w, card).finally(() => {
+        if (btn.parentNode == null) return;
+        btn.disabled = false;
+        btn.textContent = '重新搜索';
+      });
+    });
+    return btn;
+  }
+
   function buildManualFixPanel(w, card) {
     const openNow = slotNeedsCodeEntry(w);
     const box = document.createElement('div');
@@ -3236,11 +3718,15 @@
         });
       });
     }
-    [form, toggle].forEach((el) => {
+    const actions = document.createElement('div');
+    actions.className = 'manual-fix-actions';
+    if (cardShowsEmptyCover(w)) actions.appendChild(buildCoverResearchButton(w, card));
+    actions.appendChild(toggle);
+    [form, toggle, actions].forEach((el) => {
       el.addEventListener('pointerdown', stopCarouselBubble);
       el.addEventListener('touchstart', stopCarouselBubble, { passive: true });
     });
-    box.appendChild(toggle);
+    box.appendChild(actions);
     box.appendChild(form);
     return box;
   }
@@ -5331,6 +5817,7 @@
         theme_keywords: normalizeKeywordList(w.theme_keywords || w.themeKeywords),
         keyword_queries: normalizeKeywordList(w.keyword_queries || w.keywordQueries),
         visual_mismatch: !!(w.visual_mismatch || w.visualMismatch),
+        visual_lock: !!(w.visual_lock || w.visualLock),
         visual_note: String(w.visual_note || w.visualNote || '').trim(),
         unidentified: !!w.unidentified,
         skipped: !!w.skipped,
@@ -5479,8 +5966,11 @@
         const incomingQ = normalizeKeywordList(data.keyword_queries);
         if (incomingQ.length) patch.keyword_queries = incomingQ;
         work = backfillWorkTreeLocal(Object.assign({}, work, patch));
+        const sharedOne = shareSessionTitleZh([work]);
+        if (sharedOne.changed && sharedOne.works[0]) work = sharedOne.works[0];
         patch.stills = work.stills;
         patch.related = work.related;
+        if (work.title_zh) patch.title_zh = work.title_zh;
         persistHistoryWork(recId, workIndex, patch);
       }
     } catch (_) {}
@@ -5568,9 +6058,18 @@
         }
         nextWorks.push(next);
       }
+      const shared = shareSessionTitleZh(nextWorks);
+      if (shared.changed) {
+        changed = true;
+        shared.works.forEach((w, i) => {
+          if (w !== nextWorks[i]) {
+            persistHistoryWork(id, i, { title_zh: w.title_zh || '', related: w.related || [] });
+          }
+        });
+      }
       if (viewingHistoryId !== id) return;
       if (!changed) return;
-      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: nextWorks });
+      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: shared.works });
       paintHistoryDetail(fresh);
     } catch (_) {}
   }
@@ -5597,16 +6096,24 @@
     setStatus('重新辨識第 ' + idx + ' 張…', 'busy');
     let single = null;
     const sessionId = lastIdentifyPayload && lastIdentifyPayload.session_id;
+    const priorCode = reliablePromoteCode(work);
+    const unverified = slotRetryUnverified(work);
+    const relatedCodes = unverified ? relatedCodesForRetry(work) : [];
     try {
       try {
         const streamed = await apiIdentifyStream(
-          { images: [file] },
+          { images: [file], priorCode: priorCode, relatedCodes: relatedCodes, priorUnverified: unverified },
           null,
           { quiet: true, slotIndex: idx, sessionId: sessionId || '' }
         );
         single = streamed && streamed.data;
       } catch (_) {
-        const classic = await apiIdentify({ images: [file] });
+        const classic = await apiIdentify({
+          images: [file],
+          priorCode: priorCode,
+          relatedCodes: relatedCodes,
+          priorUnverified: unverified,
+        });
         single = classic && classic.data;
       }
     } catch (err) {
@@ -5630,6 +6137,7 @@
       const recId = historySavePromise ? await historySavePromise : null;
       if (recId) replaceHistorySessionWorks(recId, sessionWorksFromIdentify(patched));
     } catch (_) {}
+    enrichLiveGalleryTitleZh(patched, result.items);
     setStatus('');
     showToast('已重新辨識這張');
     return { ok: true };
@@ -5739,6 +6247,7 @@
         renderGallery(result);
         // Persist history (async thumbs)
         historySavePromise = appendHistoryFromIdentify(data, imgs).catch(() => null);
+        enrichLiveGalleryTitleZh(data, result.items);
         // Clear pending selection but keep sticky shots until 重新開始
         clearPending(false);
         // Auto-hide progress so it cannot permanently cover gallery bottom/footer
@@ -6143,6 +6652,9 @@
       sessionWorksFromIdentify,
       identifyPayloadFromHistory,
       galleryFromIdentify,
+      applyResolvedTitleZh,
+      missingTitleZhRequests,
+      shareSessionTitleZh,
       historySessionWorks,
       isRelatedBucketItem,
       formatDisplayTitle,
@@ -6173,6 +6685,8 @@
       followIdentifyJob,
       IDENTIFY_JOB_FOLLOW_MS,
       mergeSlotRetryIntoIdentify,
+      relatedCodesForRetry,
+      slotRetryUnverified,
       noteSlotUploads: function (files) {
         slotUploadFiles = Array.isArray(files) ? files.slice() : [];
       },
@@ -6183,8 +6697,12 @@
       slotNeedsCodeEntry,
       batchQueryKeepsFrames,
       workHasUsableCover,
+      cardShowsEmptyCover,
       workHasUsableTitle,
       mergeManualFixIntoWork,
+      mergeCoverRefreshIntoWork,
+      refreshCardCover,
+      coverResearchTask: () => lastCoverResearchTask,
       persistManualWorkFix,
       applyManualWorkFix,
       workDownloadFilename,

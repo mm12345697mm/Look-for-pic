@@ -147,6 +147,130 @@ class BatchTitleZhTests(unittest.TestCase):
         self.assertEqual(payload["title_zh"], "巨乳集訓")
         self.assertEqual(payload["results"][0]["title_zh"], "巨乳集訓")
 
+    def test_related_zh_fills_same_code_main_and_not_a_different_code(self):
+        payload = {
+            "code": "APGH-015",
+            "title": "十五の題",
+            "results": [
+                {
+                    "code": "APGH-015",
+                    "title": "十五の題",
+                    "title_zh": "十五中文",
+                    "line": "main",
+                    "related_by_title": [
+                        {
+                            "code": "APGH-012",
+                            "title": "十二の題",
+                            "line": "theme",
+                            "title_zh": "十二中文",
+                        },
+                        {"code": "TYVM-349", "title": "別題", "line": "keyword"},
+                    ],
+                },
+                {"code": "APGH-012", "title": "十二の題", "line": "multi"},
+            ],
+        }
+        with mock.patch.object(S, "http_get", side_effect=AssertionError("fetch")):
+            S.harmonize_batch_title_zh(payload)
+        self.assertEqual(payload["results"][1]["title_zh"], "十二中文")
+        self.assertEqual(payload["results"][0]["title_zh"], "十五中文")
+        related = payload["results"][0]["related_by_title"]
+        self.assertEqual(related[0]["title_zh"], "十二中文")
+        self.assertFalse(related[1].get("title_zh"))
+        self.assertNotEqual(related[0]["title_zh"], "十五中文")
+
+    def test_related_title_fetch_is_not_starved_by_mains(self):
+        import time
+
+        payload = {
+            "code": "AAA-001",
+            "title": "主日文",
+            "line": "main",
+            "results": [
+                {
+                    "code": "AAA-001",
+                    "title": "主日文",
+                    "line": "main",
+                    "related_by_title": [
+                        {"code": "BBB-002", "title": "相關日文", "line": "theme"},
+                    ],
+                },
+                {"code": "CCC-003", "title": "二日文", "line": "multi"},
+                {"code": "DDD-004", "title": "三日文", "line": "multi"},
+            ],
+        }
+        calls = []
+
+        def fake(code, **_kwargs):
+            shown = S.format_display_code(str(code))
+            calls.append(shown)
+            time.sleep(0.12)
+            return "中文" + shown[-3:]
+
+        with mock.patch.object(S, "resolve_chinese_title", side_effect=fake):
+            with mock.patch.object(S, "offline_cache_get", return_value=None):
+                S._fill_unfetched_title_zh(payload, budget_sec=0.2)
+        self.assertIn("BBB-002", calls)
+        rel = payload["results"][0]["related_by_title"][0]
+        self.assertEqual(rel.get("title_zh"), "中文002")
+        self.assertNotEqual(payload["results"][1].get("title_zh"), "中文002")
+
+    def test_stamp_does_not_copy_title_zh_onto_a_different_code(self):
+        import time
+
+        payload = {
+            "code": "APGH-015",
+            "title": "十五の題",
+            "title_zh": "十五中文",
+            "results": [
+                {
+                    "code": "APGH-015",
+                    "title": "十五の題",
+                    "title_zh": "十五中文",
+                    "from_image_index": 1,
+                    "line": "main",
+                }
+            ],
+            "related": [
+                {
+                    "code": "TYVM-349",
+                    "title": "別題",
+                    "from_image_index": 1,
+                    "line": "multi",
+                }
+            ],
+        }
+        with mock.patch.object(S, "resolve_chinese_title", return_value=None):
+            with mock.patch.object(S, "offline_cache_get", return_value=None):
+                S._stamp_multi_batch(payload, time.monotonic(), {1: 1.0})
+        self.assertFalse(payload["related"][0].get("title_zh"))
+        self.assertEqual(payload["results"][0]["title_zh"], "十五中文")
+
+    def test_title_zh_api_returns_real_titles_for_main_and_related(self):
+        def fake(code, **_kwargs):
+            shown = S.format_display_code(str(code))
+            return {"APGH-015": "十五中文", "APGH-012": "十二中文"}.get(shown)
+
+        with mock.patch.object(S, "resolve_chinese_title", side_effect=fake):
+            with mock.patch.object(S, "offline_cache_get", return_value=None):
+                client = S.app.test_client()
+                res = client.post(
+                    "/api/title-zh",
+                    json={
+                        "items": [
+                            {"code": "APGH-015", "title": "十五の題", "line": "main"},
+                            {"code": "APGH-012", "title": "十二の題", "line": "theme"},
+                            {"code": "TYVM-349", "title": "別題", "line": "keyword"},
+                        ]
+                    },
+                )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data["ok"])
+        self.assertEqual(data["titles"].get("APGH-015"), "十五中文")
+        self.assertEqual(data["titles"].get("APGH-012"), "十二中文")
+        self.assertNotIn("TYVM-349", data["titles"])
+
     def test_progress_event_carries_monotonic_mark(self):
         seen = []
         S._progress(seen.append, "search", "active", "搜尋第 1/2 張…", 0.55, phase="目錄查詢")
