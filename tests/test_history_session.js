@@ -2532,6 +2532,20 @@ function walkNodes(node, acc) {
     assert.strictEqual(H.formatKeywordChip('ノーブラ'), 'ノーブラ（無胸罩）');
     assert.strictEqual(H.formatKeywordChip('誘惑'), '誘惑（誘惑）');
     assert.strictEqual(H.formatKeywordChip('架空未收錄語'), '架空未收錄語');
+    // Kana catalog/title chips get a lexicon gloss. Unknown kana stays bare.
+    assert.strictEqual(H.formatKeywordChip('ハメ撮り'), 'ハメ撮り（自拍）');
+    assert.strictEqual(H.formatKeywordChip('ハイレグ'), 'ハイレグ（高衩）');
+    assert.strictEqual(H.formatKeywordChip('パイパン'), 'パイパン（無毛）');
+    assert.strictEqual(H.formatKeywordChip('イラマチオ'), 'イラマチオ（深喉）');
+    assert.strictEqual(H.formatKeywordChip('ごっくん'), 'ごっくん（吞精）');
+    assert.strictEqual(H.formatKeywordChip('お姉さん'), 'お姉さん（御姐）');
+    assert.strictEqual(H.formatKeywordChip('メガネっ娘'), 'メガネっ娘（眼鏡娘）');
+    assert.strictEqual(H.formatKeywordChip('眼鏡っ娘'), '眼鏡っ娘（眼鏡娘）');
+    assert.strictEqual(H.formatKeywordChip('逆レ'), '逆レ（逆強姦）');
+    assert.strictEqual(H.formatKeywordChip('水着'), '水着（泳衣）');
+    assert.strictEqual(H.formatKeywordChip('淫語'), '淫語（淫語）');
+    assert.strictEqual(H.formatKeywordChip('ヌルヌル'), 'ヌルヌル');
+    assert.ok(H.formatKeywordChip('ハメ撮り').indexOf('（）') === -1);
 
     // A shorter snapshot keeps its chips and appends a new one. 巨乳 already
     // present is not added again. Saved queries are not replaced.
