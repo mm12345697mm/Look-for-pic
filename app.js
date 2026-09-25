@@ -238,7 +238,7 @@
     const items = Array.isArray(raw)
       ? raw
       : (typeof raw === 'string' ? raw.split(/[\s,，、・/|]+/) : []);
-    // BOD / VOL stored on an old card is not a theme. Refresh from the title.
+    // BOD / VOL stored on an old card is not a theme list.
     if (items.some((item) => isEditionKeyword(item))) return true;
     const related = (work && work.related) || [];
     const hasKw = related.some((r) => relatedLineFromRaw(r) === 'keyword');
@@ -258,21 +258,6 @@
     const hasTitle = !!(opts.title && String(opts.title).trim());
     const hasActress = !!(opts.actress && String(opts.actress).trim());
     return hasTitle || hasActress;
-  }
-
-  function applyTitleZhOntoRelated(existing, incoming) {
-    const byCode = {};
-    (incoming || []).forEach((r) => {
-      if (!r || !r.code) return;
-      byCode[String(r.code)] = r;
-    });
-    return (existing || []).map((r) => {
-      if (!r || !r.code) return r;
-      const hit = byCode[String(r.code)];
-      const zh = hit ? String(hit.title_zh || hit.titleZh || '').trim() : '';
-      if (!zh || String(r.title_zh || r.titleZh || '').trim()) return r;
-      return Object.assign({}, r, { title_zh: zh });
-    });
   }
 
   function workNeedsTitleZh(w) {
@@ -404,32 +389,6 @@
     return next;
   }
 
-  function workNeedsStillsFill(w) {
-    if (!w || !String(w.cid || '').trim()) return false;
-    const n = (Array.isArray(w.stills) ? w.stills : []).filter(Boolean).length;
-    return n < 10;
-  }
-
-  function backfillWorkStillsLocal(w) {
-    if (!workNeedsStillsFill(w)) return w;
-    const extra = stillUrls(String(w.cid), 10);
-    return Object.assign({}, w, { stills: mergeStillsKeepExisting(w.stills, extra) });
-  }
-
-  function backfillWorkTreeLocal(w) {
-    if (!w) return w;
-    let next = backfillWorkStillsLocal(w);
-    const rel = next.related || [];
-    let relChanged = false;
-    const nextRel = rel.map((r) => {
-      const fr = backfillWorkStillsLocal(r);
-      if (fr !== r) relChanged = true;
-      return fr;
-    });
-    if (relChanged) next = Object.assign({}, next, { related: nextRel });
-    return next;
-  }
-
   function mergeStillsKeepExisting(prev, incoming) {
     const out = [];
     const seen = {};
@@ -546,6 +505,8 @@
         actress: rec.actress,
         cid: rec.cid || '',
         related: rec.related || [],
+        theme_keywords: normalizeKeywordList(rec.theme_keywords || rec.themeKeywords),
+        keyword_queries: normalizeKeywordList(rec.keyword_queries || rec.keywordQueries),
         line: 'main',
       },
     ];
@@ -917,6 +878,11 @@
     '美尻': '美臀',
     '乳首': '乳頭',
     '女教師': '女教師',
+    '先生': '老師',
+    '2人っきり': '兩人獨處',
+    'プライベート補習': '私人補習',
+    '面倒みてあげる': '幫忙照顧',
+    '全部面倒みてあげる': '全都照顧',
     'ナース': '護士',
     '女医': '女醫師',
     '秘書': '秘書',
@@ -948,6 +914,99 @@
     'CA': '空姐',
     'VR': 'VR',
     'SP': '特別篇',
+    // Kana / mixed theme tokens the extractor or a Japanese catalog genre
+    // already emits. Established Traditional Chinese tags only. A one-off
+    // title scrap with no entry stays Japanese (no empty parentheses).
+    'お姉さん': '御姐',
+    '逆レ': '逆強姦',
+    '眼鏡っ娘': '眼鏡娘',
+    'メガネっ娘': '眼鏡娘',
+    'ハメ撮り': '自拍',
+    'ハイレグ': '高衩',
+    'パイパン': '無毛',
+    'イラマチオ': '深喉',
+    'イラマ': '深喉',
+    'ごっくん': '吞精',
+    'ぶっかけ': '噴精',
+    'アナル': '肛交',
+    'オナニー': '自慰',
+    'レズ': '女同',
+    'レズビアン': '女同',
+    'キス': '接吻',
+    'セックス': '性交',
+    '即ハメ': '即插',
+    '生ハメ': '無套',
+    '足コキ': '足交',
+    '尻コキ': '臀交',
+    'バック': '後入',
+    '立ちバック': '站立後入',
+    'おもちゃ': '玩具',
+    'ローター': '跳蛋',
+    'バイブ': '按摩棒',
+    '電マ': '電動按摩棒',
+    'ローション': '潤滑液',
+    'スパンキング': '打屁股',
+    'ボンテージ': '束縛裝',
+    'お漏らし': '漏尿',
+    'フィスト': '拳交',
+    'ペニバン': '假陽具',
+    'クスコ': '擴陰器',
+    '2穴': '雙穴',
+    '3穴': '三穴',
+    '顔面騎乗': '顏面騎乘',
+    '騎乗位': '騎乘位',
+    'ご奉仕': '侍奉',
+    '汗だく': '滿身大汗',
+    '泥酔': '爛醉',
+    'ドラッグ': '藥物',
+    '夜這い': '夜襲',
+    '寝取られ': '被寢取',
+    '筆おろし': '開苞',
+    '男の娘': '偽娘',
+    'ニューハーフ': '變性人',
+    'ミニ系': '嬌小',
+    'コギャル': '高中辣妹',
+    'キャバ嬢': '酒店小姐',
+    'ソープ': '泡泡浴',
+    'デリヘル': '外送',
+    'デカチン': '巨根',
+    'ツインテール': '雙馬尾',
+    'ショートカット': '短髮',
+    'ロングヘア': '長髮',
+    'ポニーテール': '馬尾',
+    '青姦': '野外性交',
+    'カーセックス': '車震',
+    '覗き': '偷窺',
+    'パンチラ': '走光',
+    '胸チラ': '露胸',
+    'ノーパン': '無內褲',
+    '競泳水着': '競賽泳衣',
+    'マイクロビキニ': '迷你比基尼',
+    'ビキニ': '比基尼',
+    'レオタード': '緊身衣',
+    'ブルマ': '運動短褲',
+    'セーラー服': '水手服',
+    '体操服': '體操服',
+    'ランジェリー': '情趣內衣',
+    'ニーソックス': '及膝襪',
+    'ニーハイ': '過膝襪',
+    'ルーズソックス': '泡泡襪',
+    '網タイツ': '網襪',
+    'ガーター': '吊襪帶',
+    'ガーターベルト': '吊襪帶',
+    'ストッキング': '絲襪',
+    'Tバック': '丁字褲',
+    '黒パンスト': '黑絲襪',
+    'ミニスカ': '迷你裙',
+    'ボディコン': '緊身裙',
+    '主観': '主觀',
+    '処女': '處女',
+    '絶頂': '高潮',
+    '淫乱': '淫亂',
+    '淫語': '淫語',
+    '浣腸': '灌腸',
+    '連続中出し': '連續中出',
+    '一泊二日': '一晚兩日',
   };
 
   function keywordGloss(tok) {
@@ -4624,8 +4683,13 @@
     } catch (_) {}
   }
 
-  /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file. */
+  /** Parallel with on-screen DMM <img>: cache a same-origin JPEG via /api/cdn-file.
+   *  History detail paints the saved snapshot and does not start this fetch.
+   */
+  let paintingHistorySnapshot = false;
+
   function warmCoverFromProxy(img, url) {
+    if (paintingHistorySnapshot) return;
     const u = String(url || '').trim();
     if (!u || isNowPrintingUrl(u)) return;
     const urls = dmmCoverVariantUrls(u);
@@ -5919,65 +5983,9 @@
     return rec.id;
   }
 
-  async function fillWorkRelatedGaps(work, recId, workIndex) {
-    const before = work;
-    work = backfillWorkTreeLocal(work);
-    if (work !== before) {
-      const localPatch = { stills: work.stills, cid: work.cid };
-      if (Array.isArray(work.related)) localPatch.related = work.related;
-      persistHistoryWork(recId, workIndex, localPatch);
-    }
-    const related = work.related || [];
-    const need =
-      relatedNeedsTitleZh(related) ||
-      relatedBucketsNeedFill(related, { title: work.title, actress: work.actress }) ||
-      workNeedsTitleZh(work) ||
-      workNeedsThemeKeywords(work);
-    if (!need) return work;
-    try {
-      const res = await fetch('/api/related-by-title', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: work.title || '',
-          code: work.code || '',
-          actress: work.actress || '',
-          seed: related,
-        }),
-      });
-      const data = await res.json();
-      if (data && data.ok && Array.isArray(data.related_by_title)) {
-        const incoming = data.related_by_title;
-        // A saved related list is frozen. A later search must not shrink 14↔9.
-        // Chinese titles may be copied onto the same rows; membership stays.
-        const frozen = relatedHasPersistedMembership(related);
-        const merged = frozen
-          ? applyTitleZhOntoRelated(related, incoming)
-          : (related && related.length
-            ? mergeRelatedIncremental(related, incoming)
-            : slimRelatedForHistory(incoming));
-        const patch = { related: merged, stills: work.stills, cid: work.cid };
-        const incomingZh = String(data.title_zh || '').trim();
-        if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
-          patch.title_zh = incomingZh;
-        }
-        const incomingKw = normalizeKeywordList(data.theme_keywords);
-        if (incomingKw.length) patch.theme_keywords = incomingKw;
-        const incomingQ = normalizeKeywordList(data.keyword_queries);
-        if (incomingQ.length) patch.keyword_queries = incomingQ;
-        work = backfillWorkTreeLocal(Object.assign({}, work, patch));
-        const sharedOne = shareSessionTitleZh([work]);
-        if (sharedOne.changed && sharedOne.works[0]) work = sharedOne.works[0];
-        patch.stills = work.stills;
-        patch.related = work.related;
-        if (work.title_zh) patch.title_zh = work.title_zh;
-        persistHistoryWork(recId, workIndex, patch);
-      }
-    } catch (_) {}
-    return work;
-  }
-
   function paintHistoryDetail(rec) {
+    paintingHistorySnapshot = true;
+    try {
     historyDetailEl.innerHTML = '';
     if (rec.ok === false && rec.message) {
       const notice = document.createElement('div');
@@ -6038,51 +6046,20 @@
     (result.items || []).forEach((w) => {
       historyDetailEl.appendChild(buildWorkCarousel(w));
     });
-  }
-
-  async function enrichHistoryDetail(rec, id) {
-    try {
-      const works = historySessionWorks(rec);
-      let changed = false;
-      const nextWorks = [];
-      for (let i = 0; i < works.length; i++) {
-        const next = await fillWorkRelatedGaps(works[i], id, i);
-        if (
-          next !== works[i] ||
-          JSON.stringify(next && next.related) !== JSON.stringify(works[i] && works[i].related) ||
-          String((next && next.title_zh) || '') !== String((works[i] && works[i].title_zh) || '') ||
-          JSON.stringify((next && next.theme_keywords) || []) !==
-            JSON.stringify((works[i] && works[i].theme_keywords) || [])
-        ) {
-          changed = true;
-        }
-        nextWorks.push(next);
-      }
-      const shared = shareSessionTitleZh(nextWorks);
-      if (shared.changed) {
-        changed = true;
-        shared.works.forEach((w, i) => {
-          if (w !== nextWorks[i]) {
-            persistHistoryWork(id, i, { title_zh: w.title_zh || '', related: w.related || [] });
-          }
-        });
-      }
-      if (viewingHistoryId !== id) return;
-      if (!changed) return;
-      const fresh = loadHistory().find((x) => x.id === id) || Object.assign({}, rec, { works: shared.works });
-      paintHistoryDetail(fresh);
-    } catch (_) {}
+    } finally {
+      paintingHistorySnapshot = false;
+    }
   }
 
   function openHistoryDetail(id) {
     const rec = loadHistory().find((x) => x.id === id);
     if (!rec) return false;
     viewingHistoryId = id;
+    // Saved snapshot only. Missing or stale fields wait for 重新辨識.
     paintHistoryDetail(rec);
     showScreen('history-detail');
     hideUserShots();
     hideProgress();
-    enrichHistoryDetail(rec, id);
     return true;
   }
 

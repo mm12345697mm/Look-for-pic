@@ -577,6 +577,117 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         self.assertEqual(out.get("title_zh"), "中文")
         self.assertIsNone(S.offline_cache_get(code="DOSD-008"))
 
+    def test_saved_catalog_keywords_survive_enrich_and_title_only_put(self):
+        """A results-page chip list is a snapshot. Title-only recompute must not replace it."""
+        title = "先生が2人っきりのプライベート補習で全部面倒みてあげる"
+        rich = [
+            "潮吹き",
+            "水着",
+            "巨乳",
+            "女教師",
+            "痴女",
+            "童貞",
+            "顔射",
+            "先生",
+            "2人っきり",
+            "プライベート補習",
+        ]
+        queries = ["巨乳", "女教師", "潮吹き", "水着"]
+        thin = S._recompute_theme_keywords({"title": title, "actress": "柊ゆうき"})
+        self.assertEqual(
+            thin["theme_keywords"],
+            ["先生", "2人っきり", "プライベート補習", "全部面倒みてあげる", "面倒みてあげる"],
+        )
+        self.assertNotEqual(thin["theme_keywords"], rich)
+        self.assertIn("全部面倒みてあげる", thin["theme_keywords"])
+        self.assertNotIn("水着", thin["theme_keywords"])
+        # Union keeps saved chips, skips 巨乳 when it is already there, and
+        # appends a new token. A full snapshot does not shrink to make room
+        # for 全部面倒みてあげる.
+        self.assertEqual(
+            S._union_keyword_lists(
+                ["巨乳", "女教師", "痴女"],
+                ["巨乳", "水着", "女教師"],
+            ),
+            ["巨乳", "女教師", "痴女", "水着"],
+        )
+        self.assertEqual(
+            S._union_keyword_lists(rich, thin["theme_keywords"]),
+            rich,
+        )
+        # 巨乳 already in the saved nine is skipped; the new chip appends.
+        already = rich[:9]
+        self.assertIn("巨乳", already)
+        self.assertEqual(
+            S._union_keyword_lists(already, ["教室", "巨乳"]),
+            already + ["教室"],
+        )
+        # At the cap, 巨乳 may displace a newly appended chip, never a saved one.
+        saved_nine = [k for k in rich if k != "巨乳"]
+        self.assertEqual(len(saved_nine), 9)
+        self.assertEqual(
+            S._union_keyword_lists(saved_nine, ["教室", "巨乳"]),
+            saved_nine + ["巨乳"],
+        )
+        # Edition junk is not a snapshot and still rebuilds from the title.
+        self.assertFalse(
+            S._theme_keyword_snapshot_frozen({"title": title, "theme_keywords": ["BOD", "中出し"]})
+        )
+        refreshed = S._keep_saved_theme_keywords(
+            {"title": title, "theme_keywords": ["BOD", "中出し"], "keyword_queries": ["BOD"]}
+        )
+        self.assertNotIn("BOD", refreshed["theme_keywords"])
+        self.assertIn("先生", refreshed["theme_keywords"])
+
+        payload = self._stored_payload(
+            code="APGH-012",
+            title=title,
+            actress="柊ゆうき",
+            theme_keywords=list(rich),
+            keyword_queries=list(queries),
+        )
+        S.offline_cache_put(payload)
+        hit = S.offline_cache_get(code="APGH-012")
+        self.assertIsNotNone(hit)
+        self.assertEqual(hit.get("theme_keywords"), rich)
+        self.assertEqual(hit.get("keyword_queries"), queries)
+        self.assertNotIn("全部面倒みてあげる", hit.get("theme_keywords") or [])
+
+        def fake_resolve(code, title_ja=None, existing_zh=None, user_title=None, **_kwargs):
+            c = str(code or "")
+            if c == "APGH-012":
+                return "中文主標"
+            if c in ("NHDTC-100", "NHDTC-0100"):
+                return "中文相關"
+            return None
+
+        with self._keep_seed_related(), mock.patch.object(
+            S, "resolve_chinese_title", side_effect=fake_resolve
+        ):
+            out = S.enrich_offline_cache_hit(hit)
+        self.assertEqual(out.get("title_zh"), "中文主標")
+        self.assertEqual(out["related_by_title"][0].get("title_zh"), "中文相關")
+        self.assertEqual(out.get("theme_keywords"), rich)
+        self.assertEqual(out.get("keyword_queries"), queries)
+        self.assertNotIn("全部面倒みてあげる", out.get("theme_keywords") or [])
+
+        # A later put that only has the title must not store the thinner rebuild.
+        S.offline_cache_put(
+            {
+                "ok": True,
+                "code": "APGH-012",
+                "title": title,
+                "actress": "柊ゆうき",
+                "cover": "https://example.com/c.jpg",
+                "stills": ["https://example.com/1.jpg"],
+                "related_by_title": payload["related_by_title"],
+            }
+        )
+        again = S.offline_cache_get(code="APGH-012")
+        self.assertEqual(again.get("theme_keywords"), rich)
+        self.assertEqual(again.get("keyword_queries"), queries)
+        self.assertNotIn("面倒みてあげる", again.get("theme_keywords") or [])
+
 
 class TestIncrementalRelatedBackfill(unittest.TestCase):
     def test_cap_related_buckets_maxima_not_quotas(self):
@@ -858,6 +969,66 @@ class TestRelatedByTitleApi(unittest.TestCase):
         self.assertEqual(len(related), 13)
         self.assertTrue(all(str(r.get("title_zh") or "").strip() for r in related))
         self.assertTrue(resolved)
+
+    def test_posted_keyword_snapshot_is_not_replaced_by_title_recompute(self):
+        title = "先生が2人っきりのプライベート補習で全部面倒みてあげる"
+        rich = [
+            "潮吹き",
+            "水着",
+            "巨乳",
+            "女教師",
+            "痴女",
+            "童貞",
+            "顔射",
+            "先生",
+            "2人っきり",
+            "プライベート補習",
+        ]
+        queries = ["巨乳", "女教師", "潮吹き", "水着"]
+        seed = [
+            {
+                "code": "APGH-001",
+                "title": "別作品の題名です",
+                "title_zh": "",
+                "line": "keyword",
+                "why": "關鍵字",
+                "cover": "https://example.com/r.jpg",
+                "cid": "apgh00001",
+            }
+        ]
+
+        def keep_seed(*_args, **kwargs):
+            return list(kwargs.get("seed") or [])
+
+        with mock.patch.object(S, "find_related_by_title", side_effect=keep_seed), mock.patch.object(
+            S, "resolve_chinese_title", return_value="補上的中文"
+        ), mock.patch.object(
+            S,
+            "fetch_public_zh_catalog",
+            return_value={"genres": [], "series": None, "cover": None},
+        ):
+            client = S.app.test_client()
+            res = client.post(
+                "/api/related-by-title",
+                json={
+                    "title": title,
+                    "code": "APGH-012",
+                    "actress": "柊ゆうき",
+                    "seed": seed,
+                    "theme_keywords": list(rich),
+                    "keyword_queries": list(queries),
+                },
+            )
+        self.assertEqual(res.status_code, 200)
+        data = res.get_json()
+        self.assertTrue(data.get("ok"))
+        self.assertEqual(data.get("theme_keywords"), rich)
+        self.assertEqual(data.get("keyword_queries"), queries)
+        self.assertNotIn("全部面倒みてあげる", data.get("theme_keywords") or [])
+        self.assertNotIn("面倒みてあげる", data.get("theme_keywords") or [])
+        related = data.get("related_by_title") or []
+        self.assertEqual(related[0].get("code"), "APGH-001")
+        self.assertEqual(related[0].get("title_zh"), "補上的中文")
 
 
 class TestEntryId(unittest.TestCase):

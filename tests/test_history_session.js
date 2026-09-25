@@ -459,14 +459,15 @@ function related(n, line) {
     'success row opens detail without waiting for related fetch'
   );
   assert.ok(getEl('history-detail').children.length >= 1, 'session layout painted immediately');
-  assert.ok(fetchCalls >= 1, 'related enrich starts in the background');
+  assert.strictEqual(fetchCalls, 0, 'opening 記錄 does not fetch in the background');
 
   const openedFail = H.openHistoryDetail('click-fail');
   assert.strictEqual(openedFail, true);
   assert.ok(getEl('screen-history-detail').classList.contains('active'));
 }
 
-// Related gap fingerprint: missing title_zh still needs a pass even at cap
+// Gap predicates still describe missing title_zh / empty related.
+// Opening 記錄 does not fetch or rewrite from them.
 {
   const full = related(5, 'theme').concat(related(5, 'keyword'), related(3, 'actress'));
   assert.ok(!H.relatedBucketsNeedFill(full, { title: 'テーマ', actress: '誰か' }));
@@ -2401,20 +2402,250 @@ function walkNodes(node, acc) {
         ],
       },
     ]);
-    context.fetch = async () => ({
-      ok: true,
-      json: async () => ({
-        ok: true,
-        related_by_title: related(3, 'keyword').concat(related(2, 'theme'), related(1, 'actress')),
-      }),
-    });
+    let fetches = 0;
+    context.fetch = async () => {
+      fetches += 1;
+      throw new Error('history open must not fetch');
+    };
     H.openHistoryDetail('freeze-14');
     await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fetches, 0, 'opening a full snapshot does not fetch');
     const rec = H.loadHistory().find((x) => x.id === 'freeze-14');
     assert.ok(rec && rec.works && rec.works[0]);
     assert.strictEqual((rec.works[0].related || []).length, 14, 'saved related count stays 14');
     assert.strictEqual(rec.works[0].related[0].code, 'KEEP-001');
     assert.strictEqual(rec.works[0].related[13].code, 'KEEP-014');
+  }
+
+  // Opening 記錄 paints the saved snapshot and stops. It does not post
+  // related-by-title, fill title_zh, or refresh theme_keywords. Gloss is
+  // display-time only. A thinner title list must not appear.
+  {
+    const saved = ['潮吹き', '水着', '巨乳', '女教師', '痴女', '童貞', '顔射', '先生', '2人っきり', 'プライベート補習'];
+    const savedQ = ['巨乳', '女教師', '潮吹き', '水着'];
+    const thin = ['先生', '2人っきり', 'プライベート補習', '全部面倒みてあげる', '面倒みてあげる'];
+    const title = '先生が2人っきりのプライベート補習で全部面倒みてあげる';
+    const cover = 'https://pics.dmm.co.jp/digital/video/apgh00001/apgh00001pl.jpg';
+    H.saveHistory([
+      {
+        id: 'apgh-snap',
+        ok: true,
+        code: 'APGH-012',
+        title: title,
+        works: [
+          {
+            code: 'APGH-012',
+            title: title,
+            actress: '柊ゆうき',
+            line: 'main',
+            theme_keywords: saved.slice(),
+            keyword_queries: savedQ.slice(),
+            related: [
+              {
+                code: 'APGH-001',
+                title: '別作品',
+                title_zh: '',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    let fetches = 0;
+    context.fetch = async () => {
+      fetches += 1;
+      throw new Error('history open must not fetch');
+    };
+    H.openHistoryDetail('apgh-snap');
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fetches, 0, 'opening 記錄 does not post related-by-title');
+    const snap = H.loadHistory().find((x) => x.id === 'apgh-snap');
+    assert.ok(snap && snap.works && snap.works[0]);
+    // History arrays live in the app realm; compare by value, not prototype.
+    assert.strictEqual(snap.works[0].theme_keywords.join('・'), saved.join('・'));
+    assert.strictEqual(snap.works[0].keyword_queries.join('・'), savedQ.join('・'));
+    assert.strictEqual(snap.works[0].related[0].title_zh, '');
+    assert.strictEqual(snap.works[0].related[0].code, 'APGH-001');
+    thin.filter((tok) => saved.indexOf(tok) === -1).forEach((tok) => {
+      assert.strictEqual(snap.works[0].theme_keywords.indexOf(tok), -1, tok);
+    });
+    const chips = walkNodes(getEl('history-detail')).filter(
+      (n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw')
+    );
+    assert.deepStrictEqual(
+      chips.map((c) => c.getAttribute('data-kw')),
+      saved
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '水着').textContent,
+      '水着（泳衣）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '童貞').textContent,
+      '童貞（處男）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '顔射').textContent,
+      '顔射（顏射）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '潮吹き').textContent,
+      '潮吹き（潮吹）'
+    );
+    assert.ok(!chips.some((c) => c.getAttribute('data-kw') === '全部面倒みてあげる'));
+    assert.ok(!chips.some((c) => c.getAttribute('data-kw') === '面倒みてあげる'));
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === 'プライベート補習').textContent,
+      'プライベート補習（私人補習）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '先生').textContent,
+      '先生（老師）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '2人っきり').textContent,
+      '2人っきり（兩人獨處）'
+    );
+    assert.strictEqual(H.formatKeywordChip('面倒みてあげる'), '面倒みてあげる（幫忙照顧）');
+    assert.strictEqual(H.formatKeywordChip('全部面倒みてあげる'), '全部面倒みてあげる（全都照顧）');
+    assert.strictEqual(H.formatKeywordChip('ノーブラ'), 'ノーブラ（無胸罩）');
+    assert.strictEqual(H.formatKeywordChip('誘惑'), '誘惑（誘惑）');
+    assert.strictEqual(H.formatKeywordChip('架空未收錄語'), '架空未收錄語');
+    // Kana catalog/title chips get a lexicon gloss. Unknown kana stays bare.
+    assert.strictEqual(H.formatKeywordChip('ハメ撮り'), 'ハメ撮り（自拍）');
+    assert.strictEqual(H.formatKeywordChip('ハイレグ'), 'ハイレグ（高衩）');
+    assert.strictEqual(H.formatKeywordChip('パイパン'), 'パイパン（無毛）');
+    assert.strictEqual(H.formatKeywordChip('イラマチオ'), 'イラマチオ（深喉）');
+    assert.strictEqual(H.formatKeywordChip('ごっくん'), 'ごっくん（吞精）');
+    assert.strictEqual(H.formatKeywordChip('お姉さん'), 'お姉さん（御姐）');
+    assert.strictEqual(H.formatKeywordChip('メガネっ娘'), 'メガネっ娘（眼鏡娘）');
+    assert.strictEqual(H.formatKeywordChip('眼鏡っ娘'), '眼鏡っ娘（眼鏡娘）');
+    assert.strictEqual(H.formatKeywordChip('逆レ'), '逆レ（逆強姦）');
+    assert.strictEqual(H.formatKeywordChip('水着'), '水着（泳衣）');
+    assert.strictEqual(H.formatKeywordChip('淫語'), '淫語（淫語）');
+    assert.strictEqual(H.formatKeywordChip('ヌルヌル'), 'ヌルヌル');
+    assert.ok(H.formatKeywordChip('ハメ撮り').indexOf('（）') === -1);
+
+    // A shorter saved list stays as saved. Open does not append 水着 or fill title_zh.
+    const shortSaved = ['巨乳', '女教師', '痴女'];
+    H.saveHistory([
+      {
+        id: 'union-append',
+        ok: true,
+        code: 'APGH-012',
+        title: title,
+        works: [
+          {
+            code: 'APGH-012',
+            title: title,
+            line: 'main',
+            theme_keywords: shortSaved.slice(),
+            keyword_queries: ['巨乳'],
+            related: [
+              {
+                code: 'APGH-001',
+                title: '別作品',
+                title_zh: '',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    H.openHistoryDetail('union-append');
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fetches, 0, 'a short snapshot is not enriched on open');
+    const uni = H.loadHistory().find((x) => x.id === 'union-append');
+    assert.ok(uni && uni.works && uni.works[0]);
+    assert.strictEqual(uni.works[0].theme_keywords.join('・'), '巨乳・女教師・痴女');
+    assert.strictEqual(uni.works[0].keyword_queries.join('・'), '巨乳');
+    assert.strictEqual(uni.works[0].related[0].title_zh, '');
+    const uniChips = walkNodes(getEl('history-detail')).filter(
+      (n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw')
+    );
+    assert.strictEqual(
+      uniChips.map((c) => c.getAttribute('data-kw')).join('・'),
+      '巨乳・女教師・痴女'
+    );
+    assert.strictEqual(
+      uniChips.find((c) => c.getAttribute('data-kw') === '巨乳').textContent,
+      '巨乳（巨乳）'
+    );
+    assert.ok(!uniChips.some((c) => c.getAttribute('data-kw') === '水着'));
+
+    // Edition junk and an empty chip list stay as saved. Open does not refresh them.
+    H.saveHistory([
+      {
+        id: 'bod-refresh',
+        ok: true,
+        code: 'BOD-001',
+        title: '巨乳の女教師',
+        works: [
+          {
+            code: 'BOD-001',
+            title: '巨乳の女教師',
+            line: 'main',
+            theme_keywords: ['BOD', '中出し'],
+            keyword_queries: ['BOD'],
+            related: [
+              {
+                code: 'REL-001',
+                title: 'x',
+                title_zh: '已有',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    H.openHistoryDetail('bod-refresh');
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fetches, 0, 'edition junk is not refreshed on open');
+    const bod = H.loadHistory().find((x) => x.id === 'bod-refresh');
+    assert.strictEqual(bod.works[0].theme_keywords.join('・'), 'BOD・中出し');
+    assert.strictEqual(bod.works[0].keyword_queries.join('・'), 'BOD');
+
+    H.saveHistory([
+      {
+        id: 'empty-kw',
+        ok: true,
+        code: 'EMP-001',
+        title: '巨乳',
+        works: [
+          {
+            code: 'EMP-001',
+            title: '巨乳',
+            line: 'main',
+            theme_keywords: [],
+            related: [
+              {
+                code: 'REL-009',
+                title: 'k',
+                title_zh: '中',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    H.openHistoryDetail('empty-kw');
+    await new Promise((r) => setTimeout(r, 40));
+    assert.strictEqual(fetches, 0, 'an empty chip list is not filled on open');
+    const emp = H.loadHistory().find((x) => x.id === 'empty-kw');
+    assert.strictEqual((emp.works[0].theme_keywords || []).join('・'), '');
+    assert.ok(!emp.works[0].keyword_queries || emp.works[0].keyword_queries.length === 0);
   }
 
   // SSE died on 目錄查詢 3/4. Polling the job must walk later slots and finish.
