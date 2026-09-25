@@ -6360,8 +6360,6 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
     entry_id = _offline_cache_entry_id(code)
     if not entry_id:
         return
-    # Read before build: a title-only rebuild mutates theme_keywords in place.
-    incoming_keyword_snapshot = _theme_keyword_snapshot_frozen(payload)
     value = _offline_cache_build_value(payload)
     value["touched_at"] = time.time()
     index_keys = _offline_cache_index_keys(code=code, image_hash=image_hash)
@@ -6402,17 +6400,22 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                             continue
                         if not value.get(field) and prev.get(field):
                             value[field] = prev[field]
-                    # A later put with no chip snapshot must not replace a saved
-                    # results-page list with a thinner title-only recompute.
-                    if (
-                        not incoming_keyword_snapshot
-                        and _theme_keyword_snapshot_frozen(prev)
-                        and _keyword_list_drops_saved(
-                            value.get("theme_keywords"), prev.get("theme_keywords")
+                    # Union into the saved chip list. Never replace it with a
+                    # thinner recompute. New tokens append; duplicates skip.
+                    if _theme_keyword_snapshot_frozen(prev):
+                        value["theme_keywords"] = _union_keyword_lists(
+                            prev.get("theme_keywords"),
+                            value.get("theme_keywords"),
+                            limit=10,
                         )
-                    ):
-                        value["theme_keywords"] = list(prev.get("theme_keywords") or [])
-                        value["keyword_queries"] = list(prev.get("keyword_queries") or [])
+                        prev_queries = _keyword_snapshot_list(prev.get("keyword_queries"))
+                        if prev_queries and not _keyword_list_has_edition_marker(prev_queries):
+                            if _keyword_list_drops_saved(
+                                value.get("keyword_queries"), prev_queries
+                            ):
+                                value["keyword_queries"] = _normalize_keyword_list(
+                                    prev_queries, limit=8
+                                )
                     if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
                         value["cover"] = prev.get("cover")
                         if prev.get("cover_source"):
@@ -10701,6 +10704,56 @@ def _keyword_list_drops_saved(new_raw, prev_raw) -> bool:
     return not prev <= new
 
 
+def _union_keyword_lists(saved, incoming, *, limit: int = 10) -> list[str]:
+    """Saved chips first. Append only tokens that are not already there.
+
+    A recompute must not replace a richer list. Non-junk saved chips stay
+    even when the merged list hits the cap; 巨乳 / 美乳 / 爆乳 may displace
+    a newly appended chip, not a saved one. ノーブラ誘惑 stays two chips.
+    """
+    base = _normalize_keyword_list(_keyword_snapshot_list(saved), limit=max(limit, 50))
+    extra = _normalize_keyword_list(_keyword_snapshot_list(incoming), limit=max(limit, 50))
+    seen = {tok.casefold() for tok in base}
+    merged = list(base)
+    for tok in extra:
+        key = tok.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        merged.append(tok)
+    if len(base) >= limit:
+        return _cap_theme_keywords(base, limit=limit)
+    if len(merged) <= limit:
+        return merged
+    saved_cf = {tok.casefold() for tok in base}
+    chosen = list(base)
+    chosen_cf = set(saved_cf)
+    for tok in merged:
+        key = tok.casefold()
+        if len(chosen) >= limit or key in chosen_cf:
+            continue
+        chosen.append(tok)
+        chosen_cf.add(key)
+    for tok in merged:
+        if not _is_body_generic_token(tok) or tok.casefold() in chosen_cf:
+            continue
+        replaced = False
+        for i in range(len(chosen) - 1, -1, -1):
+            cur = chosen[i]
+            if cur.casefold() in saved_cf or _is_body_generic_token(cur):
+                continue
+            chosen.pop(i)
+            chosen_cf.discard(cur.casefold())
+            replaced = True
+            break
+        if replaced or len(chosen) < limit:
+            chosen.append(tok)
+            chosen_cf.add(tok.casefold())
+    order = {tok.casefold(): i for i, tok in enumerate(merged)}
+    chosen.sort(key=lambda tok: order.get(tok.casefold(), 10_000))
+    return chosen
+
+
 def _stamp_theme_keywords(payload: dict) -> dict:
     """Attach theme_keywords + keyword_queries on a work so the UI does not re-guess.
 
@@ -10783,20 +10836,26 @@ def _keep_saved_theme_keywords(payload: dict) -> dict:
 
 
 def _restore_saved_theme_keywords(payload: dict, saved: dict | None) -> dict:
-    """Put the caller's chip snapshot back after a title-only recompute.
+    """Union the caller's chip snapshot with whatever enrich just recomputed.
 
-    /api/related-by-title fills missing title_zh and empty related buckets.
-    That pass must not replace theme_keywords / keyword_queries the results
-    page already stored. Edition junk is not a snapshot and stays recomputed.
+    Saved non-junk chips stay, in their saved order. A new token is appended
+    once; a duplicate (巨乳 again) is skipped. A thinner title-only list
+    cannot clear the snapshot. Saved keyword_queries stay when present so
+    glued title queries are not written over them. Edition junk is not a
+    snapshot and stays recomputed.
     """
     if not isinstance(payload, dict) or not isinstance(saved, dict):
         return payload
     if not _theme_keyword_snapshot_frozen(saved):
         return payload
-    payload["theme_keywords"] = _keyword_snapshot_list(saved.get("theme_keywords"))
+    payload["theme_keywords"] = _union_keyword_lists(
+        saved.get("theme_keywords"),
+        payload.get("theme_keywords"),
+        limit=10,
+    )
     queries = _keyword_snapshot_list(saved.get("keyword_queries"))
     if queries and not _keyword_list_has_edition_marker(queries):
-        payload["keyword_queries"] = queries
+        payload["keyword_queries"] = _normalize_keyword_list(queries, limit=8)
     return payload
 
 

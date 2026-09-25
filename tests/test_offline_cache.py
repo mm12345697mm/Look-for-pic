@@ -601,6 +601,34 @@ class TestOfflineCacheChineseTitles(unittest.TestCase):
         self.assertNotEqual(thin["theme_keywords"], rich)
         self.assertIn("全部面倒みてあげる", thin["theme_keywords"])
         self.assertNotIn("水着", thin["theme_keywords"])
+        # Union keeps saved chips, skips 巨乳 when it is already there, and
+        # appends a new token. A full snapshot does not shrink to make room
+        # for 全部面倒みてあげる.
+        self.assertEqual(
+            S._union_keyword_lists(
+                ["巨乳", "女教師", "痴女"],
+                ["巨乳", "水着", "女教師"],
+            ),
+            ["巨乳", "女教師", "痴女", "水着"],
+        )
+        self.assertEqual(
+            S._union_keyword_lists(rich, thin["theme_keywords"]),
+            rich,
+        )
+        # 巨乳 already in the saved nine is skipped; the new chip appends.
+        already = rich[:9]
+        self.assertIn("巨乳", already)
+        self.assertEqual(
+            S._union_keyword_lists(already, ["教室", "巨乳"]),
+            already + ["教室"],
+        )
+        # At the cap, 巨乳 may displace a newly appended chip, never a saved one.
+        saved_nine = [k for k in rich if k != "巨乳"]
+        self.assertEqual(len(saved_nine), 9)
+        self.assertEqual(
+            S._union_keyword_lists(saved_nine, ["教室", "巨乳"]),
+            saved_nine + ["巨乳"],
+        )
         # Edition junk is not a snapshot and still rebuilds from the title.
         self.assertFalse(
             S._theme_keyword_snapshot_frozen({"title": title, "theme_keywords": ["BOD", "中出し"]})

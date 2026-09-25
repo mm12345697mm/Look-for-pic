@@ -815,6 +815,58 @@
   }
 
   /**
+   * Saved chips first. Append tokens the saved list does not already have.
+   * A recompute must not drop a saved non-junk chip. At the cap, 巨乳 / 美乳 /
+   * 爆乳 may replace a newly appended chip only.
+   */
+  function unionKeywordLists(saved, incoming, limit) {
+    limit = limit || 10;
+    const base = normalizeKeywordList(saved);
+    const extra = normalizeKeywordList(incoming);
+    const seen = {};
+    const merged = [];
+    base.forEach((tok) => {
+      if (seen[tok]) return;
+      seen[tok] = true;
+      merged.push(tok);
+    });
+    extra.forEach((tok) => {
+      if (seen[tok]) return;
+      seen[tok] = true;
+      merged.push(tok);
+    });
+    if (base.length >= limit) return base.slice(0, limit);
+    if (merged.length <= limit) return merged;
+    const chosen = base.slice();
+    const inSaved = {};
+    base.forEach((tok) => {
+      inSaved[tok] = true;
+    });
+    merged.forEach((tok) => {
+      if (chosen.length >= limit || chosen.indexOf(tok) !== -1 || inSaved[tok]) return;
+      chosen.push(tok);
+    });
+    const body = { '巨乳': 1, '美乳': 1, '爆乳': 1 };
+    merged.forEach((tok) => {
+      if (!body[tok] || chosen.indexOf(tok) !== -1) return;
+      let replaced = false;
+      for (let i = chosen.length - 1; i >= 0; i--) {
+        if (inSaved[chosen[i]] || body[chosen[i]]) continue;
+        chosen.splice(i, 1);
+        replaced = true;
+        break;
+      }
+      if ((replaced || chosen.length < limit) && chosen.indexOf(tok) === -1) chosen.push(tok);
+    });
+    const order = {};
+    merged.forEach((tok, i) => {
+      order[tok] = i;
+    });
+    chosen.sort((a, b) => order[a] - order[b]);
+    return chosen;
+  }
+
+  /**
    * Traditional Chinese gloss for a keyword chip. Lexicon only — never a
    * guessed catalog title. Same-script words (巨乳, 誘惑) still get the
    * parenthetical the chip rule asks for.
@@ -927,6 +979,11 @@
     '美尻': '美臀',
     '乳首': '乳頭',
     '女教師': '女教師',
+    '先生': '老師',
+    '2人っきり': '兩人獨處',
+    'プライベート補習': '私人補習',
+    '面倒みてあげる': '幫忙照顧',
+    '全部面倒みてあげる': '全都照顧',
     'ナース': '護士',
     '女医': '女醫師',
     '秘書': '秘書',
@@ -5974,10 +6031,16 @@
         if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
           patch.title_zh = incomingZh;
         }
-        // Catalog genre chips saved with the record stay. A title-only
-        // recompute (全部面倒みてあげる＋面倒みてあげる) must not replace them.
-        // An empty list, or BOD / VOL junk, may still take the response.
-        if (!themeKeywordSnapshotFrozen(work)) {
+        // Saved chips stay. New distinct chips append; a duplicate is skipped.
+        // A title-only recompute must not clear the snapshot. BOD / VOL, or an
+        // empty list, may still take the response as a whole.
+        if (themeKeywordSnapshotFrozen(work)) {
+          const savedKw = normalizeKeywordList(work.theme_keywords || work.themeKeywords);
+          const mergedKw = unionKeywordLists(savedKw, data.theme_keywords);
+          if (mergedKw.join('\u0001') !== savedKw.join('\u0001')) {
+            patch.theme_keywords = mergedKw;
+          }
+        } else {
           const incomingKw = normalizeKeywordList(data.theme_keywords);
           if (incomingKw.length) patch.theme_keywords = incomingKw;
           const incomingQ = normalizeKeywordList(data.keyword_queries);

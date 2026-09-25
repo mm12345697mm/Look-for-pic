@@ -2515,6 +2515,90 @@ function walkNodes(node, acc) {
     );
     assert.ok(!chips.some((c) => c.getAttribute('data-kw') === '全部面倒みてあげる'));
     assert.ok(!chips.some((c) => c.getAttribute('data-kw') === '面倒みてあげる'));
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === 'プライベート補習').textContent,
+      'プライベート補習（私人補習）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '先生').textContent,
+      '先生（老師）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '2人っきり').textContent,
+      '2人っきり（兩人獨處）'
+    );
+    assert.strictEqual(H.formatKeywordChip('面倒みてあげる'), '面倒みてあげる（幫忙照顧）');
+    assert.strictEqual(H.formatKeywordChip('全部面倒みてあげる'), '全部面倒みてあげる（全都照顧）');
+    assert.strictEqual(H.formatKeywordChip('ノーブラ'), 'ノーブラ（無胸罩）');
+    assert.strictEqual(H.formatKeywordChip('誘惑'), '誘惑（誘惑）');
+    assert.strictEqual(H.formatKeywordChip('架空未收錄語'), '架空未收錄語');
+
+    // A shorter snapshot keeps its chips and appends a new one. 巨乳 already
+    // present is not added again. Saved queries are not replaced.
+    const shortSaved = ['巨乳', '女教師', '痴女'];
+    H.saveHistory([
+      {
+        id: 'union-append',
+        ok: true,
+        code: 'APGH-012',
+        title: title,
+        works: [
+          {
+            code: 'APGH-012',
+            title: title,
+            line: 'main',
+            theme_keywords: shortSaved.slice(),
+            keyword_queries: ['巨乳'],
+            related: [
+              {
+                code: 'APGH-001',
+                title: '別作品',
+                title_zh: '',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    context.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        related_by_title: [
+          {
+            code: 'APGH-001',
+            title: '別作品',
+            title_zh: '補上的中文',
+            line: 'keyword',
+            why: '關鍵字',
+            cover: cover,
+          },
+        ],
+        theme_keywords: ['巨乳', '水着', '女教師'],
+        keyword_queries: ['全部面倒みてあげる', '面倒みてあげる'],
+      }),
+    });
+    H.openHistoryDetail('union-append');
+    await new Promise((r) => setTimeout(r, 40));
+    const uni = H.loadHistory().find((x) => x.id === 'union-append');
+    assert.ok(uni && uni.works && uni.works[0]);
+    assert.strictEqual(uni.works[0].theme_keywords.join('・'), '巨乳・女教師・痴女・水着');
+    assert.strictEqual(uni.works[0].keyword_queries.join('・'), '巨乳');
+    assert.strictEqual(uni.works[0].related[0].title_zh, '補上的中文');
+    const uniChips = walkNodes(getEl('history-detail')).filter(
+      (n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw')
+    );
+    assert.strictEqual(
+      uniChips.map((c) => c.getAttribute('data-kw')).join('・'),
+      '巨乳・女教師・痴女・水着'
+    );
+    assert.strictEqual(
+      uniChips.find((c) => c.getAttribute('data-kw') === '水着').textContent,
+      '水着（泳衣）'
+    );
 
     // Edition junk is still replaced. A missing chip list can still be filled.
     H.saveHistory([
