@@ -2417,6 +2417,208 @@ function walkNodes(node, acc) {
     assert.strictEqual(rec.works[0].related[13].code, 'KEEP-014');
   }
 
+  // APGH-012 history detail is the results-page snapshot. Filling a missing
+  // related title_zh must not replace catalog genre chips with the title-only
+  // scraps (全部面倒みてあげる＋面倒みてあげる).
+  {
+    const saved = ['潮吹き', '水着', '巨乳', '女教師', '痴女', '童貞', '顔射', '先生', '2人っきり', 'プライベート補習'];
+    const savedQ = ['巨乳', '女教師', '潮吹き', '水着'];
+    const thin = ['先生', '2人っきり', 'プライベート補習', '全部面倒みてあげる', '面倒みてあげる'];
+    const title = '先生が2人っきりのプライベート補習で全部面倒みてあげる';
+    const cover = 'https://pics.dmm.co.jp/digital/video/apgh00001/apgh00001pl.jpg';
+    H.saveHistory([
+      {
+        id: 'apgh-snap',
+        ok: true,
+        code: 'APGH-012',
+        title: title,
+        works: [
+          {
+            code: 'APGH-012',
+            title: title,
+            actress: '柊ゆうき',
+            line: 'main',
+            theme_keywords: saved.slice(),
+            keyword_queries: savedQ.slice(),
+            related: [
+              {
+                code: 'APGH-001',
+                title: '別作品',
+                title_zh: '',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    let posted = null;
+    context.fetch = async (url, opts) => {
+      assert.ok(String(url).indexOf('/api/related-by-title') !== -1, String(url));
+      posted = JSON.parse((opts && opts.body) || '{}');
+      return {
+        ok: true,
+        json: async () => ({
+          ok: true,
+          title_zh: '',
+          related_by_title: [
+            {
+              code: 'APGH-001',
+              title: '別作品',
+              title_zh: '補上的中文',
+              line: 'keyword',
+              why: '關鍵字',
+              cover: cover,
+            },
+          ],
+          theme_keywords: thin,
+          keyword_queries: thin,
+        }),
+      };
+    };
+    H.openHistoryDetail('apgh-snap');
+    await new Promise((r) => setTimeout(r, 40));
+    assert.ok(posted, 'history enrich posts related-by-title');
+    assert.deepStrictEqual(posted.theme_keywords, saved);
+    assert.deepStrictEqual(posted.keyword_queries, savedQ);
+    const snap = H.loadHistory().find((x) => x.id === 'apgh-snap');
+    assert.ok(snap && snap.works && snap.works[0]);
+    // History arrays live in the app realm; compare by value, not prototype.
+    assert.strictEqual(snap.works[0].theme_keywords.join('・'), saved.join('・'));
+    assert.strictEqual(snap.works[0].keyword_queries.join('・'), savedQ.join('・'));
+    assert.strictEqual(snap.works[0].related[0].title_zh, '補上的中文');
+    assert.strictEqual(snap.works[0].related[0].code, 'APGH-001');
+    const chips = walkNodes(getEl('history-detail')).filter(
+      (n) => n.className === 'kw-chip' && n.getAttribute && n.getAttribute('data-kw')
+    );
+    assert.deepStrictEqual(
+      chips.map((c) => c.getAttribute('data-kw')),
+      saved
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '水着').textContent,
+      '水着（泳衣）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '童貞').textContent,
+      '童貞（處男）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '顔射').textContent,
+      '顔射（顏射）'
+    );
+    assert.strictEqual(
+      chips.find((c) => c.getAttribute('data-kw') === '潮吹き').textContent,
+      '潮吹き（潮吹）'
+    );
+    assert.ok(!chips.some((c) => c.getAttribute('data-kw') === '全部面倒みてあげる'));
+    assert.ok(!chips.some((c) => c.getAttribute('data-kw') === '面倒みてあげる'));
+
+    // Edition junk is still replaced. A missing chip list can still be filled.
+    H.saveHistory([
+      {
+        id: 'bod-refresh',
+        ok: true,
+        code: 'BOD-001',
+        title: '巨乳の女教師',
+        works: [
+          {
+            code: 'BOD-001',
+            title: '巨乳の女教師',
+            line: 'main',
+            theme_keywords: ['BOD', '中出し'],
+            keyword_queries: ['BOD'],
+            related: [
+              {
+                code: 'REL-001',
+                title: 'x',
+                title_zh: '已有',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    context.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        related_by_title: [
+          {
+            code: 'REL-001',
+            title: 'x',
+            title_zh: '已有',
+            line: 'keyword',
+            why: '關鍵字',
+            cover: cover,
+          },
+        ],
+        theme_keywords: ['巨乳', '女教師'],
+        keyword_queries: ['巨乳', '女教師'],
+      }),
+    });
+    H.openHistoryDetail('bod-refresh');
+    await new Promise((r) => setTimeout(r, 40));
+    const bod = H.loadHistory().find((x) => x.id === 'bod-refresh');
+    assert.strictEqual(bod.works[0].theme_keywords.join('・'), '巨乳・女教師');
+    assert.strictEqual(bod.works[0].keyword_queries.join('・'), '巨乳・女教師');
+
+    H.saveHistory([
+      {
+        id: 'empty-kw',
+        ok: true,
+        code: 'EMP-001',
+        title: '巨乳',
+        works: [
+          {
+            code: 'EMP-001',
+            title: '巨乳',
+            line: 'main',
+            theme_keywords: [],
+            related: [
+              {
+                code: 'REL-009',
+                title: 'k',
+                title_zh: '中',
+                line: 'keyword',
+                why: '關鍵字',
+                cover: cover,
+              },
+            ],
+          },
+        ],
+      },
+    ]);
+    context.fetch = async () => ({
+      ok: true,
+      json: async () => ({
+        ok: true,
+        related_by_title: [
+          {
+            code: 'REL-009',
+            title: 'k',
+            title_zh: '中',
+            line: 'keyword',
+            why: '關鍵字',
+            cover: cover,
+          },
+        ],
+        theme_keywords: ['巨乳'],
+        keyword_queries: ['巨乳'],
+      }),
+    });
+    H.openHistoryDetail('empty-kw');
+    await new Promise((r) => setTimeout(r, 40));
+    const emp = H.loadHistory().find((x) => x.id === 'empty-kw');
+    assert.strictEqual(emp.works[0].theme_keywords.join('・'), '巨乳');
+    assert.strictEqual(emp.works[0].keyword_queries.join('・'), '巨乳');
+  }
+
   // SSE died on 目錄查詢 3/4. Polling the job must walk later slots and finish.
   {
     const FALSE_TIMEOUT = ['時間不夠', '尚未查完', '尚未鎖定'];

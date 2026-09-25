@@ -246,6 +246,14 @@
     return !normalizeKeywordList(raw).length;
   }
 
+  /** Saved results-page chips. Gap fill must not replace them.
+   *  Edition junk (BOD / VOL) is not a snapshot and may still refresh.
+   */
+  function themeKeywordSnapshotFrozen(work) {
+    if (!work || workNeedsThemeKeywords(work)) return false;
+    return normalizeKeywordList(work.theme_keywords || work.themeKeywords).length > 0;
+  }
+
   function relatedHasPersistedMembership(related) {
     return (related || []).some((r) => r && String(r.code || '').trim());
   }
@@ -546,6 +554,8 @@
         actress: rec.actress,
         cid: rec.cid || '',
         related: rec.related || [],
+        theme_keywords: normalizeKeywordList(rec.theme_keywords || rec.themeKeywords),
+        keyword_queries: normalizeKeywordList(rec.keyword_queries || rec.keywordQueries),
         line: 'main',
       },
     ];
@@ -5943,6 +5953,9 @@
           code: work.code || '',
           actress: work.actress || '',
           seed: related,
+          // So the response echoes this snapshot instead of a title-only rebuild.
+          theme_keywords: normalizeKeywordList(work.theme_keywords || work.themeKeywords),
+          keyword_queries: normalizeKeywordList(work.keyword_queries || work.keywordQueries),
         }),
       });
       const data = await res.json();
@@ -5961,10 +5974,15 @@
         if (incomingZh && !String(work.title_zh || work.titleZh || '').trim()) {
           patch.title_zh = incomingZh;
         }
-        const incomingKw = normalizeKeywordList(data.theme_keywords);
-        if (incomingKw.length) patch.theme_keywords = incomingKw;
-        const incomingQ = normalizeKeywordList(data.keyword_queries);
-        if (incomingQ.length) patch.keyword_queries = incomingQ;
+        // Catalog genre chips saved with the record stay. A title-only
+        // recompute (全部面倒みてあげる＋面倒みてあげる) must not replace them.
+        // An empty list, or BOD / VOL junk, may still take the response.
+        if (!themeKeywordSnapshotFrozen(work)) {
+          const incomingKw = normalizeKeywordList(data.theme_keywords);
+          if (incomingKw.length) patch.theme_keywords = incomingKw;
+          const incomingQ = normalizeKeywordList(data.keyword_queries);
+          if (incomingQ.length) patch.keyword_queries = incomingQ;
+        }
         work = backfillWorkTreeLocal(Object.assign({}, work, patch));
         const sharedOne = shareSessionTitleZh([work]);
         if (sharedOne.changed && sharedOne.works[0]) work = sharedOne.works[0];

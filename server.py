@@ -6081,17 +6081,24 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     """
     if not isinstance(payload, dict):
         return payload
+    # Gap fills below (public catalog, related search) recompute chips from the
+    # title. Remember the results-page list first so that pass cannot replace it.
+    saved_keywords = {
+        "theme_keywords": _keyword_snapshot_list(payload.get("theme_keywords")),
+        "keyword_queries": _keyword_snapshot_list(payload.get("keyword_queries")),
+    }
     before_identity = _payload_enrichment_fingerprint(payload)
     try:
         _backfill_catalog_identity(payload)
     except Exception:
         pass
-    _recompute_theme_keywords(payload)
+    _keep_saved_theme_keywords(payload)
     if not _payload_needs_enrichment(payload):
         try:
             enrich_related_public_catalog(payload)
         except Exception:
             pass
+        _restore_saved_theme_keywords(payload, saved_keywords)
         try:
             if _payload_enrichment_fingerprint(payload) != before_identity:
                 offline_cache_put(payload, image_hash=image_hash)
@@ -6151,7 +6158,8 @@ def enrich_offline_cache_hit(payload: dict, *, image_hash: str | None = None) ->
     # Attempt markers for this request only — next open still checks gaps.
     payload["cache_backfilled"] = True
     payload["chinese_titles_attached"] = True
-    _recompute_theme_keywords(payload)
+    _keep_saved_theme_keywords(payload)
+    _restore_saved_theme_keywords(payload, saved_keywords)
     _finalize_related_note(payload)
     try:
         if _payload_enrichment_fingerprint(payload) != before:
@@ -6216,7 +6224,7 @@ def _offline_cache_build_value(payload: dict) -> dict:
             payload.get("genres"), actress=str(payload.get("actress") or "") or None
         ),
         "series": str(payload.get("series") or "").strip() or None,
-        "theme_keywords": list((_recompute_theme_keywords(payload).get("theme_keywords")) or []),
+        "theme_keywords": list((_keep_saved_theme_keywords(payload).get("theme_keywords")) or []),
         "keyword_queries": list(payload.get("keyword_queries") or []),
         "message": payload.get("message") or "",
         "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -6338,7 +6346,7 @@ def offline_cache_get(
                 out.setdefault("related", [])
                 out.setdefault("stills", out.get("stills") or [])
                 out.setdefault("related_by_title", out.get("related_by_title") or [])
-                _recompute_theme_keywords(out)
+                _keep_saved_theme_keywords(out)
                 return out
         except Exception:
             return None
@@ -6352,6 +6360,8 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
     entry_id = _offline_cache_entry_id(code)
     if not entry_id:
         return
+    # Read before build: a title-only rebuild mutates theme_keywords in place.
+    incoming_keyword_snapshot = _theme_keyword_snapshot_frozen(payload)
     value = _offline_cache_build_value(payload)
     value["touched_at"] = time.time()
     index_keys = _offline_cache_index_keys(code=code, image_hash=image_hash)
@@ -6388,11 +6398,21 @@ def offline_cache_put(payload: dict, *, image_hash: str | None = None) -> None:
                         "keyword_queries",
                     ):
                         if field in ("theme_keywords", "keyword_queries"):
-                            # Recomputed from the current title. Do not restore a
-                            # stale chip list (lone 家庭教師, VOL/OL junk).
+                            # Handled after the loop. Edition junk is not restored.
                             continue
                         if not value.get(field) and prev.get(field):
                             value[field] = prev[field]
+                    # A later put with no chip snapshot must not replace a saved
+                    # results-page list with a thinner title-only recompute.
+                    if (
+                        not incoming_keyword_snapshot
+                        and _theme_keyword_snapshot_frozen(prev)
+                        and _keyword_list_drops_saved(
+                            value.get("theme_keywords"), prev.get("theme_keywords")
+                        )
+                    ):
+                        value["theme_keywords"] = list(prev.get("theme_keywords") or [])
+                        value["keyword_queries"] = list(prev.get("keyword_queries") or [])
                     if not usable_cover_url(value.get("cover")) and usable_cover_url(prev.get("cover")):
                         value["cover"] = prev.get("cover")
                         if prev.get("cover_source"):
@@ -10645,6 +10665,42 @@ def _keyword_list_has_edition_marker(raw) -> bool:
     return any(_contains_edition_marker(str(item or "")) for item in raw)
 
 
+def _keyword_snapshot_list(raw) -> list[str]:
+    """Chip strings already stored on a payload. Does not retokenize a title."""
+    if isinstance(raw, str):
+        raw = re.split(r"[\s,，、・/|]+", raw)
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(item or "").strip() for item in raw if str(item or "").strip()]
+
+
+def _theme_keyword_snapshot_frozen(payload: dict | None) -> bool:
+    """True when theme_keywords is the results-page snapshot, not edition junk.
+
+    History open, cache read, and gap backfill must keep this list. BOD / VOL
+    / Blu-ray lists are stale and may still be rebuilt from the title.
+    """
+    if not isinstance(payload, dict):
+        return False
+    chips = _keyword_snapshot_list(payload.get("theme_keywords"))
+    if not chips:
+        return False
+    if _keyword_list_has_edition_marker(chips) or _keyword_list_has_edition_marker(
+        payload.get("keyword_queries")
+    ):
+        return False
+    return True
+
+
+def _keyword_list_drops_saved(new_raw, prev_raw) -> bool:
+    """True when `new_raw` is missing a chip the saved list already had."""
+    prev = {tok.casefold() for tok in _keyword_snapshot_list(prev_raw)}
+    if not prev:
+        return False
+    new = {tok.casefold() for tok in _keyword_snapshot_list(new_raw)}
+    return not prev <= new
+
+
 def _stamp_theme_keywords(payload: dict) -> dict:
     """Attach theme_keywords + keyword_queries on a work so the UI does not re-guess.
 
@@ -10711,6 +10767,36 @@ def _recompute_theme_keywords(payload: dict) -> dict:
     payload["keyword_queries"] = _keyword_search_queries(
         title, kws, selected_only=False, series=series or None
     )
+    return payload
+
+
+def _keep_saved_theme_keywords(payload: dict) -> dict:
+    """Keep a saved chip snapshot. Recompute only when it is missing or stale.
+
+    Cache get / enrich and other gap fills used to call _recompute_theme_keywords
+    unconditionally. A title with no genres then replaced catalog chips
+    (潮吹き, 水着, 女教師, …) with title scraps (全部面倒みてあげる).
+    """
+    if _theme_keyword_snapshot_frozen(payload):
+        return payload
+    return _recompute_theme_keywords(payload)
+
+
+def _restore_saved_theme_keywords(payload: dict, saved: dict | None) -> dict:
+    """Put the caller's chip snapshot back after a title-only recompute.
+
+    /api/related-by-title fills missing title_zh and empty related buckets.
+    That pass must not replace theme_keywords / keyword_queries the results
+    page already stored. Edition junk is not a snapshot and stays recomputed.
+    """
+    if not isinstance(payload, dict) or not isinstance(saved, dict):
+        return payload
+    if not _theme_keyword_snapshot_frozen(saved):
+        return payload
+    payload["theme_keywords"] = _keyword_snapshot_list(saved.get("theme_keywords"))
+    queries = _keyword_snapshot_list(saved.get("keyword_queries"))
+    if queries and not _keyword_list_has_edition_marker(queries):
+        payload["keyword_queries"] = queries
     return payload
 
 
@@ -15287,6 +15373,15 @@ def related_by_title_api():
         except Exception:
             pass
         _stamp_listed_work_keywords(wrap)
+        # Gap fill may recompute chips from the title alone (no catalog genres
+        # on this request). The saved results-page list wins.
+        _restore_saved_theme_keywords(
+            wrap,
+            {
+                "theme_keywords": body.get("theme_keywords"),
+                "keyword_queries": body.get("keyword_queries"),
+            },
+        )
     except Exception as e:
         return jsonify({"ok": False, "related_by_title": [], "message": str(e)}), 500
     return jsonify({
