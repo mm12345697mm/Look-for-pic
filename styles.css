@@ -793,7 +793,17 @@ label.btn {
   line-height: 1.4;
 }
 .manual-fix-caption { font-weight: 700; }
+.manual-fix-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
 .manual-fix-toggle[hidden] { display: none !important; }
+.btn-cover-research:disabled {
+  opacity: 0.65;
+  cursor: progress;
+}
 .manual-fix-toggle {
   display: inline-flex;
   align-items: center;

@@ -8063,6 +8063,84 @@ def _apply_public_cover_fallback(item: dict | None, meta: dict | None) -> None:
         item["cover_source"] = source
 
 
+def _http_catalog_urls(urls) -> list[str]:
+    """http(s) catalog media only. Uploads and now_printing stay out."""
+    out: list[str] = []
+    for raw in urls or []:
+        clean = _catalog_jacket_url(raw)
+        if not clean or _is_upload_media_url(clean) or clean in out:
+            continue
+        out.append(clean)
+    return out
+
+
+def refresh_catalog_cover(
+    code: str | None,
+    *,
+    title: str | None = None,
+    cid: str | None = None,
+) -> dict:
+    """Look up the jacket again for the code already on one card.
+
+    Does not run identify and does not pick a different 品番. The caller
+    writes the cover back into that same card. A client upload (data: / blob:)
+    is never the jacket. DMM is first; MissAV then Jable only when DMM has
+    no jacket. Sample stills are included only when a DMM cid resolves
+    (those URLs are derived, not a second scrape).
+    """
+    raw_code = str(code or "").strip()
+    raw_title = str(title or "").strip()
+    if not raw_code and raw_title and parse_code_parts(raw_title):
+        raw_code = raw_title
+        raw_title = ""
+    disp = format_display_code(raw_code) if raw_code and parse_code_parts(raw_code) else ""
+    out: dict = {
+        "ok": bool(disp),
+        "code": disp or None,
+        "title": raw_title or None,
+        "cid": None,
+        "cover": None,
+        "stills": [],
+        "cover_source": None,
+    }
+    if not disp:
+        out["message"] = "沒有可搜索的番號"
+        return out
+    cid_in = str(cid or "").strip()
+    if is_now_printing_url(cid_in):
+        cid_in = ""
+    try:
+        rcid, cover, stills = sanitize_cover_fields(disp, cid_in or None, None)
+    except Exception:
+        rcid, cover, stills = None, None, []
+    jacket = _catalog_jacket_url(cover)
+    if jacket and not _is_upload_media_url(jacket):
+        out["cid"] = str(rcid or "") or None
+        out["cover"] = jacket
+        out["stills"] = _http_catalog_urls(stills)
+        if rcid and not out["stills"]:
+            out["stills"] = _http_catalog_urls(still_urls(str(rcid), 10))
+        return out
+    try:
+        meta = fetch_public_zh_catalog(
+            disp,
+            title_ja=raw_title or None,
+            page_limit=2,
+            timeout=6.0,
+        )
+    except Exception:
+        meta = {}
+    item = {"code": disp, "title": raw_title, "cover": None}
+    _apply_public_cover_fallback(item, meta if isinstance(meta, dict) else {})
+    jacket = _catalog_jacket_url(item.get("cover"))
+    if jacket and not _is_upload_media_url(jacket):
+        out["cover"] = jacket
+        source = str(item.get("cover_source") or (meta or {}).get("cover_source") or "").lower()
+        if source in ("missav", "jable"):
+            out["cover_source"] = source
+    return out
+
+
 def _cover_progress_detail(payload: dict | None) -> tuple[str, str]:
     """Progress step for the jacket. Public fallback names its source.
 
@@ -14850,6 +14928,23 @@ def cdn_file():
             "Cache-Control": "no-store",
         },
     )
+
+
+@app.route("/api/cover-refresh", methods=["POST"])
+def cover_refresh_api():
+    """Re-resolve one card's catalog jacket. Does not add a gallery row.
+
+    Body cover is ignored: an upload must not become the jacket.
+    """
+    body = request.get_json(silent=True) or {}
+    if not isinstance(body, dict):
+        body = {}
+    result = refresh_catalog_cover(
+        str(body.get("code") or ""),
+        title=str(body.get("title") or ""),
+        cid=str(body.get("cid") or ""),
+    )
+    return jsonify(result)
 
 
 @app.route("/api/related-by-title", methods=["GET", "POST"])

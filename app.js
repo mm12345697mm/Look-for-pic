@@ -66,6 +66,7 @@
   let promoteBusy = false;
   let lastPromoteTask = null;
   let lastManualTask = null;
+  let lastCoverResearchTask = null;
   let promoteEpoch = 0;
 
   function batchQueryKeepsFrames(fileCount, busy, openFrame) {
@@ -290,6 +291,13 @@
     if (!url || isNowPrintingUrl(url) || isLocalCoverUrl(url)) return false;
     if (w && w.titleOnly) return false;
     return isCatalogMediaUrl(url);
+  }
+
+  /** 暫無封面: a coded card with no http(s) catalog jacket. */
+  function cardShowsEmptyCover(w) {
+    if (!w || w.skipped || w.unidentified || w.titleOnly) return false;
+    if (!reliablePromoteCode(w)) return false;
+    return !workHasUsableCover(w);
   }
 
   function workHasUsableTitle(w) {
@@ -3110,6 +3118,222 @@
     return { ok: true, work: placed.work, slotIndex: placed.slotIndex };
   }
 
+  /**
+   * Fold a cover-refresh payload into this same card.
+   * A catalog jacket already on the card stays. data: / blob: never become the cover.
+   */
+  function mergeCoverRefreshIntoWork(oldW, data) {
+    const prior = Object.assign({}, oldW || {});
+    const preview = String(prior.userPreview || prior.user_preview || '').trim();
+    if (preview && prior.cover === preview) prior.cover = '';
+    if (isLocalCoverUrl(prior.cover)) prior.cover = '';
+    if (workHasUsableCover(prior)) return prior;
+    const raw = data && typeof data === 'object' ? data : {};
+    const jacket = catalogOnlyUrl(raw.cover || raw.cover_url, '');
+    if (!jacket || isLocalCoverUrl(jacket) || (preview && jacket === preview)) return prior;
+    prior.cover = jacket;
+    const cid = String(raw.cid || '').trim();
+    if (cid && !isNowPrintingUrl(cid)) prior.cid = cid;
+    const stills = (Array.isArray(raw.stills) ? raw.stills : [])
+      .map((u) => String(u || '').trim())
+      .filter((u) => isCatalogMediaUrl(u) && !isLocalCoverUrl(u) && u !== preview);
+    if (stills.length) prior.stills = mergeStillsKeepExisting(prior.stills, stills);
+    prior.line = (oldW && oldW.line) || prior.line;
+    prior.code = (oldW && oldW.code) || prior.code;
+    prior.userPreview = preview;
+    return prior;
+  }
+
+  function sameRelatedSlot(row, oldW) {
+    if (!row || !oldW) return false;
+    if (row === oldW) return true;
+    if (!row.code || !oldW.code || !codesMatch(row.code, oldW.code)) return false;
+    const rl = String(row.line || '');
+    const ol = String(oldW.line || '');
+    if (rl && ol && rl !== ol) return false;
+    return true;
+  }
+
+  function badgeTextOfCard(card) {
+    const found = [];
+    function walk(node) {
+      if (!node) return;
+      if (elHasClass(node, 'card-line')) found.push(node);
+      (node.children || []).forEach(walk);
+    }
+    walk(card);
+    return found.length ? String(found[0].textContent || '') : '';
+  }
+
+  function replaceCardInPlace(card, nextW) {
+    if (!card) return null;
+    const badge = badgeTextOfCard(card);
+    const slide = card.parentNode || card.parentElement;
+    const nextCard = buildWorkCard(nextW, {
+      slide: !!(slide && elHasClass(slide, 'work-carousel-slide')),
+      badgeLabel: badge || undefined,
+    });
+    replaceNode(card, nextCard);
+    return nextCard;
+  }
+
+  /** Write the jacket onto the existing slot. Never appends a gallery row or a related row. */
+  function rememberCoverOnSameSlot(oldW, nextW, card) {
+    const surface = card ? surfaceForCard(card) : 'gallery';
+    const related = card ? !isMainSlideCard(card) : isRelatedCarouselLine(String((oldW && oldW.line) || ''));
+    const block = card ? closestEl(card, 'work-carousel-block') : null;
+    const slotIndex = block ? carouselSlotIndex(block) : 0;
+    if (!related && surface !== 'history') {
+      const items = (lastGalleryItems || []).slice();
+      if (slotIndex >= 0 && slotIndex < items.length) {
+        const prior = items[slotIndex] || {};
+        const priorCode = reliablePromoteCode(prior);
+        const nextCode = reliablePromoteCode(nextW);
+        if (!priorCode || !nextCode || codesMatch(priorCode, nextCode)) {
+          const merged = Object.assign({}, prior, {
+            cover: nextW.cover,
+            cid: nextW.cid || prior.cid || '',
+            stills: nextW.stills && nextW.stills.length ? nextW.stills : prior.stills || [],
+          });
+          const preview = String(merged.userPreview || merged.user_preview || '').trim();
+          if (isLocalCoverUrl(merged.cover) || (preview && merged.cover === preview)) merged.cover = '';
+          items[slotIndex] = merged;
+          lastGalleryItems = items;
+        }
+      }
+    } else if (related && surface !== 'history') {
+      const items = (lastGalleryItems || []).slice();
+      const parent = items[slotIndex];
+      if (parent && Array.isArray(parent.relatedByTitle)) {
+        let hit = false;
+        const rel = parent.relatedByTitle.map((r) => {
+          if (!sameRelatedSlot(r, oldW)) return r;
+          hit = true;
+          return nextW;
+        });
+        if (hit) {
+          items[slotIndex] = Object.assign({}, parent, { relatedByTitle: rel });
+          lastGalleryItems = items;
+        }
+      }
+    }
+    writeCoverIntoHistory(slotIndex, oldW, nextW, related, surface);
+    return slotIndex;
+  }
+
+  function writeCoverIntoHistory(slotIndex, oldW, nextW, isRelated, surface) {
+    const cover = catalogOnlyUrl(nextW && nextW.cover, '');
+    if (!cover || isLocalCoverUrl(cover)) return;
+    const list = loadHistory();
+    let hIdx = -1;
+    if (surface === 'history' && viewingHistoryId) {
+      hIdx = list.findIndex((x) => x && x.id === viewingHistoryId);
+    }
+    if (hIdx < 0 && surface !== 'history') {
+      hIdx = findGalleryHistoryIndex(list, lastGalleryItems);
+    }
+    if (hIdx < 0) return;
+    const rec = list[hIdx];
+    const works = historySessionWorks(rec).slice();
+    if (slotIndex < 0 || slotIndex >= works.length) return;
+    const slot = Object.assign({}, works[slotIndex] || {});
+    const stills = (Array.isArray(nextW.stills) ? nextW.stills : []).filter((u) => isCatalogMediaUrl(u));
+    if (isRelated) {
+      const rows = Array.isArray(slot.related) ? slot.related.slice() : [];
+      let hit = false;
+      const nextRows = rows.map((r) => {
+        if (!sameRelatedSlot(r, oldW)) return r;
+        hit = true;
+        const row = Object.assign({}, r, { cover: cover });
+        if (nextW.cid) row.cid = nextW.cid;
+        if (stills.length) row.stills = stills;
+        return row;
+      });
+      if (!hit) return;
+      slot.related = nextRows;
+      works[slotIndex] = slot;
+      const nextRec = Object.assign({}, rec, { works: works });
+      if (slotIndex === 0) nextRec.related = nextRows;
+      list[hIdx] = nextRec;
+      saveHistory(list);
+      return;
+    }
+    const slotCode = reliablePromoteCode(slot);
+    const nextCode = reliablePromoteCode(nextW);
+    if (slotCode && nextCode && !codesMatch(slotCode, nextCode)) return;
+    slot.cover = cover;
+    if (nextW.cid) slot.cid = nextW.cid;
+    if (stills.length) slot.stills = stills;
+    works[slotIndex] = slot;
+    const nextRec = Object.assign({}, rec, { works: works });
+    if (slotIndex === 0) {
+      nextRec.cover = cover;
+      if (stills.length) nextRec.stills = stills;
+    }
+    list[hIdx] = nextRec;
+    saveHistory(list);
+  }
+
+  async function refreshCardCover(oldW, card) {
+    const code = reliablePromoteCode(oldW);
+    const title = usableManualTitle(oldW && oldW.title);
+    if (!code && !title) {
+      showToast('沒有可搜索的番號或名稱');
+      return { ok: false, reason: 'empty' };
+    }
+    let data = null;
+    try {
+      const res = await fetch('/api/cover-refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code: code,
+          title: title,
+          cid: String((oldW && oldW.cid) || ''),
+        }),
+      });
+      try {
+        data = await res.json();
+      } catch (_) {
+        data = null;
+      }
+      if (!res || !res.ok || !data || data.ok === false) {
+        throw new Error((data && data.message) || '重新搜索失敗');
+      }
+    } catch (err) {
+      showToast((err && err.message) || '重新搜索失敗');
+      return { ok: false, reason: 'fetch' };
+    }
+    const next = mergeCoverRefreshIntoWork(oldW, data);
+    if (!workHasUsableCover(next)) {
+      showToast('仍無封面');
+      return { ok: false, reason: 'miss', work: oldW };
+    }
+    rememberCoverOnSameSlot(oldW, next, card);
+    replaceCardInPlace(card, next);
+    showToast('已更新封面');
+    return { ok: true, work: next };
+  }
+
+  function buildCoverResearchButton(w, card) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'manual-fix-toggle btn-cover-research';
+    btn.textContent = '重新搜索';
+    btn.setAttribute('aria-label', '重新搜索');
+    bindWorkAction(btn, () => {
+      if (btn.disabled) return;
+      btn.disabled = true;
+      btn.textContent = '搜索中…';
+      lastCoverResearchTask = refreshCardCover(w, card).finally(() => {
+        if (btn.parentNode == null) return;
+        btn.disabled = false;
+        btn.textContent = '重新搜索';
+      });
+    });
+    return btn;
+  }
+
   function buildManualFixPanel(w, card) {
     const openNow = slotNeedsCodeEntry(w);
     const box = document.createElement('div');
@@ -3236,11 +3460,15 @@
         });
       });
     }
-    [form, toggle].forEach((el) => {
+    const actions = document.createElement('div');
+    actions.className = 'manual-fix-actions';
+    if (cardShowsEmptyCover(w)) actions.appendChild(buildCoverResearchButton(w, card));
+    actions.appendChild(toggle);
+    [form, toggle, actions].forEach((el) => {
       el.addEventListener('pointerdown', stopCarouselBubble);
       el.addEventListener('touchstart', stopCarouselBubble, { passive: true });
     });
-    box.appendChild(toggle);
+    box.appendChild(actions);
     box.appendChild(form);
     return box;
   }
@@ -6183,8 +6411,12 @@
       slotNeedsCodeEntry,
       batchQueryKeepsFrames,
       workHasUsableCover,
+      cardShowsEmptyCover,
       workHasUsableTitle,
       mergeManualFixIntoWork,
+      mergeCoverRefreshIntoWork,
+      refreshCardCover,
+      coverResearchTask: () => lastCoverResearchTask,
       persistManualWorkFix,
       applyManualWorkFix,
       workDownloadFilename,
