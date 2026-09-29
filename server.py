@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import fcntl
 import hashlib
 import io
@@ -15,6 +16,8 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor, wait
 from html import unescape
 from pathlib import Path
 from typing import Any
@@ -1655,7 +1658,19 @@ def resolve_cover_cid(code: str) -> tuple[str | None, str | None]:
     """
     Try CID candidates until a real (non-now_printing) DMM cover is found.
     Returns (cid, cover_url) or (None, None).
+    Inside one identify job a found cover is reused; a miss is probed again.
     """
+    memo = _job_catalog_memo()
+    key = ("cover_cid", format_display_code(str(code or "")) or str(code or ""))
+    if memo is not None and key in memo:
+        return memo[key]
+    found = _resolve_cover_cid_uncached(code)
+    if memo is not None and found[0] and found[1]:
+        memo[key] = found
+    return found
+
+
+def _resolve_cover_cid_uncached(code: str) -> tuple[str | None, str | None]:
     for cid in cover_cid_candidates(code):
         url = cover_url(cid)
         ok, final = probe_cover_url(url)
@@ -2711,6 +2726,109 @@ def dmm_cover_variant_urls(url: str) -> list[str]:
     return out
 
 
+# Catalog jackets and stills are immutable per URL. Identify, related probes,
+# and the ↓ proxy often fetch the same file within minutes. Only real JPEG
+# bytes are kept; a miss or placeholder is never cached, so a transient CDN
+# failure is retried on the next call.
+MEDIA_BYTES_CACHE_TTL_S = 1800.0
+MEDIA_BYTES_CACHE_MAX_TOTAL = 48 * 1024 * 1024
+MEDIA_BYTES_CACHE_MAX_ITEM = 4 * 1024 * 1024
+MEDIA_PREFETCH_WORKERS = 6
+_MEDIA_BYTES_CACHE: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
+_MEDIA_BYTES_CACHE_SIZE = 0
+_MEDIA_BYTES_LOCK = threading.Lock()
+
+
+def _media_bytes_cache_get(url: str) -> bytes | None:
+    now = time.monotonic()
+    with _MEDIA_BYTES_LOCK:
+        hit = _MEDIA_BYTES_CACHE.get(url)
+        if hit is None:
+            return None
+        ts, blob = hit
+        if now - ts > MEDIA_BYTES_CACHE_TTL_S:
+            _media_bytes_cache_drop_locked(url)
+            return None
+        _MEDIA_BYTES_CACHE.move_to_end(url)
+        return blob
+
+
+def _media_bytes_cache_drop_locked(url: str) -> None:
+    global _MEDIA_BYTES_CACHE_SIZE
+    old = _MEDIA_BYTES_CACHE.pop(url, None)
+    if old is not None:
+        _MEDIA_BYTES_CACHE_SIZE -= len(old[1])
+
+
+def _media_bytes_cache_put(url: str, blob: bytes) -> None:
+    global _MEDIA_BYTES_CACHE_SIZE
+    if not url or not blob or len(blob) > MEDIA_BYTES_CACHE_MAX_ITEM:
+        return
+    with _MEDIA_BYTES_LOCK:
+        _media_bytes_cache_drop_locked(url)
+        _MEDIA_BYTES_CACHE[url] = (time.monotonic(), blob)
+        _MEDIA_BYTES_CACHE_SIZE += len(blob)
+        while _MEDIA_BYTES_CACHE and _MEDIA_BYTES_CACHE_SIZE > MEDIA_BYTES_CACHE_MAX_TOTAL:
+            oldest = next(iter(_MEDIA_BYTES_CACHE))
+            _media_bytes_cache_drop_locked(oldest)
+
+
+def _media_bytes_cache_clear() -> None:
+    global _MEDIA_BYTES_CACHE_SIZE
+    with _MEDIA_BYTES_LOCK:
+        _MEDIA_BYTES_CACHE.clear()
+        _MEDIA_BYTES_CACHE_SIZE = 0
+
+
+def _prefetch_media_bytes(urls, *, workers: int = MEDIA_PREFETCH_WORKERS) -> dict[str, bytes]:
+    """Download several catalog files at once. Result order does not matter.
+
+    Each file keeps its own download_cover_bytes timeout, so this never
+    shortens a fetch; it only stops independent files from waiting in line.
+    """
+    todo: list[str] = []
+    seen: set[str] = set()
+    for u in urls or []:
+        s = str(u or "").strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        todo.append(s)
+    out: dict[str, bytes] = {}
+    if not todo:
+        return out
+    if len(todo) == 1 or workers <= 1:
+        for s in todo:
+            try:
+                blob = download_cover_bytes(s)
+            except Exception:
+                blob = None
+            if blob:
+                out[s] = blob
+        return out
+
+    def _one(s: str) -> tuple[str, bytes | None]:
+        try:
+            return s, download_cover_bytes(s)
+        except Exception:
+            return s, None
+
+    with ThreadPoolExecutor(max_workers=min(int(workers), len(todo))) as pool:
+        for s, blob in pool.map(_one, todo):
+            if blob:
+                out[s] = blob
+    return out
+
+
+def _parallel_map(fn, items: list, *, workers: int = MEDIA_PREFETCH_WORKERS) -> list:
+    """Order-preserving map over independent I/O steps."""
+    rows = list(items or [])
+    if len(rows) <= 1 or workers <= 1:
+        return [fn(x) for x in rows]
+    with ThreadPoolExecutor(max_workers=min(int(workers), len(rows))) as pool:
+        return list(pool.map(fn, rows))
+
+
 def download_cover_bytes(url: str, timeout: float | None = None) -> bytes | None:
     """Fetch candidate cover/still bytes. Prefer DMM CDN; reject placeholders."""
     if timeout is None:
@@ -2720,6 +2838,9 @@ def download_cover_bytes(url: str, timeout: float | None = None) -> bytes | None
         return None
     if is_now_printing_url(u):
         return None
+    cached = _media_bytes_cache_get(u)
+    if cached is not None:
+        return cached
     connect_t = 2.5
     read_t = max(1.5, float(timeout))
     headers_list = _cdn_header_variants()
@@ -2757,6 +2878,7 @@ def download_cover_bytes(url: str, timeout: float | None = None) -> bytes | None
                 continue
             if not _looks_like_jpeg(r.content):
                 continue
+            _media_bytes_cache_put(u, r.content)
             return r.content
         except Exception:
             continue
@@ -2827,6 +2949,8 @@ def enrich_title_candidate(c: dict, why: str = "片名候選") -> dict:
         out["genres"] = c.get("genres")
     if c.get("visual") is not None:
         out["visual"] = c.get("visual")
+    if c.get("look_alike") is not None:
+        out["look_alike"] = c.get("look_alike")
     if c.get("visual_score") is not None:
         out["visual_score"] = c.get("visual_score")
         vs = c.get("visual") or {}
@@ -3218,7 +3342,23 @@ def _catalog_genres_for_code(code: str, present: list | None = None) -> list[str
 
 
 def fetch_avbase_by_code(code: str) -> dict | None:
-    """Resolve a 品番 via avbase.net work page / works?q=code (title + actress + studio)."""
+    """Resolve a 品番 via avbase.net work page / works?q=code (title + actress + studio).
+
+    One identify job asks for the same 品番 from the OCR cross-check, the
+    candidate list, and related enrich. A found work is reused for that job
+    as a deep copy; a miss is fetched again.
+    """
+    memo = _job_catalog_memo()
+    key = ("avbase", format_display_code(str(code or "")) or str(code or "").strip().upper())
+    if memo is not None and key in memo:
+        return copy.deepcopy(memo[key])
+    found = _fetch_avbase_by_code_uncached(code)
+    if memo is not None and isinstance(found, dict) and (found.get("title") or found.get("code")):
+        memo[key] = copy.deepcopy(found)
+    return found
+
+
+def _fetch_avbase_by_code_uncached(code: str) -> dict | None:
     from urllib.parse import quote
 
     display = format_display_code(code) if parse_code_parts(code) else (code or "").strip().upper()
@@ -4030,9 +4170,93 @@ def _same_catalog_verdict(frame: float, figure: float) -> dict:
     return enforce_visual_same_work(vm)
 
 
+# Looks-alike probe for related cards when the main did not lock. This only
+# orders a「視覺相似」bucket; it never sets visual_lock or clears 未核對.
+LOOK_ALIKE_MIN = 0.58
+LOOK_ALIKE_PROBE_MAX = 10
+LOOK_ALIKE_PROBE_BUDGET_S = 6.0
+
+
+def _color_hist(img: Image.Image) -> list[float]:
+    small = img.convert("RGB").resize((48, 48), Image.Resampling.BILINEAR)
+    bins = [0.0] * 64
+    for r, g, b in small.getdata():
+        bins[(r >> 6) * 16 + (g >> 6) * 4 + (b >> 6)] += 1.0
+    total = sum(bins) or 1.0
+    return [x / total for x in bins]
+
+
+def _color_hist_similarity(a: Image.Image, b: Image.Image) -> float:
+    ha, hb = _color_hist(a), _color_hist(b)
+    return float(sum(min(x, y) for x, y in zip(ha, hb)))
+
+
+def _look_alike_score(
+    user: Image.Image,
+    catalog: Image.Image,
+    frame: float | None = None,
+    figure: float | None = None,
+) -> float:
+    """0–1 resemblance: framing, the figure region, and the colour palette.
+
+    Same pose / outfit colours / composition score high; a different jacket
+    of the same series scores lower. It is a ranking signal, not identity.
+    """
+    try:
+        if frame is None or figure is None:
+            frame, figure = _aligned_jacket_scores(user, catalog)
+        user_fig = _figure_crop(user)
+        hist = max(
+            _color_hist_similarity(user_fig, _figure_crop(view))
+            for view in _jacket_front_views(catalog, user)
+        )
+    except Exception:
+        return 0.0
+    score = 0.45 * max(0.0, float(frame)) + 0.25 * max(0.0, float(figure)) + 0.30 * hist
+    return round(max(0.0, min(1.0, score)), 3)
+
+
+def _visual_similar_strength(row: dict | None) -> float:
+    """How much this row looks like the upload. 0 when there is no such evidence.
+
+    Uses the Gemini compare already on the row (person / clothes / face /
+    pose) and the deterministic look-alike score. An explicit person *and*
+    clothes miss is not similar, whatever the palette says.
+    """
+    if not isinstance(row, dict):
+        return 0.0
+    vm = row.get("visual") if isinstance(row.get("visual"), dict) else None
+    gem = 0.0
+    if vm:
+        if vm.get("match_person") is False and vm.get("match_clothes") is False:
+            return 0.0
+        try:
+            conf = float(vm.get("confidence") or 0.0)
+        except (TypeError, ValueError):
+            conf = 0.0
+        hits = sum(
+            1
+            for k in ("match_person", "match_clothes", "match_face", "match_pose", "match_accessories")
+            if vm.get(k) is True
+        )
+        if vm.get("match_person") is True or vm.get("match_clothes") is True or conf >= 0.45:
+            gem = min(1.0, 0.35 + 0.5 * conf + 0.06 * hits)
+    try:
+        la = float(row.get("look_alike") or 0.0)
+    except (TypeError, ValueError):
+        la = 0.0
+    if la < LOOK_ALIKE_MIN:
+        la = 0.0
+    return round(max(gem, la), 3)
+
+
 def _best_same_catalog_picture(
-    user_img: Image.Image, pairs: list[tuple[dict, bytes]]
+    user_img: Image.Image,
+    pairs: list[tuple[dict, bytes]],
+    *,
+    look_alike: dict[int, float] | None = None,
 ) -> tuple[dict, float, float] | None:
+    """Same-picture winner. ``look_alike`` collects id(item) → resemblance score."""
     best: tuple[dict, float, float] | None = None
     best_key = (-1.0, -1.0)
     for item, blob in pairs:
@@ -4040,6 +4264,8 @@ def _best_same_catalog_picture(
         if catalog is None:
             continue
         frame, figure = _same_catalog_image_scores(user_img, catalog)
+        if look_alike is not None:
+            look_alike[id(item)] = _look_alike_score(user_img, catalog, frame, figure)
         if not _is_same_catalog_image(frame, figure):
             continue
         key = (float(frame), float(figure))
@@ -4055,6 +4281,12 @@ def _best_same_catalog_still(
     """A catalog still that is the upload, when the cover itself is not."""
     best: tuple[dict, float, float] | None = None
     best_key = (-1.0, -1.0)
+    _prefetch_media_bytes(
+        u
+        for item in items
+        if isinstance(item, dict)
+        for u in _collect_still_urls(item, limit=3)
+    )
     for item in items:
         if not isinstance(item, dict):
             continue
@@ -4202,8 +4434,7 @@ def rank_candidates_by_visual(
         rest = [dict(c) for i, c in enumerate(coded) if i not in pick_set]
     t0 = time.monotonic()
 
-    pairs: list[tuple[dict, bytes]] = []
-    for c in top:
+    def _prep_cover(c: dict) -> tuple[dict, bytes | None]:
         item = dict(c)
         disp_c = format_display_code(str(item["code"]))
         rcid, rcover, _ = sanitize_cover_fields(
@@ -4225,6 +4456,10 @@ def rank_candidates_by_visual(
                 blob = download_cover_bytes(alt)
                 if blob:
                     item["cover"] = alt
+        return item, blob
+
+    pairs: list[tuple[dict, bytes]] = []
+    for item, blob in _parallel_map(_prep_cover, top):
         if not blob:
             meta["skipped"] += 1
             continue
@@ -4233,7 +4468,15 @@ def rank_candidates_by_visual(
     # Identical jacket / same-composition crop is deterministic. Gemini must
     # not be able to false-fail it, and a later still with another pose must
     # not revoke it. A different picture falls through to person/clothes/pose.
-    same_hit = _best_same_catalog_picture(user_img, pairs) if user_img is not None else None
+    look_alike: dict[int, float] = {}
+    same_hit = (
+        _best_same_catalog_picture(user_img, pairs, look_alike=look_alike)
+        if user_img is not None
+        else None
+    )
+    for item, _blob in pairs:
+        if id(item) in look_alike:
+            item["look_alike"] = look_alike[id(item)]
     if same_hit is None and user_img is not None:
         still_sources = [item for item, _blob in pairs] or coded
         same_hit = _best_same_catalog_still(user_img, still_sources)
@@ -4442,16 +4685,16 @@ def rank_candidates_by_visual(
     if ranked_pairs:
         n_still_codes = min(4, len(ranked_pairs)) if len(ranked_pairs) >= 2 else 1
         flat_pairs: list[tuple[dict, bytes]] = []
-        for _sc, it in ranked_pairs[:n_still_codes]:
-            urls = _collect_still_urls(it, limit=3)
+        still_plan = [
+            (it, _collect_still_urls(it, limit=3)) for _sc, it in ranked_pairs[:n_still_codes]
+        ]
+        fetched = _prefetch_media_bytes(u for _it, urls in still_plan for u in urls)
+        for it, urls in still_plan:
             got = 0
             for u in urls:
                 if got >= 3:
                     break
-                try:
-                    blob = download_cover_bytes(u)
-                except Exception:
-                    blob = None
+                blob = fetched.get(str(u or "").strip())
                 if not blob:
                     continue
                 flat_pairs.append((dict(it), blob))
@@ -5242,6 +5485,11 @@ RELATED_KEYWORD_CAP = 5
 # Interactive「關鍵字再搜」only. Carousel keyword bucket stays RELATED_KEYWORD_CAP.
 RELATED_KEYWORD_RESEARCH_CAP = 10
 RELATED_ACTRESS_CAP = 3
+# 「視覺相似」: looks like the upload, not a confirmed same image. Only filled
+# when the main card did not visually lock.
+RELATED_VISUAL_CAP = 3
+RELATED_VISUAL_WHY = "視覺相似（未確認同圖）"
+RELATED_CAROUSEL_MAX = RELATED_THEME_CAP + RELATED_KEYWORD_CAP + RELATED_ACTRESS_CAP + RELATED_VISUAL_CAP
 # Floor for the keyword bucket. Title search may consume the shared deadline;
 # 關鍵字相關 still gets this slice, the same way 同女優 keeps its own budget.
 RELATED_KEYWORD_BUDGET = 5.0
@@ -5347,9 +5595,13 @@ def _slim_related_for_cache(items: list | None) -> list[dict]:
                 "series": it.get("series") or None,
                 "theme_keywords": list(fresh.get("theme_keywords") or []),
                 "stills": list(it.get("stills") or [])[:10] if isinstance(it.get("stills"), list) else [],
+                "look_alike": it.get("look_alike"),
+                "visual_similarity": it.get("visual_similarity"),
+                "prior_line": it.get("prior_line"),
+                "prior_why": it.get("prior_why"),
             }
         )
-        if len(slim) >= 13:
+        if len(slim) >= RELATED_CAROUSEL_MAX:
             break
     return slim
 
@@ -5384,6 +5636,8 @@ def _related_line_of(x: dict | None) -> str:
     ln = str(x.get("line") or "")
     if ln == "title":
         ln = "theme"
+    if ln == "visual":
+        return "visual"
     why = str(x.get("why") or "")
     if ln == "keyword" or (ln not in {"theme", "keyword", "actress"} and "關鍵字" in why):
         return "keyword"
@@ -5425,7 +5679,7 @@ def _carousel_related_items(payload: dict | None) -> list[dict]:
         if use_curated:
             out.append(x)
             continue
-        if ln in {"theme", "keyword", "actress", "title"} or any(
+        if ln in {"theme", "keyword", "actress", "title", "visual"} or any(
             s in why for s in ("關鍵字", "同女優", "同演員", "主題相近", "片名相近")
         ):
             out.append(x)
@@ -5655,6 +5909,7 @@ def _cap_related_buckets(items, *, main: dict | None = None) -> list[dict]:
     cards move ahead inside that bucket before the cap. No series means the
     previous order.
     """
+    visual: list[dict] = []
     theme: list[dict] = []
     keyword_pool: list[dict] = []
     actress: list[dict] = []
@@ -5674,7 +5929,9 @@ def _cap_related_buckets(items, *, main: dict | None = None) -> list[dict]:
         item["code"] = rc
         item["line"] = _related_line_of(item)
         ln = item["line"]
-        if ln == "theme":
+        if ln == "visual":
+            visual.append(item)
+        elif ln == "theme":
             theme.append(item)
         elif ln == "keyword":
             keyword_pool.append(item)
@@ -5692,7 +5949,12 @@ def _cap_related_buckets(items, *, main: dict | None = None) -> list[dict]:
         RELATED_KEYWORD_CAP,
         main=main if prefer else None,
     )
-    return theme[:RELATED_THEME_CAP] + keyword + actress[:RELATED_ACTRESS_CAP]
+    return (
+        visual[:RELATED_VISUAL_CAP]
+        + theme[:RELATED_THEME_CAP]
+        + keyword
+        + actress[:RELATED_ACTRESS_CAP]
+    )
 
 
 def _keyword_related_sort_key(item: dict | None) -> tuple:
@@ -5794,6 +6056,8 @@ class _JobZhState:
         self.depth = 0
         self.memo: dict[str, str] = {}
         self.fetched: set[str] = set()
+        # Positive catalog lookups for this identify job only (cover CID, work page).
+        self.catalog: dict[tuple, Any] = {}
 
 
 _JOB_ZH = threading.local()
@@ -5814,6 +6078,7 @@ def _job_zh_begin() -> None:
     if st.depth == 0:
         st.memo.clear()
         st.fetched.clear()
+        st.catalog.clear()
     st.depth += 1
 
 
@@ -5823,6 +6088,13 @@ def _job_zh_end() -> None:
     if st.depth == 0:
         st.memo.clear()
         st.fetched.clear()
+        st.catalog.clear()
+
+
+def _job_catalog_memo() -> dict | None:
+    """This job's catalog memo, or None outside an identify job."""
+    st = _job_zh_state()
+    return st.catalog if st.depth > 0 else None
 
 
 def _keep_stored_title_zh(raw, title_ja=None, code=None) -> str | None:
@@ -5971,7 +6243,7 @@ def _related_title_slide(item: dict | None) -> bool:
     """Carousel slides (片名 / 關鍵字 / 同演員), not a 主作品 row."""
     if not isinstance(item, dict):
         return False
-    return str(item.get("line") or "") in {"theme", "keyword", "actress", "title"}
+    return str(item.get("line") or "") in {"theme", "keyword", "actress", "title", "visual"}
 
 
 def _fill_unfetched_title_zh(payload: dict, *, budget_sec: float = 8.0) -> dict:
@@ -7202,8 +7474,7 @@ def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None)
         return None
     if min(user.size) < 64:
         return None
-    scored: list[tuple[float, dict]] = []
-    for cand in coded[:12]:
+    def _jacket_blob(cand: dict) -> bytes | None:
         disp = format_display_code(str(cand.get("code")))
         cid = str(cand.get("cid") or "") or (code_to_cid(disp) or "")
         url = str(cand.get("cover") or "") or (cover_url(cid) if cid else "")
@@ -7212,6 +7483,11 @@ def _jacket_lock_winner(user_image_bytes: bytes | None, candidates: list | None)
             alt = cover_url(cid)
             if alt and alt != url:
                 blob = download_cover_bytes(alt)
+        return blob
+
+    scored: list[tuple[float, dict]] = []
+    picked = coded[:12]
+    for cand, blob in zip(picked, _parallel_map(_jacket_blob, picked)):
         if not blob:
             continue
         try:
@@ -12421,11 +12697,22 @@ def _rescue_weak_visual_related(payload: dict | None) -> dict | None:
     def _supports(row: dict) -> str | None:
         return _related_support_line(row, **ctx)
 
+    visual_rows = _pick_visual_similar_rows(
+        existing + [x for x in (payload.get("candidates") or []) if isinstance(x, dict)],
+        main_code=main_code,
+    )
+
     kept: list[dict] = []
     seen: set[str] = set()
     if main_code:
         seen.add(main_code)
+    for row in visual_rows:
+        seen.add(str(row.get("code")))
     for row in existing:
+        if _related_line_of(row) == "visual":
+            row = _unpick_visual_row(row)
+            if row is None:
+                continue
         raw_code = str(row.get("code") or "")
         if not raw_code or not parse_code_parts(raw_code):
             continue
@@ -12474,7 +12761,7 @@ def _rescue_weak_visual_related(payload: dict | None) -> dict | None:
             item.pop("title_zh", None)
         fresh.append(item)
 
-    combined = kept + fresh
+    combined = visual_rows + kept + fresh
     if not combined:
         return payload
 
@@ -12499,7 +12786,8 @@ def _rescue_weak_visual_related(payload: dict | None) -> dict | None:
         return [it for _i, it in rows[:cap]]
 
     out = (
-        _take("theme", RELATED_THEME_CAP)
+        visual_rows[:RELATED_VISUAL_CAP]
+        + _take("theme", RELATED_THEME_CAP)
         + _take("keyword", RELATED_KEYWORD_CAP)
         + _take("actress", RELATED_ACTRESS_CAP)
     )
@@ -12507,6 +12795,139 @@ def _rescue_weak_visual_related(payload: dict | None) -> dict | None:
         return payload
     payload["related_by_title"] = _sanitize_related_rows(out)
     return payload
+
+
+def _pick_visual_similar_rows(rows: list[dict], *, main_code: str | None) -> list[dict]:
+    """Up to RELATED_VISUAL_CAP rows that look like the upload, best first.
+
+    Rows with a catalog jacket go ahead so the user can recognise the work.
+    Each row is labelled similar-not-confirmed; nothing here locks a work.
+    Chinese titles are carried only when the row already has one.
+    """
+    pool: list[tuple[tuple, dict]] = []
+    seen: set[str] = set()
+    for idx, raw in enumerate(rows or []):
+        if not isinstance(raw, dict):
+            continue
+        raw_code = str(raw.get("code") or "")
+        if not raw_code or not parse_code_parts(raw_code):
+            continue
+        code = format_display_code(raw_code)
+        if main_code and (code == main_code or codes_numeric_equal(code, main_code)):
+            continue
+        strength = _visual_similar_strength(raw)
+        if strength <= 0 and _related_line_of(raw) == "visual":
+            try:
+                strength = float(raw.get("visual_similarity") or 0.0)
+            except (TypeError, ValueError):
+                strength = 0.0
+        if strength <= 0:
+            continue
+        if code in seen:
+            continue
+        seen.add(code)
+        item = _sanitize_related_row(dict(raw))
+        item["code"] = code
+        prior_line = str(raw.get("line") or "")
+        if prior_line in {"theme", "title", "keyword", "actress"}:
+            item["prior_line"] = _related_line_of(raw)
+            item["prior_why"] = str(raw.get("why") or "")
+        item["line"] = "visual"
+        item["why"] = RELATED_VISUAL_WHY
+        item["visual_similarity"] = strength
+        item.pop("visual_lock", None)
+        item.pop("visual_score", None)
+        item.pop("score", None)
+        if not str(raw.get("title_zh") or "").strip():
+            item.pop("title_zh", None)
+        cover = 1 if _related_has_real_cover(item) else 0
+        pool.append(((cover, strength, -idx), item))
+    pool.sort(key=lambda pair: pair[0], reverse=True)
+    return [it for _k, it in pool[:RELATED_VISUAL_CAP]]
+
+
+def _unpick_visual_row(row: dict) -> dict | None:
+    """A 視覺相似 row that lost its slot goes back to its old bucket, if it had one."""
+    prior = str(row.get("prior_line") or "")
+    if prior not in {"theme", "keyword", "actress"}:
+        return None
+    back = dict(row)
+    back["line"] = prior
+    back["why"] = str(row.get("prior_why") or "") or back.get("why")
+    for key in ("prior_line", "prior_why", "visual_similarity"):
+        back.pop(key, None)
+    return back
+
+
+def _probe_related_look_alike(
+    payload: dict | None,
+    image_bytes: bytes | None,
+    *,
+    budget_s: float = LOOK_ALIKE_PROBE_BUDGET_S,
+) -> dict | None:
+    """Score related / candidate jackets against the upload when the main is weak.
+
+    Downloads run in parallel and stop waiting at ``budget_s``; unfinished
+    rows are simply left unscored. Then the weak-card rescue re-buckets so the
+    closest-looking works fill 視覺相似. Locked or manual cards are untouched.
+    """
+    if not isinstance(payload, dict) or not image_bytes or not _card_visual_is_weak(payload):
+        return payload
+    user_img = _open_rgb_image(image_bytes)
+    if user_img is None or min(user_img.size) < 32:
+        return payload
+    main_code = _catalog_code_of(payload)
+    rows: list[dict] = []
+    seen: set[str] = set()
+    sources = list(payload.get("related_by_title") or []) + list(payload.get("candidates") or [])
+    for row in sources:
+        if not isinstance(row, dict) or row.get("look_alike") is not None:
+            continue
+        raw_code = str(row.get("code") or "")
+        if not raw_code or not parse_code_parts(raw_code):
+            continue
+        code = format_display_code(raw_code)
+        if code in seen or (main_code and codes_numeric_equal(code, main_code)):
+            continue
+        if not _catalog_jacket_url(row.get("cover") or row.get("cover_url")):
+            continue
+        seen.add(code)
+        rows.append(row)
+        if len(rows) >= LOOK_ALIKE_PROBE_MAX:
+            break
+    if not rows:
+        return payload
+
+    def _cover_of(row: dict) -> str:
+        return _catalog_jacket_url(row.get("cover") or row.get("cover_url"))
+
+    pool = ThreadPoolExecutor(max_workers=min(MEDIA_PREFETCH_WORKERS, len(rows)))
+    try:
+        futures = {pool.submit(download_cover_bytes, _cover_of(r)): r for r in rows}
+        done, _pending = wait(list(futures), timeout=max(0.5, float(budget_s)))
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
+    by_code: dict[str, float] = {}
+    for fut in done:
+        row = futures[fut]
+        try:
+            blob = fut.result()
+        except Exception:
+            blob = None
+        catalog = _open_rgb_image(blob)
+        if catalog is None:
+            continue
+        score = _look_alike_score(user_img, catalog)
+        row["look_alike"] = score
+        by_code[format_display_code(str(row.get("code")))] = score
+    if not by_code:
+        return payload
+    for row in sources:
+        if isinstance(row, dict) and row.get("look_alike") is None:
+            code = format_display_code(str(row.get("code") or ""))
+            if code in by_code:
+                row["look_alike"] = by_code[code]
+    return _rescue_weak_visual_related(payload)
 
 
 def attach_related_by_title(
@@ -12603,7 +13024,7 @@ def attach_related_by_title(
                 if not isinstance(r, dict):
                     continue
                 fixed.append(_preserve_related_bucket(r))
-            item["related_by_title"] = fixed[:13]
+            item["related_by_title"] = fixed[:RELATED_CAROUSEL_MAX]
             try:
                 attach_chinese_titles(
                     item,
@@ -14799,6 +15220,15 @@ def _run_multi_identify_pipeline_inner(
             filled = attach_related_by_title(
                 row, budget_sec=_related_budget_for_slot(row), per_item=False
             )
+            slot_img = row.get("from_image_index")
+            if isinstance(slot_img, int) and 1 <= slot_img <= len(images):
+                try:
+                    filled = (
+                        _probe_related_look_alike(filled, images[slot_img - 1][0], budget_s=4.0)
+                        or filled
+                    )
+                except Exception:
+                    pass
             rel = _sanitize_related_rows(filled.get("related_by_title") or [])
             row["related_by_title"] = rel
             total_rel += len(rel)
@@ -15083,6 +15513,11 @@ def _complete_identify_result(
             result = attach_related_by_title(result, budget_sec=budget)
         except Exception:
             result.setdefault("related_by_title", [])
+        if image_bytes:
+            try:
+                result = _probe_related_look_alike(result, image_bytes) or result
+            except Exception:
+                pass
     else:
         result.setdefault("related_by_title", [])
     _stamp_listed_work_keywords(result)
