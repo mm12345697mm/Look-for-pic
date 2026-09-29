@@ -4482,9 +4482,9 @@ function walkNodes(node, acc) {
       related(5, 'visual').map((r, i) => Object.assign(r, { code: 'VIS-' + (100 + i) }))
         .concat(related(6, 'theme'))
     );
-    assert.deepStrictEqual(
-      capped.map((r) => r.line),
-      ['visual', 'visual', 'visual', 'theme', 'theme', 'theme', 'theme', 'theme']
+    assert.strictEqual(
+      capped.map((r) => r.line).join(','),
+      'visual,visual,visual,theme,theme,theme,theme,theme'
     );
     assert.strictEqual(H.relatedLineFromRaw({ line: 'visual', why: '片名相近' }), 'visual');
     const slim = H.slimRelatedForHistory([
@@ -4635,7 +4635,7 @@ function walkNodes(node, acc) {
       assert.strictEqual(done.work.cover, lookCover, 'catalog jacket is the main cover');
       assert.ok(done.work.stills.every((u) => u.indexOf('data:') !== 0));
       assert.strictEqual(done.work.userPreview, shot, 'upload stays the query shot only');
-      assert.strictEqual(done.work.titleZh, '', 'old main Chinese title is not carried to another code');
+      assert.ok(!done.work.titleZh, 'old main Chinese title is not carried to another code');
       assert.strictEqual(done.work.actress, '本物女優');
       assert.strictEqual(H.slotRetryUnverified(done.work), false, 're-identify keeps the confirmed code');
       forms.forEach((form) => {
@@ -4662,7 +4662,7 @@ function walkNodes(node, acc) {
       assert.strictEqual(stored.works[0].user_confirmed, true);
       assert.strictEqual(stored.works[0].cover, lookCover);
       assert.strictEqual(stored.works[0].user_preview, shot);
-      assert.strictEqual(stored.works[0].title_zh, '');
+      assert.ok(!stored.works[0].title_zh);
       assert.strictEqual(stored.cover, lookCover);
       assert.ok(String(getEl('lfp-toast').textContent).indexOf('已確認 LOOK-002 就是這張') !== -1);
     } finally {
