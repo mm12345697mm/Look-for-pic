@@ -235,6 +235,23 @@ vm.runInContext(src, context);
 const H = context.window.__lfpHistory;
 assert.ok(H, 'expected window.__lfpHistory test hook');
 
+// Each scenario installs its own fetch stub, i.e. a fresh network. The ↓ image
+// cache in app.js is per page load, so drop it whenever the stub changes.
+{
+  let fetchStub = context.fetch;
+  Object.defineProperty(context, 'fetch', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      return fetchStub;
+    },
+    set(fn) {
+      fetchStub = fn;
+      if (H.clearWorkImageCache) H.clearWorkImageCache();
+    },
+  });
+}
+
 function related(n, line) {
   return Array.from({ length: n }, (_, i) => ({
     code: 'REL-' + String(i + 1).padStart(3, '0'),
@@ -4456,6 +4473,201 @@ function walkNodes(node, acc) {
       true
     );
     assert.strictEqual(H.slotRetryUnverified({ code: 'APGH-012', visualLock: true }), false);
+  }
+
+  // 視覺相似 bucket and 「就是這張」: unpressed rows stay similar only; pressing
+  // puts that work in the main slot as a confirmed lock with its catalog jacket.
+  {
+    const capped = H.capRelatedBuckets(
+      related(5, 'visual').map((r, i) => Object.assign(r, { code: 'VIS-' + (100 + i) }))
+        .concat(related(6, 'theme'))
+    );
+    assert.deepStrictEqual(
+      capped.map((r) => r.line),
+      ['visual', 'visual', 'visual', 'theme', 'theme', 'theme', 'theme', 'theme']
+    );
+    assert.strictEqual(H.relatedLineFromRaw({ line: 'visual', why: '片名相近' }), 'visual');
+    const slim = H.slimRelatedForHistory([
+      { code: 'VIS-001', line: 'visual', why: '視覺相似（未確認同圖）', visual_similarity: 0.7, prior_line: 'theme' },
+    ]);
+    assert.strictEqual(slim[0].line, 'visual');
+    assert.strictEqual(slim[0].visual_similarity, 0.7);
+    assert.strictEqual(slim[0].prior_line, 'theme');
+
+    const shot = 'data:image/jpeg;base64,likeshot';
+    const mainCover = 'https://pics.dmm.co.jp/digital/video/weak00001/weak00001pl.jpg';
+    const lookCover = 'https://pics.dmm.co.jp/digital/video/look00002/look00002pl.jpg';
+    const upload = {
+      ok: true,
+      code: 'WEAK-001',
+      title: '別の作品',
+      title_zh: '弱主中文',
+      actress: '別女優',
+      cover: mainCover,
+      cid: 'weak00001',
+      user_preview: shot,
+      from_image_index: 1,
+      visual_mismatch: true,
+      visual_lock: false,
+      visual_note: '未核對圖片（人物／衣服／姿勢與這張上傳圖不符）',
+      related_by_title: [
+        {
+          code: 'LOOK-002',
+          title: '似ている作品',
+          line: 'visual',
+          why: '視覺相似（未確認同圖）',
+          cover: lookCover,
+          visual_similarity: 0.74,
+        },
+        {
+          code: 'WEAK-003',
+          title: '同系列',
+          title_zh: '同系列中',
+          line: 'theme',
+          why: '同系列',
+          cover: 'https://pics.dmm.co.jp/digital/video/weak00003/weak00003pl.jpg',
+        },
+      ],
+    };
+    const works = H.sessionWorksFromIdentify(upload);
+    const rec = {
+      id: 'confirm-session',
+      ts: Date.now(),
+      kind: 'session',
+      code: works[0].code,
+      title: works[0].title,
+      title_zh: works[0].title_zh,
+      cover: works[0].cover,
+      related: works[0].related,
+      userShots: [shot],
+      works: works,
+    };
+    const saved = H.loadHistory();
+    saved.unshift(rec);
+    H.saveHistory(saved);
+    H.renderGallery(H.galleryFromIdentify(upload));
+
+    function labelsOf(node) {
+      return walkNodes(node)
+        .filter((n) => n.tagName === 'BUTTON' && String(n.className || '').indexOf('work-action') !== -1)
+        .map((n) => n.getAttribute('aria-label'));
+    }
+    function textOf(node) {
+      return walkNodes(node).map((n) => n._text || '').join('\n');
+    }
+    const CONFIRM = '就是這張（與上傳圖為同一張圖）';
+    let blocks = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+    assert.strictEqual(blocks.length, 1);
+    let slides = walkNodes(blocks[0]).filter((n) => n.className === 'work-carousel-slide');
+    assert.strictEqual(slides.length, 3);
+    assert.ok(labelsOf(slides[0]).indexOf(CONFIRM) === -1, 'main card has no 就是這張');
+    assert.ok(textOf(slides[0]).indexOf('未核對') !== -1);
+    assert.ok(labelsOf(slides[1]).indexOf(CONFIRM) !== -1, 'similar card shows 就是這張');
+    assert.ok(labelsOf(slides[2]).indexOf(CONFIRM) !== -1, 'other related cards can confirm too');
+    const simText = textOf(slides[1]);
+    assert.ok(simText.indexOf('視覺相似（未確認）') !== -1, simText);
+    assert.ok(simText.indexOf('尚未確認為同一張圖') !== -1, simText);
+    const simImgs = walkNodes(slides[1]).filter((n) => n.tagName === 'IMG').map((n) => String(n.src || ''));
+    assert.ok(simImgs.indexOf(lookCover) !== -1, 'similar row still shows its catalog cover');
+    const hint = walkNodes(blocks[0]).find((n) => n.className === 'work-carousel-hint');
+    assert.ok(String(hint.textContent).indexOf('視覺相似') !== -1, hint.textContent);
+
+    const untouched = H.loadHistory().find((x) => x.id === 'confirm-session');
+    assert.strictEqual(untouched.works[0].code, 'WEAK-001', 'unpressed: main stays');
+    assert.strictEqual(untouched.works[0].visual_mismatch, true, 'unpressed: 未核對 stays');
+    assert.strictEqual(untouched.works[0].visual_lock, false);
+    assert.strictEqual(untouched.works[0].related[0].line, 'visual', 'unpressed: row stays similar');
+
+    const noUpload = Object.assign({}, upload, { user_preview: '', from_image_index: null });
+    H.renderGallery(H.galleryFromIdentify(noUpload));
+    const plain = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-slide');
+    assert.ok(plain.every((s) => labelsOf(s).indexOf(CONFIRM) === -1), 'code-only search has no 就是這張');
+    H.renderGallery(H.galleryFromIdentify(upload));
+
+    const forms = [];
+    function RecForm() {
+      this.pairs = [];
+      forms.push(this);
+    }
+    RecForm.prototype.append = function (k, v) {
+      this.pairs.push([String(k), v]);
+    };
+    const prevForm = context.FormData;
+    context.FormData = RecForm;
+    context.fetch = async (url, opts) => {
+      const u = String(url || '');
+      if (u.indexOf('/api/identify/stream') !== -1) {
+        return { ok: false, status: 404, headers: { get: () => '' }, body: null, json: async () => ({}) };
+      }
+      if (u.indexOf('/api/identify') !== -1) {
+        return {
+          ok: true,
+          status: 200,
+          headers: { get: () => 'application/json' },
+          json: async () => ({
+            ok: true,
+            code: 'LOOK-002',
+            title: '似ている作品',
+            actress: '本物女優',
+            cid: 'look00002',
+            cover: lookCover,
+            user_preview: shot,
+            stills: ['https://pics.dmm.co.jp/digital/video/look00002/look00002jp-1.jpg', shot],
+            visual_lock: false,
+            related_by_title: [],
+          }),
+        };
+      }
+      return { ok: false, status: 404, headers: { get: () => '' }, json: async () => ({}) };
+    };
+    try {
+      blocks = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+      slides = walkNodes(blocks[0]).filter((n) => n.className === 'work-carousel-slide');
+      const btn = walkNodes(slides[1]).find((n) => n.getAttribute && n.getAttribute('aria-label') === CONFIRM);
+      assert.strictEqual(btn.textContent, '就是這張');
+      btn.click();
+      const done = await H.promoteTask();
+      assert.strictEqual(done.ok, true, done && done.reason);
+      assert.strictEqual(done.work.code, 'LOOK-002');
+      assert.strictEqual(done.work.visualLock, true);
+      assert.strictEqual(done.work.visualMismatch, false);
+      assert.strictEqual(done.work.visualNote, '');
+      assert.strictEqual(done.work.cover, lookCover, 'catalog jacket is the main cover');
+      assert.ok(done.work.stills.every((u) => u.indexOf('data:') !== 0));
+      assert.strictEqual(done.work.userPreview, shot, 'upload stays the query shot only');
+      assert.strictEqual(done.work.titleZh, '', 'old main Chinese title is not carried to another code');
+      assert.strictEqual(done.work.actress, '本物女優');
+      assert.strictEqual(H.slotRetryUnverified(done.work), false, 're-identify keeps the confirmed code');
+      forms.forEach((form) => {
+        const keys = form.pairs.map((p) => p[0]);
+        assert.ok(keys.indexOf('image') === -1 && keys.indexOf('images') === -1, keys.join(','));
+      });
+
+      const after = walkNodes(getEl('gallery-cards')).filter((n) => n.className === 'work-carousel-block');
+      assert.strictEqual(after.length, 1, 'confirm replaces this slot, it does not append');
+      const mainSlide = walkNodes(after[0]).filter((n) => n.className === 'work-carousel-slide')[0];
+      const mainText = textOf(mainSlide);
+      assert.ok(mainText.indexOf('LOOK-002') !== -1, mainText);
+      assert.ok(mainText.indexOf('未核對') === -1, mainText);
+      assert.ok(mainText.indexOf('已確認：就是這張') !== -1, mainText);
+      const relCodes = walkNodes(after[0]).filter((n) => n.className === 'card-code').map((n) => n.textContent);
+      assert.ok(relCodes.indexOf('WEAK-003') !== -1, 'other related rows stay');
+      assert.strictEqual(relCodes.filter((c) => c === 'LOOK-002').length, 1, 'confirmed code is not also a related row');
+
+      const stored = H.loadHistory().find((x) => x.id === 'confirm-session');
+      assert.strictEqual(stored.works.length, 1);
+      assert.strictEqual(stored.works[0].code, 'LOOK-002');
+      assert.strictEqual(stored.works[0].visual_lock, true);
+      assert.strictEqual(stored.works[0].visual_mismatch, false);
+      assert.strictEqual(stored.works[0].user_confirmed, true);
+      assert.strictEqual(stored.works[0].cover, lookCover);
+      assert.strictEqual(stored.works[0].user_preview, shot);
+      assert.strictEqual(stored.works[0].title_zh, '');
+      assert.strictEqual(stored.cover, lookCover);
+      assert.ok(String(getEl('lfp-toast').textContent).indexOf('已確認 LOOK-002 就是這張') !== -1);
+    } finally {
+      context.FormData = prevForm;
+    }
   }
 
   console.log('test_history_session.js: ok');
