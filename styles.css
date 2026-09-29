@@ -345,6 +345,21 @@ label.btn {
   overflow-wrap: normal;
   line-break: strict;
 }
+.card-similar-note,
+.card-confirmed-note {
+  margin: 6px 0 0;
+  font-size: 0.78rem;
+  line-height: 1.4;
+  word-break: normal;
+  overflow-wrap: normal;
+  line-break: strict;
+}
+.card-similar-note {
+  color: var(--muted);
+}
+.card-confirmed-note {
+  color: var(--ok);
+}
 .cjk-atom {
   white-space: nowrap;
 }
@@ -1370,6 +1385,12 @@ body.lightbox-open {
 .work-action-promote {
   padding: 0 8px;
   color: var(--text);
+  letter-spacing: 0;
+}
+.work-action-confirm {
+  padding: 0 8px;
+  border-color: var(--ok);
+  color: var(--ok);
   letter-spacing: 0;
 }
 .work-action:active {

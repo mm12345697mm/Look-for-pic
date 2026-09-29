@@ -146,8 +146,11 @@
     return /now_printing/i.test(s) || /\/noimage\//i.test(s);
   }
 
+  // 視覺相似 3 + 片名 5 + 關鍵字 5 + 同演員 3.
+  const RELATED_CAROUSEL_MAX = 16;
+
   function slimRelatedForHistory(items) {
-    return (Array.isArray(items) ? items : []).slice(0, 13).map((r) => ({
+    return (Array.isArray(items) ? items : []).slice(0, RELATED_CAROUSEL_MAX).map((r) => ({
       code: r.code || '',
       title: r.title || '',
       title_zh: r.title_zh || r.titleZh || '',
@@ -164,7 +167,15 @@
       ),
       search_elapsed_ms: elapsedMsValue(r.search_elapsed_ms != null ? r.search_elapsed_ms : r.searchElapsedMs),
       work_elapsed_ms: elapsedMsValue(r.work_elapsed_ms != null ? r.work_elapsed_ms : r.workElapsedMs),
+      visual_similarity: visualSimilarityOf(r),
+      prior_line: r.prior_line || r.priorLine || '',
+      prior_why: r.prior_why || r.priorWhy || '',
     }));
+  }
+
+  function visualSimilarityOf(r) {
+    const n = Number(r && (r.visual_similarity != null ? r.visual_similarity : r.visualSimilarity));
+    return Number.isFinite(n) && n > 0 ? n : null;
   }
 
   function whyIsActressBucket(why) {
@@ -180,6 +191,7 @@
     const why = String((r && r.why) || '');
     let rl = (r && r.line) || '';
     if (rl === 'title') rl = 'theme';
+    if (rl === 'visual') return 'visual';
     // Explicit bucket wins. A 同女優 note that only mentions 主題 in passing
     // stays actress so it cannot sit between 片名 and 關鍵字.
     if (rl === 'keyword') return 'keyword';
@@ -199,7 +211,9 @@
     if (!r) return false;
     const line = String(r.line || '');
     const why = String(r.why || '');
-    if (line === 'theme' || line === 'keyword' || line === 'actress' || line === 'title') return true;
+    if (line === 'theme' || line === 'keyword' || line === 'actress' || line === 'title' || line === 'visual') {
+      return true;
+    }
     if (line === 'main' || line === 'multi' || line === 'candidate') return false;
     if (/候選|candidate/i.test(why) || /多圖/i.test(why)) return false;
     if (/主題|theme|片名相近/i.test(why)) return true;
@@ -402,8 +416,8 @@
   }
 
   function capRelatedBuckets(items) {
-    const buckets = { theme: [], keyword: [], actress: [] };
-    const caps = { theme: 5, keyword: 5, actress: 3 };
+    const buckets = { visual: [], theme: [], keyword: [], actress: [] };
+    const caps = { visual: 3, theme: 5, keyword: 5, actress: 3 };
     const seen = {};
     (items || []).forEach((r) => {
       if (!r || !r.code) return;
@@ -414,7 +428,7 @@
       seen[key] = true;
       buckets[line].push(Object.assign({}, r, { line: line }));
     });
-    return buckets.theme.concat(buckets.keyword, buckets.actress);
+    return buckets.visual.concat(buckets.theme, buckets.keyword, buckets.actress);
   }
 
   function mergeRelatedIncremental(existing, incoming) {
@@ -558,6 +572,7 @@
       visual_mismatch: !!(src.visual_mismatch || src.visualMismatch),
       visual_lock: !!(src.visual_lock || src.visualLock),
       visual_note: String(src.visual_note || src.visualNote || '').trim(),
+      user_confirmed: !!(src.user_confirmed || src.userConfirmed),
       unidentified: skippedSlot ? false : !!(src.unidentified || src.frame_unidentified),
       skipped: skippedSlot,
       user_preview: String(src.user_preview || src.userPreview || '').trim(),
@@ -1188,7 +1203,7 @@
   }
 
   function isRelatedCarouselLine(line) {
-    return line === 'theme' || line === 'keyword' || line === 'actress';
+    return line === 'theme' || line === 'keyword' || line === 'actress' || line === 'visual';
   }
 
   function isCatalogMediaUrl(url) {
@@ -1274,6 +1289,10 @@
       visualMismatch: !!(raw.visual_mismatch || raw.visualMismatch),
       visualLock: !!(raw.visual_lock || raw.visualLock),
       visualNote: String(raw.visual_note || raw.visualNote || '').trim(),
+      userConfirmed: !!(raw.user_confirmed || raw.userConfirmed),
+      visualSimilarity: visualSimilarityOf(raw),
+      priorLine: String(raw.prior_line || raw.priorLine || ''),
+      priorWhy: String(raw.prior_why || raw.priorWhy || ''),
       jobElapsedMs: elapsedMsValue(raw.job_elapsed_ms != null ? raw.job_elapsed_ms : raw.jobElapsedMs),
       workElapsedMs: elapsedMsValue(raw.work_elapsed_ms != null ? raw.work_elapsed_ms : raw.workElapsedMs),
       searchElapsedMs: elapsedMsValue(
@@ -2748,6 +2767,7 @@
     if (line === 'main') return '主作品';
     if (line === 'theme') return '主題相近';
     if (line === 'actress') return '同女優';
+    if (line === 'visual') return '視覺相似';
     if (line === 'keyword') return '關鍵字';
     if (line === 'candidate') return '片名候選';
     if (line === 'multi') return '多圖辨識';
@@ -2862,7 +2882,9 @@
       const line = String((rw && rw.line) || '');
       return line === 'theme' || line === 'title' || why.includes('片名') || why.includes('主題');
     });
+    const hasVisual = (relatedList || []).some((rw) => String((rw && rw.line) || '') === 'visual');
     const parts = [];
+    if (hasVisual) parts.push('視覺相似');
     if (hasTitle) parts.push('片名');
     if (hasKeyword) {
       const kws = normalizeKeywordList(keywords);
@@ -2910,6 +2932,19 @@
       );
       meta.appendChild(noteEl);
     }
+    if (w.userConfirmed && !w.visualMismatch) {
+      const okEl = document.createElement('p');
+      okEl.className = 'card-confirmed-note';
+      okEl.textContent = '已確認：就是這張';
+      meta.appendChild(okEl);
+    } else if (String(w.line || '') === 'visual') {
+      const simEl = document.createElement('p');
+      simEl.className = 'card-similar-note';
+      simEl.textContent = opts.confirmSame
+        ? '外觀相似，尚未確認為同一張圖；若是請按「就是這張」'
+        : '外觀相似，尚未確認為同一張圖';
+      meta.appendChild(simEl);
+    }
     const badge = w.skipped ? '已跳過' : (opts.badgeLabel || lineLabel(w.line));
     const hitKeywords =
       badge === '關鍵字'
@@ -2939,7 +2974,7 @@
     appendCover(coverWrap, w);
 
     card.appendChild(meta);
-    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap));
+    if (!w.skipped) card.appendChild(buildWorkActions(w, coverWrap, { confirmSame: !!opts.confirmSame }));
     card.appendChild(coverWrap);
     if (workNeedsManualFix(w)) {
       card.appendChild(buildManualFixPanel(w, card));
@@ -3233,8 +3268,27 @@
     return null;
   }
 
-  function finalizeManualWork(prior, source) {
-    const next = mergeManualFixIntoWork(prior, source, '');
+  /** Upload identity of a slot only: no code, title, gloss, or related of the old work. */
+  function slotIdentityOf(prior) {
+    const p = prior || {};
+    return {
+      line: p.line || 'main',
+      fromImageIndex: p.fromImageIndex || p.from_image_index || null,
+      userPreview: String(p.userPreview || p.user_preview || '').trim(),
+    };
+  }
+
+  function finalizeManualWork(prior, source, opts) {
+    const confirm = opts && opts.confirm;
+    const next = mergeManualFixIntoWork(confirm ? slotIdentityOf(prior) : prior, source, '');
+    if (confirm) {
+      Object.assign(next, confirm);
+      if (!(next.relatedByTitle && next.relatedByTitle.length)) {
+        next.relatedByTitle = ((prior && prior.relatedByTitle) || []).filter(
+          (r) => r && r.code && !codesMatch(String(r.code), String(next.code || ''))
+        );
+      }
+    }
     next.line = (prior && prior.line) || next.line || 'main';
     next.fromImageIndex = (prior && (prior.fromImageIndex || prior.from_image_index)) || next.fromImageIndex || null;
     next.userPreview = String((prior && (prior.userPreview || prior.user_preview)) || '').trim();
@@ -3282,6 +3336,12 @@
       from_image_index: imageIndex,
       line: nextW.line || (slotIndex === 0 ? 'main' : 'multi'),
     };
+    if (nextW.userConfirmed) {
+      single.visual_lock = true;
+      single.visual_mismatch = false;
+      single.visual_note = '';
+      single.user_confirmed = true;
+    }
     lastIdentifyPayload = mergeSlotRetryIntoIdentify(lastIdentifyPayload, imageIndex, single);
   }
 
@@ -3300,10 +3360,11 @@
    * Put a catalog identify back into the same vertical gallery slot.
    * Other uploads stay. Candidates do not become new rows.
    */
-  function placeManualWorkInSlot(oldW, source, card, preferHistoryId) {
+  function placeManualWorkInSlot(oldW, source, card, preferHistoryId, opts) {
     const surface = card ? surfaceForCard(card) : (viewingHistoryId ? 'history' : 'gallery');
     const block = card ? closestEl(card, 'work-carousel-block') : null;
-    const mainSlide = isMainSlideCard(card);
+    // 「就是這張」 from a related slide replaces this carousel's main work.
+    const mainSlide = !!(opts && opts.confirm) || isMainSlideCard(card);
 
     if (!mainSlide && card) {
       const nextW = finalizeManualWork(oldW, source);
@@ -3311,6 +3372,7 @@
       const nextCard = buildWorkCard(nextW, {
         slide: true,
         badgeLabel: lineLabel(nextW.line),
+        confirmSame: cardHasConfirmSame(card),
       });
       replaceNode(card, nextCard);
       return { work: nextW, slotIndex: block ? carouselSlotIndex(block) : 0 };
@@ -3324,7 +3386,7 @@
       let slotIndex = block ? carouselSlotIndex(block) : indexOfGallerySlot(works, oldW);
       if (slotIndex < 0 || slotIndex >= works.length) slotIndex = 0;
       const prior = historyWorkToGallery(works[slotIndex], slotIndex) || oldW || {};
-      const nextW = finalizeManualWork(prior, source);
+      const nextW = finalizeManualWork(prior, source, opts);
       const hist = historyWorkFromResolvedSlot(nextW, prior);
       if (idx >= 0) writePromotedHistorySlot(idx, slotIndex, hist);
       const fresh = loadHistory().find((x) => x && x.id === viewingHistoryId);
@@ -3336,7 +3398,7 @@
     let slotIndex = block ? carouselSlotIndex(block) : indexOfGallerySlot(before, oldW);
     if (slotIndex < 0) slotIndex = 0;
     const prior = before[slotIndex] || oldW || {};
-    const nextW = finalizeManualWork(prior, source);
+    const nextW = finalizeManualWork(prior, source, opts);
     const items = before.slice();
     if (!items.length) items.push(nextW);
     else if (slotIndex >= items.length) items.push(nextW);
@@ -3489,6 +3551,7 @@
     const nextCard = buildWorkCard(nextW, {
       slide: !!(slide && elHasClass(slide, 'work-carousel-slide')),
       badgeLabel: badge || undefined,
+      confirmSame: cardHasConfirmSame(card),
     });
     replaceNode(card, nextCard);
     return nextCard;
@@ -3899,6 +3962,9 @@
       matched_keywords: (r && (r.matchedKeywords || r.matched_keywords)) || [],
       search_elapsed_ms: elapsedMsValue(r && (r.searchElapsedMs != null ? r.searchElapsedMs : r.search_elapsed_ms)),
       work_elapsed_ms: elapsedMsValue(r && (r.workElapsedMs != null ? r.workElapsedMs : r.work_elapsed_ms)),
+      visual_similarity: visualSimilarityOf(r),
+      prior_line: (r && (r.priorLine || r.prior_line)) || '',
+      prior_why: (r && (r.priorWhy || r.prior_why)) || '',
     }));
     return slimWorkForHistory(
       {
@@ -3915,6 +3981,8 @@
         related_by_title: related,
         theme_keywords: work.themeKeywords || work.theme_keywords || [],
         keyword_queries: work.keywordQueries || work.keyword_queries || [],
+        visual_lock: !!(work.visualLock || work.visual_lock),
+        user_confirmed: !!(work.userConfirmed || work.user_confirmed),
         line: line,
         job_elapsed_ms: elapsedMsValue(work.jobElapsedMs != null ? work.jobElapsedMs : work.job_elapsed_ms),
         work_elapsed_ms: elapsedMsValue(work.workElapsedMs != null ? work.workElapsedMs : work.work_elapsed_ms),
@@ -4282,13 +4350,123 @@
     }
   }
 
-  function buildWorkActions(w, coverWrap) {
+  function mainCardOfBlock(block) {
+    if (!block) return null;
+    let found = null;
+    function walk(node) {
+      if (!node || found) return;
+      if (elHasClass(node, 'work-carousel-slide')) {
+        const kids = node.children || [];
+        for (let i = 0; i < kids.length; i++) {
+          if (elHasClass(kids[i], 'card')) {
+            found = kids[i];
+            return;
+          }
+        }
+        return;
+      }
+      (node.children || []).forEach(walk);
+    }
+    walk(block);
+    return found;
+  }
+
+  /** 「就是這張」 only means something when this carousel's main came from an upload. */
+  function carouselCanConfirmSame(mainWork) {
+    if (!mainWork || mainWork.skipped) return false;
+    return !!(String(mainWork.userPreview || mainWork.user_preview || '').trim() ||
+      mainWork.fromImageIndex || mainWork.from_image_index);
+  }
+
+  function cardHasConfirmSame(card) {
+    let hit = false;
+    function walk(node) {
+      if (!node || hit) return;
+      if (elHasClass(node, 'work-action-confirm')) {
+        hit = true;
+        return;
+      }
+      (node.children || []).forEach(walk);
+    }
+    walk(card);
+    return hit;
+  }
+
+  /**
+   * 「就是這張」: the user says this related work is the same picture as the
+   * upload. Identify that 品番 by code, then put it in this carousel's main
+   * slot as a confirmed visual lock (clears 未核對). The catalog jacket stays
+   * the cover; the upload is never used as it. Unpressed rows stay similar only.
+   */
+  async function confirmSameImage(relatedWork, card) {
+    const code = reliablePromoteCode(relatedWork);
+    if (!code) {
+      showToast('這部沒有可用番號，無法確認');
+      return { ok: false, reason: 'nocode' };
+    }
+    if (promoteBusy) {
+      showToast('正在處理上一個動作…');
+      return { ok: false, reason: 'busy' };
+    }
+    promoteBusy = true;
+    const block = closestEl(card, 'work-carousel-block');
+    const mainCard = mainCardOfBlock(block) || card;
+    let preferHistoryId = viewingHistoryId || '';
+    showToast('正在確認 ' + code + ' 為同一張圖…', { persist: true });
+    try {
+      if (historySavePromise && !preferHistoryId) {
+        try {
+          preferHistoryId = (await historySavePromise) || '';
+        } catch (_) {}
+      }
+      const data = await identifyCodeForPromote(code);
+      settlePromoteProgress();
+      const source = pickManualIdentifySource(data);
+      if (!source || !reliablePromoteCode(source) || !codesMatch(String(source.code), code)) {
+        showToast((data && data.message) || '找不到這部作品');
+        return { ok: false, reason: 'miss', data: data };
+      }
+      const confirmedSource = Object.assign({}, source);
+      if (!String(confirmedSource.title_zh || confirmedSource.titleZh || '').trim()) {
+        const zh = sameCodeGloss(relatedWork, code, 'titleZh', 'title_zh');
+        if (zh) confirmedSource.title_zh = zh;
+      }
+      const placed = placeManualWorkInSlot(null, confirmedSource, mainCard, preferHistoryId, {
+        confirm: {
+          visualLock: true,
+          visualMismatch: false,
+          visualNote: '',
+          userConfirmed: true,
+        },
+      });
+      if (!placed || !placed.work) {
+        showToast('無法更新這個欄位');
+        return { ok: false, reason: 'place' };
+      }
+      showToast('已確認 ' + formatDisplayCode(placed.work.code) + ' 就是這張');
+      return { ok: true, work: placed.work, slotIndex: placed.slotIndex };
+    } catch (err) {
+      if (err && err.superseded) return { ok: false, reason: 'superseded' };
+      settlePromoteProgress();
+      showToast((err && err.message) || '確認失敗');
+      return { ok: false, reason: 'error' };
+    } finally {
+      promoteBusy = false;
+    }
+  }
+
+  function buildWorkActions(w, coverWrap, opts) {
+    opts = opts || {};
     const bar = document.createElement('div');
     bar.className = 'work-actions';
     bar.setAttribute('role', 'group');
     const displayTitle = formatDisplayTitle(w.title, w.titleZh);
     const canPromote = isRelatedCarouselLine(String((w && w.line) || '')) && !!reliablePromoteCode(w);
-    bar.setAttribute('aria-label', canPromote ? '複製、下載與以此為主' : '複製與下載');
+    const canConfirm = canPromote && !!opts.confirmSame;
+    bar.setAttribute(
+      'aria-label',
+      canConfirm ? '複製、下載、以此為主與就是這張' : canPromote ? '複製、下載與以此為主' : '複製與下載'
+    );
     const specs = [
       { mark: '番', icon: ICON_COPY, label: '複製番號', run: () => copyWorkField(w.code, '已複製') },
       { mark: '名', icon: ICON_COPY, label: '複製名稱', run: () => copyWorkField(displayTitle, '已複製') },
@@ -4319,6 +4497,17 @@
         run: (e) => {
           const host = (e && (e.currentTarget || e.target)) || null;
           lastPromoteTask = promoteRelatedToMain(w, host);
+        },
+      });
+    }
+    if (canConfirm) {
+      specs.push({
+        text: '就是這張',
+        label: '就是這張（與上傳圖為同一張圖）',
+        extraClass: ' work-action-confirm',
+        run: (e) => {
+          const host = (e && (e.currentTarget || e.target)) || null;
+          lastPromoteTask = confirmSameImage(w, host);
         },
       });
     }
@@ -4597,12 +4786,58 @@
     return name === 'AbortError' || /abort|cancel/i.test(msg);
   }
 
+  // ↓ and cover warm-up share one in-memory copy per catalog URL, so a
+  // second ↓ or the jacket already warmed for display is not fetched again.
+  // Only successful bytes stay; a failed fetch is retried next time.
+  const WORK_IMAGE_CACHE_MAX_BYTES = 40 * 1024 * 1024;
+  const workImageCache = new Map();
+  let workImageCacheBytes = 0;
+
+  function rememberWorkImage(url, buf) {
+    if (!buf || !buf.byteLength || buf.byteLength > WORK_IMAGE_CACHE_MAX_BYTES / 4) return;
+    const old = workImageCache.get(url);
+    if (old && old.buf) workImageCacheBytes -= old.buf.byteLength;
+    workImageCache.delete(url);
+    workImageCache.set(url, { buf: buf });
+    workImageCacheBytes += buf.byteLength;
+    while (workImageCacheBytes > WORK_IMAGE_CACHE_MAX_BYTES && workImageCache.size) {
+      const oldestKey = workImageCache.keys().next().value;
+      const oldest = workImageCache.get(oldestKey);
+      if (oldest && oldest.buf) workImageCacheBytes -= oldest.buf.byteLength;
+      workImageCache.delete(oldestKey);
+    }
+  }
+
+  function clearWorkImageCache() {
+    workImageCache.clear();
+    workImageCacheBytes = 0;
+  }
+
   async function fetchWorkImageBuffer(url) {
-    const res = await fetch(cdnProxyUrl(url));
-    if (!res.ok) throw new Error('cdn');
-    const buf = await res.arrayBuffer();
-    if (!buf || !buf.byteLength) throw new Error('empty');
-    return buf;
+    const key = String(url || '').trim();
+    const hit = key && workImageCache.get(key);
+    if (hit) {
+      if (hit.buf) return hit.buf;
+      if (hit.pending) return hit.pending;
+    }
+    const pending = (async function () {
+      const res = await fetch(cdnProxyUrl(url));
+      if (!res.ok) throw new Error('cdn');
+      const buf = await res.arrayBuffer();
+      if (!buf || !buf.byteLength) throw new Error('empty');
+      return buf;
+    })();
+    if (!key) return pending;
+    workImageCache.set(key, { pending: pending });
+    try {
+      const buf = await pending;
+      rememberWorkImage(key, buf);
+      return buf;
+    } catch (err) {
+      const cur = workImageCache.get(key);
+      if (cur && cur.pending === pending) workImageCache.delete(key);
+      throw err;
+    }
   }
 
   async function fetchWorkImageBufferTries(url, tries) {
@@ -5140,15 +5375,17 @@
     track.appendChild(mainSlide);
     slides.push(mainSlide);
 
+    const confirmSame = carouselCanConfirmSame(mainWork);
     related.forEach((rw, i) => {
       const slide = document.createElement('div');
       slide.className = 'work-carousel-slide';
       const line = relatedLineFromRaw(rw);
       let badge = '相關 ' + (i + 1);
-      if (line === 'actress') badge = '同演員';
+      if (line === 'visual') badge = '視覺相似（未確認）';
+      else if (line === 'actress') badge = '同演員';
       else if (line === 'keyword') badge = '關鍵字';
       else if (line === 'theme') badge = '片名相近';
-      slide.appendChild(buildWorkCard(rw, { slide: true, badgeLabel: badge }));
+      slide.appendChild(buildWorkCard(rw, { slide: true, badgeLabel: badge, confirmSame: confirmSame }));
       track.appendChild(slide);
       slides.push(slide);
     });
@@ -6695,6 +6932,14 @@
       reliablePromoteCode,
       promotedGalleryWork,
       promoteRelatedToMain,
+      confirmSameImage,
+      carouselCanConfirmSame,
+      capRelatedBuckets,
+      relatedLineFromRaw,
+      slimRelatedForHistory,
+      buildWorkCarousel,
+      fetchWorkImageBuffer,
+      clearWorkImageCache,
       promoteTask: () => lastPromoteTask,
       manualTask: () => lastManualTask,
       renderGallery,
