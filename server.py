@@ -6965,6 +6965,7 @@ def identify_code(
     code: str,
     ocr_preview: str | None = None,
     vision_meta: dict | None = None,
+    on_progress=None,
 ) -> dict:
     display = format_display_code(code)
     parts = parse_code_parts(display)
@@ -7193,6 +7194,23 @@ def identify_code(
             message = "看圖辨識（標題）＋ DMM CDN"
             related_note = related_note or "無法取得線上相關；僅顯示主作品 CDN。"
 
+    # Title lookup is the search step. The jacket probe and the public-catalog
+    # fallback that may replace an empty jacket are the cover step. Chinese-title
+    # lookup sits between those two cover calls and stays there so identify
+    # results do not change; that time is on the cover clock.
+    if on_progress:
+        if title and str(title).strip():
+            _progress(on_progress, "search", "done", f"標題：{str(title)[:48]}", 4 / 6)
+        else:
+            _progress(
+                on_progress,
+                "search",
+                "done",
+                (str(message or "")[:80] or "已查詢（可能無標題）"),
+                4 / 6,
+            )
+        _progress(on_progress, "cover", "active", "CDN 封面載入中…", 4 / 6)
+
     cid, cover, stills = sanitize_cover_fields(
         code=display,
         cid=str(cid) if cid else None,
@@ -7259,6 +7277,9 @@ def identify_code(
     }
     _merge_public_catalog_theme(out, catalog_zh)
     _apply_public_cover_fallback(out, catalog_zh)
+    if on_progress:
+        cover_status, cover_detail = _cover_progress_detail(out)
+        _progress(on_progress, "cover", cover_status, cover_detail, 5 / 6)
     try:
         _backfill_catalog_identity(out)
     except Exception:
@@ -14812,6 +14833,7 @@ def _run_multi_identify_pipeline_inner(
         if not any((j.get("title") or "").casefold() == key for j in jobs):
             jobs.append({"kind": "title", "code": "", "title": user_title, "row": None})
 
+    # Close 彙整番號／片名 before verify. A later step must not leave that row active.
     _progress(
         on_progress,
         "parse",
@@ -15880,6 +15902,43 @@ def _run_identify_pipeline_inner(
     else:
         _progress(on_progress, "vision", "skipped", "無圖片，略過看圖辨識", 2 / 6)
 
+    # Step 3 starts when we read 番號／片名. Jacket scoring below is this step.
+    # The row is closed before verify or search: once a higher step is the
+    # high-water mark, the client drops a later parse event and the spinner
+    # would stay on with a clock already frozen at zero.
+    parse_open = True
+    _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
+
+    def _mark_parse(status: str, detail: str, progress: float) -> None:
+        nonlocal parse_open
+        if not parse_open:
+            return
+        parse_open = False
+        _progress(on_progress, "parse", status, detail, progress)
+
+    def _close_parse_before_advance() -> None:
+        """Done when a 番號 or 片名 was read; skipped when the read found nothing."""
+        if not parse_open:
+            return
+        # Stay under verify's 3/7 (0.429) so that step is not a percent rewind.
+        progress = 0.40
+        disp = ""
+        if code and parse_code_parts(str(code)):
+            disp = format_display_code(code)
+        if disp:
+            _mark_parse("done", f"番號：{disp}", progress)
+            return
+        if user_title and is_usable_title(user_title):
+            _mark_parse("done", f"使用片名：{user_title.strip()[:40]}", progress)
+            return
+        seen_title = ""
+        if vision_meta and is_usable_title(vision_meta.get("title")):
+            seen_title = str(vision_meta.get("title") or "").strip()
+        if seen_title:
+            _mark_parse("done", f"已讀到片名：{seen_title[:40]}", progress)
+            return
+        _mark_parse("skipped", "略過", progress)
+
     # A still with almost no print: vision often returns nothing, while OCR
     # still has a short distinctive phrase the catalog can search.
     if image_bytes is not None and not is_usable_title((vision_meta or {}).get("title")):
@@ -15952,8 +16011,8 @@ def _run_identify_pipeline_inner(
             code = ""
             search_mode = "title"
 
-    # Step 3: parse code/title
-    _progress(on_progress, "parse", "active", "整理番號／片名…", 2 / 6)
+    # The read is finished. Verify and search must not start while parse is active.
+    _close_parse_before_advance()
 
     early_payload: dict | None = None
     early_status = 200
@@ -16070,7 +16129,7 @@ def _run_identify_pipeline_inner(
         vtitle = str(vision_meta.get("title") or "").strip()
         vactress = vision_meta.get("actress")
         vstudio = vision_meta.get("studio")
-        _progress(on_progress, "parse", "done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
+        _mark_parse("done", f"已讀到片名：{vtitle[:40]}", 3 / 6)
         _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6, phase="目錄查詢")
         phrase_extras = list(text_queries or [])
         phrase_blob = "\n".join(
@@ -16248,12 +16307,12 @@ def _run_identify_pipeline_inner(
                     + f"以片名搜尋：「{str(vtitle).strip()}」。未解析出番號。",
                 )
             )
-            _progress(on_progress, "parse", "done", "僅有片名", 3 / 6)
+            _mark_parse("done", "僅有片名", 3 / 6)
             _progress(on_progress, "search", "skipped", "無法解析番號", 4 / 6)
             _progress(on_progress, "cover", "skipped", "無番號可抓封面", 5 / 6)
             _progress(on_progress, "done", "done", "完成（僅片名）", 1.0)
             return early_payload, 200
-        _progress(on_progress, "parse", "error", "未在圖片中找到番號或片名", 0.45)
+        _mark_parse("error", "未在圖片中找到番號或片名", 0.45)
         _progress(on_progress, "search", "skipped", "略過", 0.5)
         _progress(on_progress, "cover", "skipped", "略過", 0.5)
         _progress(on_progress, "done", "error", "辨識失敗", 1.0)
@@ -16270,7 +16329,7 @@ def _run_identify_pipeline_inner(
     # Title-only input (no image/code)
     if not code and user_title:
         search_mode = "title"
-        _progress(on_progress, "parse", "done", f"使用片名：{user_title[:40]}", 3 / 6)
+        _mark_parse("done", f"使用片名：{user_title[:40]}", 3 / 6)
         _progress(on_progress, "search", "active", "正在用片名搜尋…", 3 / 6, phase="目錄查詢")
         hit = None
         try:
@@ -16384,7 +16443,7 @@ def _run_identify_pipeline_inner(
             )
 
     if not code:
-        _progress(on_progress, "parse", "error", "請提供 image、code 或 title", 0.4)
+        _mark_parse("error", "請提供 image、code 或 title", 0.4)
         return (
             empty_identify(
                 message="請提供 image、code 或 title",
@@ -16395,13 +16454,31 @@ def _run_identify_pipeline_inner(
             400,
         )
 
-    # Have a code
+    # Have a code. Parse was already closed before verify; keep this for a path
+    # that somehow reaches here with the row still open.
     disp = format_display_code(code)
-    _progress(on_progress, "parse", "done", f"番號：{disp}", 3 / 6)
+    _mark_parse("done", f"番號：{disp}", 3 / 6)
 
     # Step 4: search metadata
     _progress(on_progress, "search", "active", f"搜尋作品資料（{disp}）…", 3 / 6)
-    result = identify_code(code, ocr_preview=ocr_preview, vision_meta=vision_meta)
+    cover_clock = {"done": False}
+
+    def _relay_progress(evt):
+        if (
+            isinstance(evt, dict)
+            and evt.get("step") == "cover"
+            and evt.get("status") in ("done", "skipped", "error")
+        ):
+            cover_clock["done"] = True
+        if on_progress:
+            on_progress(evt)
+
+    result = identify_code(
+        code,
+        ocr_preview=ocr_preview,
+        vision_meta=vision_meta,
+        on_progress=_relay_progress,
+    )
     result["vision_used"] = vision_used
     result["search_mode"] = search_mode if search_mode in ("code", "title", "manual") else (
         "manual" if user_code else ("title" if user_title else "code")
@@ -16419,17 +16496,21 @@ def _run_identify_pipeline_inner(
     result.setdefault("vision_used", vision_used)
 
     src = result.get("message") or ""
-    if result.get("title"):
-        _progress(on_progress, "search", "done", f"標題：{str(result['title'])[:48]}", 4 / 6)
-    else:
-        _progress(on_progress, "search", "done", (src[:80] or "已查詢（可能無標題）"), 4 / 6)
+    # identify_code already closed search and ran the cover clock around the
+    # jacket probe. Emitting search done after cover would be a rewind.
+    if not cover_clock["done"]:
+        if result.get("title"):
+            _progress(on_progress, "search", "done", f"標題：{str(result['title'])[:48]}", 4 / 6)
+        else:
+            _progress(on_progress, "search", "done", (src[:80] or "已查詢（可能無標題）"), 4 / 6)
 
-    # Step 5: cover/stills (URLs already built in identify_code).
-    # A MissAV/Jable product cover counts as ready. 無封面 URL only when
-    # DMM, MissAV, and Jable all lacked a usable jacket.
-    _progress(on_progress, "cover", "active", "CDN 封面載入中…", 4 / 6)
-    cover_status, cover_detail = _cover_progress_detail(result)
-    _progress(on_progress, "cover", cover_status, cover_detail, 5 / 6)
+        # Cache and demo hits return before any jacket probe. Their cover step
+        # is only this report, so the clock stays at zero.
+        # A MissAV/Jable product cover counts as ready. 無封面 URL only when
+        # DMM, MissAV, and Jable all lacked a usable jacket.
+        _progress(on_progress, "cover", "active", "CDN 封面載入中…", 4 / 6)
+        cover_status, cover_detail = _cover_progress_detail(result)
+        _progress(on_progress, "cover", cover_status, cover_detail, 5 / 6)
 
     # Attach other title-search codes as gallery cards when applicable
     if title_search_hit:
