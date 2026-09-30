@@ -5791,9 +5791,14 @@ def _lock_work_catalog_media(work: dict | None) -> dict | None:
 
 
 def _lock_identify_payload_media(payload: dict | None) -> dict | None:
-    """Strip the query image off the main work and every listed result."""
+    """Strip the query image off the main work and every listed result.
+
+    Every identify exit passes here, so Chinese glosses are also put in
+    Traditional script at this point.
+    """
     if not isinstance(payload, dict):
         return payload
+    _zh_fields_to_traditional(payload)
     _lock_work_catalog_media(payload)
     for key in ("results", "candidates"):
         rows = payload.get(key)
@@ -8197,6 +8202,80 @@ def _strip_billing_suffix(text: str) -> str:
     return t.strip(" -\u3000。．.！!？?")
 
 
+_S2T_LOCK = threading.Lock()
+_S2T_CONVERTER: Any = None
+_S2T_READY = False
+
+
+def _s2t_converter():
+    """OpenCC s2tw: Simplified → Traditional (Taiwan glyphs), no vocabulary swaps."""
+    global _S2T_CONVERTER, _S2T_READY
+    if _S2T_READY:
+        return _S2T_CONVERTER
+    with _S2T_LOCK:
+        if not _S2T_READY:
+            try:
+                import opencc
+
+                _S2T_CONVERTER = opencc.OpenCC("s2tw")
+            except Exception:
+                _S2T_CONVERTER = None
+            _S2T_READY = True
+    return _S2T_CONVERTER
+
+
+def to_traditional_zh(text: str | None) -> str | None:
+    """Traditional script for an existing Chinese gloss. Kana text is left as is.
+
+    Only the script changes; nothing is translated. Without OpenCC the text
+    is returned unchanged.
+    """
+    if not text or not isinstance(text, str):
+        return text
+    if re.search(r"[\u3040-\u30ff]", text):
+        return text
+    conv = _s2t_converter()
+    if conv is None:
+        return text
+    try:
+        with _S2T_LOCK:
+            out = conv.convert(text)
+    except Exception:
+        return text
+    return out or text
+
+
+_ZH_GLOSS_FIELDS = ("title_zh", "actress_zh", "studio_zh")
+
+
+def _zh_fields_to_traditional(payload: dict | None) -> dict | None:
+    """Main, results, candidates, and related rows: Chinese glosses in Traditional."""
+    if not isinstance(payload, dict):
+        return payload
+
+    def fix(row: dict) -> None:
+        for key in _ZH_GLOSS_FIELDS:
+            val = row.get(key)
+            if isinstance(val, str) and val.strip():
+                row[key] = to_traditional_zh(val)
+
+    fix(payload)
+    for key in ("results", "candidates", "related_by_title", "related"):
+        rows = payload.get(key)
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            fix(row)
+            nested = row.get("related_by_title")
+            if isinstance(nested, list):
+                for sub in nested:
+                    if isinstance(sub, dict):
+                        fix(sub)
+    return payload
+
+
 def _clean_title_zh(
     raw: str | None,
     *,
@@ -8252,7 +8331,7 @@ def _clean_title_zh(
     limit = 160 if trusted else 80
     if len(t) < 2 or len(t) > limit:
         return None
-    return t
+    return to_traditional_zh(t)
 
 
 _ACTRESS_CHROME = frozenset(
@@ -8312,7 +8391,7 @@ def _clean_actress_zh(
     ja = re.sub(r"\s+", "", (actress_ja or "").strip())
     if ja and t == ja:
         return None
-    return t
+    return to_traditional_zh(t)
 
 
 def _actress_names_from_html(

@@ -3,3 +3,4 @@ pillow
 requests
 gunicorn
 curl_cffi
+opencc==1.4.2
