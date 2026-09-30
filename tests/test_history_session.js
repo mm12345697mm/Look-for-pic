@@ -3883,6 +3883,147 @@ function walkNodes(node, acc) {
     assert.ok(blob.indexOf('時間不夠') === -1);
   }
 
+  // A later step closes an earlier active row. The clock keeps the real span.
+  // A step that never left pending is skipped. Rewind still drops a backwards event.
+  {
+    H.showProgress();
+    function row(id) {
+      const steps = getEl('progress-steps').children;
+      return steps.find((n) => n.dataset && n.dataset.step === id);
+    }
+    function timerOf(id) {
+      return (row(id).children || []).find((n) => String(n.className || '').indexOf('step-timer') !== -1);
+    }
+    function cls(id) {
+      return String(row(id).className || '');
+    }
+    H.applyProgressEvent({
+      step: 'parse',
+      status: 'active',
+      detail: '整理番號／片名…',
+      progress: 0.333,
+      t_ms: 10000,
+    });
+    H.applyProgressEvent({
+      step: 'verify',
+      status: 'skipped',
+      detail: '無可核對片名',
+      progress: 0.429,
+      t_ms: 45000,
+    });
+    assert.ok(cls('parse').indexOf('is-active') === -1, 'parse must leave the spinner');
+    assert.ok(cls('parse').indexOf('is-done') !== -1, 'parse ran, so it is done');
+    assert.ok(cls('verify').indexOf('is-skipped') !== -1);
+    assert.strictEqual(timerOf('parse').textContent, '00:00:35');
+    assert.ok(cls('receive').indexOf('is-skipped') !== -1, 'receive never ran');
+    assert.strictEqual(timerOf('receive').textContent, '00:00:00');
+
+    H.showProgress();
+    H.applyProgressEvent({
+      step: 'parse',
+      status: 'active',
+      detail: '整理番號／片名…',
+      progress: 0.333,
+      t_ms: 10000,
+    });
+    H.applyProgressEvent({
+      step: 'parse',
+      status: 'done',
+      detail: '番號：MIDA-616',
+      progress: 0.4,
+      t_ms: 45000,
+    });
+    H.applyProgressEvent({
+      step: 'verify',
+      status: 'skipped',
+      detail: '無可核對片名',
+      progress: 0.429,
+      t_ms: 45100,
+    });
+    assert.ok(cls('parse').indexOf('is-active') === -1);
+    assert.ok(cls('parse').indexOf('is-done') !== -1);
+    assert.strictEqual(timerOf('parse').textContent, '00:00:35');
+    assert.ok(cls('verify').indexOf('is-skipped') !== -1);
+
+    H.showProgress();
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'active',
+      detail: '搜尋作品資料…',
+      progress: 0.5,
+      t_ms: 1000,
+    });
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'done',
+      detail: '標題',
+      progress: 0.67,
+      t_ms: 36000,
+    });
+    H.applyProgressEvent({
+      step: 'cover',
+      status: 'active',
+      detail: 'CDN 封面載入中…',
+      progress: 0.67,
+      t_ms: 36000,
+    });
+    H.applyProgressEvent({
+      step: 'cover',
+      status: 'done',
+      detail: '封面就緒＋劇照 10 張',
+      progress: 0.83,
+      t_ms: 42000,
+    });
+    assert.ok(cls('search').indexOf('is-active') === -1);
+    assert.ok(cls('search').indexOf('is-done') !== -1);
+    assert.strictEqual(timerOf('search').textContent, '00:00:35');
+    assert.ok(cls('cover').indexOf('is-done') !== -1);
+    assert.strictEqual(timerOf('cover').textContent, '00:00:06');
+    assert.ok(cls('parse').indexOf('is-skipped') !== -1);
+    const heldPct = getEl('progress-pct').textContent;
+    const heldDetail = getEl('progress-detail').textContent;
+    H.applyProgressEvent({
+      step: 'vision',
+      status: 'active',
+      detail: '辨識第 1/4 張…',
+      progress: 0.2,
+      t_ms: 50000,
+    });
+    H.applyProgressEvent({
+      step: 'parse',
+      status: 'active',
+      detail: '整理番號／片名…',
+      progress: 0.3,
+      t_ms: 51000,
+    });
+    assert.strictEqual(getEl('progress-pct').textContent, heldPct);
+    assert.strictEqual(getEl('progress-detail').textContent, heldDetail);
+    assert.ok(cls('vision').indexOf('is-active') === -1);
+    assert.ok(cls('cover').indexOf('is-active') === -1);
+    assert.strictEqual(timerOf('cover').textContent, '00:00:06');
+    assert.strictEqual(timerOf('search').textContent, '00:00:35');
+
+    H.showProgress();
+    H.applyProgressEvent({
+      step: 'parse',
+      status: 'active',
+      detail: '整理番號／片名…',
+      progress: 0.333,
+      t_ms: 1000,
+    });
+    H.applyProgressEvent({
+      step: 'search',
+      status: 'error',
+      detail: '搜尋失敗',
+      progress: 0.7,
+      t_ms: 4000,
+    });
+    assert.ok(cls('parse').indexOf('is-active') === -1);
+    assert.ok(cls('parse').indexOf('is-done') !== -1);
+    assert.strictEqual(timerOf('parse').textContent, '00:00:03');
+    assert.ok(cls('search').indexOf('is-error') !== -1);
+  }
+
   // 總時間 is once at the gallery top. Each main shows 單一作品時間 under 劇照. Related keeps its own time.
   {
     const cover = 'https://pics.dmm.co.jp/digital/video/real00852/real00852pl.jpg';
