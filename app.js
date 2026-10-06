@@ -1548,19 +1548,31 @@
     ensureStepClockTicker();
   }
 
-  function freezeStepClock(stepId, evt) {
+  function freezeStepClock(stepId, evt, opts) {
+    const extend = !!(opts && opts.extend);
     const clock = stepClocks[stepId];
-    if (clock && clock.state === 'frozen') return;
+    // A clock already frozen while its row was still active must take the
+    // full span from first active through this close, not stay at 00:00:00.
+    if (clock && clock.state === 'frozen' && !extend) return;
     let ms = 0;
-    if (clock && clock.state === 'running') {
+    if (clock && (clock.state === 'running' || (extend && clock.state === 'frozen'))) {
       const serverEnd = evt && typeof evt.t_ms === 'number' ? evt.t_ms : null;
-      if (clock.serverMark != null && serverEnd != null && serverEnd >= clock.serverMark) {
-        ms = serverEnd - clock.serverMark;
+      const mark = clock.serverMark;
+      if (mark != null && serverEnd != null && serverEnd >= mark) {
+        ms = serverEnd - mark;
+      } else if (clock.state === 'running') {
+        ms = Math.max(0, Date.now() - (clock.startedAt || Date.now()));
       } else {
-        ms = Math.max(0, Date.now() - clock.startedAt);
+        ms = clock.frozenMs || 0;
       }
+      if (extend && (clock.frozenMs || 0) > ms) ms = clock.frozenMs;
     }
-    stepClocks[stepId] = { state: 'frozen', frozenMs: ms, startedAt: 0, serverMark: null };
+    stepClocks[stepId] = {
+      state: 'frozen',
+      frozenMs: ms,
+      startedAt: clock && clock.startedAt ? clock.startedAt : 0,
+      serverMark: clock && clock.serverMark != null ? clock.serverMark : null,
+    };
   }
 
   function tickStepClocks() {
@@ -1790,11 +1802,38 @@
     progressPanel.setAttribute('aria-busy', 'true');
   }
 
+  // A later active/done/skipped/error closes every earlier row that is still
+  // pending or active. A step that became active ran, so it is done and its
+  // clock freezes for the whole span since it first went active. A step that
+  // is still pending never meaningfully ran, so it is skipped. An earlier
+  // row must not keep spinning after a later row has moved on.
+  function closeEarlierProgressSteps(step, evt) {
+    const ids = listStepRows(progressStepsEl).map((n) => n.dataset.step);
+    const idx = ids.indexOf(step);
+    for (let i = 0; i < idx; i++) {
+      const prevId = ids[i];
+      const prevState = progressState[prevId];
+      if (prevState === 'done' || prevState === 'error' || prevState === 'skipped') continue;
+      const ran = prevState === 'active';
+      const next = ran ? 'done' : 'skipped';
+      progressState[prevId] = next;
+      const prev = findStepRow(progressStepsEl, prevId);
+      if (prev) {
+        prev.className = 'progress-step is-' + next;
+        // Leave a phase that was earned (封面鎖定) on a step that ran.
+        if (!ran) setStepPhase(prev, '');
+      }
+      freezeStepClock(prevId, evt, { extend: ran });
+      paintStepTimer(prevId);
+    }
+  }
+
   function applyProgressEvent(evt) {
     if (!evt || !evt.step) return;
     if (progressEventWouldRewind(evt)) return;
     const step = evt.step;
     const status = evt.status || 'active';
+    const wasActive = progressState[step] === 'active';
     progressState[step] = status;
     const li = findStepRow(progressStepsEl, step);
     if (li) {
@@ -1806,37 +1845,13 @@
         if (row !== li) setStepPhase(row, '');
       });
     }
-    if (status === 'active' || status === 'done' || status === 'skipped') {
-      const ids = listStepRows(progressStepsEl).map((n) => n.dataset.step);
-      const idx = ids.indexOf(step);
-      for (let i = 0; i < idx; i++) {
-        const prevId = ids[i];
-        const prevState = progressState[prevId];
-        if (prevState === 'error' || prevState === 'skipped') continue;
-        if (prevState === 'pending') {
-          progressState[prevId] = 'done';
-          const prev = findStepRow(progressStepsEl, prevId);
-          if (prev) {
-            prev.className = 'progress-step is-done';
-            setStepPhase(prev, '');
-          }
-        }
-        const clock = stepClocks[prevId];
-        if (!clock || clock.state === 'running') {
-          // Freeze a step that already started. Leave its phase label alone:
-          // 封面鎖定 stays beside that row after the batch moves on.
-          if (clock && clock.state === 'running') {
-            freezeStepClock(prevId, evt);
-            paintStepTimer(prevId);
-          } else if (prevState === 'pending') {
-            freezeStepClock(prevId, evt);
-            paintStepTimer(prevId);
-          }
-        }
-      }
+    if (status === 'active' || status === 'done' || status === 'skipped' || status === 'error') {
+      closeEarlierProgressSteps(step, evt);
     }
     if (status === 'active') startStepClock(step, evt);
-    else if (status === 'done' || status === 'skipped' || status === 'error') freezeStepClock(step, evt);
+    else if (status === 'done' || status === 'skipped' || status === 'error') {
+      freezeStepClock(step, evt, { extend: wasActive });
+    }
     paintStepTimer(step);
     if (evt.detail) {
       progressDetailEl.textContent = String(evt.detail);
