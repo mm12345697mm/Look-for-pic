@@ -24,6 +24,28 @@
 
   let runId = 0;
 
+  // Keep the screen awake while an identify session is running and this page
+  // is visible. Hidden tabs release the lock; a still-running session
+  // reacquires it when the page is shown again. Missing API is a no-op.
+  const identifyWake = (function () {
+    const noop = {
+      begin: function () { return 0; },
+      end: function () { return false; },
+      endAll: function () {},
+    };
+    if (typeof createScreenWakeLock !== 'function' || typeof createIdentifyWakeSession !== 'function') {
+      return noop;
+    }
+    try {
+      return createIdentifyWakeSession(createScreenWakeLock({
+        navigator: typeof navigator !== 'undefined' ? navigator : null,
+        document: typeof document !== 'undefined' ? document : null,
+      }));
+    } catch (_) {
+      return noop;
+    }
+  })();
+
   // --- DOM ---
   const $ = (id) => document.getElementById(id);
   const screenHome = $('screen-home');
@@ -2760,6 +2782,7 @@
   function resetBaseline() {
     runId += 1;
     identifyBusy = false;
+    identifyWake.endAll();
     batchFiles = [];
     slotUploadFiles = [];
     lastIdentifyPayload = null;
@@ -3469,6 +3492,8 @@
       return { ok: false, reason: 'empty' };
     }
 
+    const wakeId = identifyWake.begin();
+    try {
     let preferHistoryId = viewingHistoryId || '';
     if (historySavePromise) {
       try {
@@ -3510,6 +3535,9 @@
     }
     showToast(workNeedsManualFix(placed.work) ? '已套用，仍可再補番號或名稱' : '已核對封面');
     return { ok: true, work: placed.work, slotIndex: placed.slotIndex };
+    } finally {
+      identifyWake.end(wakeId);
+    }
   }
 
   /**
@@ -4345,6 +4373,7 @@
     const block = closestEl(card, 'work-carousel-block');
     const slotIndex = typeof opts.slotIndex === 'number' ? opts.slotIndex : carouselSlotIndex(block);
     showToast('正在以 ' + code + ' 延伸…', { persist: true });
+    const wakeId = identifyWake.begin();
     try {
       const data = await identifyCodeForPromote(code);
       const placed = applyPromotedMain(data, relatedWork, slotIndex, surface);
@@ -4362,6 +4391,7 @@
       return { ok: false, reason: 'error' };
     } finally {
       promoteBusy = false;
+      identifyWake.end(wakeId);
     }
   }
 
@@ -4428,6 +4458,7 @@
     const mainCard = mainCardOfBlock(block) || card;
     let preferHistoryId = viewingHistoryId || '';
     showToast('正在確認 ' + code + ' 為同一張圖…', { persist: true });
+    const wakeId = identifyWake.begin();
     try {
       if (historySavePromise && !preferHistoryId) {
         try {
@@ -4467,6 +4498,7 @@
       return { ok: false, reason: 'error' };
     } finally {
       promoteBusy = false;
+      identifyWake.end(wakeId);
     }
   }
 
@@ -6322,6 +6354,8 @@
       showToast('這張原圖不在了，請重新選取');
       return { ok: false, reason: 'missing-file' };
     }
+    const wakeId = identifyWake.begin();
+    try {
     setStatus('重新辨識第 ' + idx + ' 張…', 'busy');
     let single = null;
     const sessionId = lastIdentifyPayload && lastIdentifyPayload.session_id;
@@ -6370,9 +6404,14 @@
     setStatus('');
     showToast('已重新辨識這張');
     return { ok: true };
+    } finally {
+      identifyWake.end(wakeId);
+    }
   }
 
   async function runIdentify({ images, image, code, title } = {}, myRun) {
+    const wakeId = identifyWake.begin();
+    try {
     const imgs = images && images.length ? images : image ? [image] : [];
     identifyBusy = true;
     activeIdentifyJobId = '';
@@ -6529,6 +6568,9 @@
       setStatus((e && e.message) || String(e), 'err');
       progressPanel.setAttribute('aria-busy', 'false');
       showOcrPrompt(myRun);
+    }
+    } finally {
+      identifyWake.end(wakeId);
     }
   }
 
